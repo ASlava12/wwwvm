@@ -73,6 +73,20 @@ pub struct Cpu {
     pub halted: bool,
 }
 
+/// Decoded 16-bit effective address: linear = (sregs[seg] << 4) + off.
+#[derive(Copy, Clone, Debug)]
+pub struct EffAddr {
+    pub seg: usize,
+    pub off: u16,
+}
+
+/// Either side of a ModR/M operand: register index or memory address.
+#[derive(Copy, Clone, Debug)]
+pub enum Rm {
+    Reg(u8),
+    Mem(EffAddr),
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
@@ -206,94 +220,150 @@ impl Cpu {
         self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x8000) != 0);
     }
 
+    /// Decode a 16-bit ModR/M effective address. `mode` must be 0b00,
+    /// 0b01 or 0b10 — the 0b11 case is "register, not memory" and the
+    /// caller dispatches it separately. Advances IP past any disp.
+    fn compute_ea(&mut self, mode: u8, rm: u8, mem: &Memory) -> EffAddr {
+        // Special slot: mode=00, rm=110 means [disp16] — no register
+        // operand at all. Default segment DS.
+        if mode == 0b00 && rm == 0b110 {
+            let off = self.fetch_u16(mem);
+            return EffAddr { seg: sreg::DS, off };
+        }
+        let (base, default_ss) = match rm {
+            0b000 => (self.regs[r16::BX].wrapping_add(self.regs[r16::SI]), false),
+            0b001 => (self.regs[r16::BX].wrapping_add(self.regs[r16::DI]), false),
+            0b010 => (self.regs[r16::BP].wrapping_add(self.regs[r16::SI]), true),
+            0b011 => (self.regs[r16::BP].wrapping_add(self.regs[r16::DI]), true),
+            0b100 => (self.regs[r16::SI], false),
+            0b101 => (self.regs[r16::DI], false),
+            0b110 => (self.regs[r16::BP], true),
+            0b111 => (self.regs[r16::BX], false),
+            _ => unreachable!("rm is 3 bits"),
+        };
+        let disp = match mode {
+            0b00 => 0,
+            0b01 => self.fetch_u8(mem) as i8 as i16 as u16,
+            0b10 => self.fetch_u16(mem),
+            _ => unreachable!("mode is 2 bits, caller filters 0b11"),
+        };
+        EffAddr {
+            seg: if default_ss { sreg::SS } else { sreg::DS },
+            off: base.wrapping_add(disp),
+        }
+    }
+
+    /// Fetch a ModR/M byte and resolve the r/m side into a [`Rm`]. The
+    /// returned tuple is (mode, reg, rm) where `reg` is the 3-bit
+    /// register field for the opposite operand and `mode` is kept for
+    /// instructions whose group decoding looks at it.
+    fn fetch_modrm(&mut self, mem: &Memory) -> (u8, u8, Rm) {
+        let byte = self.fetch_u8(mem);
+        let mode = byte >> 6;
+        let reg = (byte >> 3) & 0x07;
+        let rm_field = byte & 0x07;
+        let rm = if mode == 0b11 {
+            Rm::Reg(rm_field)
+        } else {
+            Rm::Mem(self.compute_ea(mode, rm_field, mem))
+        };
+        (mode, reg, rm)
+    }
+
+    fn read_rm8(&self, rm: Rm, mem: &Memory) -> u8 {
+        match rm {
+            Rm::Reg(i) => self.read_r8(i),
+            Rm::Mem(ea) => mem.read_u8(Self::linear(self.sregs[ea.seg], ea.off)),
+        }
+    }
+    fn write_rm8(&mut self, rm: Rm, mem: &mut Memory, value: u8) {
+        match rm {
+            Rm::Reg(i) => self.write_r8(i, value),
+            Rm::Mem(ea) => mem.write_u8(Self::linear(self.sregs[ea.seg], ea.off), value),
+        }
+    }
+    fn read_rm16(&self, rm: Rm, mem: &Memory) -> u16 {
+        match rm {
+            Rm::Reg(i) => self.read_r16(i),
+            Rm::Mem(ea) => mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off)),
+        }
+    }
+    fn write_rm16(&mut self, rm: Rm, mem: &mut Memory, value: u16) {
+        match rm {
+            Rm::Reg(i) => self.write_r16(i, value),
+            Rm::Mem(ea) => mem.write_u16(Self::linear(self.sregs[ea.seg], ea.off), value),
+        }
+    }
+
     /// Execute one of the 8 standard ALU operations encoded in opcode
     /// 0x00..0x3F. `op` is the operation (0=ADD … 7=CMP) and `variant`
-    /// selects operand form (0..5). Currently mod=11 only for the
-    /// register-mode variants — memory ModR/M arrives in a follow-up.
-    fn alu_dispatch(
-        &mut self,
-        opcode: u8,
-        op_cs: u16,
-        op_ip: u16,
-        mem: &mut Memory,
-    ) -> Result<(), CpuError> {
+    /// (opcode & 7) selects operand form. Supports all 16-bit ModR/M
+    /// memory modes plus register-direct (mod=11) and the
+    /// `AL,imm8`/`AX,imm16` short forms.
+    fn alu_dispatch(&mut self, opcode: u8, mem: &mut Memory) -> Result<(), CpuError> {
         let op = (opcode >> 3) & 7;
         let variant = opcode & 7;
-        // Resolve operands & destination per variant.
-        enum Dest { R8(u8), R16(u8) }
+
+        // Resolve operands per variant. After this block we have:
+        //   a, b        the two values (a is the destination side)
+        //   dest        where to write the result (None = imm form)
+        //   is_word     8-bit vs 16-bit
+        #[derive(Copy, Clone)]
+        enum Dest {
+            Rm(Rm),
+            Reg8(u8),
+            Reg16(u8),
+        }
         let is_word: bool;
         let a: u32;
         let b: u32;
         let dest: Dest;
         match variant {
             0 => {
-                // r/m8, r8 — write back to r/m
-                let modrm = self.fetch_u8(mem);
-                let (mode, reg, rm) = parse_modrm(modrm);
-                if mode != 0b11 {
-                    return Err(CpuError::UnimplementedModRm { opcode, mode, cs: op_cs, ip: op_ip });
-                }
-                a = self.read_r8(rm) as u32;
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                a = self.read_rm8(rm, mem) as u32;
                 b = self.read_r8(reg) as u32;
-                dest = Dest::R8(rm);
+                dest = Dest::Rm(rm);
                 is_word = false;
             }
             1 => {
-                // r/m16, r16
-                let modrm = self.fetch_u8(mem);
-                let (mode, reg, rm) = parse_modrm(modrm);
-                if mode != 0b11 {
-                    return Err(CpuError::UnimplementedModRm { opcode, mode, cs: op_cs, ip: op_ip });
-                }
-                a = self.read_r16(rm) as u32;
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                a = self.read_rm16(rm, mem) as u32;
                 b = self.read_r16(reg) as u32;
-                dest = Dest::R16(rm);
+                dest = Dest::Rm(rm);
                 is_word = true;
             }
             2 => {
-                // r8, r/m8 — write back to reg
-                let modrm = self.fetch_u8(mem);
-                let (mode, reg, rm) = parse_modrm(modrm);
-                if mode != 0b11 {
-                    return Err(CpuError::UnimplementedModRm { opcode, mode, cs: op_cs, ip: op_ip });
-                }
+                let (_, reg, rm) = self.fetch_modrm(mem);
                 a = self.read_r8(reg) as u32;
-                b = self.read_r8(rm) as u32;
-                dest = Dest::R8(reg);
+                b = self.read_rm8(rm, mem) as u32;
+                dest = Dest::Reg8(reg);
                 is_word = false;
             }
             3 => {
-                // r16, r/m16
-                let modrm = self.fetch_u8(mem);
-                let (mode, reg, rm) = parse_modrm(modrm);
-                if mode != 0b11 {
-                    return Err(CpuError::UnimplementedModRm { opcode, mode, cs: op_cs, ip: op_ip });
-                }
+                let (_, reg, rm) = self.fetch_modrm(mem);
                 a = self.read_r16(reg) as u32;
-                b = self.read_r16(rm) as u32;
-                dest = Dest::R16(reg);
+                b = self.read_rm16(rm, mem) as u32;
+                dest = Dest::Reg16(reg);
                 is_word = true;
             }
             4 => {
-                // AL, imm8
                 let imm = self.fetch_u8(mem);
                 a = self.read_r8(0) as u32;
                 b = imm as u32;
-                dest = Dest::R8(0);
+                dest = Dest::Reg8(0);
                 is_word = false;
             }
             5 => {
-                // AX, imm16
                 let imm = self.fetch_u16(mem);
                 a = self.read_r16(0) as u32;
                 b = imm as u32;
-                dest = Dest::R16(0);
+                dest = Dest::Reg16(0);
                 is_word = true;
             }
-            _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+            _ => unreachable!("ALU dispatch only covers variants 0..5"),
         }
 
-        // Apply the op and update flags. CMP discards the result.
         let cin = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
         let (result, writeback) = if !is_word {
             let (a8, b8) = (a as u8, b as u8);
@@ -325,8 +395,10 @@ impl Cpu {
 
         if writeback {
             match dest {
-                Dest::R8(i) => self.write_r8(i, result as u8),
-                Dest::R16(i) => self.write_r16(i, result as u16),
+                Dest::Rm(rm) if is_word => self.write_rm16(rm, mem, result as u16),
+                Dest::Rm(rm) => self.write_rm8(rm, mem, result as u8),
+                Dest::Reg8(i) => self.write_r8(i, result as u8),
+                Dest::Reg16(i) => self.write_r16(i, result as u16),
             }
         }
         Ok(())
@@ -390,7 +462,50 @@ impl Cpu {
             // slots are PUSH/POP sreg / prefixes, handled elsewhere).
             0x00..=0x05 | 0x08..=0x0D | 0x10..=0x15 | 0x18..=0x1D
             | 0x20..=0x25 | 0x28..=0x2D | 0x30..=0x35 | 0x38..=0x3D => {
-                self.alu_dispatch(opcode, op_cs, op_ip, mem)?;
+                self.alu_dispatch(opcode, mem)?;
+            }
+
+            // MOV r/m8, r8 — direction = r/m
+            0x88 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_r8(reg);
+                self.write_rm8(rm, mem, v);
+            }
+            // MOV r/m16, r16
+            0x89 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_r16(reg);
+                self.write_rm16(rm, mem, v);
+            }
+            // MOV r8, r/m8 — direction = reg
+            0x8A => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_rm8(rm, mem);
+                self.write_r8(reg, v);
+            }
+            // MOV r16, r/m16
+            0x8B => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_rm16(rm, mem);
+                self.write_r16(reg, v);
+            }
+            // MOV r/m8, imm8  — Group 11 /0
+            0xC6 => {
+                let (_, reg_field, rm) = self.fetch_modrm(mem);
+                if reg_field != 0 {
+                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                }
+                let imm = self.fetch_u8(mem);
+                self.write_rm8(rm, mem, imm);
+            }
+            // MOV r/m16, imm16
+            0xC7 => {
+                let (_, reg_field, rm) = self.fetch_modrm(mem);
+                if reg_field != 0 {
+                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                }
+                let imm = self.fetch_u16(mem);
+                self.write_rm16(rm, mem, imm);
             }
 
             // INC r16 (0x40-0x47) / DEC r16 (0x48-0x4F). Per the 8086,
@@ -490,18 +605,21 @@ impl Cpu {
     }
 }
 
-fn parse_modrm(byte: u8) -> (u8, u8, u8) {
-    (byte >> 6, (byte >> 3) & 0x07, byte & 0x07)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wwwvm_devices::IoBus;
 
     fn run_payload(bytes: &[u8], steps: usize) -> (Cpu, Memory, IoBus) {
+        run_with_data(bytes, 0, &[], steps)
+    }
+
+    fn run_with_data(bytes: &[u8], data_at: u32, data: &[u8], steps: usize) -> (Cpu, Memory, IoBus) {
         let mut mem = Memory::new(0x10_0000);
         mem.write_slice(0x7C00, bytes);
+        if !data.is_empty() {
+            mem.write_slice(data_at, data);
+        }
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         let mut io = IoBus::new();
@@ -630,6 +748,99 @@ mod tests {
         assert_eq!(cpu.regs[r16::AX], 0xFFFF);
         assert!(!cpu.has(flag::ZF));
         assert!(cpu.has(flag::SF));
+    }
+
+    #[test]
+    fn mov_byte_to_memory_and_back_via_bx() {
+        // MOV BX, 0x500 ; MOV AL, 0x42 ; MOV [BX], AL
+        // MOV CL, 0     ; MOV CL, [BX]
+        // ModR/M for [BX]: mod=00 rm=111
+        //   MOV [BX], AL : 0x88 modrm=00 000(AL) 111(BX) = 0x07
+        //   MOV CL, [BX] : 0x8A modrm=00 001(CL) 111(BX) = 0x0F
+        let (cpu, mem, _) = run_payload(&[
+            0xBB, 0x00, 0x05,
+            0xB0, 0x42,
+            0x88, 0x07,
+            0xB1, 0x00,
+            0x8A, 0x0F,
+            0xF4,
+        ], 12);
+        assert_eq!(mem.read_u8(0x500), 0x42);
+        assert_eq!(cpu.read_r8(1), 0x42);
+    }
+
+    #[test]
+    fn mov_word_imm_to_disp16_address() {
+        // MOV WORD [0x600], 0xCAFE
+        // 0xC7 modrm=00 000 110 = 0x06, then disp16=0x0600, then imm16=0xCAFE
+        let (_, mem, _) = run_payload(&[
+            0xC7, 0x06, 0x00, 0x06, 0xFE, 0xCA,
+            0xF4,
+        ], 4);
+        assert_eq!(mem.read_u16(0x600), 0xCAFE);
+    }
+
+    #[test]
+    fn add_reg_to_memory_via_bx() {
+        // MOV WORD [0x700], 10
+        // MOV BX, 0x700 ; MOV AX, 5 ; ADD [BX], AX
+        //   ADD r/m16, r16 = 0x01 /r ; mod=00 reg=000(AX) rm=111(BX) = 0x07
+        let (_, mem, _) = run_payload(&[
+            0xC7, 0x06, 0x00, 0x07, 0x0A, 0x00,
+            0xBB, 0x00, 0x07,
+            0xB8, 0x05, 0x00,
+            0x01, 0x07,
+            0xF4,
+        ], 10);
+        assert_eq!(mem.read_u16(0x700), 15);
+    }
+
+    #[test]
+    fn bp_addressing_defaults_to_ss_segment() {
+        // SS is 0 in our reset_to_boot, so this is just a sanity check
+        // that decoding picks SS (not DS) for [BP] form, and that the
+        // address still resolves correctly when both are zero.
+        // MOV BP, 0x900 ; MOV WORD [BP], 0x1357 (mod=10 rm=110 disp16=0)
+        //   0xC7 modrm=10 000 110 = 0x86 ; disp16=0x0000 ; imm16=0x1357
+        let (_, mem, _) = run_payload(&[
+            0xBD, 0x00, 0x09,
+            0xC7, 0x86, 0x00, 0x00, 0x57, 0x13,
+            0xF4,
+        ], 6);
+        assert_eq!(mem.read_u16(0x900), 0x1357);
+    }
+
+    #[test]
+    fn sum_array_in_memory_via_indirect_addressing() {
+        // Array of u16 at 0x800: 1, 2, 3, 4, 5, 0 (terminator)
+        //   MOV SI, 0x800
+        //   MOV CX, 2          ; step
+        //   XOR AX, AX
+        // loop (offset 8):
+        //   MOV BX, [SI]       ; 8B 1C  (mod=00 reg=011 BX rm=100 [SI])
+        //   OR  BX, BX         ; 09 DB
+        //   JZ  +6  -> done    ; 74 06
+        //   ADD AX, BX         ; 01 D8
+        //   ADD SI, CX         ; 01 CE  (SI += CX)
+        //   JMP -12 -> loop    ; EB F4
+        // done (offset 0x14):
+        //   HLT                ; F4
+        let array: &[u8] = &[1,0, 2,0, 3,0, 4,0, 5,0, 0,0];
+        let bytes = [
+            0xBE, 0x00, 0x08,
+            0xB9, 0x02, 0x00,
+            0x31, 0xC0,
+            0x8B, 0x1C,
+            0x09, 0xDB,
+            0x74, 0x06,
+            0x01, 0xD8,
+            0x01, 0xCE,
+            0xEB, 0xF4,
+            0xF4,
+        ];
+        let (cpu, _, _) = run_with_data(&bytes, 0x800, array, 200);
+        assert_eq!(cpu.regs[r16::AX], 15);
+        assert!(cpu.halted);
     }
 
     #[test]
