@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cpu",
+    "crates/mem",
+    "crates/devices",
+    "crates/vm",
+    "crates/wasm",
+    "crates/proxy",
+]
+exclude = ["guest"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/wwwvm"
+rust-version = "1.75"
+
+[workspace.dependencies]
+log = "0.4"
+thiserror = "1"
