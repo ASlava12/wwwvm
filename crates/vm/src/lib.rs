@@ -146,6 +146,21 @@ impl Vm {
         self.io.kbd.push_scancode(code);
     }
 
+    /// Seed the CMOS clock with binary date/time. Year is two-digit
+    /// (00..99). A guest probing 0x70/0x71 sees these values, with
+    /// Status B already configured for binary + 24-hour mode.
+    pub fn set_cmos_time(
+        &mut self,
+        year: u8,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.io.cmos.set_time(year, month, day, hour, minute, second);
+    }
+
     /// Drain everything the guest has transmitted since the last call.
     pub fn drain_output(&mut self) -> Vec<u8> {
         self.io.uart_mut().drain_tx()

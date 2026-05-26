@@ -22,11 +22,13 @@ pub trait IoDevice {
     fn write(&mut self, port: u16, value: u8);
 }
 
+mod cmos;
 mod keyboard;
 mod pic;
 mod pit;
 mod uart;
 
+pub use cmos::{Cmos, reg as cmos_reg};
 pub use keyboard::Keyboard;
 pub use pic::Pic;
 pub use pit::Pit;
@@ -40,6 +42,7 @@ pub struct IoBus {
     pub pic: Pic,
     pub pit: Pit,
     pub kbd: Keyboard,
+    pub cmos: Cmos,
 }
 
 impl IoBus {
@@ -49,6 +52,7 @@ impl IoBus {
             pic: Pic::master(),
             pit: Pit::standard(),
             kbd: Keyboard::new(),
+            cmos: Cmos::new(),
         }
     }
 
@@ -58,6 +62,7 @@ impl IoBus {
             pic: Pic::master(),
             pit: Pit::standard(),
             kbd: Keyboard::new(),
+            cmos: Cmos::new(),
         }
     }
 
@@ -131,6 +136,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.kbd.read(port);
         }
+        let (lo, hi) = self.cmos.port_range();
+        if port >= lo && port <= hi {
+            return self.cmos.read(port);
+        }
         0xFF
     }
 
@@ -153,6 +162,11 @@ impl IoBus {
         let (lo, hi) = self.kbd.port_range();
         if port >= lo && port <= hi {
             self.kbd.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.cmos.port_range();
+        if port >= lo && port <= hi {
+            self.cmos.write(port, value);
         }
     }
 }
@@ -200,6 +214,14 @@ mod tests {
         assert!(bus.pic.pending_vector().is_none());
         bus.refresh_irqs();
         assert_eq!(bus.pic.pending_vector(), Some(0x08 + 1));
+    }
+
+    #[test]
+    fn iobus_routes_to_cmos() {
+        let mut bus = IoBus::new();
+        bus.cmos.set_time(26, 5, 27, 8, 0, 0);
+        bus.write(0x70, cmos_reg::HOURS);
+        assert_eq!(bus.read(0x71), 8);
     }
 
     #[test]

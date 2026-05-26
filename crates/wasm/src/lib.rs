@@ -133,6 +133,21 @@ impl WwwVm {
         self.inner.push_scancode(code);
     }
 
+    /// Seed the CMOS clock with binary date/time. Year is two-digit
+    /// (00..99). Useful from JS when you want the guest to read a
+    /// specific wall-clock time on boot.
+    pub fn set_cmos_time(
+        &mut self,
+        year: u8,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.inner.set_cmos_time(year, month, day, hour, minute, second);
+    }
+
     /// Drain everything the guest has emitted since the previous call.
     /// Returned as a UTF-8 string with lossy replacement for non-UTF-8
     /// bytes (the host UART is a byte stream, not text — but the demo
