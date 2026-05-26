@@ -34,12 +34,17 @@ pub use pic::Pic;
 pub use pit::Pit;
 pub use uart::Uart;
 
-/// Concrete IO dispatcher. Owns one instance each of UART, PIC, PIT,
-/// keyboard; routes accesses by port. Unmapped ports read 0xFF (open
-/// bus on real hardware) and accept writes silently.
+/// Concrete IO dispatcher. Owns one instance of each PC device,
+/// including the cascaded master+slave 8259A PIC pair. Routes
+/// accesses by port. Unmapped ports read 0xFF (open bus on real
+/// hardware) and accept writes silently.
 pub struct IoBus {
     pub uart: Uart,
+    /// Master PIC, 0x20/0x21, vector base 0x08 — IRQs 0..7.
     pub pic: Pic,
+    /// Slave PIC, 0xA0/0xA1, vector base 0x70 — IRQs 8..15. Cascaded
+    /// through master IRQ 2 (the standard PC wiring).
+    pub slave_pic: Pic,
     pub pit: Pit,
     pub kbd: Keyboard,
     pub cmos: Cmos,
@@ -47,9 +52,12 @@ pub struct IoBus {
 
 impl IoBus {
     pub fn new() -> Self {
+        let mut slave_pic = Pic::new(0xA0);
+        slave_pic.vector_base = 0x70;
         Self {
             uart: Uart::com1(),
             pic: Pic::master(),
+            slave_pic,
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
@@ -57,9 +65,12 @@ impl IoBus {
     }
 
     pub fn with_uart(uart: Uart) -> Self {
+        let mut slave_pic = Pic::new(0xA0);
+        slave_pic.vector_base = 0x70;
         Self {
             uart,
             pic: Pic::master(),
+            slave_pic,
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
@@ -105,17 +116,46 @@ impl IoBus {
         if self.pit.take_ch0_pending() {
             self.pic.irr |= 1u8 << 0;
         }
+        // Cascade — slave-pending state controls master IRR bit 2.
+        // Level-triggered so master deasserts as soon as the slave has
+        // nothing left to deliver.
+        let cascade_bit = 1u8 << 2;
+        if self.slave_pic.pending_vector().is_some() {
+            self.pic.irr |= cascade_bit;
+        } else {
+            self.pic.irr &= !cascade_bit;
+        }
     }
 
     /// CPU-side accessor: highest-priority unmasked pending IRQ, or
-    /// None if there's nothing to deliver right now.
+    /// None if there's nothing to deliver right now. If the master
+    /// reports IRQ 2 (the cascade), we descend into the slave and
+    /// return *its* vector instead — the CPU never sees the cascade
+    /// IRQ directly.
     pub fn pending_irq_vector(&self) -> Option<u8> {
-        self.pic.pending_vector()
+        let vec = self.pic.pending_vector()?;
+        let master_irq = vec.wrapping_sub(self.pic.vector_base);
+        if master_irq == 2 {
+            self.slave_pic.pending_vector()
+        } else {
+            Some(vec)
+        }
     }
 
-    /// CPU-side accessor: latch the IRQ as in-service. Caller should
-    /// already have read `pending_irq_vector` and decided to dispatch.
+    /// CPU-side accessor: latch the IRQ as in-service. For a cascade
+    /// IRQ we ack the slave first (its IRR→ISR move), then the master
+    /// (the cascade IRQ 2 stays in master's ISR until the handler
+    /// EOIs both PICs). That matches the two-INTA-cycle behavior real
+    /// hardware uses.
     pub fn ack_irq(&mut self) {
+        let vec = match self.pic.pending_vector() {
+            Some(v) => v,
+            None => return,
+        };
+        let master_irq = vec.wrapping_sub(self.pic.vector_base);
+        if master_irq == 2 {
+            self.slave_pic.ack();
+        }
         self.pic.ack();
     }
 
@@ -139,6 +179,10 @@ impl IoBus {
         let (lo, hi) = self.cmos.port_range();
         if port >= lo && port <= hi {
             return self.cmos.read(port);
+        }
+        let (lo, hi) = self.slave_pic.port_range();
+        if port >= lo && port <= hi {
+            return self.slave_pic.read(port);
         }
         0xFF
     }
@@ -167,6 +211,11 @@ impl IoBus {
         let (lo, hi) = self.cmos.port_range();
         if port >= lo && port <= hi {
             self.cmos.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.slave_pic.port_range();
+        if port >= lo && port <= hi {
+            self.slave_pic.write(port, value);
         }
     }
 }
@@ -214,6 +263,46 @@ mod tests {
         assert!(bus.pic.pending_vector().is_none());
         bus.refresh_irqs();
         assert_eq!(bus.pic.pending_vector(), Some(0x08 + 1));
+    }
+
+    #[test]
+    fn iobus_routes_to_slave_pic() {
+        let mut bus = IoBus::new();
+        bus.write(0xA1, 0xAA);
+        assert_eq!(bus.read(0xA1), 0xAA);
+    }
+
+    #[test]
+    fn slave_pending_cascades_through_master_irq2() {
+        let mut bus = IoBus::new();
+        bus.slave_pic.imr = 0; // unmask all on slave
+        bus.pic.imr = !(1 << 2); // master only sees IRQ 2 (the cascade)
+        // Slave IRQ 0 → vector 0x70
+        bus.slave_pic.raise_irq(0);
+        // Without refresh, master is unaware.
+        assert!(bus.pic.pending_vector().is_none());
+        bus.refresh_irqs();
+        // refresh latched IRQ 2 into master IRR; pending_irq_vector
+        // now follows the cascade and returns the slave's vector.
+        assert_eq!(bus.pending_irq_vector(), Some(0x70));
+    }
+
+    #[test]
+    fn cascade_ack_clears_both_pic_irr_bits() {
+        let mut bus = IoBus::new();
+        bus.slave_pic.imr = 0;
+        bus.pic.imr = !(1 << 2);
+        bus.slave_pic.raise_irq(3); // slave IRQ 11 → vector 0x73
+        bus.refresh_irqs();
+        assert_eq!(bus.pending_irq_vector(), Some(0x73));
+        bus.ack_irq();
+        // Both PICs moved their bits from IRR to ISR.
+        assert_eq!(bus.pic.isr & (1 << 2), 1 << 2);
+        assert_eq!(bus.slave_pic.isr & (1 << 3), 1 << 3);
+        // No further pending — refresh_irqs deasserts master cascade
+        // once slave has nothing left unmasked-and-unserviced.
+        bus.refresh_irqs();
+        assert!(bus.pending_irq_vector().is_none());
     }
 
     #[test]

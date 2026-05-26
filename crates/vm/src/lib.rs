@@ -528,6 +528,58 @@ mod tests {
         assert_eq!(vm.read_mem_u8(0x900), 4);
     }
 
+    /// End-to-end cascade IRQ delivery: host raises an IRQ on the
+    /// slave PIC, the master sees IRQ 2 from the cascade, the CPU
+    /// gets the *slave's* vector. Handler EOIs both PICs (the
+    /// canonical PC pattern) and IRETs.
+    ///
+    /// Slave IRQ 0 = vector 0x70. Without the cascade, the master
+    /// would never deliver it.
+    #[test]
+    fn slave_pic_cascade_delivers_irq_through_vm() {
+        let main: &[u8] = &[
+            0xB0, 0xFB,                    // MOV AL, 0xFB  (master: unmask IRQ 2 cascade)
+            0xE6, 0x21,                    // OUT 0x21, AL
+            0xB0, 0xFE,                    // MOV AL, 0xFE  (slave: unmask IRQ 0)
+            0xE6, 0xA1,                    // OUT 0xA1, AL
+            0xFB,                          // STI
+            0x80, 0xFB, 0x00,              // CMP BL, 0
+            0x74, 0xFB,                    // JZ -5
+            0xF4,                          // HLT
+        ];
+        // Handler: EOI slave first (0xA0), then master (0x20). The
+        // order matters on real hardware — slave's ISR must clear
+        // before master's so the cascade line deasserts cleanly.
+        let handler: &[u8] = &[
+            0x50,                          // PUSH AX
+            0xB3, 0x77,                    // MOV BL, 0x77   (proof we ran)
+            0xB0, 0x20,
+            0xE6, 0xA0,                    // OUT 0xA0, AL   (slave EOI)
+            0xB0, 0x20,
+            0xE6, 0x20,                    // OUT 0x20, AL   (master EOI)
+            0x58,                          // POP AX
+            0xCF,                          // IRET
+        ];
+        let handler_addr: u32 = 0x7C40;
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, main);
+        vm.load_image(handler_addr, handler);
+        // Slave IRQ 0 → vector 0x70
+        vm.set_ivt(0x70, 0x0000, handler_addr as u16);
+        vm.boot();
+        // Raise slave IRQ 0 — the cascade should propagate.
+        vm.io.slave_pic.raise_irq(0);
+        let (_, stop) = vm.run_steps(2_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x77);
+        // Both PIC ISRs cleared by the double EOI.
+        assert_eq!(vm.io.pic.isr, 0);
+        assert_eq!(vm.io.slave_pic.isr, 0);
+    }
+
     /// End-to-end keyboard test: guest unmasks IRQ 1, STIs, spins on
     /// BL == 0. Handler reads port 0x60 into BL, EOIs the PIC. Host
     /// pushes a scan code; the IRQ should latch and dispatch.
