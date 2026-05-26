@@ -48,6 +48,20 @@
         </fieldset>
 
         <fieldset>
+          <legend>Snapshot / restore</legend>
+          <div class="snapshot-row">
+            <button id="save">Save</button>
+            <button id="load">Load</button>
+          </div>
+          <div class="snapshot-row">
+            <button id="download">Download .bin</button>
+            <button id="upload-trigger">Upload .bin</button>
+            <input type="file" id="upload" hidden accept=".bin" />
+          </div>
+          <small id="snapshot-status" class="status">no snapshot saved yet</small>
+        </fieldset>
+
+        <fieldset>
           <legend>VGA snapshot (0xB8000)</legend>
           <pre id="vga">(empty)</pre>
         </fieldset>

@@ -5,6 +5,7 @@
 // served over http (any http server — Python's http.server is fine).
 
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
+import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -121,4 +122,93 @@ $("send").addEventListener("click", async () => {
 });
 $("cmd").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("send").click();
+});
+
+const setSnapshotStatus = (text, cls = "") => {
+  const el = $("snapshot-status");
+  el.textContent = text;
+  el.className = "status" + (cls ? ` ${cls}` : "");
+};
+
+// Surface whether IndexedDB has anything stashed without forcing the
+// user to click Load to find out.
+(async () => {
+  try {
+    const keys = await listSnapshots();
+    if (keys.length > 0) {
+      setSnapshotStatus(`saved: ${keys.join(", ")}`);
+    }
+  } catch (e) {
+    setSnapshotStatus(`IndexedDB unavailable: ${e.message || e}`, "error");
+  }
+})();
+
+$("save").addEventListener("click", async () => {
+  if (!vm.is_booted()) {
+    setSnapshotStatus("can't snapshot before boot", "error");
+    return;
+  }
+  try {
+    const bytes = vm.snapshot();
+    await saveSnapshot("latest", bytes);
+    setSnapshotStatus(`saved ${bytes.length.toLocaleString()} bytes to IndexedDB`);
+  } catch (e) {
+    setSnapshotStatus(`save failed: ${e.message || e}`, "error");
+  }
+});
+
+function resumePump() {
+  if (rafHandle) cancelAnimationFrame(rafHandle);
+  setStatus("running", "running");
+  pump();
+}
+
+$("load").addEventListener("click", async () => {
+  try {
+    const bytes = await loadSnapshot("latest");
+    if (!bytes) {
+      setSnapshotStatus("no snapshot stored", "error");
+      return;
+    }
+    vm.restore(bytes);
+    term.reset();
+    setSnapshotStatus(`restored ${bytes.length.toLocaleString()} bytes`);
+    resumePump();
+  } catch (e) {
+    setSnapshotStatus(`load failed: ${e.message || e}`, "error");
+  }
+});
+
+$("download").addEventListener("click", () => {
+  if (!vm.is_booted()) {
+    setSnapshotStatus("can't snapshot before boot", "error");
+    return;
+  }
+  const bytes = vm.snapshot();
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  a.download = `wwwvm-${stamp}.bin`;
+  a.click();
+  URL.revokeObjectURL(url);
+  setSnapshotStatus(`downloaded ${bytes.length.toLocaleString()} bytes`);
+});
+
+$("upload-trigger").addEventListener("click", () => $("upload").click());
+$("upload").addEventListener("change", async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    vm.restore(bytes);
+    term.reset();
+    setSnapshotStatus(`uploaded + restored ${bytes.length.toLocaleString()} bytes`);
+    resumePump();
+  } catch (err) {
+    setSnapshotStatus(`upload failed: ${err.message || err}`, "error");
+  } finally {
+    e.target.value = ""; // allow re-selecting the same file
+  }
 });

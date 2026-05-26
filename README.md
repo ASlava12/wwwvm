@@ -224,9 +224,15 @@ python3 -m http.server -d web 8080
 
 Открыть `http://localhost:8080/`.
 
-В UI: вписать команды в Autorun (по одной в строке) → **Boot VM** →
-ввод/команды летят в гостя, вывод появляется в терминале.
-`runCommand("hello")` доступен в DevTools-консоли.
+В UI:
+* выбрать гостя (default polling или interactive IRQ-driven);
+* вписать команды в Autorun (по одной в строке) → **Boot VM**;
+* ввод/команды летят в гостя, вывод появляется в терминале;
+* **Save / Load** сохраняет/восстанавливает состояние через IndexedDB;
+* **Download .bin / Upload .bin** — портативный экспорт-импорт snapshot'а
+  в файл (≈ 1 МБ, формат с магиком `WWWVM\x00`);
+* VGA-snapshot pane отражает 0xB8000;
+* `runCommand("hello")` доступен в DevTools-консоли.
 
 ## API из JavaScript
 
