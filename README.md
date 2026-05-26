@@ -4,10 +4,13 @@
 управляется из JavaScript. Цель — обучающий проект по Linux:
 страница загружает образ, стартует VM, JS отдаёт команды и получает вывод.
 
-Проект пишется поэтапно. На текущем этапе доказан **end-to-end pipeline**
-`JS → WASM → CPU → UART → JS`: встроенный 43-байтовый гость печатает
-банер и эхом отвечает на ввод. CPU и набор устройств намеренно
-минимальны — будут расти под требования реальных ОС.
+Полный учебный PC: 8086+80186 ISA, стандартный набор устройств (UART,
+двойной PIC, PIT, клавиатура, CMOS, VGA-text), interrupt-driven I/O
+через IDT, snapshot/restore, доступ из JS через wasm-bindgen, отдельный
+Rust-прокси для сетевых соединений. Три встроенных гостя для первого
+запуска, тутор по hand-assembly в [docs/HAND_ASSEMBLY.md](docs/HAND_ASSEMBLY.md).
+Загрузка реальных ОС (Linux/FreeBSD) — большая отдельная порция,
+дороадмап ниже.
 
 ```
 ┌──────────────────────────┐         ┌──────────────────────────┐
@@ -38,149 +41,114 @@
 
 ## Что работает сейчас
 
-* **mem** — линейная физическая память, little-endian аксессоры.
-* **devices** — 16550 UART (COM1: 0x3F8), 8259A PIC (master 0x20/0x21
-  + slave 0xA0/0xA1, каскад через master IRQ 2), 8254 PIT (0x40-0x43),
-  PS/2 keyboard (0x60/0x64) и CMOS/RTC (0x70/0x71). PIC — IMR/IRR/ISR,
-  ICW1/ICW2 (ICW3/ICW4 отбрасываются), non-specific EOI через OCW2.
-  Slave PIC векторная база 0x70 (IRQ 8..15 → vector 0x70..0x77); если
-  master выставляет IRQ 2, `pending_irq_vector` спускается в slave и
-  возвращает его вектор, а `ack_irq` делает ack на обоих чипах
-  (соответствует двухтактному INTA на железе). UART — IER на offset+1.
-  PIT — канал 0 в режимах 0/2/3. Keyboard — очередь scan-кодов;
-  level-triggered IRQ 1. CMOS — 128-байтное хранилище за index-латчем,
-  по умолчанию Status B = binary + 24h, дата 2026-01-01 (host
-  перезаписывает через `Vm::set_cmos_time`).
-  `IoBus::refresh_irqs` смешивает уровневые (UART → IRQ 4,
-  keyboard → IRQ 1, cascade → IRQ 2) и фронтовые (PIT → IRQ 0) сигналы.
-* **cpu** — реальный режим x86: `MOV r8/r16, imm`; `MOV r/m, r`,
-  `MOV r, r/m`, `MOV r/m, imm` (опкоды 0x88–0x8B, 0xC6/0xC7); `LODSB`;
-  полная ALU-семья (`ADD`/`OR`/`ADC`/`SBB`/`AND`/`SUB`/`XOR`/`CMP`,
-  8 и 16 бит, формы `r/m,r`, `r,r/m`, `AL,imm8`, `AX,imm16`).
-  **Полное 16-битное ModR/M-адресование памяти** — все 8 r/m-форм
-  (`[BX+SI]`, `[BX+DI]`, `[BP+SI]`, `[BP+DI]`, `[SI]`, `[DI]`, `[BP]`,
-  `[BX]`), включая исключение `mod=00,rm=110 → [disp16]`, с правильным
-  выбором сегмента по умолчанию (SS для `[BP*]`, иначе DS), и disp8/disp16.
-  `INC`/`DEC r16`; `TEST AL/AX, imm`; `IN/OUT` через DX и imm8;
-  **Group 1** (`ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm` — 0x80/0x81/0x83
-  с sign-extension);
-  **Group 3** (`NOT`, `NEG`, `TEST r/m, imm`, `MUL`/`IMUL`/`DIV`/`IDIV` —
-  0xF6/0xF7, 8 и 16 бит, с правильной обработкой DX:AX для 16-бит и
-  возвратом `CpuError::DivideError` на деление на ноль или переполнение
-  частного);
-  **Group 4** (`INC`/`DEC r/m8` — 0xFE);
-  **Group 5** (`INC`/`DEC r/m16`, `CALL r/m16` near indirect, `JMP r/m16`
-  near indirect, `PUSH r/m16` — 0xFF);
-  **Group 2** сдвиги/повороты (`SHL`/`SHR`/`SAR`/`ROL`/`ROR` r/m,1 / CL / imm —
-  0xC0/0xC1/0xD0..0xD3; RCL/RCR пока не реализованы);
-  **строковые операции** `MOVS`/`STOS`/`LODS`/`SCAS`/`CMPS` (B/W) с
-  учётом DF и сегментов DS/ES; префиксы `REP`/`REPE`/`REPNE`
-  (0xF2/0xF3) для повторения с CX-счётчиком, для CMPS/SCAS — с
-  условием ZF;
-  **сегментные префиксы** `CS:`/`DS:`/`ES:`/`SS:` (0x26/0x2E/0x36/0x3E)
-  для любой инструкции с памятью; работают и до, и после REP-префикса;
-  автоматически сбрасываются после каждой инструкции (state — в
-  `Cpu::seg_override`);
-  **сегментные регистры из гостя** — `MOV sreg, r/m16` / `MOV r/m16, sreg`
-  (0x8E/0x8C), `LES`/`LDS` (0xC4/0xC5) для загрузки 32-битного far-указателя
-  в регистр и ES/DS одной инструкцией;
-  **LEA** `r16, m` (0x8D) — вычисляет EA, не читает память;
-  **XCHG** — полная семья: `r/m, r` 8/16-бит (0x86/0x87), short-form
-  `XCHG AX, r16` (0x91..0x97), плюс 0x90 (NOP = XCHG AX,AX);
-  **прерывания в реал-моде** — `INT3` (0xCC), `INT imm8` (0xCD),
-  `INTO` (0xCE, срабатывает только при OF=1), `IRET` (0xCF). IVT
-  читается с линейного 0 как 256 записей offset:segment по 4 байта;
-  INT толкает FLAGS, CS, IP, очищает IF и загружает CS:IP из вектора;
-  IRET откатывает всё назад (см. `Cpu::do_interrupt`);
-  **sign-extension** `CBW` (0x98) AL→AX, `CWD` (0x99) AX→DX:AX —
-  обязательны перед `IDIV` для корректного знакового деления;
-  **flag transfer** `LAHF` (0x9F) FLAGS-low→AH, `SAHF` (0x9E) AH→FLAGS-low;
-  **far-инструкции**: `CALL ptr16:16` (0x9A, push CS+IP, load CS:IP из imm),
-  `JMP ptr16:16` (0xEA, без стека), `RETF`/`RETF imm16` (0xCB/0xCA),
-  `CALL m16:16`/`JMP m16:16` (Group 5 FF /3, /5 — far indirect через
-  4-байтный указатель в памяти);
-  **PUSH/POP сегментных регистров** — `PUSH ES/CS/SS/DS` (0x06/0x0E/0x16/0x1E),
-  `POP ES/SS/DS` (0x07/0x17/0x1F). `POP CS` (0x0F) намеренно не реализован
-  — на 80286+ это префикс 2-байтных опкодов;
-  **счётные циклы**: `LOOP` (0xE2), `LOOPE`/`LOOPZ` (0xE1), `LOOPNE`/`LOOPNZ`
-  (0xE0) с CX-pre-decrement, `JCXZ` (0xE3) без декремента — стандартная
-  пара для защищённой счётной итерации;
-  **16-битные порты**: `IN AX, DX`/`OUT DX, AX` (0xED/0xEF) и формы с imm8
-  (0xE5/0xE7); реализованы как пара 8-битных доступов к port и port+1;
-  **XLAT** (0xD7) — `AL = mem[DS:BX+AL]`, идиома таблицы перевода;
-  **управление CF**: `CLC`/`STC`/`CMC` (0xF8/0xF9/0xF5);
-  **префиксы-noop**: `LOCK` (0xF0), `WAIT` (0x9B) принимаются и
-  засчитываются за one-step (на одиночном CPU без FPU они ни на что
-  не влияют);
-  **80186 additions**: `PUSHA`/`POPA` (0x60/0x61, 8 GPR одним блоком —
-  идиома пролога handler'ов), `IMUL r16, r/m16, imm8/imm16`
-  (0x69/0x6B — трёхоперандное знаковое умножение, основа для умножения
-  на константу из компилятора), `ENTER imm16, 0` (0xC8 — стандартный
-  function prologue), `LEAVE` (0xC9). ENTER с уровнем вложенности > 0
-  не поддерживается (компиляторы C/Rust его не эмитят);
-  **доставка внешних IRQ**. В начале `step()` CPU проверяет
-  `IoBus::pending_irq_vector()`; при `IF=1` и наличии незамаскированного
-  pending IRQ — `ack` PIC + `do_interrupt(vec)`. Интегрирует UART и
-  будущие устройства в стандартный INT-цикл реал-моды.
-  **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
-  (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
-  `RET`/`RET imm16` (0xC3/0xC2);
-  `JMP rel8/rel16`; весь набор `Jcc rel8` (использует CF/ZF/SF/OF/PF);
-  флаги корректно обновляются для арифметики и логики;
-  `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
-  `CpuError::Unimplemented { opcode, cs, ip }`.
-* **vm** — `load_default_guest`, `load_interactive_demo`, `set_autorun_commands`,
-  `boot`, `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`,
-  `push_scancode`, `set_cmos_time`, `set_ivt(vec, seg, off)`, `read_mem_u8/u16`,
-  `vga_text_snapshot()`, `snapshot()`/`restore(bytes)`. Два встроенных
-  гостя: `HELLO_GUEST` (~43 байта, polling LSR + echo) и
-  `interactive_demo` (banner + IRQ-driven UART echo). Гость пишет в
-  VGA-text напрямую в RAM на 0xB8000 — host читает обратно через
-  `vga_text_snapshot` (25 строк × 80 ASCII-символов). Snapshot v2
-  ≈ 1 MiB + ~200 байт: 16-байтный header (`WWWVM\x00` + version=2 +
-  reserved), 36-байтный CPU image, 1 МБ memory dump, length-prefixed
-  device-state секция (UART tx/rx + IER, master/slave PIC IMR/IRR/ISR/
-  init_state/vector_base, PIT counter/reload/mode/flags, keyboard
-  queue, CMOS storage 128 байт). Restore читает и v1 (без device
-  state), и v2 — обратная совместимость для уже сохранённых blob'ов.
-* **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
-  `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
-  `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
-* **proxy** — отдельный Rust-бинарь. Принимает WebSocket, первое
-  сообщение JSON `{"host","port"}`, дальше байты в обе стороны.
-  Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
-* **web** — демо-страница с xterm.js и `window.runCommand(text)`,
-  возвращающим `Promise<string>`.
-* Тестов — **158 зелёных** (mem 6 + devices 29 + cpu 98 + vm 19 + wasm 1
-  + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
-  `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
-  **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)
-  и **periodic timer** (PIT mode 2 → IRQ 0 → handler инкрементит счётчик
-  в RAM до 4 → HLT) — полная цепочка device → PIC IRR → CPU → IDT →
-  handler → device drain работает для двух разных типов источников IRQ.
+### CPU (`crates/cpu`) — 8086 ISA полностью + 80186-добавки
 
-## Что НЕ работает (намеренно, дорожная карта)
+Поддерживается весь основной набор инструкций реального режима:
+полная ALU-семья (8/16 бит, все формы операндов), сдвиги и
+повороты включая RCL/RCR через CF, MUL/IMUL/DIV/IDIV, INC/DEC,
+TEST/CMP, MOV/MOVS/LODS/STOS/SCAS/CMPS с REP-префиксами, стек
+SS:SP с PUSH/POP/PUSHA/POPA, near и far CALL/RET/RETF, condition jumps,
+LOOP/LOOPE/LOOPNE/JCXZ, XCHG, LEA, XLAT, CBW/CWD/LAHF/SAHF, BCD-семейство
+(DAA/DAS/AAA/AAS/AAM/AAD), ENTER/LEAVE (level 0), 3-операндный IMUL,
+управление флагами (CLC/STC/CMC/CLD/STD/CLI/STI).
 
-Это учебный проект; полноценная поддержка Alpine/Linux в одном сеансе
-нереалистична. Ниже — что осталось добавить.
+ModR/M полный — все 16-битные формы адресации с правильным выбором
+сегмента по умолчанию (SS для `[BP*]`, иначе DS), seg-override
+префиксы CS:/DS:/ES:/SS:, ModR/M-память во всех ALU-командах.
 
-| Этап | Объём | Зачем |
-|------|-------|-------|
-| `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
-| Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
-| BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
-| 8042 controller commands (self-test, port disable), keyboard scan-code translation на host-стороне | малый | Совместимость со стандартными KB-драйверами |
-| Реальные устройства: IDE/ATA, RTC alarm IRQ (через slave), VGA-graphics (≥320×200) | средний | Загрузочные тракты дистрибутивов, графические демо |
-| Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
-| 32-бит (i386): операнд/адрес-префиксы 0x66/0x67, long-mode позже | большой | Любое 32+ ядро |
-| Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
-| Protected mode + paging | большой | Любое современное ядро |
-| Long mode (x86_64) | большой | 64-битные ядра |
-| PIC/PIT/RTC/PS2/CMOS | средний | Загрузка дистрибутивов |
-| Эмуляция IDE/ATA или virtio-blk | средний | Чтение rootfs |
-| ne2k или virtio-net + slirp-подобный TCP/IP | средний | Сеть из гостя через прокси |
-| VGA-текст / fbcon | малый | Видеть `init` без UART-консоли |
-| Снимки/persist состояния в IndexedDB | малый | Сохранение сессий студентов |
+Прерывания в реал-моде — `INT imm8`/`INT3`/`INTO`/`IRET` через IVT
+на линейном 0. Внешние IRQ от устройств доставляются автоматически:
+в начале `step()` CPU проверяет `IoBus::pending_irq_vector()` и,
+если `IF=1`, делает ack + `do_interrupt(vec)`.
+
+Неподдержанный опкод → `CpuError::Unimplemented { opcode, cs, ip }`,
+деление на ноль → `CpuError::DivideError`. Тестов — 98.
+
+### Устройства (`crates/devices`) — стандартный PC stack
+
+| Чип | Порты | IRQ | Триггер |
+|-----|-------|-----|---------|
+| 16550 UART (COM1)        | 0x3F8..0x3FF | 4  | level (rx + IER bit 0) |
+| 8259A PIC (master)       | 0x20/0x21    | —  | — |
+| 8259A PIC (slave)        | 0xA0/0xA1    | 8..15 → каскад через master IRQ 2 |
+| 8254 PIT (канал 0)       | 0x40..0x43   | 0  | edge (terminal count) |
+| PS/2 keyboard            | 0x60/0x64    | 1  | level (rx queue non-empty) |
+| MC146818 CMOS/RTC        | 0x70/0x71    | —  | (alarm IRQ 8 не реализован) |
+| VGA text mode (RAM)      | mem 0xB8000  | —  | — |
+
+`IoBus::refresh_irqs` на каждом шаге CPU перекладывает все pending
+IRQ в IRR. Slave автоматически каскадит через master IRQ 2: если master
+выставляет IRQ 2, `pending_irq_vector` спускается в slave и возвращает
+его вектор, а `ack_irq` ack'ает оба чипа — двухтактный INTA на железе.
+
+### Оркестрация (`crates/vm`)
+
+API из JS:
+- **Lifecycle:** `new()` → `load_default_guest()` / `load_interactive_demo()` /
+  `load_calculator_demo()` / `load_image(addr, bytes)` → `set_autorun_commands(…)`
+  → `boot()` → `run_steps(budget) -> (steps, Stop)`
+- **I/O:** `send_input(bytes)`, `drain_output() -> Vec<u8>`,
+  `push_scancode(code)`, `set_cmos_time(y,m,d,h,mi,s)`
+- **Память/IDT:** `set_ivt(vec, seg, off)`, `read_mem_u8/u16(addr)`,
+  `vga_text_snapshot() -> String`
+- **Persistence:** `snapshot() -> Vec<u8>` / `restore(&[u8]) -> Result<…>`
+
+Три встроенных гостя:
+- `HELLO_GUEST` (43 байта) — polling LSR + echo;
+- `interactive_demo` — banner через LODSB + IRQ-driven UART echo;
+- `calculator_demo` — `byte²` через MUL, decimal-форматирование через
+  divide-by-10 + push/pop.
+
+Snapshot v2 ≈ 1 MiB + ~200 байт: header `WWWVM\x00` + 36-байтный CPU
+image + 1 МБ memory dump + length-prefixed device-state секция.
+`restore` принимает и v1 (без device state, backward compat), и v2.
+
+### Bridge в JS (`crates/wasm`)
+
+`WwwVm` через wasm-bindgen экспортирует весь lifecycle Vm плюс
+`snapshot/restore` (как `Vec<u8>` / `&[u8]`) и `vga_text_snapshot()`.
+Ошибки CPU surface как `last_error: Option<String>`.
+
+### Сеть (`crates/proxy`)
+
+Standalone Rust-бинарь на tokio + tokio-tungstenite. Принимает
+WebSocket, первое сообщение JSON `{"host","port"}`, дальше байты в
+обе стороны. Allow-list — env var `WWWVM_PROXY_ALLOWLIST`
+(`*` / `host:port` / `host:*`, comma-separated).
+
+### Веб-демо (`web/`)
+
+- xterm.js terminal с двусторонним IO;
+- селектор между 3 встроенными гостями + autorun-textarea;
+- `window.runCommand(text) -> Promise<string>` для DevTools;
+- **Save/Load** через IndexedDB (`storage.js`);
+- **Download .bin / Upload .bin** — портативный экспорт-импорт;
+- pane с VGA-snapshot 80×25.
+
+### Качество
+
+**158 тестов** зелёные (mem 6 + devices 29 + cpu 98 + vm 19 + wasm 1
++ proxy 5). CI gates: `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings`, `cargo test --workspace --locked`. Throughput
+≈ 110 MIPS release (см. `cargo run --example throughput -p wwwvm-vm --release`).
+
+## Что НЕ работает (дорожная карта)
+
+Полноценная поддержка Alpine/Linux требует серьёзного развития CPU
+и устройств — таблица ниже описывает крупные оставшиеся шаги.
+
+| Шаг | Объём | Зачем |
+|-----|-------|-------|
+| Protected mode (CR0.PE, GDT, дескрипторы, IDT-gates) | большой | Любое современное ядро |
+| 32-бит (i386): operand/address-size префиксы 0x66/0x67, новые регистры EAX..EDI | большой | 32-битный код |
+| Long mode (x86_64), CR4/EFER, страничная трансляция 4 уровня | большой | 64-битные ядра |
+| Страничная трансляция (CR0.PG, CR3, PDE/PTE) | большой | Любое ядро использующее MMU |
+| BIOS-handler'ы по векторам (0x10 VGA, 0x13 disk, 0x16 KBD, 0x19 boot) | средний | Гости, ожидающие стандартного PC BIOS API |
+| IDE/ATA или virtio-blk | средний | Чтение rootfs с эмулированного диска |
+| ne2k или virtio-net + slirp-подобный TCP/IP | средний | Сеть из гостя через имеющийся `crates/proxy` |
+| VGA graphics (≥320×200), framebuffer-mapping | средний | Графические гости, fbcon |
+| RTC alarm IRQ (через slave PIC), 8042 controller commands | малый | Полнота PC-периферии |
+| Keyboard scan-code translation (Set 1) на host-стороне | малый | Маппинг JS keyboard event → guest |
 | 9P / passthrough FS поверх postMessage | малый | Передача файлов между host и гостем |
 
 ## Сборка и запуск
@@ -191,7 +159,7 @@
 cargo test --workspace
 ```
 
-Должно вывести 157 пройденных тестов на текущий момент. CI
+Должно вывести 158 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
@@ -240,7 +208,8 @@ python3 -m http.server -d web 8080
 Открыть `http://localhost:8080/`.
 
 В UI:
-* выбрать гостя (default polling или interactive IRQ-driven);
+* выбрать гостя (default polling, interactive IRQ-driven, или
+  calculator с MUL и decimal-форматированием);
 * вписать команды в Autorun (по одной в строке) → **Boot VM**;
 * ввод/команды летят в гостя, вывод появляется в терминале;
 * **Save / Load** сохраняет/восстанавливает состояние через IndexedDB;
