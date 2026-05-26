@@ -383,6 +383,73 @@ mod tests {
         assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x42);
     }
 
+    /// End-to-end test for the 8254 timer: configure ch0 mode 2 with
+    /// reload 5, point IRQ 0's vector at a handler that increments a
+    /// counter in memory and EOIs the PIC. Main routine spins until
+    /// the counter reaches 4 then HLTs. Every five CPU steps the PIT
+    /// fires an edge → IRR → handler → +1 counter → EOI.
+    ///
+    /// ```text
+    /// 0x00: C7 06 20 00 30 7C    MOV WORD [0x20], 0x7C30    ; IVT[0x08].offset
+    /// 0x06: C7 06 22 00 00 00    MOV WORD [0x22], 0x0000    ; IVT[0x08].segment
+    /// 0x0C: B0 34                 MOV AL, 0x34              ; PIT mode 2, RW=3
+    /// 0x0E: E6 43                 OUT 0x43, AL
+    /// 0x10: B0 05                 MOV AL, 5                 ; reload LSB
+    /// 0x12: E6 40                 OUT 0x40, AL
+    /// 0x14: 30 C0                 XOR AL, AL                ; reload MSB
+    /// 0x16: E6 40                 OUT 0x40, AL
+    /// 0x18: B0 FE                 MOV AL, 0xFE              ; unmask IRQ 0
+    /// 0x1A: E6 21                 OUT 0x21, AL
+    /// 0x1C: FB                    STI
+    /// 0x1D: 80 3E 00 09 04        CMP byte [0x900], 4
+    /// 0x22: 75 F9                 JNZ -7 -> 0x1D
+    /// 0x24: F4                    HLT
+    /// (padding to 0x30)
+    /// 0x30: 50                    PUSH AX                   ; handler
+    /// 0x31: FE 06 00 09           INC byte [0x900]
+    /// 0x35: B0 20                 MOV AL, 0x20
+    /// 0x37: E6 20                 OUT 0x20, AL              ; EOI
+    /// 0x39: 58                    POP AX
+    /// 0x3A: CF                    IRET
+    /// ```
+    #[test]
+    fn pit_timer_drives_irq0_handler_through_vm() {
+        let program: &[u8] = &[
+            0xC7, 0x06, 0x20, 0x00, 0x30, 0x7C,
+            0xC7, 0x06, 0x22, 0x00, 0x00, 0x00,
+            0xB0, 0x34,
+            0xE6, 0x43,
+            0xB0, 0x32,                   // reload LSB = 50
+            0xE6, 0x40,
+            0x30, 0xC0,
+            0xE6, 0x40,
+            0xB0, 0xFE,
+            0xE6, 0x21,
+            0xFB,
+            0x80, 0x3E, 0x00, 0x09, 0x04,
+            0x75, 0xF9,
+            0xF4,
+            // pad to 0x30 (offset 0x25 .. 0x2F = 11 bytes)
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            // handler at 0x30
+            0x50,
+            0xFE, 0x06, 0x00, 0x09,
+            0xB0, 0x20,
+            0xE6, 0x20,
+            0x58,
+            0xCF,
+        ];
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        let (_, stop) = vm.run_steps(5_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        assert_eq!(vm.mem().read_u8(0x900), 4);
+    }
+
     /// Divide-by-zero in the guest must surface as `Stop::CpuError`
     /// rather than silently producing garbage. This is the VM-side
     /// view of `CpuError::DivideError`.

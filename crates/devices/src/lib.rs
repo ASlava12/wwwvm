@@ -267,21 +267,165 @@ impl IoDevice for Pic {
     }
 }
 
+/// 8254 Programmable Interval Timer — minimal channel-0 subset.
+///
+/// What we model:
+///   * Channel 0 with reload register, current counter, and modes 0
+///     (one-shot) and 2/3 (periodic — both reload on terminal count
+///     and behave identically for IRQ generation purposes).
+///   * Control-word writes to 0x43 with SC=0 and access pattern
+///     RW=3 (LSB then MSB). Other RW patterns are accepted but the
+///     reload-value writes will silently not latch.
+///   * `tick(n)` decrements the counter by n; on terminal count it
+///     latches a pending edge for IRQ 0 and (mode 2/3) reloads.
+///
+/// Channels 1 and 2 accept writes silently and don't generate IRQs.
+pub struct Pit {
+    base_port: u16,
+    pub ch0_reload: u16,
+    pub ch0_counter: u32,
+    pub ch0_mode: u8,
+    pub ch0_running: bool,
+    /// Set true on terminal count; consumed by `take_ch0_pending`.
+    ch0_pending_edge: bool,
+    /// Next byte written to a channel-0 data port: 0 = LSB, 1 = MSB.
+    write_state: u8,
+    pending_lsb: u8,
+}
+
+impl Pit {
+    pub const BASE: u16 = 0x40;
+
+    pub fn new(base_port: u16) -> Self {
+        Self {
+            base_port,
+            ch0_reload: 0,
+            ch0_counter: 0,
+            ch0_mode: 0,
+            ch0_running: false,
+            ch0_pending_edge: false,
+            write_state: 0,
+            pending_lsb: 0,
+        }
+    }
+
+    pub fn standard() -> Self {
+        Self::new(Self::BASE)
+    }
+
+    /// Advance the timer by `n` ticks. On reaching zero in mode 0 the
+    /// channel halts; in modes 2/3 it reloads from `ch0_reload` (with
+    /// 0 treated as 0x10000 — the 8254 convention). Each terminal
+    /// count latches a single pending edge that the IoBus will
+    /// translate into an IRQ.
+    pub fn tick(&mut self, n: u32) {
+        if !self.ch0_running || n == 0 {
+            return;
+        }
+        let mut remaining = n;
+        loop {
+            if self.ch0_counter == 0 {
+                match self.ch0_mode {
+                    0 => {
+                        self.ch0_running = false;
+                        return;
+                    }
+                    _ => {
+                        let reload = if self.ch0_reload == 0 {
+                            0x10000
+                        } else {
+                            self.ch0_reload as u32
+                        };
+                        self.ch0_counter = reload;
+                    }
+                }
+            }
+            let take = remaining.min(self.ch0_counter);
+            self.ch0_counter -= take;
+            remaining -= take;
+            if self.ch0_counter == 0 {
+                self.ch0_pending_edge = true;
+            }
+            if remaining == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Consume the channel-0 edge, if any. IoBus calls this each
+    /// `refresh_irqs` and turns a true result into a one-shot IRR
+    /// set on the PIC.
+    pub fn take_ch0_pending(&mut self) -> bool {
+        let p = self.ch0_pending_edge;
+        self.ch0_pending_edge = false;
+        p
+    }
+}
+
+impl IoDevice for Pit {
+    fn port_range(&self) -> (u16, u16) {
+        (self.base_port, self.base_port + 3)
+    }
+
+    fn read(&mut self, port: u16) -> u8 {
+        // Reads are rarely used by guest software outside of latching
+        // commands which we don't model. Return the current counter
+        // low byte for channel 0 as a stub.
+        if port - self.base_port == 0 {
+            (self.ch0_counter & 0xFF) as u8
+        } else {
+            0
+        }
+    }
+
+    fn write(&mut self, port: u16, value: u8) {
+        match port - self.base_port {
+            3 => {
+                // Control word: SC RW M BCD
+                let sc = value >> 6;
+                let rw = (value >> 4) & 3;
+                let mode = (value >> 1) & 7;
+                if sc == 0 && rw == 3 {
+                    self.ch0_mode = mode;
+                    self.write_state = 0;
+                    self.ch0_pending_edge = false;
+                    self.ch0_running = false;
+                }
+                // Other channels / access patterns ignored.
+            }
+            0 => {
+                if self.write_state == 0 {
+                    self.pending_lsb = value;
+                    self.write_state = 1;
+                } else {
+                    let reload = (self.pending_lsb as u16) | ((value as u16) << 8);
+                    self.ch0_reload = reload;
+                    self.ch0_counter = if reload == 0 { 0x10000 } else { reload as u32 };
+                    self.ch0_running = true;
+                    self.write_state = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Concrete IO dispatcher. Owns the UART and the master PIC, routes
 /// accesses by port. Unmapped ports read 0xFF (open bus on real
 /// hardware) and accept writes silently.
 pub struct IoBus {
     pub uart: Uart,
     pub pic: Pic,
+    pub pit: Pit,
 }
 
 impl IoBus {
     pub fn new() -> Self {
-        Self { uart: Uart::com1(), pic: Pic::master() }
+        Self { uart: Uart::com1(), pic: Pic::master(), pit: Pit::standard() }
     }
 
     pub fn with_uart(uart: Uart) -> Self {
-        Self { uart, pic: Pic::master() }
+        Self { uart, pic: Pic::master(), pit: Pit::standard() }
     }
 
     pub fn uart_mut(&mut self) -> &mut Uart {
@@ -292,21 +436,29 @@ impl IoBus {
         &mut self.pic
     }
 
-    /// Latch every device-asserted IRQ line into the PIC's IRR.
-    /// CPUs call this once per step() before checking pending IRQs.
-    /// Standard wiring on a PC: COM1 → IRQ 4.
+    /// Latch every device-asserted IRQ line into the PIC's IRR and
+    /// drive time-based devices forward by one tick. CPUs call this
+    /// once per step() before checking pending IRQs.
     ///
-    /// We model level-triggered IRQs: IRR mirrors the current device
-    /// line each refresh. Without this, a handler that runs *while*
-    /// the device is still asserting would re-arm IRR for the IRQ it
-    /// just acked, and the IRQ would fire a second time after EOI
-    /// against a device that has already been serviced.
+    /// Standard wiring on a PC: COM1 → IRQ 4 (level-triggered, mirrors
+    /// the line); PIT channel 0 → IRQ 0 (edge-triggered, one IRR pulse
+    /// per terminal count).
     pub fn refresh_irqs(&mut self) {
+        // UART — level-triggered. IRR bit 4 mirrors the line.
         let irq4_bit = 1u8 << 4;
         if self.uart.irq_pending() {
             self.pic.irr |= irq4_bit;
         } else {
             self.pic.irr &= !irq4_bit;
+        }
+        // PIT — one tick per CPU step. Each terminal count gets
+        // translated into a one-shot IRR set on IRQ 0. The PIC keeps
+        // the bit until ack, so even if multiple ticks fire between
+        // refresh calls (we only do one per step) the handler still
+        // runs once per pulse — periodic timers work as expected.
+        self.pit.tick(1);
+        if self.pit.take_ch0_pending() {
+            self.pic.irr |= 1u8 << 0;
         }
     }
 
@@ -331,6 +483,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.pic.read(port);
         }
+        let (lo, hi) = self.pit.port_range();
+        if port >= lo && port <= hi {
+            return self.pit.read(port);
+        }
         0xFF
     }
 
@@ -343,6 +499,11 @@ impl IoBus {
         let (lo, hi) = self.pic.port_range();
         if port >= lo && port <= hi {
             self.pic.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.pit.port_range();
+        if port >= lo && port <= hi {
+            self.pit.write(port, value);
         }
     }
 }
@@ -478,6 +639,50 @@ mod tests {
         assert!(bus.pic.pending_vector().is_none());
         bus.refresh_irqs();
         assert_eq!(bus.pic.pending_vector(), Some(0x08 + 4));
+    }
+
+    #[test]
+    fn pit_mode2_fires_periodic_edge_every_reload_ticks() {
+        let mut pit = Pit::standard();
+        // Control: SC=0, RW=3 (LSB then MSB), mode=2, BCD=0  → 0b00110100 = 0x34
+        pit.write(0x43, 0x34);
+        // Reload value 3
+        pit.write(0x40, 0x03);
+        pit.write(0x40, 0x00);
+        // Three ticks should bring counter to 0 → pending edge.
+        pit.tick(3);
+        assert!(pit.take_ch0_pending());
+        assert!(!pit.take_ch0_pending()); // consumed once
+        // Three more — periodic mode reloads automatically.
+        pit.tick(3);
+        assert!(pit.take_ch0_pending());
+    }
+
+    #[test]
+    fn pit_mode0_oneshot_halts_after_first_terminal_count() {
+        let mut pit = Pit::standard();
+        // Mode 0 (one-shot): control byte 0b00110000 = 0x30
+        pit.write(0x43, 0x30);
+        pit.write(0x40, 0x02);
+        pit.write(0x40, 0x00);
+        pit.tick(2);
+        assert!(pit.take_ch0_pending());
+        // Further ticks must not fire — channel halts.
+        pit.tick(100);
+        assert!(!pit.take_ch0_pending());
+    }
+
+    #[test]
+    fn iobus_refresh_translates_pit_edge_into_pic_irr() {
+        let mut bus = IoBus::new();
+        // Configure PIT mode 2, reload 1 — fires every tick.
+        bus.write(0x43, 0x34);
+        bus.write(0x40, 0x01);
+        bus.write(0x40, 0x00);
+        // Unmask IRQ 0
+        bus.pic.imr = 0xFE;
+        bus.refresh_irqs(); // ticks once, channel hits zero → edge
+        assert_eq!(bus.pic.pending_vector(), Some(0x08));
     }
 
     #[test]
