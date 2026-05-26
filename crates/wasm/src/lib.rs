@@ -49,6 +49,23 @@ impl WwwVm {
         self.inner.load_image(addr, bytes);
     }
 
+    /// Write an IVT entry. Vector `v` lives at linear `v*4`. Use this
+    /// from JS to install an interrupt handler without emitting MOV
+    /// WORD instructions in the guest.
+    pub fn set_ivt(&mut self, vector: u8, segment: u16, offset: u16) {
+        self.inner.set_ivt(vector, segment, offset);
+    }
+
+    /// Read a single byte from guest RAM.
+    pub fn read_mem_u8(&self, addr: u32) -> u8 {
+        self.inner.read_mem_u8(addr)
+    }
+
+    /// Read a 16-bit little-endian word from guest RAM.
+    pub fn read_mem_u16(&self, addr: u32) -> u16 {
+        self.inner.read_mem_u16(addr)
+    }
+
     /// Pre-queue commands to be delivered to the guest at boot. Pass an
     /// array of strings from JS — each is appended with `\n`.
     pub fn set_autorun(&mut self, commands: Vec<String>) {

@@ -227,7 +227,11 @@ vm.load_default_guest();
 // 2. Заранее задать команды на автозапуск
 vm.set_autorun(["echo hi", "ls /"]);
 
-// 3. Загрузиться (CS:IP -> 0000:7C00, autorun-байты доставляются в UART rx)
+// 3. (Опционально) Установить IVT-обработчик из JS, без MOV WORD в госте
+//    vm.set_ivt(vector, segment, offset);
+// vm.set_ivt(0x0C, 0x0000, 0x7C40);     // IRQ 4 (UART)
+
+// 4. Загрузиться (CS:IP -> 0000:7C00, autorun-байты доставляются в UART rx)
 vm.boot();
 
 // 4. Прокачивать CPU из rAF-цикла
@@ -245,6 +249,10 @@ vm.send_command("uptime");
 
 // 6. Или асинхронно с возвратом результата (см. web/main.js)
 const result = await window.runCommand("date");
+
+// 7. Прочитать содержимое памяти гостя (для дебага/ассертов из JS)
+const status_byte = vm.read_mem_u8(0x900);
+const counter = vm.read_mem_u16(0x902);
 ```
 
 ## Структура

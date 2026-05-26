@@ -55,9 +55,32 @@ impl Vm {
         }
     }
 
-    /// Copy bytes into physical RAM at `addr`.
+    /// Copy bytes into physical RAM at `addr`. The same primitive
+    /// powers `load_image` (a guest program), seeding data tables,
+    /// and writing IVT entries.
     pub fn load_image(&mut self, addr: u32, bytes: &[u8]) {
         self.mem.write_slice(addr, bytes);
+    }
+
+    /// Write an IVT entry for the given vector. Vector `v` lives at
+    /// linear address `v*4` as a 4-byte (offset, segment) record. JS
+    /// callers use this to wire up handlers without emitting a string
+    /// of `MOV WORD` instructions in the guest.
+    pub fn set_ivt(&mut self, vector: u8, segment: u16, offset: u16) {
+        let base = (vector as u32) * 4;
+        self.mem.write_u16(base, offset);
+        self.mem.write_u16(base + 2, segment);
+    }
+
+    /// Read a single byte from guest RAM. Useful for assertions in
+    /// integration tests and for JS-side inspection of guest state.
+    pub fn read_mem_u8(&self, addr: u32) -> u8 {
+        self.mem.read_u8(addr)
+    }
+
+    /// Read a 16-bit little-endian word from guest RAM.
+    pub fn read_mem_u16(&self, addr: u32) -> u16 {
+        self.mem.read_u16(addr)
     }
 
     /// Load the bundled hello guest at the standard boot-sector address.
@@ -301,153 +324,90 @@ mod tests {
         assert_eq!(out, vec![9, 25, 0]);
     }
 
-    /// End-to-end interrupt-driven serial: guest sets up an IRQ 4
-    /// handler that reads a byte from the UART RBR into BL, EOIs the
-    /// PIC, and IRETs. The main routine enables IER bit 0, unmasks
-    /// IRQ 4, STIs, and spins until BL != 0 then HLTs.
-    ///
-    /// The host pushes a byte to the UART rx queue before stepping;
-    /// the very first `refresh_irqs` should latch IRQ 4 into the PIC,
-    /// the CPU dispatches to the handler, the handler drains the
-    /// byte, and the main loop exits.
-    ///
-    /// Layout:
-    /// ```text
-    /// 0x00: C7 06 30 00 20 7C    MOV WORD [0x30], 0x7C20   ; IVT[0x0C].offset
-    /// 0x06: C7 06 32 00 00 00    MOV WORD [0x32], 0x0000   ; IVT[0x0C].segment
-    /// 0x0C: FB                    STI
-    /// 0x0D: BA F9 03              MOV DX, 0x3F9             ; UART IER
-    /// 0x10: B0 01                 MOV AL, 1
-    /// 0x12: EE                    OUT DX, AL
-    /// 0x13: B0 EF                 MOV AL, 0xEF
-    /// 0x15: E6 21                 OUT 0x21, AL              ; PIC IMR
-    /// 0x17: 80 FB 00              CMP BL, 0
-    /// 0x1A: 74 FB                 JZ -5 -> 0x17
-    /// 0x1C: F4                    HLT
-    /// (padding to 0x20)
-    /// 0x20: 50                    PUSH AX                   ; handler
-    /// 0x21: BA F8 03              MOV DX, 0x3F8             ; UART RBR
-    /// 0x24: EC                    IN AL, DX
-    /// 0x25: 88 C3                 MOV BL, AL
-    /// 0x27: B0 20                 MOV AL, 0x20
-    /// 0x29: E6 20                 OUT 0x20, AL              ; PIC EOI
-    /// 0x2B: 58                    POP AX
-    /// 0x2C: CF                    IRET
-    /// ```
+    /// End-to-end interrupt-driven serial: handler reads a byte from
+    /// the UART RBR into BL, EOIs the PIC, IRETs. Main routine
+    /// enables IER, unmasks IRQ 4, STIs, spins until BL != 0, HLTs.
+    /// IVT for vector 0x0C is wired via `set_ivt` so the guest
+    /// program is pure code.
     #[test]
     fn uart_rx_drives_irq4_handler_through_vm() {
-        let program: &[u8] = &[
-            // setup IVT[0x0C]
-            0xC7, 0x06, 0x30, 0x00, 0x20, 0x7C,
-            0xC7, 0x06, 0x32, 0x00, 0x00, 0x00,
-            // enable IF
-            0xFB,
-            // IER = 1
-            0xBA, 0xF9, 0x03,
+        let main: &[u8] = &[
+            0xFB,                          // STI
+            0xBA, 0xF9, 0x03,              // MOV DX, 0x3F9 (UART IER)
             0xB0, 0x01,
-            0xEE,
-            // unmask IRQ 4
+            0xEE,                          // OUT DX, AL
             0xB0, 0xEF,
-            0xE6, 0x21,
-            // wait-loop: while BL == 0 spin
-            0x80, 0xFB, 0x00,
-            0x74, 0xFB,
-            0xF4,
-            // padding to 0x20
-            0x90, 0x90, 0x90,
-            // handler at 0x20
-            0x50,
-            0xBA, 0xF8, 0x03,
-            0xEC,
-            0x88, 0xC3,
-            0xB0, 0x20,
-            0xE6, 0x20,
-            0x58,
-            0xCF,
+            0xE6, 0x21,                    // OUT 0x21, AL (PIC IMR)
+            0x80, 0xFB, 0x00,              // CMP BL, 0
+            0x74, 0xFB,                    // JZ -5
+            0xF4,                          // HLT
         ];
+        let handler: &[u8] = &[
+            0x50,                          // PUSH AX
+            0xBA, 0xF8, 0x03,              // MOV DX, 0x3F8 (RBR)
+            0xEC,                          // IN AL, DX
+            0x88, 0xC3,                    // MOV BL, AL
+            0xB0, 0x20,
+            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
+            0x58,                          // POP AX
+            0xCF,                          // IRET
+        ];
+        let handler_addr: u32 = 0x7C40;
         let mut vm = Vm::new();
-        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.load_image(BOOT_LOAD_ADDR, main);
+        vm.load_image(handler_addr, handler);
+        vm.set_ivt(0x0C, 0x0000, handler_addr as u16);
         vm.boot();
-        // Push the byte the guest is supposed to pick up via IRQ.
         vm.send_input(&[0x42]);
         let (_, stop) = vm.run_steps(5_000);
         match stop {
             Stop::Halted => {}
             other => panic!("expected Halted, got {other:?}"),
         }
-        match stop {
-            Stop::Halted => {}
-            other => panic!("expected Halted, got {other:?}"),
-        }
-        // BL was set by the handler reading from RBR.
         assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x42);
     }
 
-    /// End-to-end test for the 8254 timer: configure ch0 mode 2 with
-    /// reload 5, point IRQ 0's vector at a handler that increments a
-    /// counter in memory and EOIs the PIC. Main routine spins until
-    /// the counter reaches 4 then HLTs. Every five CPU steps the PIT
-    /// fires an edge → IRR → handler → +1 counter → EOI.
-    ///
-    /// ```text
-    /// 0x00: C7 06 20 00 30 7C    MOV WORD [0x20], 0x7C30    ; IVT[0x08].offset
-    /// 0x06: C7 06 22 00 00 00    MOV WORD [0x22], 0x0000    ; IVT[0x08].segment
-    /// 0x0C: B0 34                 MOV AL, 0x34              ; PIT mode 2, RW=3
-    /// 0x0E: E6 43                 OUT 0x43, AL
-    /// 0x10: B0 05                 MOV AL, 5                 ; reload LSB
-    /// 0x12: E6 40                 OUT 0x40, AL
-    /// 0x14: 30 C0                 XOR AL, AL                ; reload MSB
-    /// 0x16: E6 40                 OUT 0x40, AL
-    /// 0x18: B0 FE                 MOV AL, 0xFE              ; unmask IRQ 0
-    /// 0x1A: E6 21                 OUT 0x21, AL
-    /// 0x1C: FB                    STI
-    /// 0x1D: 80 3E 00 09 04        CMP byte [0x900], 4
-    /// 0x22: 75 F9                 JNZ -7 -> 0x1D
-    /// 0x24: F4                    HLT
-    /// (padding to 0x30)
-    /// 0x30: 50                    PUSH AX                   ; handler
-    /// 0x31: FE 06 00 09           INC byte [0x900]
-    /// 0x35: B0 20                 MOV AL, 0x20
-    /// 0x37: E6 20                 OUT 0x20, AL              ; EOI
-    /// 0x39: 58                    POP AX
-    /// 0x3A: CF                    IRET
-    /// ```
+    /// End-to-end test for the 8254 timer. PIT ch0 mode 2 fires every
+    /// 50 ticks → IRQ 0 → handler increments byte at 0x900 and EOIs
+    /// the PIC. Main spins until the counter reaches 4, then HLTs.
+    /// IVT and handler placement are managed via `set_ivt` so the
+    /// program stays linear.
     #[test]
     fn pit_timer_drives_irq0_handler_through_vm() {
-        let program: &[u8] = &[
-            0xC7, 0x06, 0x20, 0x00, 0x30, 0x7C,
-            0xC7, 0x06, 0x22, 0x00, 0x00, 0x00,
-            0xB0, 0x34,
-            0xE6, 0x43,
-            0xB0, 0x32,                   // reload LSB = 50
-            0xE6, 0x40,
-            0x30, 0xC0,
-            0xE6, 0x40,
-            0xB0, 0xFE,
-            0xE6, 0x21,
-            0xFB,
-            0x80, 0x3E, 0x00, 0x09, 0x04,
-            0x75, 0xF9,
-            0xF4,
-            // pad to 0x30 (offset 0x25 .. 0x2F = 11 bytes)
-            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-            // handler at 0x30
-            0x50,
-            0xFE, 0x06, 0x00, 0x09,
-            0xB0, 0x20,
-            0xE6, 0x20,
-            0x58,
-            0xCF,
+        let main: &[u8] = &[
+            0xB0, 0x34,                   // MOV AL, 0x34   (PIT mode 2, RW=3)
+            0xE6, 0x43,                   // OUT 0x43, AL
+            0xB0, 0x32,                   // MOV AL, 50     (reload LSB)
+            0xE6, 0x40,                   // OUT 0x40, AL
+            0x30, 0xC0,                   // XOR AL, AL     (reload MSB = 0)
+            0xE6, 0x40,                   // OUT 0x40, AL
+            0xB0, 0xFE,                   // MOV AL, 0xFE   (unmask IRQ 0)
+            0xE6, 0x21,                   // OUT 0x21, AL
+            0xFB,                          // STI
+            0x80, 0x3E, 0x00, 0x09, 0x04,  // CMP byte [0x900], 4
+            0x75, 0xF9,                   // JNZ -7
+            0xF4,                          // HLT
         ];
+        let handler: &[u8] = &[
+            0x50,                          // PUSH AX
+            0xFE, 0x06, 0x00, 0x09,        // INC byte [0x900]
+            0xB0, 0x20,
+            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
+            0x58,                          // POP AX
+            0xCF,                          // IRET
+        ];
+        let handler_addr: u32 = 0x7C50;
         let mut vm = Vm::new();
-        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.load_image(BOOT_LOAD_ADDR, main);
+        vm.load_image(handler_addr, handler);
+        vm.set_ivt(0x08, 0x0000, handler_addr as u16);
         vm.boot();
         let (_, stop) = vm.run_steps(5_000);
         match stop {
             Stop::Halted => {}
             other => panic!("expected Halted, got {other:?}"),
         }
-        assert_eq!(vm.mem().read_u8(0x900), 4);
+        assert_eq!(vm.read_mem_u8(0x900), 4);
     }
 
     /// Divide-by-zero in the guest must surface as `Stop::CpuError`
