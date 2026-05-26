@@ -40,10 +40,13 @@
 
 * **mem** — линейная физическая память, little-endian аксессоры.
 * **devices** — 16550 UART (COM1: 0x3F8). Драйнер `tx`, очередь `rx`, LSR.
-* **cpu** — реальный режим x86: `MOV r8/r16, imm`; `LODSB`; `OR r/m8, r8`
-  (mod=11); `TEST AL, imm`; `IN/OUT` через DX и imm8; `JMP rel8/rel16`;
-  весь набор `Jcc rel8`; флаги ZF/SF/PF/CF/OF для логических операций;
-  `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
+* **cpu** — реальный режим x86: `MOV r8/r16, imm`; `LODSB`;
+  полная ALU-семья reg-to-reg (`ADD`/`OR`/`ADC`/`SBB`/`AND`/`SUB`/`XOR`/`CMP`,
+  8 и 16 бит, формы `r/m,r`, `r,r/m`, `AL,imm8`, `AX,imm16`; mod=11);
+  `INC`/`DEC r16`; `TEST AL/AX, imm`; `IN/OUT` через DX и imm8;
+  `JMP rel8/rel16`; весь набор `Jcc rel8` (использует CF/ZF/SF/OF/PF);
+  флаги ZF/SF/PF/CF/OF/(почти) AF корректно обновляются для арифметики
+  и логики; `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
   `CpuError::Unimplemented { opcode, cs, ip }`.
 * **vm** — `load_default_guest`, `set_autorun_commands`, `boot`,
   `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`.
@@ -56,8 +59,8 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **17 зелёных** (mem 4 + devices 5 + cpu 4 + vm 3 + wasm 1)
-  плюс 5 для прокси.
+* Тестов — **29 зелёных** (mem 4 + devices 5 + cpu 11 + vm 3 + wasm 1
+  + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
 
@@ -66,7 +69,12 @@
 
 | Этап | Объём | Зачем |
 |------|-------|-------|
-| Полный набор инструкций i8086 (add/sub/mul/div/inc/dec, ModR/M с памятью и SIB, прерывания, IRET/INT) | большой | Запускать что-то сложнее эхо-цикла |
+| ModR/M с памятью (mod=00/01/10), все 7 базовых форм адресации | средний | Любой код, работающий через указатели |
+| `MOV r/m, r` / `MOV r, r/m` / `MOV r/m, imm` (мем-формы) | малый | Реальный пролог функций, локальные переменные |
+| `PUSH`/`POP r16` (со стеком SS:SP), `PUSH/POP sreg`, `CALL`/`RET` | средний | Подпрограммы, любой `_start` от линкера |
+| Group 1/3 (`/r` с imm: `ADD r/m, imm`, `MUL`, `DIV`, `NEG`, `NOT`) | средний | Запускать что-то сложнее эхо-цикла |
+| `MOVS`, `STOS`, `SCAS`, `CMPS`, `REP`-префиксы | малый | `memcpy`/`memset` в гостях |
+| Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |
 | Long mode (x86_64) | большой | 64-битные ядра |
 | PIC/PIT/RTC/PS2/CMOS | средний | Загрузка дистрибутивов |
