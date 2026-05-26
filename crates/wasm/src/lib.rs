@@ -53,6 +53,12 @@ impl WwwVm {
         self.inner.load_interactive_demo();
     }
 
+    /// Load the calculator demo: each byte pushed via send_input is
+    /// squared (via MUL) and emitted as a decimal string + newline.
+    pub fn load_calculator_demo(&mut self) {
+        self.inner.load_calculator_demo();
+    }
+
     /// Load arbitrary bytes (e.g. a future kernel/initrd) at `addr`.
     pub fn load_image(&mut self, addr: u32, bytes: &[u8]) {
         self.inner.load_image(addr, bytes);

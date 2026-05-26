@@ -151,7 +151,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **157 зелёных** (mem 6 + devices 29 + cpu 98 + vm 18 + wasm 1
+* Тестов — **158 зелёных** (mem 6 + devices 29 + cpu 98 + vm 19 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
   **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)

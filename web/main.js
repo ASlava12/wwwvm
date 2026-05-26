@@ -76,6 +76,8 @@ $("boot").addEventListener("click", () => {
   const guestKind = document.querySelector('input[name="guest"]:checked')?.value || "default";
   if (guestKind === "interactive") {
     vm.load_interactive_demo();
+  } else if (guestKind === "calculator") {
+    vm.load_calculator_demo();
   } else {
     vm.load_default_guest();
   }

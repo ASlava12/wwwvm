@@ -315,6 +315,16 @@ impl Vm {
         self.set_ivt(d::IRQ4_VECTOR, 0, d::HANDLER_ADDR as u16);
     }
 
+    /// Load the bundled mini-calculator demo: poll a byte, square it
+    /// via `MUL`, print the result as decimal followed by `\n`. Lives
+    /// across two memory regions — main at 0x7C00, the print_dec
+    /// subroutine at 0x7C30.
+    pub fn load_calculator_demo(&mut self) {
+        use calculator_demo as d;
+        self.load_image(d::BASE_ADDR, d::MAIN);
+        self.load_image(d::PRINT_DEC_ADDR, d::PRINT_DEC);
+    }
+
     /// Queue commands to be delivered to the guest the moment it boots.
     /// Each command is terminated with `\n` and they are concatenated in
     /// order — `["ls", "cat /etc/os-release"]` becomes `"ls\ncat …\n"`.
@@ -447,6 +457,59 @@ pub const HELLO_GUEST: &[u8] = &[
     0xEB, 0xF1, // jmp -15
     b'w', b'w', b'w', b'v', b'm', b':', b' ', b'r', b'e', b'a', b'd', b'y', 0x0A, 0x00,
 ];
+
+/// Mini-calculator guest. Each byte pushed via `vm.send_input(&[n])`
+/// is squared with `MUL r/m8` (AX = AL × BL) and printed as decimal
+/// followed by a newline. The print_dec subroutine showcases the
+/// canonical ASCII-formatting idiom — divide by ten, push the
+/// remainder, repeat until the quotient is zero, then pop and emit.
+///
+/// `[7]` → `"49\n"`, `[16]` → `"256\n"`, `[255]` → `"65025\n"`.
+pub mod calculator_demo {
+    pub const BASE_ADDR: u32 = 0x7C00;
+    pub const PRINT_DEC_ADDR: u32 = 0x7C30;
+
+    /// Main poll-mul-print loop. See [docs/HAND_ASSEMBLY.md](../../docs/HAND_ASSEMBLY.md)
+    /// for an annotated walkthrough of how the bytes encode the
+    /// instructions.
+    pub const MAIN: &[u8] = &[
+        // 0x00 BA FD 03    MOV DX, 0x3FD       ; UART LSR
+        0xBA, 0xFD, 0x03, // 0x03 EC          IN  AL, DX
+        0xEC, // 0x04 A8 01       TEST AL, 1
+        0xA8, 0x01, // 0x06 74 FB       JZ  -5  -> 0x03     ; spin until ready
+        0x74, 0xFB, // 0x08 BA F8 03    MOV DX, 0x3F8       ; UART RBR
+        0xBA, 0xF8, 0x03, // 0x0B EC          IN  AL, DX
+        0xEC, // 0x0C 88 C3       MOV BL, AL
+        0x88, 0xC3, // 0x0E F6 E3       MUL BL              ; AX = AL * BL
+        0xF6, 0xE3, // 0x10 E8 1D 00    CALL +0x1D -> 0x30  ; print_dec
+        0xE8, 0x1D, 0x00, // 0x13 B0 0A       MOV AL, '\n'
+        0xB0, 0x0A, // 0x15 BA F8 03    MOV DX, 0x3F8
+        0xBA, 0xF8, 0x03, // 0x18 EE          OUT DX, AL
+        0xEE, // 0x19 EB E5       JMP -27 -> 0x00     ; next input
+        0xEB, 0xE5,
+    ];
+
+    /// `print_dec` — emits AX as a variable-length decimal string.
+    /// Loaded at 0x7C30 so the main routine's `CALL +0x1D` lands on
+    /// the first instruction.
+    pub const PRINT_DEC: &[u8] = &[
+        // 0x30 BB 0A 00    MOV BX, 10
+        0xBB, 0x0A, 0x00, // 0x33 31 C9       XOR CX, CX
+        0x31, 0xC9, // 0x35 31 D2       XOR DX, DX
+        0x31, 0xD2, // 0x37 F7 F3       DIV BX
+        0xF7, 0xF3, // 0x39 52          PUSH DX
+        0x52, // 0x3A 41          INC CX
+        0x41, // 0x3B 09 C0       OR  AX, AX
+        0x09, 0xC0, // 0x3D 75 F6       JNZ -10 -> 0x35
+        0x75, 0xF6, // 0x3F 58          POP AX
+        0x58, // 0x40 04 30       ADD AL, '0'
+        0x04, 0x30, // 0x42 BA F8 03    MOV DX, 0x3F8
+        0xBA, 0xF8, 0x03, // 0x45 EE          OUT DX, AL
+        0xEE, // 0x46 E2 F7       LOOP -9 -> 0x3F
+        0xE2, 0xF7, // 0x48 C3          RET
+        0xC3,
+    ];
+}
 
 /// Interrupt-driven interactive demo. Unlike [`HELLO_GUEST`], which
 /// polls the UART LSR in a tight loop, this one wires the UART to
@@ -844,6 +907,31 @@ mod tests {
             other => panic!("expected Halted, got {other:?}"),
         }
         assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x42);
+    }
+
+    #[test]
+    fn calculator_demo_squares_and_prints_decimal() {
+        let cases: &[(u8, &str)] = &[
+            (0, "0\n"),
+            (1, "1\n"),
+            (7, "49\n"),
+            (10, "100\n"),
+            (16, "256\n"),
+            (255, "65025\n"),
+        ];
+        for &(input, expected) in cases {
+            let mut vm = Vm::new();
+            vm.load_calculator_demo();
+            vm.boot();
+            vm.send_input(&[input]);
+            vm.run_steps(50_000);
+            let out = vm.drain_output();
+            let got = String::from_utf8_lossy(&out);
+            assert_eq!(
+                got, expected,
+                "input={input}: expected {expected:?}, got {got:?}"
+            );
+        }
     }
 
     #[test]
