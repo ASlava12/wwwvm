@@ -1,0 +1,14 @@
+[package]
+name = "wwwvm-cpu"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+wwwvm-mem = { path = "../mem" }
+wwwvm-devices = { path = "../devices" }
+thiserror = { workspace = true }
