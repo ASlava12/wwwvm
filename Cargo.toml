@@ -1,12 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cpu",
     "crates/mem",
-    "crates/devices",
-    "crates/vm",
-    "crates/wasm",
-    "crates/proxy",
 ]
 exclude = ["guest"]
 
