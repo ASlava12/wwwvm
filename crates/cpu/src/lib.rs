@@ -755,6 +755,16 @@ impl Cpu {
         if self.halted {
             return Ok(());
         }
+        // External interrupt delivery — must come *before* fetch so an
+        // unmasked IRQ runs its handler at the next instruction boundary
+        // instead of one boundary late.
+        if self.has(flag::IF) {
+            if let Some(vec) = io.pending_irq_vector() {
+                io.ack_irq();
+                self.do_interrupt(vec, mem);
+                return Ok(());
+            }
+        }
         self.seg_override = None;
         let op_cs = self.sregs[sreg::CS];
         let op_ip = self.ip;
@@ -3303,6 +3313,121 @@ mod tests {
             CpuError::Unimplemented { opcode: 0xC8, .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn unmasked_irq_dispatches_through_ivt_when_if_set() {
+        // Set up IVT[0x08] (IRQ 0 vector) to handler at 0x7C10.
+        // Program: STI, then a tight loop of NOPs. We raise IRQ 0
+        // before stepping, so the very first step should service the
+        // IRQ via the handler.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(0x08 * 4, 0x7C10);
+        mem.write_u16(0x08 * 4 + 2, 0);
+        let program = &[
+            0xFB,                // STI                       offset 0
+            0x90, 0x90, 0x90,    // NOPs we never reach pre-handler
+            0xF4,                // HLT
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
+            // 0x10: handler
+            0xB3, 0xAB,          // MOV BL, 0xAB
+            // EOI to master PIC: OUT 0x20, AL where AL=0x20
+            0xB0, 0x20,
+            0xE6, 0x20,
+            0xCF,                // IRET
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        // Unmask IRQ 0 and raise it.
+        io.pic_mut().imr = 0xFE;
+        io.pic_mut().raise_irq(0);
+
+        for _ in 0..40 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_eq!(cpu.read_r8(3), 0xAB);
+        assert!(cpu.halted);
+        // ISR cleared by EOI
+        assert_eq!(io.pic_mut().isr, 0);
+        // Stack balanced
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn cli_blocks_irq_delivery() {
+        // IRQ raised but IF cleared (default after reset). Step a
+        // sequence of NOPs — handler must NOT run. Then STI; the next
+        // step should pick it up.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(0x08 * 4, 0x7C10);
+        mem.write_u16(0x08 * 4 + 2, 0);
+        let program = &[
+            0x90, 0x90, 0x90,    // 3 NOPs while IF=0
+            0xFB,                // STI                  offset 3
+            0x90, 0x90,          // these *might* be replaced by IRQ
+            0xF4,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
+            0xB3, 0xCD,          // MOV BL, 0xCD          handler
+            0xB0, 0x20, 0xE6, 0x20,
+            0xCF,
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        io.pic_mut().imr = 0xFE;
+        io.pic_mut().raise_irq(0);
+
+        // Three NOPs with IF=0: handler must not run.
+        for _ in 0..3 {
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_ne!(cpu.read_r8(3), 0xCD);
+        // STI then run to completion.
+        for _ in 0..40 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_eq!(cpu.read_r8(3), 0xCD);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn masked_irq_stays_pending_until_unmasked() {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(0x08 * 4, 0x7C10);
+        mem.write_u16(0x08 * 4 + 2, 0);
+        let program = &[
+            0xFB,                // STI
+            0x90, 0x90, 0x90, 0x90,
+            // Unmask IRQ 0 via OUT 0x21, 0xFE
+            0xB0, 0xFE,
+            0xE6, 0x21,
+            0x90, 0x90, 0x90,
+            0xF4,
+            0, 0, 0,            // pad to 0x10
+            0xB3, 0x11,          // handler: MOV BL, 0x11
+            0xB0, 0x20, 0xE6, 0x20,
+            0xCF,
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        // IRQ 0 raised, but IMR=0xFF (default) blocks it.
+        io.pic_mut().raise_irq(0);
+
+        // Run a few steps. Until OUT 0x21, 0xFE runs the handler stays
+        // blocked. After it, IRQ should be delivered.
+        for _ in 0..50 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_eq!(cpu.read_r8(3), 0x11);
+        assert!(cpu.halted);
     }
 
     #[test]

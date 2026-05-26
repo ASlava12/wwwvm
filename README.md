@@ -39,7 +39,10 @@
 ## Что работает сейчас
 
 * **mem** — линейная физическая память, little-endian аксессоры.
-* **devices** — 16550 UART (COM1: 0x3F8). Драйнер `tx`, очередь `rx`, LSR.
+* **devices** — 16550 UART (COM1: 0x3F8) и 8259A PIC (master, 0x20/0x21).
+  PIC моделирует IMR/IRR/ISR, ICW1/ICW2-инициализацию (ICW3/ICW4
+  принимаются и отбрасываются), non-specific EOI через OCW2. Slave-PIC
+  (IRQ 8..15) пока нет.
 * **cpu** — реальный режим x86: `MOV r8/r16, imm`; `MOV r/m, r`,
   `MOV r, r/m`, `MOV r/m, imm` (опкоды 0x88–0x8B, 0xC6/0xC7); `LODSB`;
   полная ALU-семья (`ADD`/`OR`/`ADC`/`SBB`/`AND`/`SUB`/`XOR`/`CMP`,
@@ -104,7 +107,11 @@
   (0x69/0x6B — трёхоперандное знаковое умножение, основа для умножения
   на константу из компилятора), `ENTER imm16, 0` (0xC8 — стандартный
   function prologue), `LEAVE` (0xC9). ENTER с уровнем вложенности > 0
-  не поддерживается (компиляторы C/Rust его не эмитят).
+  не поддерживается (компиляторы C/Rust его не эмитят);
+  **доставка внешних IRQ**. В начале `step()` CPU проверяет
+  `IoBus::pending_irq_vector()`; при `IF=1` и наличии незамаскированного
+  pending IRQ — `ack` PIC + `do_interrupt(vec)`. Интегрирует UART и
+  будущие устройства в стандартный INT-цикл реал-моды.
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -123,9 +130,12 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **107 зелёных** (mem 4 + devices 5 + cpu 86 + vm 6 + wasm 1
+* Тестов — **115 зелёных** (mem 4 + devices 10 + cpu 89 + vm 6 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART) и `DIV`-by-zero → `Stop::CpuError`.
+  PIC покрыт юнит-тестами на masking/EOI/ICW + интеграционными
+  (доставка IRQ через IDT, блокировка по CLI, отложенная доставка
+  после OUT 0x21).
 
 ## Что НЕ работает (намеренно, дорожная карта)
 
@@ -138,7 +148,8 @@
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
 | `RCL`/`RCR` (Group 2 /2,/3), BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Big-number арифметика, DOS-era BCD-код |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
-| Реальные устройства: PIC (8259A), PIT (8254), RTC (CMOS), PS/2, IDE/ATA | средний | Загрузочные тракты любого реального дистрибутива |
+| Реальные устройства: slave PIC (IRQ 8..15), PIT (8254), RTC (CMOS), PS/2, IDE/ATA | средний | Загрузочные тракты любого реального дистрибутива |
+| UART → IRQ 4 (master PIC) при наличии rx-байтов | малый | Interrupt-driven serial вместо опроса LSR |
 | Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
 | 32-бит (i386): операнд/адрес-префиксы 0x66/0x67, long-mode позже | большой | Любое 32+ ядро |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
