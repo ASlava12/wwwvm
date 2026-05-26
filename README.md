@@ -191,9 +191,21 @@
 cargo test --workspace
 ```
 
-Должно вывести 148 пройденных тестов на текущий момент. CI
+Должно вывести 157 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
+
+### Throughput-бенчмарк
+
+```bash
+cargo run --example throughput -p wwwvm-vm --release
+```
+
+Гоняет ALU-цикл (`ADD BX, CX` + `LOOP`, 65535 итераций) через
+`Vm::run_steps` и измеряет инструкций в секунду. На современном
+x86_64 host'е release-сборка даёт ~100 MIPS, debug — ~12 MIPS.
+Это включает `refresh_irqs`, IRQ-check и fetch+decode+execute на
+каждом шаге — то есть видимый из JS throughput.
 
 ### Прокси
 
