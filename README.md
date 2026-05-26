@@ -136,11 +136,13 @@
   гостя: `HELLO_GUEST` (~43 байта, polling LSR + echo) и
   `interactive_demo` (banner + IRQ-driven UART echo). Гость пишет в
   VGA-text напрямую в RAM на 0xB8000 — host читает обратно через
-  `vga_text_snapshot` (25 строк × 80 ASCII-символов). Snapshot v1
-  ≈ 1 MiB + 52 байта: 16-байтный header (`WWWVM\x00` + version + reserved),
-  36-байтный CPU image, 1 МБ memory dump. v1 захватывает CPU + RAM;
-  device-state (UART очереди, PIC/PIT/keyboard/CMOS) сбрасывается при
-  restore — снимать stay-rest-point'ы (boot, idle `JMP -2`, HLT).
+  `vga_text_snapshot` (25 строк × 80 ASCII-символов). Snapshot v2
+  ≈ 1 MiB + ~200 байт: 16-байтный header (`WWWVM\x00` + version=2 +
+  reserved), 36-байтный CPU image, 1 МБ memory dump, length-prefixed
+  device-state секция (UART tx/rx + IER, master/slave PIC IMR/IRR/ISR/
+  init_state/vector_base, PIT counter/reload/mode/flags, keyboard
+  queue, CMOS storage 128 байт). Restore читает и v1 (без device
+  state), и v2 — обратная совместимость для уже сохранённых blob'ов.
 * **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
   `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
   `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
