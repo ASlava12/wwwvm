@@ -312,6 +312,40 @@ impl Cpu {
         v
     }
 
+    /// Compute one of the 8 standard ALU ops on 8-bit operands and
+    /// update flags. Returns (result, true) for ADD/OR/ADC/SBB/AND/SUB/
+    /// XOR (writeback) or (result, false) for CMP. `op` is the same
+    /// 0..7 encoding used by both the main ALU dispatch and Group 1.
+    fn alu_apply8(&mut self, op: u8, a: u8, b: u8) -> (u8, bool) {
+        let cin = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
+        match op {
+            0 => { let r = a.wrapping_add(b); self.flags_add8(a, b, 0, r); (r, true) }
+            1 => { let r = a | b; self.flags_logic8(r); (r, true) }
+            2 => { let r = a.wrapping_add(b).wrapping_add(cin); self.flags_add8(a, b, cin, r); (r, true) }
+            3 => { let r = a.wrapping_sub(b).wrapping_sub(cin); self.flags_sub8(a, b, cin, r); (r, true) }
+            4 => { let r = a & b; self.flags_logic8(r); (r, true) }
+            5 => { let r = a.wrapping_sub(b); self.flags_sub8(a, b, 0, r); (r, true) }
+            6 => { let r = a ^ b; self.flags_logic8(r); (r, true) }
+            7 => { let r = a.wrapping_sub(b); self.flags_sub8(a, b, 0, r); (r, false) }
+            _ => unreachable!("op is 3 bits"),
+        }
+    }
+
+    fn alu_apply16(&mut self, op: u8, a: u16, b: u16) -> (u16, bool) {
+        let cin: u16 = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
+        match op {
+            0 => { let r = a.wrapping_add(b); self.flags_add16(a, b, 0, r); (r, true) }
+            1 => { let r = a | b; self.flags_logic16(r); (r, true) }
+            2 => { let r = a.wrapping_add(b).wrapping_add(cin); self.flags_add16(a, b, cin, r); (r, true) }
+            3 => { let r = a.wrapping_sub(b).wrapping_sub(cin); self.flags_sub16(a, b, cin, r); (r, true) }
+            4 => { let r = a & b; self.flags_logic16(r); (r, true) }
+            5 => { let r = a.wrapping_sub(b); self.flags_sub16(a, b, 0, r); (r, true) }
+            6 => { let r = a ^ b; self.flags_logic16(r); (r, true) }
+            7 => { let r = a.wrapping_sub(b); self.flags_sub16(a, b, 0, r); (r, false) }
+            _ => unreachable!("op is 3 bits"),
+        }
+    }
+
     /// Execute one of the 8 standard ALU operations encoded in opcode
     /// 0x00..0x3F. `op` is the operation (0=ADD … 7=CMP) and `variant`
     /// (opcode & 7) selects operand form. Supports all 16-bit ModR/M
@@ -381,33 +415,12 @@ impl Cpu {
             _ => unreachable!("ALU dispatch only covers variants 0..5"),
         }
 
-        let cin = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
         let (result, writeback) = if !is_word {
-            let (a8, b8) = (a as u8, b as u8);
-            match op {
-                0 => { let r = a8.wrapping_add(b8); self.flags_add8(a8, b8, 0, r); (r as u32, true) }
-                1 => { let r = a8 | b8; self.flags_logic8(r); (r as u32, true) }
-                2 => { let r = a8.wrapping_add(b8).wrapping_add(cin as u8); self.flags_add8(a8, b8, cin as u8, r); (r as u32, true) }
-                3 => { let r = a8.wrapping_sub(b8).wrapping_sub(cin as u8); self.flags_sub8(a8, b8, cin as u8, r); (r as u32, true) }
-                4 => { let r = a8 & b8; self.flags_logic8(r); (r as u32, true) }
-                5 => { let r = a8.wrapping_sub(b8); self.flags_sub8(a8, b8, 0, r); (r as u32, true) }
-                6 => { let r = a8 ^ b8; self.flags_logic8(r); (r as u32, true) }
-                7 => { let r = a8.wrapping_sub(b8); self.flags_sub8(a8, b8, 0, r); (r as u32, false) }
-                _ => unreachable!(),
-            }
+            let (r, wb) = self.alu_apply8(op, a as u8, b as u8);
+            (r as u32, wb)
         } else {
-            let (a16, b16) = (a as u16, b as u16);
-            match op {
-                0 => { let r = a16.wrapping_add(b16); self.flags_add16(a16, b16, 0, r); (r as u32, true) }
-                1 => { let r = a16 | b16; self.flags_logic16(r); (r as u32, true) }
-                2 => { let r = a16.wrapping_add(b16).wrapping_add(cin); self.flags_add16(a16, b16, cin, r); (r as u32, true) }
-                3 => { let r = a16.wrapping_sub(b16).wrapping_sub(cin); self.flags_sub16(a16, b16, cin, r); (r as u32, true) }
-                4 => { let r = a16 & b16; self.flags_logic16(r); (r as u32, true) }
-                5 => { let r = a16.wrapping_sub(b16); self.flags_sub16(a16, b16, 0, r); (r as u32, true) }
-                6 => { let r = a16 ^ b16; self.flags_logic16(r); (r as u32, true) }
-                7 => { let r = a16.wrapping_sub(b16); self.flags_sub16(a16, b16, 0, r); (r as u32, false) }
-                _ => unreachable!(),
-            }
+            let (r, wb) = self.alu_apply16(op, a as u16, b as u16);
+            (r as u32, wb)
         };
 
         if writeback {
@@ -506,6 +519,153 @@ impl Cpu {
                 let v = self.read_rm16(rm, mem);
                 self.write_r16(reg, v);
             }
+            // Group 1: ALU r/m, imm.  reg field of ModR/M = op (0=ADD..7=CMP)
+            //   0x80: r/m8, imm8
+            //   0x81: r/m16, imm16
+            //   0x83: r/m16, imm8 sign-extended to 16-bit
+            0x80 => {
+                let (_, op, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u8(mem);
+                let a = self.read_rm8(rm, mem);
+                let (r, wb) = self.alu_apply8(op, a, imm);
+                if wb { self.write_rm8(rm, mem, r); }
+            }
+            0x81 => {
+                let (_, op, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u16(mem);
+                let a = self.read_rm16(rm, mem);
+                let (r, wb) = self.alu_apply16(op, a, imm);
+                if wb { self.write_rm16(rm, mem, r); }
+            }
+            0x83 => {
+                let (_, op, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u8(mem) as i8 as i16 as u16;
+                let a = self.read_rm16(rm, mem);
+                let (r, wb) = self.alu_apply16(op, a, imm);
+                if wb { self.write_rm16(rm, mem, r); }
+            }
+
+            // Group 3 (0xF6 8-bit, 0xF7 16-bit). reg field selects:
+            //   /0 = TEST r/m, imm   (imm is fetched here)
+            //   /2 = NOT r/m          (no flag updates)
+            //   /3 = NEG r/m          (subtract from 0, sets CF if op != 0)
+            //   /4 = MUL, /5 = IMUL, /6 = DIV, /7 = IDIV — deferred
+            0xF6 => {
+                let (_, sub, rm) = self.fetch_modrm(mem);
+                match sub {
+                    0 | 1 => {
+                        let imm = self.fetch_u8(mem);
+                        let v = self.read_rm8(rm, mem);
+                        let r = v & imm;
+                        self.flags_logic8(r);
+                    }
+                    2 => {
+                        let v = self.read_rm8(rm, mem);
+                        self.write_rm8(rm, mem, !v);
+                    }
+                    3 => {
+                        let v = self.read_rm8(rm, mem);
+                        let r = 0u8.wrapping_sub(v);
+                        self.flags_sub8(0, v, 0, r);
+                        // NEG sets CF = (operand != 0); flags_sub8 already
+                        // computed CF as (0 < v) which is exactly that.
+                        self.write_rm8(rm, mem, r);
+                    }
+                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                }
+            }
+            0xF7 => {
+                let (_, sub, rm) = self.fetch_modrm(mem);
+                match sub {
+                    0 | 1 => {
+                        let imm = self.fetch_u16(mem);
+                        let v = self.read_rm16(rm, mem);
+                        let r = v & imm;
+                        self.flags_logic16(r);
+                    }
+                    2 => {
+                        let v = self.read_rm16(rm, mem);
+                        self.write_rm16(rm, mem, !v);
+                    }
+                    3 => {
+                        let v = self.read_rm16(rm, mem);
+                        let r = 0u16.wrapping_sub(v);
+                        self.flags_sub16(0, v, 0, r);
+                        self.write_rm16(rm, mem, r);
+                    }
+                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                }
+            }
+
+            // Group 4 (0xFE): INC/DEC r/m8.
+            //   /0 = INC, /1 = DEC. Other sub-ops are undefined.
+            0xFE => {
+                let (_, sub, rm) = self.fetch_modrm(mem);
+                let cf_before = self.has(flag::CF);
+                let v = self.read_rm8(rm, mem);
+                let r = match sub {
+                    0 => {
+                        let r = v.wrapping_add(1);
+                        self.flags_add8(v, 1, 0, r);
+                        r
+                    }
+                    1 => {
+                        let r = v.wrapping_sub(1);
+                        self.flags_sub8(v, 1, 0, r);
+                        r
+                    }
+                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                };
+                // INC/DEC preserve CF on 8086.
+                self.set_flag(flag::CF, cf_before);
+                self.write_rm8(rm, mem, r);
+            }
+
+            // Group 5 (0xFF): r/m16 family.
+            //   /0 = INC r/m16
+            //   /1 = DEC r/m16
+            //   /2 = CALL r/m16 (near, indirect)
+            //   /3 = CALL m16:16 (far)            — deferred
+            //   /4 = JMP r/m16 (near, indirect)
+            //   /5 = JMP m16:16 (far)             — deferred
+            //   /6 = PUSH r/m16
+            0xFF => {
+                let (_, sub, rm) = self.fetch_modrm(mem);
+                match sub {
+                    0 => {
+                        let cf_before = self.has(flag::CF);
+                        let v = self.read_rm16(rm, mem);
+                        let r = v.wrapping_add(1);
+                        self.flags_add16(v, 1, 0, r);
+                        self.set_flag(flag::CF, cf_before);
+                        self.write_rm16(rm, mem, r);
+                    }
+                    1 => {
+                        let cf_before = self.has(flag::CF);
+                        let v = self.read_rm16(rm, mem);
+                        let r = v.wrapping_sub(1);
+                        self.flags_sub16(v, 1, 0, r);
+                        self.set_flag(flag::CF, cf_before);
+                        self.write_rm16(rm, mem, r);
+                    }
+                    2 => {
+                        let target = self.read_rm16(rm, mem);
+                        let ret_ip = self.ip;
+                        self.push16(mem, ret_ip);
+                        self.ip = target;
+                    }
+                    4 => {
+                        let target = self.read_rm16(rm, mem);
+                        self.ip = target;
+                    }
+                    6 => {
+                        let v = self.read_rm16(rm, mem);
+                        self.push16(mem, v);
+                    }
+                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                }
+            }
+
             // MOV r/m8, imm8  — Group 11 /0
             0xC6 => {
                 let (_, reg_field, rm) = self.fetch_modrm(mem);
@@ -1043,6 +1203,143 @@ mod tests {
             0xF4,
         ], 8);
         assert!(cpu.has(flag::ZF));
+    }
+
+    #[test]
+    fn group1_add_imm_to_r16() {
+        // ADD AX, 7    via 0x83 /0 (sign-ext imm8) — ModR/M = 11 000 000 = 0xC0
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x05, 0x00,    // MOV AX, 5
+            0x83, 0xC0, 0x07,    // ADD AX, 7
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 12);
+    }
+
+    #[test]
+    fn group1_sub_r16_imm16() {
+        // SUB AX, 0x1000 via 0x81 /5 — ModR/M = 11 101 000 = 0xE8
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x34, 0x12,
+            0x81, 0xE8, 0x00, 0x10,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 0x0234);
+    }
+
+    #[test]
+    fn group1_cmp_imm_does_not_writeback() {
+        // CMP AL, 0x42 via 0x80 /7 — ModR/M = 11 111 000 = 0xF8
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x42,
+            0x80, 0xF8, 0x42,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.read_r8(0), 0x42);
+        assert!(cpu.has(flag::ZF));
+    }
+
+    #[test]
+    fn group3_neg_and_not_r16() {
+        // NEG AX where AX=5 -> 0xFFFB, CF=1
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x05, 0x00,
+            0xF7, 0xD8,           // NEG AX (F7 /3, ModR/M = 11 011 000 = 0xD8)
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 0xFFFB);
+        assert!(cpu.has(flag::CF));
+
+        // NOT BX where BX=0xAAAA -> 0x5555, flags untouched
+        let (cpu, _, _) = run_payload(&[
+            0xBB, 0xAA, 0xAA,
+            0xF7, 0xD3,           // NOT BX (F7 /2, ModR/M = 11 010 011 = 0xD3)
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::BX], 0x5555);
+    }
+
+    #[test]
+    fn group3_test_rm_imm() {
+        // TEST AL, 0x80 (F6 /0, modrm=11 000 000 = 0xC0); AL=0x80 → ZF=0, SF=1
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x80,
+            0xF6, 0xC0, 0x80,
+            0xF4,
+        ], 6);
+        assert!(!cpu.has(flag::ZF));
+        assert!(cpu.has(flag::SF));
+        assert_eq!(cpu.read_r8(0), 0x80);   // unchanged
+    }
+
+    #[test]
+    fn group4_inc_memory_byte() {
+        // INC byte [0x900] via FE /0 (modrm=00 000 110 = 0x06, then disp16)
+        let (_, mem, _) = run_payload(&[
+            0xC6, 0x06, 0x00, 0x09, 0x09,  // MOV byte [0x900], 9
+            0xFE, 0x06, 0x00, 0x09,        // INC byte [0x900]
+            0xF4,
+        ], 6);
+        assert_eq!(mem.read_u8(0x900), 10);
+    }
+
+    #[test]
+    fn group5_indirect_call_via_register() {
+        // Code is loaded at CS:IP = 0000:7C00, so absolute IPs are
+        // 0x7C00 + offset.
+        //
+        // 0: B8 08 7C     MOV AX, 0x7C08    ; absolute target
+        // 3: FF D0        CALL AX           (FF /2, modrm=11 010 000)
+        // 5: B3 11        MOV BL, 0x11
+        // 7: F4           HLT
+        // 8: B3 22        MOV BL, 0x22      ; callee
+        // A: C3           RET
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x08, 0x7C,
+            0xFF, 0xD0,
+            0xB3, 0x11,
+            0xF4,
+            0xB3, 0x22,
+            0xC3,
+        ], 24);
+        // The callee ran (BL=0x22), then we returned and the next line
+        // overwrote BL with 0x11. So after halt, BL == 0x11. If CALL had
+        // gone elsewhere (or RET hadn't returned), this would fail.
+        assert_eq!(cpu.read_r8(3), 0x11);
+        assert!(cpu.halted);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn group5_jmp_indirect_via_register() {
+        // JMP AX (FF /4) — jump without saving the return IP.
+        // 0: B8 06 7C     MOV AX, 0x7C06    ; absolute target
+        // 3: FF E0        JMP AX
+        // 5: F4           HLT               ; skipped
+        // 6: B3 77        MOV BL, 0x77
+        // 8: F4           HLT
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x06, 0x7C,
+            0xFF, 0xE0,
+            0xF4,
+            0xB3, 0x77,
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.read_r8(3), 0x77);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn group5_push_rm16() {
+        // PUSH [0x900] via FF /6 (modrm=00 110 110 = 0x36, disp16)
+        let (cpu, mem, _) = run_payload(&[
+            0xC7, 0x06, 0x00, 0x09, 0xCD, 0xAB,  // MOV WORD [0x900], 0xABCD
+            0xFF, 0x36, 0x00, 0x09,              // PUSH [0x900]
+            0x58,                                 // POP AX
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.regs[r16::AX], 0xABCD);
+        let _ = mem; // mem is consulted via the POP
     }
 
     #[test]

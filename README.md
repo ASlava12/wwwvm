@@ -49,6 +49,13 @@
   `[BX]`), включая исключение `mod=00,rm=110 → [disp16]`, с правильным
   выбором сегмента по умолчанию (SS для `[BP*]`, иначе DS), и disp8/disp16.
   `INC`/`DEC r16`; `TEST AL/AX, imm`; `IN/OUT` через DX и imm8;
+  **Group 1** (`ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm` — 0x80/0x81/0x83
+  с sign-extension);
+  **Group 3** (`NOT`, `NEG`, `TEST r/m, imm` — 0xF6/0xF7; `MUL`/`DIV`
+  ещё впереди);
+  **Group 4** (`INC`/`DEC r/m8` — 0xFE);
+  **Group 5** (`INC`/`DEC r/m16`, `CALL r/m16` near indirect, `JMP r/m16`
+  near indirect, `PUSH r/m16` — 0xFF);
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -67,7 +74,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **40 зелёных** (mem 4 + devices 5 + cpu 22 + vm 3 + wasm 1
+* Тестов — **49 зелёных** (mem 4 + devices 5 + cpu 31 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -79,7 +86,8 @@
 |------|-------|-------|
 | `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
-| Group 1/3 (`ADD r/m, imm`, `MUL`, `DIV`, `NEG`, `NOT`, `SHL`/`SHR`) | средний | Запускать что-то сложнее эхо-цикла |
+| `MUL`/`IMUL`/`DIV`/`IDIV` (Group 3 /4..7), `SHL`/`SHR`/`SAR`/`ROL`/`ROR` (Group 2) | средний | Компилятор C/Rust почти всегда генерирует сдвиги и умножения |
+| Префиксы строковых операций `REP`/`REPZ`/`REPNZ`, `MOVS`/`STOS`/`SCAS`/`CMPS` | малый | `memcpy`/`memset` — основа любого пролога |
 | `MOVS`, `STOS`, `SCAS`, `CMPS`, `REP`-префиксы | малый | `memcpy`/`memset` в гостях |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |
