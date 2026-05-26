@@ -520,9 +520,40 @@ impl Cpu {
                 self.flags_zsp8(result);
                 Ok(result)
             }
-            // RCL (2) / RCR (3): rotate through CF — deferred to a
-            // follow-up. They're rare in compiler output but needed
-            // for big-number arithmetic and we'll add them with tests.
+            // RCL — rotate through CF, 9-bit cycle (8 data bits + CF).
+            2 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = count % 9;
+                for _ in 0..n {
+                    let new_cf = v & 0x80 != 0;
+                    v = (v << 1) | (cf as u8);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (v & 0x80 != 0) != cf);
+                }
+                Ok(v)
+            }
+            // RCR — rotate right through CF.
+            3 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = count % 9;
+                for _ in 0..n {
+                    let new_cf = v & 1 != 0;
+                    v = (v >> 1) | ((cf as u8) << 7);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb = v & 0x80 != 0;
+                    let msb1 = v & 0x40 != 0;
+                    self.set_flag(flag::OF, msb != msb1);
+                }
+                Ok(v)
+            }
             _ => Err(CpuError::Unimplemented {
                 opcode: 0xD0,
                 cs: 0,
@@ -597,6 +628,40 @@ impl Cpu {
                 }
                 self.flags_zsp16(result);
                 Ok(result)
+            }
+            // RCL — 17-bit cycle (16 data + CF).
+            2 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = count % 17;
+                for _ in 0..n {
+                    let new_cf = v & 0x8000 != 0;
+                    v = (v << 1) | (cf as u16);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (v & 0x8000 != 0) != cf);
+                }
+                Ok(v)
+            }
+            // RCR
+            3 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = count % 17;
+                for _ in 0..n {
+                    let new_cf = v & 1 != 0;
+                    v = (v >> 1) | ((cf as u16) << 15);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb = v & 0x8000 != 0;
+                    let msb1 = v & 0x4000 != 0;
+                    self.set_flag(flag::OF, msb != msb1);
+                }
+                Ok(v)
             }
             _ => Err(CpuError::Unimplemented {
                 opcode: 0xD1,
@@ -1946,6 +2011,113 @@ impl Cpu {
                 let off = self.regs[r16::BX].wrapping_add(self.read_r8(0) as u16);
                 let v = mem.read_u8(Self::linear(self.sregs[seg], off));
                 self.write_r8(0, v);
+            }
+
+            // BCD adjusts. Rare in modern code but completing 8086 ISA.
+            // DAA — Decimal Adjust after Add. Per Intel SDM Vol. 2.
+            0x27 => {
+                let old_al = self.read_r8(0);
+                let old_cf = self.has(flag::CF);
+                let mut al = old_al;
+                let mut cf_out;
+                if (al & 0x0F) > 9 || self.has(1 << 4) {
+                    let (v, c) = al.overflowing_add(6);
+                    al = v;
+                    cf_out = c || old_cf;
+                    self.set_flag(1 << 4, true); // AF
+                } else {
+                    self.set_flag(1 << 4, false);
+                    cf_out = old_cf;
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_add(0x60);
+                    cf_out = true;
+                }
+                self.write_r8(0, al);
+                self.set_flag(flag::CF, cf_out);
+                self.flags_zsp8(al);
+            }
+            // DAS — Decimal Adjust after Subtract.
+            0x2F => {
+                let old_al = self.read_r8(0);
+                let old_cf = self.has(flag::CF);
+                let mut al = old_al;
+                let mut cf_out;
+                if (al & 0x0F) > 9 || self.has(1 << 4) {
+                    let (v, c) = al.overflowing_sub(6);
+                    al = v;
+                    cf_out = c || old_cf;
+                    self.set_flag(1 << 4, true);
+                } else {
+                    self.set_flag(1 << 4, false);
+                    cf_out = old_cf;
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_sub(0x60);
+                    cf_out = true;
+                }
+                self.write_r8(0, al);
+                self.set_flag(flag::CF, cf_out);
+                self.flags_zsp8(al);
+            }
+            // AAA — ASCII Adjust after Addition.
+            0x37 => {
+                let al = self.read_r8(0);
+                if (al & 0x0F) > 9 || self.has(1 << 4) {
+                    let new_al = al.wrapping_add(6) & 0x0F;
+                    let new_ah = self.read_r8(4).wrapping_add(1);
+                    self.write_r8(0, new_al);
+                    self.write_r8(4, new_ah);
+                    self.set_flag(1 << 4, true);
+                    self.set_flag(flag::CF, true);
+                } else {
+                    self.write_r8(0, al & 0x0F);
+                    self.set_flag(1 << 4, false);
+                    self.set_flag(flag::CF, false);
+                }
+            }
+            // AAS — ASCII Adjust after Subtraction.
+            0x3F => {
+                let al = self.read_r8(0);
+                if (al & 0x0F) > 9 || self.has(1 << 4) {
+                    let new_al = al.wrapping_sub(6) & 0x0F;
+                    let new_ah = self.read_r8(4).wrapping_sub(1);
+                    self.write_r8(0, new_al);
+                    self.write_r8(4, new_ah);
+                    self.set_flag(1 << 4, true);
+                    self.set_flag(flag::CF, true);
+                } else {
+                    self.write_r8(0, al & 0x0F);
+                    self.set_flag(1 << 4, false);
+                    self.set_flag(flag::CF, false);
+                }
+            }
+            // AAM — ASCII Adjust after Multiply. imm8 = base (typically 10).
+            // Divide-by-zero raises a Divide Error like DIV.
+            0xD4 => {
+                let base = self.fetch_u8(mem);
+                if base == 0 {
+                    return Err(CpuError::DivideError {
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
+                }
+                let al = self.read_r8(0);
+                let ah = al / base;
+                let new_al = al % base;
+                self.write_r8(4, ah);
+                self.write_r8(0, new_al);
+                self.flags_zsp8(new_al);
+            }
+            // AAD — ASCII Adjust before Division.
+            0xD5 => {
+                let base = self.fetch_u8(mem);
+                let al = self.read_r8(0);
+                let ah = self.read_r8(4);
+                let new_al = ah.wrapping_mul(base).wrapping_add(al);
+                self.write_r8(0, new_al);
+                self.write_r8(4, 0);
+                self.flags_zsp8(new_al);
             }
 
             // Carry-flag tweaks.
@@ -3606,6 +3778,141 @@ mod tests {
         }
         assert_eq!(cpu.read_r8(3), 0x11);
         assert!(cpu.halted);
+    }
+
+    #[test]
+    fn rcl_al_1_rotates_through_carry() {
+        // CF=1; MOV AL, 0x40; RCL AL, 1 → AL = 0x81 (40<<1 | CF), CF=0.
+        // RCL r/m8, 1 = 0xD0 /2, ModR/M = 11 010 000 = 0xD0
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xB0, 0x40, // MOV AL, 0x40
+                0xD0, 0xD0, // RCL AL, 1
+                0xF4,
+            ],
+            8,
+        );
+        assert_eq!(cpu.read_r8(0), 0x81);
+        assert!(!cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn rcr_al_1_brings_carry_into_top_bit() {
+        // CF=1; MOV AL, 0x02; RCR AL, 1 → AL = 0x81 (CF→top, 0x02>>1=1), CF=0
+        // RCR r/m8, 1 = 0xD0 /3, ModR/M = 11 011 000 = 0xD8
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xB0, 0x02, 0xD0, 0xD8, 0xF4,
+            ],
+            8,
+        );
+        assert_eq!(cpu.read_r8(0), 0x81);
+        assert!(!cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn rcl_ax_9_cycles_back_through_carry() {
+        // RCL with count=9 on a 9-bit cycle is identity. Reload CF=1
+        // first so we can observe it round-trip.
+        // RCL r/m8, CL: 0xD2 /2, modrm 0xD0; CL=9.
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xB0, 0xAA, // AL = 0xAA
+                0xB1, 0x09, // CL = 9
+                0xD2, 0xD0, // RCL AL, CL
+                0xF4,
+            ],
+            10,
+        );
+        assert_eq!(cpu.read_r8(0), 0xAA);
+        assert!(cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn daa_after_bcd_add() {
+        // 0x09 + 0x01 (binary) = 0x0A; DAA should adjust to 0x10 (BCD).
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x09, // MOV AL, 9
+                0x04, 0x01, // ADD AL, 1 → AL = 0x0A
+                0x27, // DAA
+                0xF4,
+            ],
+            8,
+        );
+        assert_eq!(cpu.read_r8(0), 0x10);
+    }
+
+    #[test]
+    fn das_after_bcd_sub() {
+        // 0x10 - 0x01 = 0x0F binary; DAS adjusts to 0x09.
+        let (cpu, _, _) = run_payload(&[0xB0, 0x10, 0x2C, 0x01, 0x2F, 0xF4], 8);
+        assert_eq!(cpu.read_r8(0), 0x09);
+    }
+
+    #[test]
+    fn aaa_adjusts_unpacked_bcd_carry() {
+        // After "5 + 6" = 0x0B in AL, AAA → AL=1, AH+=1, CF=1.
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x05, 0x04, 0x06, // ADD AL, 6
+                0x37, // AAA
+                0xF4,
+            ],
+            8,
+        );
+        assert_eq!(cpu.read_r8(0), 1); // AL
+        assert_eq!(cpu.read_r8(4), 1); // AH bumped
+        assert!(cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn aam_splits_al_into_ah_al() {
+        // MOV AL, 23 ; AAM (base 10) → AH=2, AL=3
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x17, // 23
+                0xD4, 0x0A, // AAM 10
+                0xF4,
+            ],
+            6,
+        );
+        assert_eq!(cpu.read_r8(4), 2); // AH
+        assert_eq!(cpu.read_r8(0), 3); // AL
+    }
+
+    #[test]
+    fn aad_combines_ah_al_into_al() {
+        // AH=2, AL=3 ; AAD (base 10) → AL = 2*10 + 3 = 23, AH = 0
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB4, 0x02, // MOV AH, 2
+                0xB0, 0x03, // MOV AL, 3
+                0xD5, 0x0A, // AAD 10
+                0xF4,
+            ],
+            8,
+        );
+        assert_eq!(cpu.read_r8(0), 23);
+        assert_eq!(cpu.read_r8(4), 0);
+    }
+
+    #[test]
+    fn aam_with_zero_base_raises_divide_error() {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, &[0xB0, 0x05, 0xD4, 0x00, 0xF4]);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        cpu.step(&mut mem, &mut io).unwrap();
+        let err = cpu.step(&mut mem, &mut io).unwrap_err();
+        match err {
+            CpuError::DivideError { .. } => {}
+            other => panic!("expected DivideError, got {other:?}"),
+        }
     }
 
     #[test]

@@ -151,7 +151,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **148 зелёных** (mem 6 + devices 29 + cpu 89 + vm 18 + wasm 1
+* Тестов — **157 зелёных** (mem 6 + devices 29 + cpu 98 + vm 18 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
   **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)
@@ -168,7 +168,6 @@
 |------|-------|-------|
 | `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
-| `RCL`/`RCR` (Group 2 /2,/3), BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Big-number арифметика, DOS-era BCD-код |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
 | 8042 controller commands (self-test, port disable), keyboard scan-code translation на host-стороне | малый | Совместимость со стандартными KB-драйверами |
 | Реальные устройства: IDE/ATA, RTC alarm IRQ (через slave), VGA-graphics (≥320×200) | средний | Загрузочные тракты дистрибутивов, графические демо |
