@@ -285,16 +285,19 @@ const counter = vm.read_mem_u16(0x902);
 ```
 crates/
   mem/        # физическая память
-  devices/    # 16550 UART + IoBus
-  cpu/        # x86 real-mode подмножество
-  vm/         # оркестратор + встроенный гость
+  devices/    # 16550 UART + 8259A PIC ×2 + 8254 PIT + PS/2 KBD + CMOS
+  cpu/        # x86 real-mode подмножество (8086 + 80186)
+  vm/         # оркестратор + встроенные гости + snapshot/restore
   wasm/       # cdylib для браузера (wasm-bindgen)
   proxy/      # отдельный бинарь: WebSocket ↔ TCP
 web/
   index.html
   main.js
+  storage.js  # IndexedDB-обёртка для snapshot/restore
   style.css
   pkg/        # сюда wasm-pack кладёт wasm + .js шим (gitignored)
+docs/
+  HAND_ASSEMBLY.md  # tutorial для студентов: писать гостей побайтово
 ```
 
 ## Лицензия
