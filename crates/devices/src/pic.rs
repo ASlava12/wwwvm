@@ -88,6 +88,36 @@ impl Pic {
         self.isr |= irq_bit;
     }
 
+    /// Snapshot: vector_base, imr, irr, isr, init_state (5 bytes).
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.push(self.vector_base);
+        out.push(self.imr);
+        out.push(self.irr);
+        out.push(self.isr);
+        out.push(match self.init_state {
+            InitState::Idle => 0,
+            InitState::ExpectIcw2 => 1,
+            InitState::ExpectIcw3 => 2,
+            InitState::ExpectIcw4 => 3,
+        });
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 5 { return Err("pic: truncated"); }
+        self.vector_base = bytes[0];
+        self.imr = bytes[1];
+        self.irr = bytes[2];
+        self.isr = bytes[3];
+        self.init_state = match bytes[4] {
+            0 => InitState::Idle,
+            1 => InitState::ExpectIcw2,
+            2 => InitState::ExpectIcw3,
+            3 => InitState::ExpectIcw4,
+            _ => return Err("pic: bad init_state tag"),
+        };
+        Ok(5)
+    }
+
     /// Software EOI — clears the highest-priority bit in ISR.
     fn non_specific_eoi(&mut self) {
         if self.isr == 0 {

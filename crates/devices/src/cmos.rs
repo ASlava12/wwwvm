@@ -106,6 +106,19 @@ impl Cmos {
     pub fn set_storage_byte(&mut self, idx: u8, value: u8) {
         self.storage[(idx & 0x7F) as usize] = value;
     }
+
+    /// Snapshot: index (u8) + 128 storage bytes.
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.push(self.index);
+        out.extend_from_slice(&self.storage);
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 1 + 128 { return Err("cmos: truncated"); }
+        self.index = bytes[0];
+        self.storage.copy_from_slice(&bytes[1..1+128]);
+        Ok(1 + 128)
+    }
 }
 
 impl Default for Cmos {

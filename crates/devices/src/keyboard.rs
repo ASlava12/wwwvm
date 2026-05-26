@@ -54,6 +54,23 @@ impl Keyboard {
     pub fn irq_pending(&self) -> bool {
         !self.queue.is_empty()
     }
+
+    /// Snapshot: queue length (u32LE) + queue bytes.
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        let len = self.queue.len() as u32;
+        out.extend_from_slice(&len.to_le_bytes());
+        for b in &self.queue {
+            out.push(*b);
+        }
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 4 { return Err("kbd: truncated"); }
+        let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if bytes.len() < 4 + n { return Err("kbd: truncated queue"); }
+        self.queue = bytes[4..4+n].iter().copied().collect();
+        Ok(4 + n)
+    }
 }
 
 impl IoDevice for Keyboard {

@@ -66,6 +66,41 @@ impl Uart {
     pub fn irq_pending(&self) -> bool {
         (self.ier & 0x01) != 0 && !self.rx_buffer.is_empty()
     }
+
+    /// Serialize UART state into `out`. Format: IER (u8), tx_len
+    /// (u32LE) + tx_bytes, rx_len (u32LE) + rx_bytes. Base port is
+    /// not stored — it's an architectural constant set at
+    /// construction.
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.push(self.ier);
+        let tx_len = self.tx_buffer.len() as u32;
+        out.extend_from_slice(&tx_len.to_le_bytes());
+        out.extend_from_slice(&self.tx_buffer);
+        let rx_len = self.rx_buffer.len() as u32;
+        out.extend_from_slice(&rx_len.to_le_bytes());
+        for b in &self.rx_buffer {
+            out.push(*b);
+        }
+    }
+
+    /// Restore from a buffer produced by `snapshot_into`. Returns the
+    /// number of bytes consumed.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let mut p = 0;
+        if bytes.len() < 1 + 4 { return Err("uart: truncated"); }
+        self.ier = bytes[p]; p += 1;
+        let tx_len = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]) as usize;
+        p += 4;
+        if bytes.len() < p + tx_len + 4 { return Err("uart: truncated tx"); }
+        self.tx_buffer = bytes[p..p+tx_len].to_vec();
+        p += tx_len;
+        let rx_len = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]) as usize;
+        p += 4;
+        if bytes.len() < p + rx_len { return Err("uart: truncated rx"); }
+        self.rx_buffer = bytes[p..p+rx_len].iter().copied().collect();
+        p += rx_len;
+        Ok(p)
+    }
 }
 
 impl IoDevice for Uart {

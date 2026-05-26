@@ -94,6 +94,32 @@ impl Pit {
         self.ch0_pending_edge = false;
         p
     }
+
+    /// Snapshot: reload (u16) + counter (u32) + mode (u8) + flags (u8:
+    /// bit0=running, bit1=pending_edge) + write_state (u8) +
+    /// pending_lsb (u8). 10 bytes.
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.ch0_reload.to_le_bytes());
+        out.extend_from_slice(&self.ch0_counter.to_le_bytes());
+        out.push(self.ch0_mode);
+        let flags = (self.ch0_running as u8) | ((self.ch0_pending_edge as u8) << 1);
+        out.push(flags);
+        out.push(self.write_state);
+        out.push(self.pending_lsb);
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 10 { return Err("pit: truncated"); }
+        self.ch0_reload = u16::from_le_bytes([bytes[0], bytes[1]]);
+        self.ch0_counter = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        self.ch0_mode = bytes[6];
+        let flags = bytes[7];
+        self.ch0_running = flags & 1 != 0;
+        self.ch0_pending_edge = flags & 2 != 0;
+        self.write_state = bytes[8];
+        self.pending_lsb = bytes[9];
+        Ok(10)
+    }
 }
 
 impl IoDevice for Pit {

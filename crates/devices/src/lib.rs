@@ -226,6 +226,73 @@ impl Default for IoBus {
     }
 }
 
+/// Snapshot blob layout: a 1-byte device count followed by repeated
+/// `[length: u32LE][device-id: u8][bytes...]` records. Length covers
+/// the device-id byte plus the payload, so a parser can skip an
+/// unknown device cleanly by jumping `length` bytes ahead.
+///
+/// Device IDs are stable: 1=UART, 2=PIC master, 3=PIC slave, 4=PIT,
+/// 5=Keyboard, 6=CMOS. New devices append. Unknown IDs are silently
+/// skipped — that's how we'll handle forward-compat snapshots later.
+impl IoBus {
+    const DEV_UART: u8 = 1;
+    const DEV_PIC_MASTER: u8 = 2;
+    const DEV_PIC_SLAVE: u8 = 3;
+    const DEV_PIT: u8 = 4;
+    const DEV_KBD: u8 = 5;
+    const DEV_CMOS: u8 = 6;
+
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(512);
+        out.push(6u8); // device count
+        let emit = |out: &mut Vec<u8>, id: u8, payload: &[u8]| {
+            let len = 1 + payload.len() as u32;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.push(id);
+            out.extend_from_slice(payload);
+        };
+        let mut buf = Vec::new();
+        buf.clear(); self.uart.snapshot_into(&mut buf); emit(&mut out, Self::DEV_UART, &buf);
+        buf.clear(); self.pic.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIC_MASTER, &buf);
+        buf.clear(); self.slave_pic.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIC_SLAVE, &buf);
+        buf.clear(); self.pit.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIT, &buf);
+        buf.clear(); self.kbd.snapshot_into(&mut buf); emit(&mut out, Self::DEV_KBD, &buf);
+        buf.clear(); self.cmos.snapshot_into(&mut buf); emit(&mut out, Self::DEV_CMOS, &buf);
+        out
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() { return Err("iobus: empty".into()); }
+        let count = bytes[0];
+        let mut p = 1;
+        for _ in 0..count {
+            if bytes.len() < p + 4 { return Err("iobus: truncated record header".into()); }
+            let len = u32::from_le_bytes([
+                bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]
+            ]) as usize;
+            p += 4;
+            if bytes.len() < p + len || len < 1 {
+                return Err("iobus: truncated record body".into());
+            }
+            let id = bytes[p];
+            let payload = &bytes[p+1..p+len];
+            let consumed = match id {
+                Self::DEV_UART => self.uart.restore(payload).map_err(str::to_string)?,
+                Self::DEV_PIC_MASTER => self.pic.restore(payload).map_err(str::to_string)?,
+                Self::DEV_PIC_SLAVE => self.slave_pic.restore(payload).map_err(str::to_string)?,
+                Self::DEV_PIT => self.pit.restore(payload).map_err(str::to_string)?,
+                Self::DEV_KBD => self.kbd.restore(payload).map_err(str::to_string)?,
+                Self::DEV_CMOS => self.cmos.restore(payload).map_err(str::to_string)?,
+                // Unknown device — skip its payload.
+                _ => payload.len(),
+            };
+            let _ = consumed; // device may consume fewer bytes than payload; trailing data ignored
+            p += len;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
