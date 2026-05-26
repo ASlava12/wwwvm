@@ -220,4 +220,112 @@ mod tests {
         assert!(s.contains("wwwvm: ready"));
         assert!(s.contains("hi\nok\n"), "got: {s:?}");
     }
+
+    /// Hand-assembled guest that uses LOOP, INC r/m8 (Group 4), and the
+    /// UART to print the five-character string "ABCDE" without storing
+    /// it in memory. Verifies the wider ISA round-trips through the
+    /// `Vm` API as a single OUT-per-character pump.
+    ///
+    /// ```text
+    /// 0: B9 05 00     MOV CX, 5
+    /// 3: B0 41        MOV AL, 'A'
+    /// 5: BA F8 03     MOV DX, 0x3F8
+    /// 8: EE           OUT DX, AL
+    /// 9: FE C0        INC AL
+    /// B: E2 FB        LOOP -5  -> 8
+    /// D: F4           HLT
+    /// ```
+    #[test]
+    fn loop_counted_print_via_uart() {
+        let program: &[u8] = &[
+            0xB9, 0x05, 0x00,
+            0xB0, 0x41,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xFE, 0xC0,
+            0xE2, 0xFB,
+            0xF4,
+        ];
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        let (_, stop) = vm.run_steps(1_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        let out = vm.drain_output();
+        assert_eq!(&out, b"ABCDE");
+    }
+
+    /// Hand-assembled "byte squarer": read a byte from the UART, square
+    /// it via `MUL r/m8`, write the low byte of the product back out.
+    /// Exercises poll-loop, IN, MUL, OUT in one tight cycle.
+    ///
+    /// ```text
+    /// 0: BA FD 03    MOV DX, 0x3FD   ; LSR
+    /// 3: EC          IN  AL, DX
+    /// 4: A8 01       TEST AL, 1
+    /// 6: 74 F8       JZ  -8 -> 0
+    /// 8: BA F8 03    MOV DX, 0x3F8
+    /// B: EC          IN  AL, DX      ; AL = input byte
+    /// C: 88 C3       MOV BL, AL
+    /// E: F6 E3       MUL BL          ; AX = AL * BL
+    /// 10: BA F8 03   MOV DX, 0x3F8
+    /// 13: EE         OUT DX, AL      ; emit low byte of product
+    /// 14: EB EA      JMP -22 -> 0
+    /// ```
+    #[test]
+    fn mul_byte_squarer_round_trip() {
+        let program: &[u8] = &[
+            0xBA, 0xFD, 0x03,
+            0xEC,
+            0xA8, 0x01,
+            0x74, 0xF8,
+            0xBA, 0xF8, 0x03,
+            0xEC,
+            0x88, 0xC3,
+            0xF6, 0xE3,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xEB, 0xEA,
+        ];
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        // Feed two byte inputs and expect their squared low bytes back.
+        vm.send_input(&[3, 5, 16]);
+        vm.run_steps(20_000);
+        let out = vm.drain_output();
+        // 3*3=9, 5*5=25, 16*16=256 → low byte 0
+        assert_eq!(out, vec![9, 25, 0]);
+    }
+
+    /// Divide-by-zero in the guest must surface as `Stop::CpuError`
+    /// rather than silently producing garbage. This is the VM-side
+    /// view of `CpuError::DivideError`.
+    #[test]
+    fn div_by_zero_surfaces_through_vm_stop() {
+        // MOV AL, 5 ; MOV BL, 0 ; DIV BL ; HLT (unreached)
+        let program: &[u8] = &[
+            0xB0, 0x05,
+            0xB3, 0x00,
+            0xF6, 0xF3,
+            0xF4,
+        ];
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        let (_, stop) = vm.run_steps(1_000);
+        match stop {
+            Stop::CpuError(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("divide error"), "got: {msg}");
+            }
+            other => panic!("expected CpuError(DivideError), got {other:?}"),
+        }
+        // VM did not transition to halted state — divide error is a
+        // separate failure mode.
+        assert!(!vm.is_halted());
+    }
 }
