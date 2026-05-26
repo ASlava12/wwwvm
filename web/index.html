@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>wwwvm — Rust VM in the browser</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>wwwvm</h1>
+      <span id="status" class="status">idle</span>
+    </header>
+
+    <main>
+      <section id="terminal-pane">
+        <div id="terminal"></div>
+      </section>
+
+      <aside id="controls">
+        <fieldset>
+          <legend>Autorun (one command per line)</legend>
+          <textarea id="autorun" rows="4" placeholder="echo hello&#10;uname -a"></textarea>
+        </fieldset>
+        <button id="boot">Boot VM</button>
+
+        <fieldset>
+          <legend>Send command</legend>
+          <input id="cmd" type="text" placeholder="type and press Enter" />
+          <button id="send">runCommand()</button>
+        </fieldset>
+
+        <fieldset>
+          <legend>Last result</legend>
+          <pre id="last-result">(none yet)</pre>
+        </fieldset>
+
+        <fieldset>
+          <legend>Diagnostics</legend>
+          <pre id="diag">CPU not booted</pre>
+        </fieldset>
+      </aside>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
