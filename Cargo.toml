@@ -5,6 +5,7 @@ members = [
     "crates/devices",
     "crates/cpu",
     "crates/vm",
+    "crates/wasm",
 ]
 exclude = ["guest"]
 
