@@ -1350,6 +1350,93 @@ impl Cpu {
                 self.write_rm16(rm, mem, imm);
             }
 
+            // PUSHA / POPA (80186+). Push all 8 GPRs in standard r16
+            // order (AX, CX, DX, BX, SP_orig, BP, SI, DI) — the SP
+            // value captured before the first push. POPA pops in
+            // reverse and ignores the SP slot.
+            0x60 => {
+                let sp_orig = self.regs[r16::SP];
+                let ax = self.regs[r16::AX];
+                self.push16(mem, ax);
+                let cx = self.regs[r16::CX];
+                self.push16(mem, cx);
+                let dx = self.regs[r16::DX];
+                self.push16(mem, dx);
+                let bx = self.regs[r16::BX];
+                self.push16(mem, bx);
+                self.push16(mem, sp_orig);
+                let bp = self.regs[r16::BP];
+                self.push16(mem, bp);
+                let si = self.regs[r16::SI];
+                self.push16(mem, si);
+                let di = self.regs[r16::DI];
+                self.push16(mem, di);
+            }
+            0x61 => {
+                self.regs[r16::DI] = self.pop16(mem);
+                self.regs[r16::SI] = self.pop16(mem);
+                self.regs[r16::BP] = self.pop16(mem);
+                let _ignored_sp = self.pop16(mem);
+                self.regs[r16::BX] = self.pop16(mem);
+                self.regs[r16::DX] = self.pop16(mem);
+                self.regs[r16::CX] = self.pop16(mem);
+                self.regs[r16::AX] = self.pop16(mem);
+            }
+
+            // IMUL r16, r/m16, imm (80186+ three-operand form).
+            //   0x69 — imm16
+            //   0x6B — imm8 sign-extended to 16
+            // The reg field of ModR/M is the destination; the source
+            // is the r/m operand multiplied by the immediate.
+            0x69 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u16(mem) as i16 as i32;
+                let a = self.read_rm16(rm, mem) as i16 as i32;
+                let product = a.wrapping_mul(imm);
+                self.write_r16(reg, product as u16);
+                let sign_extended = (product as i16) as i32;
+                let overflow = sign_extended != product;
+                self.set_flag(flag::CF, overflow);
+                self.set_flag(flag::OF, overflow);
+            }
+            0x6B => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u8(mem) as i8 as i32;
+                let a = self.read_rm16(rm, mem) as i16 as i32;
+                let product = a.wrapping_mul(imm);
+                self.write_r16(reg, product as u16);
+                let sign_extended = (product as i16) as i32;
+                let overflow = sign_extended != product;
+                self.set_flag(flag::CF, overflow);
+                self.set_flag(flag::OF, overflow);
+            }
+
+            // ENTER imm16, imm8 (80186+) — function prologue.
+            //   level = imm8 & 0x1F (only level 0 fully supported here)
+            //   push BP ; frame = SP ; BP = frame ; SP -= imm16
+            // Nesting (level > 0) would copy enclosing frame pointers
+            // before the SP decrement; rare in modern code and not
+            // emitted by any compiler we care about, so it returns
+            // Unimplemented.
+            0xC8 => {
+                let frame_size = self.fetch_u16(mem);
+                let level = self.fetch_u8(mem) & 0x1F;
+                if level != 0 {
+                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                }
+                let bp = self.regs[r16::BP];
+                self.push16(mem, bp);
+                let frame = self.regs[r16::SP];
+                self.regs[r16::BP] = frame;
+                self.regs[r16::SP] = self.regs[r16::SP].wrapping_sub(frame_size);
+            }
+            // LEAVE — function epilogue. Mirror of ENTER level 0.
+            //   SP = BP ; BP = pop
+            0xC9 => {
+                self.regs[r16::SP] = self.regs[r16::BP];
+                self.regs[r16::BP] = self.pop16(mem);
+            }
+
             // PUSH/POP segment registers. Encoding 0b000sss11{0,1} where
             // bits 3..4 select ES/CS/SS/DS in that order. POP CS (0x0F)
             // is the 2-byte opcode escape on 80286+ and undefined as
@@ -3100,6 +3187,122 @@ mod tests {
         ], 10);
         assert_eq!(cpu.regs[r16::AX], 0xBEEF);
         assert_eq!(cpu.regs[r16::BX], 0x4242);
+    }
+
+    #[test]
+    fn pusha_popa_round_trip_preserves_all_gprs() {
+        // Initialise each register to a distinct value, PUSHA, clobber
+        // them all, POPA, verify restoration. The SP slot is special
+        // — PUSHA captures the pre-push SP, POPA discards it. We verify
+        // that side too: SP returns to the value it had right after the
+        // clobber's PUSHA (because POPA restores it implicitly via its
+        // own pop count).
+        let (cpu, _, _) = run_payload(&[
+            // Distinct register seeds
+            0xB8, 0x01, 0x00,     // MOV AX, 1
+            0xB9, 0x02, 0x00,     // MOV CX, 2
+            0xBA, 0x03, 0x00,     // MOV DX, 3
+            0xBB, 0x04, 0x00,     // MOV BX, 4
+            0xBD, 0x05, 0x00,     // MOV BP, 5
+            0xBE, 0x06, 0x00,     // MOV SI, 6
+            0xBF, 0x07, 0x00,     // MOV DI, 7
+            0x60,                  // PUSHA
+            // Clobber everything
+            0x31, 0xC0,           // XOR AX, AX
+            0x31, 0xC9,           // XOR CX, CX
+            0x31, 0xD2,           // XOR DX, DX
+            0x31, 0xDB,           // XOR BX, BX
+            0x31, 0xED,           // XOR BP, BP
+            0x31, 0xF6,           // XOR SI, SI
+            0x31, 0xFF,           // XOR DI, DI
+            0x61,                  // POPA
+            0xF4,                  // HLT
+        ], 50);
+        assert_eq!(cpu.regs[r16::AX], 1);
+        assert_eq!(cpu.regs[r16::CX], 2);
+        assert_eq!(cpu.regs[r16::DX], 3);
+        assert_eq!(cpu.regs[r16::BX], 4);
+        assert_eq!(cpu.regs[r16::BP], 5);
+        assert_eq!(cpu.regs[r16::SI], 6);
+        assert_eq!(cpu.regs[r16::DI], 7);
+        // PUSHA pushed 8 words (16 bytes), POPA popped 8 — stack balanced.
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn imul_three_operand_imm16() {
+        // MOV BX, 3 ; IMUL AX, BX, 7  → AX = 21
+        //   IMUL r16, r/m16, imm16 = 0x69 /r ; modrm 11 000(AX) 011(BX) = 0xC3
+        let (cpu, _, _) = run_payload(&[
+            0xBB, 0x03, 0x00,
+            0x69, 0xC3, 0x07, 0x00,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX] as i16, 21);
+        // 21 fits in i16, no overflow
+        assert!(!cpu.has(flag::CF));
+        assert!(!cpu.has(flag::OF));
+    }
+
+    #[test]
+    fn imul_three_operand_imm8_sign_extended() {
+        // MOV BX, 1000 ; IMUL AX, BX, -10 → AX = -10000
+        //   IMUL r16, r/m16, imm8 = 0x6B /r ; modrm 11 000 011 = 0xC3
+        //   imm8 = -10 = 0xF6
+        let (cpu, _, _) = run_payload(&[
+            0xBB, 0xE8, 0x03,
+            0x6B, 0xC3, 0xF6,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX] as i16, -10000);
+        assert!(!cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn imul_three_operand_sets_overflow_when_result_truncates() {
+        // 1000 * 1000 = 1_000_000, won't fit in i16 (max 32767).
+        //   MOV BX, 1000 ; IMUL AX, BX, 1000 → CF=OF=1
+        let (cpu, _, _) = run_payload(&[
+            0xBB, 0xE8, 0x03,
+            0x69, 0xC3, 0xE8, 0x03,
+            0xF4,
+        ], 6);
+        assert!(cpu.has(flag::CF));
+        assert!(cpu.has(flag::OF));
+    }
+
+    #[test]
+    fn enter_leave_balances_frame() {
+        // ENTER 8, 0 ; LEAVE  must net-zero on the stack and leave BP
+        // pointing where it was before ENTER (since we BP wasn't set
+        // beforehand it's still 0 after LEAVE pops it back).
+        // 0: B8 EF BE     MOV AX, 0xBEEF       ; just to occupy state
+        // 3: C8 08 00 00  ENTER 8, 0
+        // 7: C9           LEAVE
+        // 8: F4           HLT
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0xEF, 0xBE,
+            0xC8, 0x08, 0x00, 0x00,
+            0xC9,
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.regs[r16::BP], 0);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn enter_with_nonzero_level_returns_unimplemented() {
+        // ENTER 16, 1 — nesting level 1 not yet supported.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, &[0xC8, 0x10, 0x00, 0x01]);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        let err = cpu.step(&mut mem, &mut io).unwrap_err();
+        match err {
+            CpuError::Unimplemented { opcode: 0xC8, .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

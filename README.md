@@ -98,7 +98,13 @@
   **управление CF**: `CLC`/`STC`/`CMC` (0xF8/0xF9/0xF5);
   **префиксы-noop**: `LOCK` (0xF0), `WAIT` (0x9B) принимаются и
   засчитываются за one-step (на одиночном CPU без FPU они ни на что
-  не влияют).
+  не влияют);
+  **80186 additions**: `PUSHA`/`POPA` (0x60/0x61, 8 GPR одним блоком —
+  идиома пролога handler'ов), `IMUL r16, r/m16, imm8/imm16`
+  (0x69/0x6B — трёхоперандное знаковое умножение, основа для умножения
+  на константу из компилятора), `ENTER imm16, 0` (0xC8 — стандартный
+  function prologue), `LEAVE` (0xC9). ENTER с уровнем вложенности > 0
+  не поддерживается (компиляторы C/Rust его не эмитят).
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -117,7 +123,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **101 зелёный** (mem 4 + devices 5 + cpu 80 + vm 6 + wasm 1
+* Тестов — **107 зелёных** (mem 4 + devices 5 + cpu 86 + vm 6 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART) и `DIV`-by-zero → `Stop::CpuError`.
 
