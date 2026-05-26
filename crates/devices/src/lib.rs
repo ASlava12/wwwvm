@@ -4,12 +4,19 @@
 //! UART is the channel between guest and host: the guest writes bytes
 //! that JS reads as terminal output, and JS pushes bytes that the guest
 //! reads as keystrokes / pre-canned commands.
+//!
+//! `IoBus` is concrete (not a trait-object container) on purpose: the
+//! VM needs typed access to the UART, and we only have a handful of
+//! devices. When we add a second device kind we will grow `IoBus` with
+//! another typed field and another range in the dispatch match.
 
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 
-/// Trait for any device that occupies a contiguous IO-port range.
+/// Trait describing the shape every port-mapped device must satisfy.
+/// Kept as documentation of the contract even though `IoBus` currently
+/// dispatches to concrete types.
 pub trait IoDevice {
     fn port_range(&self) -> (u16, u16);
     fn read(&mut self, port: u16) -> u8;
@@ -18,13 +25,13 @@ pub trait IoDevice {
 
 /// 16550-style UART, COM1 by default.
 ///
-/// We implement the bare minimum the guest payload needs:
+/// Minimal subset:
 ///   * THR (offset 0) — write transmits a byte to host output buffer
 ///   * RBR (offset 0) — read pops a byte from host input buffer
 ///   * LSR (offset 5) — bit 0 (DR) = input available, bit 5 (THRE) = always 1
 ///
 /// Other registers (IER, IIR, MCR, scratch, DLAB) return 0 and accept
-/// writes silently. That's enough for a guest that polls LSR.
+/// writes silently. Enough for a guest that polls LSR.
 pub struct Uart {
     base: u16,
     tx_buffer: Vec<u8>,
@@ -44,6 +51,10 @@ impl Uart {
 
     pub fn com1() -> Self {
         Self::new(Self::COM1_BASE)
+    }
+
+    pub fn base(&self) -> u16 {
+        self.base
     }
 
     /// Drain everything the guest has transmitted since the last call.
@@ -82,44 +93,48 @@ impl IoDevice for Uart {
         if port - self.base == 0 {
             self.tx_buffer.push(value);
         }
-        // Other writes are accepted and discarded.
     }
 }
 
-/// Dispatcher that routes IO accesses to whichever device claims the port.
-/// Linear scan is fine — we have at most a handful of devices.
-#[derive(Default)]
+/// Concrete IO dispatcher. Owns the UART and routes accesses by port.
+/// Unmapped ports read 0xFF (open bus on real hardware) and accept
+/// writes silently.
 pub struct IoBus {
-    devices: Vec<Box<dyn IoDevice>>,
+    pub uart: Uart,
 }
 
 impl IoBus {
     pub fn new() -> Self {
-        Self::default()
+        Self { uart: Uart::com1() }
     }
 
-    pub fn attach(&mut self, device: Box<dyn IoDevice>) {
-        self.devices.push(device);
+    pub fn with_uart(uart: Uart) -> Self {
+        Self { uart }
+    }
+
+    pub fn uart_mut(&mut self) -> &mut Uart {
+        &mut self.uart
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
-        for dev in &mut self.devices {
-            let (lo, hi) = dev.port_range();
-            if port >= lo && port <= hi {
-                return dev.read(port);
-            }
+        let (lo, hi) = self.uart.port_range();
+        if port >= lo && port <= hi {
+            return self.uart.read(port);
         }
         0xFF
     }
 
     pub fn write(&mut self, port: u16, value: u8) {
-        for dev in &mut self.devices {
-            let (lo, hi) = dev.port_range();
-            if port >= lo && port <= hi {
-                dev.write(port, value);
-                return;
-            }
+        let (lo, hi) = self.uart.port_range();
+        if port >= lo && port <= hi {
+            self.uart.write(port, value);
         }
+    }
+}
+
+impl Default for IoBus {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -155,9 +170,9 @@ mod tests {
     #[test]
     fn iobus_routes_to_uart() {
         let mut bus = IoBus::new();
-        bus.attach(Box::new(Uart::com1()));
         bus.write(0x3F8, b'q');
         assert_eq!(bus.read(0x3FD) >> 5 & 1, 1);
+        assert_eq!(bus.uart.drain_tx(), b"q");
     }
 
     #[test]

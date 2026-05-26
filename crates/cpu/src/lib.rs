@@ -305,7 +305,7 @@ fn parse_modrm(byte: u8) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wwwvm_devices::{IoBus, Uart};
+    use wwwvm_devices::IoBus;
 
     fn run_payload(bytes: &[u8], steps: usize) -> (Cpu, Memory, IoBus) {
         let mut mem = Memory::new(0x10_0000);
@@ -313,7 +313,6 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         let mut io = IoBus::new();
-        io.attach(Box::new(Uart::com1()));
         for _ in 0..steps {
             if cpu.halted { break; }
             cpu.step(&mut mem, &mut io).expect("step");
@@ -347,12 +346,7 @@ mod tests {
             0xEE,             // OUT DX, AL
             0xF4,             // HLT
         ], 8);
-        // First device attached is the UART
-        // We can't borrow it directly, so go through the bus: any read of
-        // LSR will not tell us tx contents. Instead emit one more byte
-        // and check via an integration helper. Easier: add a probe by
-        // reading the LSR THRE bit which is always 1.
-        assert_eq!(io.read(0x3FD) >> 5 & 1, 1);
+        assert_eq!(io.uart_mut().drain_tx(), b"X");
     }
 
     #[test]
