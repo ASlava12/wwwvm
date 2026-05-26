@@ -1,19 +1,178 @@
 # wwwvm
 
-Учебная виртуальная машина в браузере. Пишется на Rust, компилируется в
-WebAssembly, управляется из JavaScript. Цель — обучающий проект по Linux:
+Учебная виртуальная машина в браузере. Rust компилируется в WebAssembly,
+управляется из JavaScript. Цель — обучающий проект по Linux:
 страница загружает образ, стартует VM, JS отдаёт команды и получает вывод.
 
-Подробности по сборке и архитектуре будут дописаны по мере появления крейтов.
-Текущее состояние — см. ниже по мере коммитов.
+Проект пишется поэтапно. На текущем этапе доказан **end-to-end pipeline**
+`JS → WASM → CPU → UART → JS`: встроенный 43-байтовый гость печатает
+банер и эхом отвечает на ввод. CPU и набор устройств намеренно
+минимальны — будут расти под требования реальных ОС.
 
-## Статус крейтов
+```
+┌──────────────────────────┐         ┌──────────────────────────┐
+│ index.html / xterm.js    │  HTTP   │      static server       │
+│ main.js (runCommand API) ├────────►│  python -m http.server   │
+└──────────┬───────────────┘         └──────────────────────────┘
+           │ import init, { WwwVm }                                   
+           ▼                                                          
+┌──────────────────────────────────────────────────────────────────┐
+│                     crates/wasm  (cdylib)                        │
+│  WwwVm  ─►  load_image / boot / run / send_command / read_output │
+└──────────┬───────────────────────────────────────────────────────┘
+           │
+┌──────────▼──────────┐
+│  crates/vm          │  Vm = { Cpu, Memory, IoBus, autorun }
+│  HELLO_GUEST (43 B) │  pumps cycles, queues autorun on boot()
+└──┬─────┬─────┬──────┘
+   ▼     ▼     ▼
+ cpu   mem   devices (UART 16550 on COM1)
 
-| Крейт      | Назначение                              | Состояние |
-|------------|-----------------------------------------|-----------|
-| `mem`      | физическая память                        | TODO      |
-| `devices`  | UART/IO-устройства                       | TODO      |
-| `cpu`      | x86 CPU (real mode, подмножество)        | TODO      |
-| `vm`       | оркестратор + встроенный гость           | TODO      |
-| `wasm`     | wasm-bindgen API для JS                  | TODO      |
-| `proxy`    | WebSocket↔TCP-прокси                     | TODO      |
+(сеть)
+┌──────────────────────────┐  WS  ┌──────────────────────────────┐
+│ Browser                  │◄────►│ crates/proxy (Rust, tokio)    │
+│ (future virtio-net stub) │      │ WebSocket ↔ TCP gateway       │
+└──────────────────────────┘      │ allowlist via env var         │
+                                  └──────────────────────────────┘
+```
+
+## Что работает сейчас
+
+* **mem** — линейная физическая память, little-endian аксессоры.
+* **devices** — 16550 UART (COM1: 0x3F8). Драйнер `tx`, очередь `rx`, LSR.
+* **cpu** — реальный режим x86: `MOV r8/r16, imm`; `LODSB`; `OR r/m8, r8`
+  (mod=11); `TEST AL, imm`; `IN/OUT` через DX и imm8; `JMP rel8/rel16`;
+  весь набор `Jcc rel8`; флаги ZF/SF/PF/CF/OF для логических операций;
+  `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
+  `CpuError::Unimplemented { opcode, cs, ip }`.
+* **vm** — `load_default_guest`, `set_autorun_commands`, `boot`,
+  `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`.
+  Встроенный гость `HELLO_GUEST` печатает банер и эхом отвечает.
+* **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
+  `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
+  `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
+* **proxy** — отдельный Rust-бинарь. Принимает WebSocket, первое
+  сообщение JSON `{"host","port"}`, дальше байты в обе стороны.
+  Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
+* **web** — демо-страница с xterm.js и `window.runCommand(text)`,
+  возвращающим `Promise<string>`.
+* Тестов — **17 зелёных** (mem 4 + devices 5 + cpu 4 + vm 3 + wasm 1)
+  плюс 5 для прокси.
+
+## Что НЕ работает (намеренно, дорожная карта)
+
+Это учебный проект; полноценная поддержка Alpine/Linux в одном сеансе
+нереалистична. Ниже — что осталось добавить.
+
+| Этап | Объём | Зачем |
+|------|-------|-------|
+| Полный набор инструкций i8086 (add/sub/mul/div/inc/dec, ModR/M с памятью и SIB, прерывания, IRET/INT) | большой | Запускать что-то сложнее эхо-цикла |
+| Protected mode + paging | большой | Любое современное ядро |
+| Long mode (x86_64) | большой | 64-битные ядра |
+| PIC/PIT/RTC/PS2/CMOS | средний | Загрузка дистрибутивов |
+| Эмуляция IDE/ATA или virtio-blk | средний | Чтение rootfs |
+| ne2k или virtio-net + slirp-подобный TCP/IP | средний | Сеть из гостя через прокси |
+| VGA-текст / fbcon | малый | Видеть `init` без UART-консоли |
+| Снимки/persist состояния в IndexedDB | малый | Сохранение сессий студентов |
+| 9P / passthrough FS поверх postMessage | малый | Передача файлов между host и гостем |
+
+## Сборка и запуск
+
+### Хост-тесты (всегда работает)
+
+```bash
+cargo test --workspace
+```
+
+Должно вывести 17 + 5 пройденных тестов.
+
+### Прокси
+
+```bash
+WWWVM_PROXY_ALLOWLIST='*' cargo run -p wwwvm-proxy -- 127.0.0.1:9000
+```
+
+В реальном развёртывании `*` НЕ использовать — открытый прокси опасен.
+Используйте конкретные хосты: `WWWVM_PROXY_ALLOWLIST='hub.docker.com:443,deb.debian.org:80'`.
+
+### Wasm-сборка (для демо)
+
+Нужны:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+```
+
+Затем:
+
+```bash
+wasm-pack build crates/wasm --target web --out-dir ../../web/pkg
+```
+
+И поднять статический сервер из корня:
+
+```bash
+python3 -m http.server -d web 8080
+```
+
+Открыть `http://localhost:8080/`.
+
+В UI: вписать команды в Autorun (по одной в строке) → **Boot VM** →
+ввод/команды летят в гостя, вывод появляется в терминале.
+`runCommand("hello")` доступен в DevTools-консоли.
+
+## API из JavaScript
+
+```js
+import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
+await init();
+const vm = new WwwVm();
+
+// 1. Загрузить образ (встроенный hello-гость или произвольные байты)
+vm.load_default_guest();
+// или: vm.load_image(0x7C00, new Uint8Array(await fetch("...").then(r => r.arrayBuffer())));
+
+// 2. Заранее задать команды на автозапуск
+vm.set_autorun(["echo hi", "ls /"]);
+
+// 3. Загрузиться (CS:IP -> 0000:7C00, autorun-байты доставляются в UART rx)
+vm.boot();
+
+// 4. Прокачивать CPU из rAF-цикла
+function tick() {
+  vm.run(50_000);
+  const out = vm.read_output();
+  if (out) console.log("guest:", out);
+  if (vm.last_error) return console.error(vm.last_error);
+  requestAnimationFrame(tick);
+}
+tick();
+
+// 5. Отправить команду на лету
+vm.send_command("uptime");
+
+// 6. Или асинхронно с возвратом результата (см. web/main.js)
+const result = await window.runCommand("date");
+```
+
+## Структура
+
+```
+crates/
+  mem/        # физическая память
+  devices/    # 16550 UART + IoBus
+  cpu/        # x86 real-mode подмножество
+  vm/         # оркестратор + встроенный гость
+  wasm/       # cdylib для браузера (wasm-bindgen)
+  proxy/      # отдельный бинарь: WebSocket ↔ TCP
+web/
+  index.html
+  main.js
+  style.css
+  pkg/        # сюда wasm-pack кладёт wasm + .js шим (gitignored)
+```
+
+## Лицензия
+
+MIT OR Apache-2.0.
