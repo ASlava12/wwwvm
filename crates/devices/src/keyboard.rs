@@ -25,6 +25,12 @@ pub struct Keyboard {
     queue: VecDeque<u8>,
 }
 
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Keyboard {
     pub const DATA_PORT: u16 = 0x60;
     pub const STATUS_PORT: u16 = 0x64;

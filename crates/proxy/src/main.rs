@@ -78,7 +78,7 @@ impl Allowlist {
             match e {
                 AllowEntry::Anything => return true,
                 AllowEntry::Host { host: h, port: p } => {
-                    if h.eq_ignore_ascii_case(host) && p.map_or(true, |pp| pp == port) {
+                    if h.eq_ignore_ascii_case(host) && p.is_none_or(|pp| pp == port) {
                         return true;
                     }
                 }

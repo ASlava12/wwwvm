@@ -956,7 +956,7 @@ impl Cpu {
             //   0xE0 LOOPNZ / LOOPNE — also requires ZF=0
             //   0xE1 LOOPZ  / LOOPE  — also requires ZF=1
             //   0xE2 LOOP            — unconditional on flags
-            0xE0 | 0xE1 | 0xE2 => {
+            0xE0..=0xE2 => {
                 let rel = self.fetch_u8(mem) as i8;
                 let cx = self.regs[r16::CX].wrapping_sub(1);
                 self.regs[r16::CX] = cx;
@@ -2596,8 +2596,8 @@ mod tests {
             12,
         );
         let mut got = [0u8; 5];
-        for i in 0..5 {
-            got[i] = mem.read_u8(0x900 + i as u32);
+        for (i, b) in got.iter_mut().enumerate() {
+            *b = mem.read_u8(0x900 + i as u32);
         }
         assert_eq!(&got, src);
         assert_eq!(cpu.regs[r16::CX], 0);
@@ -3288,7 +3288,7 @@ mod tests {
         // dropped by our model). Verify the UART captured the low byte.
         let (_, _, mut io) = run_payload(
             &[
-                0xB8, b'Y' as u8, b'Z' as u8, // MOV AX, "ZY" → AL='Y', AH='Z'
+                0xB8, b'Y', b'Z', // MOV AX, "ZY" → AL='Y', AH='Z'
                 0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
                 0xEF, // OUT DX, AX
                 0xF4,

@@ -262,7 +262,7 @@ impl Vm {
             // we don't have to grow SnapshotError's variants.
             self.io
                 .restore(&bytes[dev_off + 4..dev_off + 4 + dev_len])
-                .map_err(|msg| SnapshotError::DeviceRestore(msg))?;
+                .map_err(SnapshotError::DeviceRestore)?;
         }
         // Now that validation passed, commit CPU state.
         self.cpu.regs = regs;
@@ -988,7 +988,7 @@ mod tests {
         cpu[33] = 0xFF;
         v1.extend_from_slice(&cpu);
         // Memory: 1 MiB of zero
-        v1.extend(std::iter::repeat(0u8).take(Vm::RAM_SIZE));
+        v1.extend(std::iter::repeat_n(0u8, Vm::RAM_SIZE));
         let mut vm = Vm::new();
         vm.send_input(b"junk"); // device state that should be dropped
         vm.restore(&v1).expect("v1 restore");
