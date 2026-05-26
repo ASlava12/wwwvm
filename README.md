@@ -74,6 +74,14 @@
   **LEA** `r16, m` (0x8D) — вычисляет EA, не читает память;
   **XCHG** — полная семья: `r/m, r` 8/16-бит (0x86/0x87), short-form
   `XCHG AX, r16` (0x91..0x97), плюс 0x90 (NOP = XCHG AX,AX);
+  **прерывания в реал-моде** — `INT3` (0xCC), `INT imm8` (0xCD),
+  `INTO` (0xCE, срабатывает только при OF=1), `IRET` (0xCF). IVT
+  читается с линейного 0 как 256 записей offset:segment по 4 байта;
+  INT толкает FLAGS, CS, IP, очищает IF и загружает CS:IP из вектора;
+  IRET откатывает всё назад (см. `Cpu::do_interrupt`);
+  **sign-extension** `CBW` (0x98) AL→AX, `CWD` (0x99) AX→DX:AX —
+  обязательны перед `IDIV` для корректного знакового деления;
+  **flag transfer** `LAHF` (0x9F) FLAGS-low→AH, `SAHF` (0x9E) AH→FLAGS-low;
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -92,7 +100,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **76 зелёных** (mem 4 + devices 5 + cpu 58 + vm 3 + wasm 1
+* Тестов — **83 зелёных** (mem 4 + devices 5 + cpu 65 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -105,8 +113,9 @@
 | `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
 | `RCL`/`RCR` (Group 2 /2,/3) | малый | Big-number арифметика, идиомы битовой блокировки |
-| `XLAT`, `CBW`/`CWD`, `LAHF`/`SAHF`, BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Полнота 8086 ISA для запуска DOS-кода |
-| Far-инструкции: `CALL ptr16:16`/`RETF`/`JMP FAR`, `PUSH`/`POP sreg` | малый | Переходы и стек через сегменты |
+| `XLAT`, BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Полнота 8086 ISA для старого DOS-кода |
+| Far-инструкции: `CALL ptr16:16`/`RETF`/`JMP FAR`, `PUSH`/`POP sreg` | малый | Переходы и стек через сегменты; нужны для далёких хендлеров |
+| BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |
 | Long mode (x86_64) | большой | 64-битные ядра |

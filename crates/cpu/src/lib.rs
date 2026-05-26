@@ -312,6 +312,26 @@ impl Cpu {
         }
     }
 
+    /// Take a real-mode software interrupt. Pushes FLAGS, CS, IP,
+    /// clears IF (mask further interrupts), and loads CS:IP from the
+    /// IVT entry — a 4-byte (offset, segment) record at linear `n*4`.
+    fn do_interrupt(&mut self, n: u8, mem: &mut Memory) {
+        let ivt_addr = (n as u32) * 4;
+        let new_ip = mem.read_u16(ivt_addr);
+        let new_cs = mem.read_u16(ivt_addr + 2);
+        let flags = self.flags;
+        self.push16(mem, flags);
+        let cs = self.sregs[sreg::CS];
+        self.push16(mem, cs);
+        let ip = self.ip;
+        self.push16(mem, ip);
+        self.set_flag(flag::IF, false);
+        // TF is not modeled yet — when it is, this is also where it
+        // gets cleared.
+        self.sregs[sreg::CS] = new_cs;
+        self.ip = new_ip;
+    }
+
     /// Push a 16-bit value onto the SS:SP stack. SP decrements *before*
     /// the write — matching real x86 — so after a push SP points at the
     /// new top word.
@@ -1317,6 +1337,58 @@ impl Cpu {
             }
             // POPF — pop FLAGS.
             0x9D => {
+                self.flags = self.pop16(mem);
+            }
+
+            // CBW — sign-extend AL into AX. AH = AL & 0x80 ? 0xFF : 0x00.
+            0x98 => {
+                let al = self.read_r8(0);
+                self.regs[r16::AX] = al as i8 as i16 as u16;
+            }
+            // CWD — sign-extend AX into DX:AX.
+            0x99 => {
+                let ax = self.regs[r16::AX] as i16;
+                self.regs[r16::DX] = if ax < 0 { 0xFFFF } else { 0 };
+            }
+
+            // SAHF — copy AH into the low byte of FLAGS (SF/ZF/AF/PF/CF).
+            // Bit 1 of FLAGS is reserved and reads as 1; the other
+            // reserved low-byte bits (3, 5) stay zero. Bits 8..15 are
+            // untouched.
+            0x9E => {
+                let ah = self.read_r8(4);
+                let mask = flag::CF | flag::PF | (1 << 4) | flag::ZF | flag::SF;
+                let preserve = self.flags & !mask;
+                self.flags = preserve | (ah as u16 & mask);
+            }
+            // LAHF — load AH from the low byte of FLAGS.
+            0x9F => {
+                let mask = flag::CF | flag::PF | (1 << 4) | flag::ZF | flag::SF;
+                // Bit 1 reads back as 1 on real x86.
+                let ah = ((self.flags & mask) as u8) | 0x02;
+                self.write_r8(4, ah);
+            }
+
+            // INT3 — single-byte software interrupt to vector 3.
+            0xCC => {
+                self.do_interrupt(3, mem);
+            }
+            // INT imm8 — software interrupt to the vector named by imm8.
+            0xCD => {
+                let n = self.fetch_u8(mem);
+                self.do_interrupt(n, mem);
+            }
+            // INTO — if OF=1, raise INT 4. Otherwise a no-op.
+            0xCE => {
+                if self.has(flag::OF) {
+                    self.do_interrupt(4, mem);
+                }
+            }
+            // IRET — pop IP, CS, FLAGS (in that order). The IF/TF state
+            // before the original INT is restored as part of FLAGS.
+            0xCF => {
+                self.ip = self.pop16(mem);
+                self.sregs[sreg::CS] = self.pop16(mem);
                 self.flags = self.pop16(mem);
             }
 
@@ -2356,6 +2428,202 @@ mod tests {
         ], 0x800, far_ptr, 6);
         assert_eq!(cpu.regs[r16::BX], 0xABCD);
         assert_eq!(cpu.sregs[sreg::DS], 0x4321);
+    }
+
+    #[test]
+    fn cbw_sign_extends_negative_al() {
+        // MOV AL, 0x80 ; CBW → AX=0xFF80
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x80,
+            0x98,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.regs[r16::AX], 0xFF80);
+    }
+
+    #[test]
+    fn cbw_preserves_positive_al() {
+        // MOV AL, 0x42 ; CBW → AX=0x0042
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x42,
+            0x98,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.regs[r16::AX], 0x0042);
+    }
+
+    #[test]
+    fn cwd_sign_extends_negative_ax_into_dx() {
+        // MOV AX, 0x8000 ; CWD → DX=0xFFFF, AX unchanged
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x00, 0x80,
+            0x99,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.regs[r16::AX], 0x8000);
+        assert_eq!(cpu.regs[r16::DX], 0xFFFF);
+    }
+
+    #[test]
+    fn lahf_sahf_round_trips_low_flags() {
+        // Force CF=1, ZF=0 via XOR AL with non-zero then add carry-out.
+        // Simpler: set a known FLAGS state, LAHF, clobber, SAHF, verify.
+        //   MOV AL, 0xFF       ; ADD AL, 1 → CF=1, ZF=1, SF=0, PF=1
+        //   LAHF               ; AH captures the flag image
+        //   MOV AL, 0          ; clobber low-flag-affecting state via flag-clobber
+        //   XOR DX, DX         ; ZF=1 anyway — pick an op that resets things
+        //   SAHF               ; restore from AH
+        //   HLT
+        // Easier deterministic test: use MOV-only ops that don't touch
+        // flags between LAHF and SAHF.
+        //   MOV AL, 0xFF
+        //   ADD AL, 1          → CF=1 ZF=1 SF=0 PF=1
+        //   LAHF               → AH bit pattern reflects above
+        //   MOV BL, AH         → BL captures it
+        //   MOV AH, 0          ; clobber AH (doesn't touch FLAGS)
+        //   MOV AH, BL         ; restore raw byte
+        //   SAHF               → flags reloaded
+        //   HLT
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0xFF,
+            0x04, 0x01,       // ADD AL, 1
+            0x9F,              // LAHF
+            0x88, 0xE3,        // MOV BL, AH (8A or 88? 88 stores reg→r/m, reg=AH(4), rm=BL(3) → 11 100 011 = 0xE3)
+            0xB4, 0x00,        // MOV AH, 0
+            0x88, 0xDC,        // MOV AH, BL (reg=BL(3), rm=AH(4) → 11 011 100 = 0xDC)
+            0x9E,              // SAHF
+            0xF4,
+        ], 10);
+        assert!(cpu.has(flag::CF));
+        assert!(cpu.has(flag::ZF));
+        assert!(cpu.has(flag::PF));
+        assert!(!cpu.has(flag::SF));
+    }
+
+    #[test]
+    fn int_dispatch_through_ivt_then_iret_resumes() {
+        // IVT[0x30] = far pointer to handler at 0:0x7C10.
+        // Program prints a marker, calls INT 0x30, then a second
+        // marker after IRET. The handler tweaks AL and IRETs.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(0xC0, 0x7C10);  // offset of handler
+        mem.write_u16(0xC2, 0x0000);  // segment
+        let program = &[
+            // 0x00: MOV AX, 0xBEEF
+            0xB8, 0xEF, 0xBE,
+            // 0x03: INT 0x30
+            0xCD, 0x30,
+            // 0x05: MOV BL, 0x22   (runs after IRET)
+            0xB3, 0x22,
+            // 0x07: HLT
+            0xF4,
+            // 0x08..0x0F: padding so handler lands at 0x7C10
+            0, 0, 0, 0, 0, 0, 0, 0,
+            // 0x10: MOV AL, 0x42
+            0xB0, 0x42,
+            // 0x12: IRET
+            0xCF,
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..50 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        // AH untouched by handler (was 0xBE from initial MOV); AL set
+        // to 0x42 by the handler.
+        assert_eq!(cpu.regs[r16::AX], 0xBE42);
+        // BL set after IRET resumed at 0x7C05.
+        assert_eq!(cpu.read_r8(3), 0x22);
+        assert!(cpu.halted);
+        // Stack must be balanced: pre-INT push of FLAGS/CS/IP (6 bytes)
+        // and post-IRET pop should restore SP to boot value.
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn int_clears_if_so_handlers_run_with_interrupts_masked() {
+        // STI ; INT 0x40 → inside handler IF must be 0.
+        // Handler stores FLAGS via PUSHF; we read it from the stack
+        // via [BP+offset]. Simpler: have the handler MOV BL,1 if IF=0
+        // by reading FLAGS via PUSHF; POP BX.
+        //
+        // Test plan:
+        //   STI                ; set IF=1
+        //   INT 0x40            ; handler at 0x7C10
+        //   HLT
+        // Handler:
+        //   PUSHF              ; push flags-in-handler
+        //   POP BX             ; BX = flags
+        //   IRET
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(0x40 * 4, 0x7C10);
+        mem.write_u16(0x40 * 4 + 2, 0);
+        let program = &[
+            0xFB,              // STI
+            0xCD, 0x40,        // INT 0x40
+            0xF4,              // HLT
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
+            0x9C,              // PUSHF
+            0x5B,              // POP BX
+            0xCF,              // IRET
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..50 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        // BX captured the FLAGS the handler saw. IF bit must be 0.
+        assert_eq!(cpu.regs[r16::BX] & flag::IF, 0);
+        // After IRET restores original FLAGS, IF should be 1 again.
+        assert!(cpu.has(flag::IF));
+    }
+
+    #[test]
+    fn into_only_fires_when_overflow_set() {
+        // Case A: OF=0 → INTO is a no-op.
+        // We provoke an arithmetic op that *clears* OF (e.g. ADD 1+1)
+        // and check that INTO doesn't transfer.
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x01,
+            0x04, 0x01,       // ADD AL, 1 → OF=0
+            0xCE,              // INTO
+            0xB3, 0x77,
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.read_r8(3), 0x77);
+        assert!(!cpu.has(flag::OF));
+
+        // Case B: OF=1 → INTO fires INT 4.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u16(4 * 4, 0x7C10);
+        mem.write_u16(4 * 4 + 2, 0);
+        let program = &[
+            0xB0, 0x7F,
+            0x04, 0x01,       // ADD AL, 1 → 0x80, OF=1
+            0xCE,              // INTO → should fire
+            0xB3, 0x11,        // runs after IRET
+            0xF4,
+            0, 0, 0, 0, 0, 0, 0, 0,    // pad to 0x10
+            // 0x10: handler
+            0xB7, 0x99,        // MOV BH, 0x99
+            0xCF,              // IRET
+        ];
+        mem.write_slice(0x7C00, program);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..50 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_eq!(cpu.read_r8(7), 0x99);  // BH set by handler
+        assert_eq!(cpu.read_r8(3), 0x11);  // BL set after IRET
     }
 
     #[test]
