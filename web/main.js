@@ -51,6 +51,13 @@ function pump() {
   }
   $("diag").textContent =
     `booted=${vm.is_booted()}  halted=${vm.is_halted()}  steps/frame=${steps}`;
+  // VGA snapshot — only render when the buffer has something visible
+  // so the pane doesn't get flooded with 25 lines of blank for guests
+  // that never touch 0xB8000.
+  const vga = vm.vga_text_snapshot();
+  if (vga.trim().length > 0) {
+    $("vga").textContent = vga;
+  }
   if (vm.is_halted()) {
     setStatus("halted", "");
     return;

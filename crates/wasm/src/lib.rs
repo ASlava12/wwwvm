@@ -72,6 +72,14 @@ impl WwwVm {
         self.inner.read_mem_u16(addr)
     }
 
+    /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
+    /// of 80 ASCII characters. Attribute bytes are dropped. Useful
+    /// for rendering the guest's text-mode display alongside the
+    /// UART terminal in the host UI.
+    pub fn vga_text_snapshot(&self) -> String {
+        self.inner.vga_text_snapshot()
+    }
+
     /// Pre-queue commands to be delivered to the guest at boot. Pass an
     /// array of strings from JS — each is appended with `\n`.
     pub fn set_autorun(&mut self, commands: Vec<String>) {

@@ -131,10 +131,11 @@
   `CpuError::Unimplemented { opcode, cs, ip }`.
 * **vm** — `load_default_guest`, `load_interactive_demo`, `set_autorun_commands`,
   `boot`, `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`,
-  `set_ivt(vec, seg, off)`, `read_mem_u8/u16`. Два встроенных гостя:
-  `HELLO_GUEST` (~43 байта, polling LSR + echo) и `interactive_demo`
-  (~60 байт суммарно, banner через LODSB + interrupt-driven UART echo
-  через IRQ 4 — настраивает IVT, IER, IMR, STI, спит в `JMP -2`).
+  `push_scancode`, `set_cmos_time`, `set_ivt(vec, seg, off)`, `read_mem_u8/u16`,
+  `vga_text_snapshot()`. Два встроенных гостя: `HELLO_GUEST` (~43 байта,
+  polling LSR + echo) и `interactive_demo` (banner + IRQ-driven UART
+  echo). Гость пишет в VGA-text напрямую в RAM на 0xB8000 — host
+  читает обратно через `vga_text_snapshot` (25 строк × 80 ASCII-символов).
 * **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
   `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
   `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
@@ -143,7 +144,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **139 зелёных** (mem 4 + devices 29 + cpu 89 + vm 11 + wasm 1
+* Тестов — **140 зелёных** (mem 4 + devices 29 + cpu 89 + vm 12 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
   **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)
@@ -163,7 +164,7 @@
 | `RCL`/`RCR` (Group 2 /2,/3), BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Big-number арифметика, DOS-era BCD-код |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
 | 8042 controller commands (self-test, port disable), keyboard scan-code translation на host-стороне | малый | Совместимость со стандартными KB-драйверами |
-| Реальные устройства: IDE/ATA, VGA-text, RTC alarm IRQ (через slave) | средний | Загрузочные тракты любого реального дистрибутива |
+| Реальные устройства: IDE/ATA, RTC alarm IRQ (через slave), VGA-graphics (≥320×200) | средний | Загрузочные тракты дистрибутивов, графические демо |
 | Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
 | 32-бит (i386): операнд/адрес-префиксы 0x66/0x67, long-mode позже | большой | Любое 32+ ядро |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |

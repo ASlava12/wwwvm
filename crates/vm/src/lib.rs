@@ -15,6 +15,14 @@ use wwwvm_mem::Memory;
 /// Standard boot-sector load address on x86.
 pub const BOOT_LOAD_ADDR: u32 = 0x7C00;
 
+/// CGA/VGA text-mode buffer base (linear). 80 columns × 25 rows of
+/// 2-byte cells (character + attribute) lives here. Guests write
+/// directly via MOV instructions; the host reads it back with
+/// [`Vm::vga_text_snapshot`].
+pub const VGA_TEXT_BASE: u32 = 0xB8000;
+pub const VGA_TEXT_COLS: usize = 80;
+pub const VGA_TEXT_ROWS: usize = 25;
+
 /// Why the run loop stopped this turn.
 #[derive(Debug)]
 pub enum Stop {
@@ -81,6 +89,29 @@ impl Vm {
     /// Read a 16-bit little-endian word from guest RAM.
     pub fn read_mem_u16(&self, addr: u32) -> u16 {
         self.mem.read_u16(addr)
+    }
+
+    /// Snapshot the VGA text-mode buffer as a plain string: 25 rows
+    /// of 80 chars, newline-separated. The attribute byte of each
+    /// cell is dropped; control bytes (and NULs from un-initialized
+    /// buffer) become spaces so the result is always readable. Use
+    /// this to render the guest's text-mode display in the host UI
+    /// or to assert on guest output in tests.
+    pub fn vga_text_snapshot(&self) -> String {
+        let mut out = String::with_capacity(VGA_TEXT_ROWS * (VGA_TEXT_COLS + 1));
+        for row in 0..VGA_TEXT_ROWS {
+            for col in 0..VGA_TEXT_COLS {
+                let off = ((row * VGA_TEXT_COLS) + col) * 2;
+                let ch = self.mem.read_u8(VGA_TEXT_BASE + off as u32);
+                if (0x20..0x7F).contains(&ch) {
+                    out.push(ch as char);
+                } else {
+                    out.push(' ');
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// Load the bundled hello guest at the standard boot-sector address.
@@ -526,6 +557,59 @@ mod tests {
             other => panic!("expected Halted, got {other:?}"),
         }
         assert_eq!(vm.read_mem_u8(0x900), 4);
+    }
+
+    /// Guest writes plain ASCII directly to the VGA text-mode buffer
+    /// at 0xB8000; the host reads it back via `vga_text_snapshot`.
+    /// Uses `MOV BYTE [disp16], imm8` for each cell — a real driver
+    /// would loop with REP STOSW, but the imm form is the most
+    /// instruction-economical way to write a known string.
+    ///
+    /// We set ES = 0xB800 first, then use ES:0 addressing so the
+    /// 16-bit offsets fit comfortably. Each char cell is char+attr,
+    /// two bytes; we only write the char byte, leaving attribute=0.
+    #[test]
+    fn guest_writes_vga_buffer_and_host_snapshots_it() {
+        // 0: B8 00 B8     MOV AX, 0xB800
+        // 3: 8E C0        MOV ES, AX        (8E /0, modrm=11 000 000)
+        // 5: 26 C6 06 00 00 'H'    MOV BYTE ES:[0x0000], 'H'
+        // ... one per char ...
+        // F4              HLT
+        //
+        // ES: prefix (0x26) before each MOV byte, with mod=00 rm=110
+        // (disp16) ModR/M = 0x06; Group-11 /0 = 0xC6.
+        let mut program: Vec<u8> = vec![
+            0xB8, 0x00, 0xB8,
+            0x8E, 0xC0,
+        ];
+        // Write "HELLO VGA" — each character at offset col*2 in the
+        // VGA cell array (so the attribute byte at col*2 + 1 stays 0).
+        for (i, &c) in b"HELLO VGA".iter().enumerate() {
+            let off = (i * 2) as u16;
+            program.extend_from_slice(&[
+                0x26,                       // ES: prefix
+                0xC6, 0x06,                 // MOV BYTE [disp16], imm8
+                (off & 0xFF) as u8,
+                (off >> 8) as u8,
+                c,
+            ]);
+        }
+        program.push(0xF4); // HLT
+
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, &program);
+        vm.boot();
+        let (_, stop) = vm.run_steps(2_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        let snapshot = vm.vga_text_snapshot();
+        let first_line = snapshot.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("HELLO VGA"),
+            "first line: {first_line:?}",
+        );
     }
 
     /// End-to-end cascade IRQ delivery: host raises an IRQ on the
