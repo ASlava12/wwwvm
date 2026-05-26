@@ -757,7 +757,10 @@ impl Cpu {
         }
         // External interrupt delivery — must come *before* fetch so an
         // unmasked IRQ runs its handler at the next instruction boundary
-        // instead of one boundary late.
+        // instead of one boundary late. Refresh first so devices that
+        // assert their line (e.g. UART with rx data and IER set) get
+        // latched into the PIC's IRR for this turn.
+        io.refresh_irqs();
         if self.has(flag::IF) {
             if let Some(vec) = io.pending_irq_vector() {
                 io.ack_irq();

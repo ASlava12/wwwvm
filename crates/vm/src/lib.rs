@@ -301,6 +301,88 @@ mod tests {
         assert_eq!(out, vec![9, 25, 0]);
     }
 
+    /// End-to-end interrupt-driven serial: guest sets up an IRQ 4
+    /// handler that reads a byte from the UART RBR into BL, EOIs the
+    /// PIC, and IRETs. The main routine enables IER bit 0, unmasks
+    /// IRQ 4, STIs, and spins until BL != 0 then HLTs.
+    ///
+    /// The host pushes a byte to the UART rx queue before stepping;
+    /// the very first `refresh_irqs` should latch IRQ 4 into the PIC,
+    /// the CPU dispatches to the handler, the handler drains the
+    /// byte, and the main loop exits.
+    ///
+    /// Layout:
+    /// ```text
+    /// 0x00: C7 06 30 00 20 7C    MOV WORD [0x30], 0x7C20   ; IVT[0x0C].offset
+    /// 0x06: C7 06 32 00 00 00    MOV WORD [0x32], 0x0000   ; IVT[0x0C].segment
+    /// 0x0C: FB                    STI
+    /// 0x0D: BA F9 03              MOV DX, 0x3F9             ; UART IER
+    /// 0x10: B0 01                 MOV AL, 1
+    /// 0x12: EE                    OUT DX, AL
+    /// 0x13: B0 EF                 MOV AL, 0xEF
+    /// 0x15: E6 21                 OUT 0x21, AL              ; PIC IMR
+    /// 0x17: 80 FB 00              CMP BL, 0
+    /// 0x1A: 74 FB                 JZ -5 -> 0x17
+    /// 0x1C: F4                    HLT
+    /// (padding to 0x20)
+    /// 0x20: 50                    PUSH AX                   ; handler
+    /// 0x21: BA F8 03              MOV DX, 0x3F8             ; UART RBR
+    /// 0x24: EC                    IN AL, DX
+    /// 0x25: 88 C3                 MOV BL, AL
+    /// 0x27: B0 20                 MOV AL, 0x20
+    /// 0x29: E6 20                 OUT 0x20, AL              ; PIC EOI
+    /// 0x2B: 58                    POP AX
+    /// 0x2C: CF                    IRET
+    /// ```
+    #[test]
+    fn uart_rx_drives_irq4_handler_through_vm() {
+        let program: &[u8] = &[
+            // setup IVT[0x0C]
+            0xC7, 0x06, 0x30, 0x00, 0x20, 0x7C,
+            0xC7, 0x06, 0x32, 0x00, 0x00, 0x00,
+            // enable IF
+            0xFB,
+            // IER = 1
+            0xBA, 0xF9, 0x03,
+            0xB0, 0x01,
+            0xEE,
+            // unmask IRQ 4
+            0xB0, 0xEF,
+            0xE6, 0x21,
+            // wait-loop: while BL == 0 spin
+            0x80, 0xFB, 0x00,
+            0x74, 0xFB,
+            0xF4,
+            // padding to 0x20
+            0x90, 0x90, 0x90,
+            // handler at 0x20
+            0x50,
+            0xBA, 0xF8, 0x03,
+            0xEC,
+            0x88, 0xC3,
+            0xB0, 0x20,
+            0xE6, 0x20,
+            0x58,
+            0xCF,
+        ];
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        // Push the byte the guest is supposed to pick up via IRQ.
+        vm.send_input(&[0x42]);
+        let (_, stop) = vm.run_steps(5_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        // BL was set by the handler reading from RBR.
+        assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x42);
+    }
+
     /// Divide-by-zero in the guest must surface as `Stop::CpuError`
     /// rather than silently producing garbage. This is the VM-side
     /// view of `CpuError::DivideError`.

@@ -36,6 +36,10 @@ pub struct Uart {
     base: u16,
     tx_buffer: Vec<u8>,
     rx_buffer: VecDeque<u8>,
+    /// Interrupt Enable Register. Only bit 0 (Received Data Available)
+    /// affects our IRQ logic; other bits are stored but otherwise
+    /// inert.
+    ier: u8,
 }
 
 impl Uart {
@@ -46,6 +50,7 @@ impl Uart {
             base,
             tx_buffer: Vec::new(),
             rx_buffer: VecDeque::new(),
+            ier: 0,
         }
     }
 
@@ -70,6 +75,14 @@ impl Uart {
     pub fn rx_pending(&self) -> usize {
         self.rx_buffer.len()
     }
+
+    /// True if the UART has a level-high interrupt line right now: rx
+    /// data is available AND the guest has enabled the RDA interrupt
+    /// in IER bit 0. `IoBus::refresh_irqs` polls this each step and
+    /// latches it into the PIC's IRR.
+    pub fn irq_pending(&self) -> bool {
+        (self.ier & 0x01) != 0 && !self.rx_buffer.is_empty()
+    }
 }
 
 impl IoDevice for Uart {
@@ -80,6 +93,7 @@ impl IoDevice for Uart {
     fn read(&mut self, port: u16) -> u8 {
         match port - self.base {
             0 => self.rx_buffer.pop_front().unwrap_or(0),
+            1 => self.ier,
             5 => {
                 let dr = if self.rx_buffer.is_empty() { 0 } else { 1 };
                 let thre = 1 << 5;
@@ -90,8 +104,10 @@ impl IoDevice for Uart {
     }
 
     fn write(&mut self, port: u16, value: u8) {
-        if port - self.base == 0 {
-            self.tx_buffer.push(value);
+        match port - self.base {
+            0 => self.tx_buffer.push(value),
+            1 => self.ier = value,
+            _ => {}
         }
     }
 }
@@ -276,6 +292,24 @@ impl IoBus {
         &mut self.pic
     }
 
+    /// Latch every device-asserted IRQ line into the PIC's IRR.
+    /// CPUs call this once per step() before checking pending IRQs.
+    /// Standard wiring on a PC: COM1 → IRQ 4.
+    ///
+    /// We model level-triggered IRQs: IRR mirrors the current device
+    /// line each refresh. Without this, a handler that runs *while*
+    /// the device is still asserting would re-arm IRR for the IRQ it
+    /// just acked, and the IRQ would fire a second time after EOI
+    /// against a device that has already been serviced.
+    pub fn refresh_irqs(&mut self) {
+        let irq4_bit = 1u8 << 4;
+        if self.uart.irq_pending() {
+            self.pic.irr |= irq4_bit;
+        } else {
+            self.pic.irr &= !irq4_bit;
+        }
+    }
+
     /// CPU-side accessor: highest-priority unmasked pending IRQ, or
     /// None if there's nothing to deliver right now.
     pub fn pending_irq_vector(&self) -> Option<u8> {
@@ -414,6 +448,36 @@ mod tests {
         // After init, writes to 0x21 go back to IMR
         pic.write(0x21, 0xFE);
         assert_eq!(pic.imr, 0xFE);
+    }
+
+    #[test]
+    fn uart_irq_pending_requires_ier_bit0_and_rx_data() {
+        let mut u = Uart::com1();
+        // No data, IER=0 → no IRQ
+        assert!(!u.irq_pending());
+        u.push_rx(b"x");
+        // Data, but IER bit 0 still 0 → no IRQ
+        assert!(!u.irq_pending());
+        // Enable RDA interrupt
+        u.write(Uart::COM1_BASE + 1, 0x01);
+        assert!(u.irq_pending());
+        // Read drains rx → no more pending
+        assert_eq!(u.read(Uart::COM1_BASE), b'x');
+        assert!(!u.irq_pending());
+    }
+
+    #[test]
+    fn iobus_refresh_irqs_latches_uart_into_pic() {
+        let mut bus = IoBus::new();
+        // Enable IER bit 0 via the bus path
+        bus.write(Uart::COM1_BASE + 1, 0x01);
+        bus.uart.push_rx(b"Q");
+        // Unmask IRQ 4 in PIC
+        bus.pic.imr = !(1 << 4);
+        // Initially PIC sees nothing — refresh latches the line
+        assert!(bus.pic.pending_vector().is_none());
+        bus.refresh_irqs();
+        assert_eq!(bus.pic.pending_vector(), Some(0x08 + 4));
     }
 
     #[test]

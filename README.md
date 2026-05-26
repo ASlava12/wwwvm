@@ -42,7 +42,11 @@
 * **devices** — 16550 UART (COM1: 0x3F8) и 8259A PIC (master, 0x20/0x21).
   PIC моделирует IMR/IRR/ISR, ICW1/ICW2-инициализацию (ICW3/ICW4
   принимаются и отбрасываются), non-specific EOI через OCW2. Slave-PIC
-  (IRQ 8..15) пока нет.
+  (IRQ 8..15) пока нет. UART дополнительно: IER на offset+1, метод
+  `irq_pending()` true при наличии rx и IER bit 0 = 1. `IoBus::refresh_irqs`
+  level-triggered: на каждом шаге CPU IRR в PIC отражает текущее
+  состояние линий устройств — это критично, чтобы handler, выполненный
+  одновременно с продолжающимся assert'ом, не зацикливался.
 * **cpu** — реальный режим x86: `MOV r8/r16, imm`; `MOV r/m, r`,
   `MOV r, r/m`, `MOV r/m, imm` (опкоды 0x88–0x8B, 0xC6/0xC7); `LODSB`;
   полная ALU-семья (`ADD`/`OR`/`ADC`/`SBB`/`AND`/`SUB`/`XOR`/`CMP`,
@@ -130,12 +134,12 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **115 зелёных** (mem 4 + devices 10 + cpu 89 + vm 6 + wasm 1
+* Тестов — **118 зелёных** (mem 4 + devices 12 + cpu 89 + vm 7 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
-  `MUL` (квадрат байта от UART) и `DIV`-by-zero → `Stop::CpuError`.
-  PIC покрыт юнит-тестами на masking/EOI/ICW + интеграционными
-  (доставка IRQ через IDT, блокировка по CLI, отложенная доставка
-  после OUT 0x21).
+  `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`, и
+  **interrupt-driven serial**: host пушит байт через `send_input`,
+  гость через IDT handler читает RBR, EOI'ит PIC и хальтится — полная
+  цепочка device → PIC IRR → CPU → IDT → handler → device drain.
 
 ## Что НЕ работает (намеренно, дорожная карта)
 
@@ -149,7 +153,6 @@
 | `RCL`/`RCR` (Group 2 /2,/3), BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Big-number арифметика, DOS-era BCD-код |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
 | Реальные устройства: slave PIC (IRQ 8..15), PIT (8254), RTC (CMOS), PS/2, IDE/ATA | средний | Загрузочные тракты любого реального дистрибутива |
-| UART → IRQ 4 (master PIC) при наличии rx-байтов | малый | Interrupt-driven serial вместо опроса LSR |
 | Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
 | 32-бит (i386): операнд/адрес-префиксы 0x66/0x67, long-mode позже | большой | Любое 32+ ядро |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
