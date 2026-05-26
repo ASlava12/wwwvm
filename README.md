@@ -192,7 +192,9 @@
 cargo test --workspace
 ```
 
-Должно вывести 17 + 5 пройденных тестов.
+Должно вывести 148 пройденных тестов на текущий момент. CI
+(`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
+и `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### Прокси
 
