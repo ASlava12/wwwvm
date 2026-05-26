@@ -51,8 +51,10 @@
   `INC`/`DEC r16`; `TEST AL/AX, imm`; `IN/OUT` через DX и imm8;
   **Group 1** (`ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm` — 0x80/0x81/0x83
   с sign-extension);
-  **Group 3** (`NOT`, `NEG`, `TEST r/m, imm` — 0xF6/0xF7; `MUL`/`DIV`
-  ещё впереди);
+  **Group 3** (`NOT`, `NEG`, `TEST r/m, imm`, `MUL`/`IMUL`/`DIV`/`IDIV` —
+  0xF6/0xF7, 8 и 16 бит, с правильной обработкой DX:AX для 16-бит и
+  возвратом `CpuError::DivideError` на деление на ноль или переполнение
+  частного);
   **Group 4** (`INC`/`DEC r/m8` — 0xFE);
   **Group 5** (`INC`/`DEC r/m16`, `CALL r/m16` near indirect, `JMP r/m16`
   near indirect, `PUSH r/m16` — 0xFF);
@@ -62,6 +64,10 @@
   учётом DF и сегментов DS/ES; префиксы `REP`/`REPE`/`REPNE`
   (0xF2/0xF3) для повторения с CX-счётчиком, для CMPS/SCAS — с
   условием ZF;
+  **сегментные префиксы** `CS:`/`DS:`/`ES:`/`SS:` (0x26/0x2E/0x36/0x3E)
+  для любой инструкции с памятью; работают и до, и после REP-префикса;
+  автоматически сбрасываются после каждой инструкции (state — в
+  `Cpu::seg_override`);
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -80,7 +86,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **60 зелёных** (mem 4 + devices 5 + cpu 42 + vm 3 + wasm 1
+* Тестов — **68 зелёных** (mem 4 + devices 5 + cpu 50 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -92,8 +98,9 @@
 |------|-------|-------|
 | `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
-| `MUL`/`IMUL`/`DIV`/`IDIV` (Group 3 /4..7), `RCL`/`RCR` (Group 2 /2,/3) | средний | Умножение/деление в коде, big-number арифметика |
-| Префиксы сегмента (`CS:`/`DS:`/`ES:`/`SS:` — 0x26/0x2E/0x36/0x3E) | малый | Гость, активно работающий через ES для строк |
+| `RCL`/`RCR` (Group 2 /2,/3), `XCHG r/m, r` (0x86/0x87) | малый | Big-number арифметика, идиомы блокировки |
+| `MOV sreg, r/m` / `MOV r/m, sreg` (0x8E/0x8C), `LDS`/`LES` (0xC5/0xC4) | малый | Установка сегментов из гостя, дальние указатели |
+| `LEA r16, m` (0x8D) | малый | Адресная арифметика без обращения в память |
 | `MOVS`, `STOS`, `SCAS`, `CMPS`, `REP`-префиксы | малый | `memcpy`/`memset` в гостях |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |
