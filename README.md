@@ -56,6 +56,12 @@
   **Group 4** (`INC`/`DEC r/m8` — 0xFE);
   **Group 5** (`INC`/`DEC r/m16`, `CALL r/m16` near indirect, `JMP r/m16`
   near indirect, `PUSH r/m16` — 0xFF);
+  **Group 2** сдвиги/повороты (`SHL`/`SHR`/`SAR`/`ROL`/`ROR` r/m,1 / CL / imm —
+  0xC0/0xC1/0xD0..0xD3; RCL/RCR пока не реализованы);
+  **строковые операции** `MOVS`/`STOS`/`LODS`/`SCAS`/`CMPS` (B/W) с
+  учётом DF и сегментов DS/ES; префиксы `REP`/`REPE`/`REPNE`
+  (0xF2/0xF3) для повторения с CX-счётчиком, для CMPS/SCAS — с
+  условием ZF;
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -74,7 +80,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **49 зелёных** (mem 4 + devices 5 + cpu 31 + vm 3 + wasm 1
+* Тестов — **60 зелёных** (mem 4 + devices 5 + cpu 42 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -86,8 +92,8 @@
 |------|-------|-------|
 | `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
-| `MUL`/`IMUL`/`DIV`/`IDIV` (Group 3 /4..7), `SHL`/`SHR`/`SAR`/`ROL`/`ROR` (Group 2) | средний | Компилятор C/Rust почти всегда генерирует сдвиги и умножения |
-| Префиксы строковых операций `REP`/`REPZ`/`REPNZ`, `MOVS`/`STOS`/`SCAS`/`CMPS` | малый | `memcpy`/`memset` — основа любого пролога |
+| `MUL`/`IMUL`/`DIV`/`IDIV` (Group 3 /4..7), `RCL`/`RCR` (Group 2 /2,/3) | средний | Умножение/деление в коде, big-number арифметика |
+| Префиксы сегмента (`CS:`/`DS:`/`ES:`/`SS:` — 0x26/0x2E/0x36/0x3E) | малый | Гость, активно работающий через ES для строк |
 | `MOVS`, `STOS`, `SCAS`, `CMPS`, `REP`-префиксы | малый | `memcpy`/`memset` в гостях |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |

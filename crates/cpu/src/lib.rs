@@ -331,6 +331,272 @@ impl Cpu {
         }
     }
 
+    /// Set ZF/SF/PF from an 8-bit result without touching CF/OF.
+    /// Used by shifts where CF/OF have their own per-op meanings.
+    fn flags_zsp8(&mut self, result: u8) {
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x80 != 0);
+        self.set_flag(flag::PF, (result.count_ones() & 1) == 0);
+    }
+
+    fn flags_zsp16(&mut self, result: u16) {
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x8000 != 0);
+        self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
+    }
+
+    /// Group 2 shift/rotate on an 8-bit operand. `sub` is the ModR/M
+    /// reg field: 0=ROL, 1=ROR, 2=RCL, 3=RCR, 4=SHL, 5=SHR, 7=SAR.
+    /// RCL/RCR are intentionally not implemented yet.
+    fn shift_apply8(&mut self, sub: u8, value: u8, count_raw: u8) -> Result<u8, CpuError> {
+        // 80186+ masks the count to 0x1F. A count of zero is a complete
+        // no-op (no flag changes either).
+        let count = count_raw & 0x1F;
+        if count == 0 {
+            return Ok(value);
+        }
+        match sub {
+            // ROL — left rotate, CF = LSB of result; OF (count=1) = msb(res) xor CF
+            0 => {
+                let result = value.rotate_left(count as u32);
+                let cf = result & 1 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x80 != 0) != cf);
+                }
+                Ok(result)
+            }
+            // ROR — right rotate, CF = MSB of result; OF (count=1) = msb xor (msb-1)
+            1 => {
+                let result = value.rotate_right(count as u32);
+                let cf = result & 0x80 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb1 = result & 0x40 != 0;
+                    self.set_flag(flag::OF, cf != msb1);
+                }
+                Ok(result)
+            }
+            // SHL/SAL — both ops, identical encoding (4 standard, 6 alias)
+            4 | 6 => {
+                let cf = if count <= 8 { ((value as u16) >> (8 - count)) & 1 != 0 } else { false };
+                let result = if count >= 8 { 0 } else { value << count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x80 != 0) != cf);
+                }
+                self.flags_zsp8(result);
+                Ok(result)
+            }
+            // SHR — logical right shift
+            5 => {
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 8 { 0 } else { value >> count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, value & 0x80 != 0);
+                }
+                self.flags_zsp8(result);
+                Ok(result)
+            }
+            // SAR — arithmetic right shift, sign-extends
+            7 => {
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 8 {
+                    if value & 0x80 != 0 { 0xFF } else { 0 }
+                } else {
+                    ((value as i8) >> count) as u8
+                };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, false);
+                }
+                self.flags_zsp8(result);
+                Ok(result)
+            }
+            // RCL (2) / RCR (3): rotate through CF — deferred to a
+            // follow-up. They're rare in compiler output but needed
+            // for big-number arithmetic and we'll add them with tests.
+            _ => Err(CpuError::Unimplemented { opcode: 0xD0, cs: 0, ip: 0 }),
+        }
+    }
+
+    fn shift_apply16(&mut self, sub: u8, value: u16, count_raw: u8) -> Result<u16, CpuError> {
+        let count = count_raw & 0x1F;
+        if count == 0 {
+            return Ok(value);
+        }
+        match sub {
+            0 => {
+                let result = value.rotate_left(count as u32);
+                let cf = result & 1 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x8000 != 0) != cf);
+                }
+                Ok(result)
+            }
+            1 => {
+                let result = value.rotate_right(count as u32);
+                let cf = result & 0x8000 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb1 = result & 0x4000 != 0;
+                    self.set_flag(flag::OF, cf != msb1);
+                }
+                Ok(result)
+            }
+            4 | 6 => {
+                let cf = if count <= 16 { ((value as u32) >> (16 - count)) & 1 != 0 } else { false };
+                let result = if count >= 16 { 0 } else { value << count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x8000 != 0) != cf);
+                }
+                self.flags_zsp16(result);
+                Ok(result)
+            }
+            5 => {
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 16 { 0 } else { value >> count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, value & 0x8000 != 0);
+                }
+                self.flags_zsp16(result);
+                Ok(result)
+            }
+            7 => {
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 16 {
+                    if value & 0x8000 != 0 { 0xFFFF } else { 0 }
+                } else {
+                    ((value as i16) >> count) as u16
+                };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, false);
+                }
+                self.flags_zsp16(result);
+                Ok(result)
+            }
+            _ => Err(CpuError::Unimplemented { opcode: 0xD1, cs: 0, ip: 0 }),
+        }
+    }
+
+    /// Common SI/DI delta for string ops, picked by DF (10 → backward).
+    fn string_delta(&self, word: bool) -> u16 {
+        let step = if word { 2 } else { 1 };
+        if self.has(flag::DF) { 0u16.wrapping_sub(step) } else { step }
+    }
+
+    fn step_movsb(&mut self, mem: &mut Memory) {
+        let src = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let dst = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let v = mem.read_u8(src);
+        mem.write_u8(dst, v);
+        let d = self.string_delta(false);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_movsw(&mut self, mem: &mut Memory) {
+        let src = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let dst = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let v = mem.read_u16(src);
+        mem.write_u16(dst, v);
+        let d = self.string_delta(true);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_stosb(&mut self, mem: &mut Memory) {
+        let dst = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let al = self.read_r8(0);
+        mem.write_u8(dst, al);
+        let d = self.string_delta(false);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_stosw(&mut self, mem: &mut Memory) {
+        let dst = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let ax = self.regs[r16::AX];
+        mem.write_u16(dst, ax);
+        let d = self.string_delta(true);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_lodsb(&mut self, mem: &Memory) {
+        let src = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let v = mem.read_u8(src);
+        self.write_r8(0, v);
+        let d = self.string_delta(false);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+    }
+    fn step_lodsw(&mut self, mem: &Memory) {
+        let src = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let v = mem.read_u16(src);
+        self.regs[r16::AX] = v;
+        let d = self.string_delta(true);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+    }
+    fn step_scasb(&mut self, mem: &Memory) {
+        let addr = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let v = mem.read_u8(addr);
+        let al = self.read_r8(0);
+        let r = al.wrapping_sub(v);
+        self.flags_sub8(al, v, 0, r);
+        let d = self.string_delta(false);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_scasw(&mut self, mem: &Memory) {
+        let addr = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let v = mem.read_u16(addr);
+        let ax = self.regs[r16::AX];
+        let r = ax.wrapping_sub(v);
+        self.flags_sub16(ax, v, 0, r);
+        let d = self.string_delta(true);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_cmpsb(&mut self, mem: &Memory) {
+        let s = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let d_addr = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let a = mem.read_u8(s);
+        let b = mem.read_u8(d_addr);
+        let r = a.wrapping_sub(b);
+        self.flags_sub8(a, b, 0, r);
+        let delta = self.string_delta(false);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+    }
+    fn step_cmpsw(&mut self, mem: &Memory) {
+        let s = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
+        let d_addr = Self::linear(self.sregs[sreg::ES], self.regs[r16::DI]);
+        let a = mem.read_u16(s);
+        let b = mem.read_u16(d_addr);
+        let r = a.wrapping_sub(b);
+        self.flags_sub16(a, b, 0, r);
+        let delta = self.string_delta(true);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+    }
+
+    /// Dispatch a single string op by primary opcode. Returns true if
+    /// the opcode is a recognized string op (callers like the REP
+    /// prefix handler use this to know whether the prefix is valid).
+    fn step_string(&mut self, inner: u8, mem: &mut Memory) -> bool {
+        match inner {
+            0xA4 => self.step_movsb(mem),
+            0xA5 => self.step_movsw(mem),
+            0xA6 => self.step_cmpsb(mem),
+            0xA7 => self.step_cmpsw(mem),
+            0xAA => self.step_stosb(mem),
+            0xAB => self.step_stosw(mem),
+            0xAC => self.step_lodsb(mem),
+            0xAD => self.step_lodsw(mem),
+            0xAE => self.step_scasb(mem),
+            0xAF => self.step_scasw(mem),
+            _ => return false,
+        }
+        true
+    }
+
     fn alu_apply16(&mut self, op: u8, a: u16, b: u16) -> (u16, bool) {
         let cin: u16 = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
         match op {
@@ -478,13 +744,62 @@ impl Cpu {
                 }
             }
 
-            0xAC => {
-                // LODSB: AL = DS:[SI]; SI += DF ? -1 : +1
-                let addr = Self::linear(self.sregs[sreg::DS], self.regs[r16::SI]);
-                let v = mem.read_u8(addr);
-                self.write_r8(0, v); // AL
-                let delta: u16 = if self.has(flag::DF) { 0xFFFF } else { 1 };
-                self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
+            // Single-shot string ops. REP-prefixed paths go through the
+            // 0xF2/0xF3 handler below.
+            0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF => {
+                self.step_string(opcode, mem);
+            }
+
+            // Group 2: shift/rotate r/m by 1, CL, or imm8.
+            //   0xD0: r/m8 by 1
+            //   0xD1: r/m16 by 1
+            //   0xD2: r/m8 by CL
+            //   0xD3: r/m16 by CL
+            //   0xC0: r/m8 by imm8
+            //   0xC1: r/m16 by imm8
+            // ModR/M reg field selects ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+            0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1 => {
+                let is_word = matches!(opcode, 0xD1 | 0xD3 | 0xC1);
+                let (_, sub, rm) = self.fetch_modrm(mem);
+                let count = match opcode {
+                    0xD0 | 0xD1 => 1,
+                    0xD2 | 0xD3 => self.read_r8(1), // CL
+                    0xC0 | 0xC1 => self.fetch_u8(mem),
+                    _ => unreachable!(),
+                };
+                if !is_word {
+                    let v = self.read_rm8(rm, mem);
+                    let r = self.shift_apply8(sub, v, count)?;
+                    self.write_rm8(rm, mem, r);
+                } else {
+                    let v = self.read_rm16(rm, mem);
+                    let r = self.shift_apply16(sub, v, count)?;
+                    self.write_rm16(rm, mem, r);
+                }
+            }
+
+            // REP / REPE / REPZ (0xF3) and REPNE / REPNZ (0xF2) prefix.
+            // For MOVS/STOS/LODS the prefix repeats CX times with no
+            // ZF condition. For CMPS/SCAS the prefix repeats while
+            // (REPE: ZF=1, REPNE: ZF=0). CX is decremented after each
+            // string-op step.
+            0xF2 | 0xF3 => {
+                let rep_zero = opcode == 0xF3;
+                let inner = self.fetch_u8(mem);
+                let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
+                while self.regs[r16::CX] != 0 {
+                    if !self.step_string(inner, mem) {
+                        return Err(CpuError::Unimplemented {
+                            opcode: inner, cs: op_cs, ip: op_ip,
+                        });
+                    }
+                    self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
+                    if conditional {
+                        let zf = self.has(flag::ZF);
+                        if rep_zero && !zf { break; }
+                        if !rep_zero && zf { break; }
+                    }
+                }
             }
 
             // Standard ALU family (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) —
@@ -1340,6 +1655,187 @@ mod tests {
         ], 8);
         assert_eq!(cpu.regs[r16::AX], 0xABCD);
         let _ = mem; // mem is consulted via the POP
+    }
+
+    #[test]
+    fn shl_by_one_sets_cf_from_top_bit() {
+        // MOV AL, 0xC0 ; SHL AL, 1 → 0x80, CF=1, OF=0 (sign unchanged)
+        // SHL r/m8, 1 = 0xD0 /4. ModR/M = 11 100 000 = 0xE0
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0xC0,
+            0xD0, 0xE0,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.read_r8(0), 0x80);
+        assert!(cpu.has(flag::CF));
+        assert!(!cpu.has(flag::OF));
+    }
+
+    #[test]
+    fn shl_by_cl_count() {
+        // MOV AX, 1 ; MOV CL, 4 ; SHL AX, CL → 0x10
+        // SHL r/m16, CL = 0xD3 /4. ModR/M = 11 100 000 = 0xE0
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x01, 0x00,
+            0xB1, 0x04,
+            0xD3, 0xE0,
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.regs[r16::AX], 0x10);
+    }
+
+    #[test]
+    fn shr_by_one_drops_lsb_into_cf() {
+        // MOV AL, 0x03 ; SHR AL, 1 → 0x01, CF=1
+        // SHR r/m8, 1 = 0xD0 /5. ModR/M = 11 101 000 = 0xE8
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x03,
+            0xD0, 0xE8,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.read_r8(0), 0x01);
+        assert!(cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn sar_sign_extends_negative() {
+        // MOV AL, 0x80 ; SAR AL, 1 → 0xC0 (sign-extended), CF=0
+        // SAR r/m8, 1 = 0xD0 /7. ModR/M = 11 111 000 = 0xF8
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x80,
+            0xD0, 0xF8,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.read_r8(0), 0xC0);
+        assert!(!cpu.has(flag::CF));
+        assert!(cpu.has(flag::SF));
+    }
+
+    #[test]
+    fn rol_by_one_wraps_msb_to_lsb() {
+        // MOV AL, 0x81 ; ROL AL, 1 → 0x03, CF=1, OF=0 (no sign flip)
+        // ROL r/m8, 1 = 0xD0 /0. ModR/M = 11 000 000 = 0xC0
+        let (cpu, _, _) = run_payload(&[
+            0xB0, 0x81,
+            0xD0, 0xC0,
+            0xF4,
+        ], 4);
+        assert_eq!(cpu.read_r8(0), 0x03);
+        assert!(cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn ror_by_imm_count() {
+        // MOV AX, 0x0001 ; ROR AX, 4 → 0x1000
+        // ROR r/m16, imm8 = 0xC1 /1. ModR/M = 11 001 000 = 0xC8
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x01, 0x00,
+            0xC1, 0xC8, 0x04,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 0x1000);
+    }
+
+    #[test]
+    fn movsb_copies_one_byte_with_si_di_increment() {
+        // src @ 0x800 = 0x77 ; ES already 0, SS=0
+        // MOV SI, 0x800 ; MOV DI, 0x900 ; MOVSB
+        let (cpu, mem, _) = run_with_data(&[
+            0xBE, 0x00, 0x08,
+            0xBF, 0x00, 0x09,
+            0xA4,
+            0xF4,
+        ], 0x800, &[0x77], 8);
+        assert_eq!(mem.read_u8(0x900), 0x77);
+        assert_eq!(cpu.regs[r16::SI], 0x801);
+        assert_eq!(cpu.regs[r16::DI], 0x901);
+    }
+
+    #[test]
+    fn rep_movsb_copies_buffer() {
+        // Copy 5 bytes from 0x800 to 0x900 with REP MOVSB.
+        //   MOV SI, 0x800
+        //   MOV DI, 0x900
+        //   MOV CX, 5
+        //   REP MOVSB   (F3 A4)
+        //   HLT
+        let src = b"hello";
+        let (cpu, mem, _) = run_with_data(&[
+            0xBE, 0x00, 0x08,
+            0xBF, 0x00, 0x09,
+            0xB9, 0x05, 0x00,
+            0xF3, 0xA4,
+            0xF4,
+        ], 0x800, src, 12);
+        let mut got = [0u8; 5];
+        for i in 0..5 { got[i] = mem.read_u8(0x900 + i as u32); }
+        assert_eq!(&got, src);
+        assert_eq!(cpu.regs[r16::CX], 0);
+    }
+
+    #[test]
+    fn rep_stosb_fills_buffer() {
+        // Fill 4 bytes at 0x900 with 0xAA.
+        //   MOV AL, 0xAA ; MOV DI, 0x900 ; MOV CX, 4 ; REP STOSB
+        let (_, mem, _) = run_payload(&[
+            0xB0, 0xAA,
+            0xBF, 0x00, 0x09,
+            0xB9, 0x04, 0x00,
+            0xF3, 0xAA,
+            0xF4,
+        ], 10);
+        for i in 0..4 {
+            assert_eq!(mem.read_u8(0x900 + i), 0xAA);
+        }
+        // Should NOT overwrite the byte one past.
+        assert_eq!(mem.read_u8(0x904), 0);
+    }
+
+    #[test]
+    fn repne_scasb_finds_terminator() {
+        // Search a NUL-terminated string for NUL using REPNE SCASB.
+        //   AL=0 ; ES:DI = 0x800 ; CX = 0xFFFF ; REPNE SCASB
+        // After: DI points one past the NUL; (0xFFFF - 1) - CX = bytes
+        // scanned.
+        let s = b"abc\0";
+        let (cpu, _, _) = run_with_data(&[
+            0xB0, 0x00,
+            0xBF, 0x00, 0x08,
+            0xB9, 0xFF, 0xFF,
+            0xF2, 0xAE,
+            0xF4,
+        ], 0x800, s, 12);
+        // Found at byte 3 ('\0'), so DI advanced 4 times.
+        assert_eq!(cpu.regs[r16::DI], 0x804);
+        assert!(cpu.has(flag::ZF));
+    }
+
+    #[test]
+    fn repe_cmpsb_stops_on_mismatch() {
+        // "abXd" at 0x800 vs "abYd" at 0x900. REPE CMPSB walks while
+        // equal — should stop on the X/Y pair. We seed 0x800 via the
+        // run_with_data data slot and write 0x900 inline via four
+        // MOV byte [disp16], imm instructions.
+        //
+        // Expected: 3 compares done (eq, eq, ne), so CX goes 4→1, DI
+        // advances 3 → 0x903, ZF=0 from the last failed compare.
+        let bytes = [
+            // Write "abYd" to 0x900
+            0xC6, 0x06, 0x00, 0x09, b'a',
+            0xC6, 0x06, 0x01, 0x09, b'b',
+            0xC6, 0x06, 0x02, 0x09, b'Y',
+            0xC6, 0x06, 0x03, 0x09, b'd',
+            // REPE CMPSB setup + run
+            0xBE, 0x00, 0x08,
+            0xBF, 0x00, 0x09,
+            0xB9, 0x04, 0x00,
+            0xF3, 0xA6,
+            0xF4,
+        ];
+        let (cpu, _, _) = run_with_data(&bytes, 0x800, b"abXd", 30);
+        assert_eq!(cpu.regs[r16::CX], 1);
+        assert_eq!(cpu.regs[r16::DI], 0x903);
+        assert!(!cpu.has(flag::ZF));
     }
 
     #[test]
