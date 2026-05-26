@@ -124,6 +124,15 @@ impl WwwVm {
         self.inner.send_input(bytes);
     }
 
+    /// Push a raw scan-code byte into the PS/2 keyboard buffer. Used
+    /// for guests that expect IRQ 1 + port 0x60 instead of the UART
+    /// byte stream. Host is responsible for translating from a
+    /// keyboard event to the scan code the guest expects (Set 1, Set
+    /// 2, etc.).
+    pub fn push_scancode(&mut self, code: u8) {
+        self.inner.push_scancode(code);
+    }
+
     /// Drain everything the guest has emitted since the previous call.
     /// Returned as a UTF-8 string with lossy replacement for non-UTF-8
     /// bytes (the host UART is a byte stream, not text — but the demo

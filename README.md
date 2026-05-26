@@ -39,15 +39,15 @@
 ## Что работает сейчас
 
 * **mem** — линейная физическая память, little-endian аксессоры.
-* **devices** — 16550 UART (COM1: 0x3F8), 8259A PIC (master, 0x20/0x21)
-  и 8254 PIT (0x40-0x43). PIC моделирует IMR/IRR/ISR, ICW1/ICW2
-  (ICW3/ICW4 принимаются и отбрасываются), non-specific EOI через OCW2.
-  UART: IER на offset+1, `irq_pending()` true при rx + IER bit 0. PIT
-  моделирует канал 0 в режимах 0 (one-shot) и 2/3 (периодический),
-  control-word на 0x43 с SC=0 и RW=3 (LSB→MSB на 0x40). На каждом
-  `refresh_irqs` PIT тикает на 1; terminal count → edge → IRR bit 0.
-  `IoBus::refresh_irqs` смешивает уровневые (UART → IRR mirrors device line)
-  и фронтовые (PIT → одиночный pulse при достижении нуля) сигналы.
+* **devices** — 16550 UART (COM1: 0x3F8), 8259A PIC (master, 0x20/0x21),
+  8254 PIT (0x40-0x43) и PS/2 keyboard (0x60/0x64). PIC моделирует
+  IMR/IRR/ISR, ICW1/ICW2 (ICW3/ICW4 принимаются и отбрасываются),
+  non-specific EOI через OCW2. UART: IER на offset+1, `irq_pending()`
+  true при rx + IER bit 0. PIT — канал 0 в режимах 0/2/3,
+  control-word на 0x43. Keyboard: очередь scan-кодов, port 0x60 read
+  pops byte, port 0x64 status bit 0 = OBF; level-triggered IRQ 1 пока
+  очередь не пуста. `IoBus::refresh_irqs` смешивает уровневые
+  (UART → IRQ 4, keyboard → IRQ 1) и фронтовые (PIT → IRQ 0) сигналы.
 * **cpu** — реальный режим x86: `MOV r8/r16, imm`; `MOV r/m, r`,
   `MOV r, r/m`, `MOV r/m, imm` (опкоды 0x88–0x8B, 0xC6/0xC7); `LODSB`;
   полная ALU-семья (`ADD`/`OR`/`ADC`/`SBB`/`AND`/`SUB`/`XOR`/`CMP`,
@@ -138,7 +138,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **122 зелёных** (mem 4 + devices 15 + cpu 89 + vm 8 + wasm 1
+* Тестов — **129 зелёных** (mem 4 + devices 20 + cpu 89 + vm 10 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
   **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)
@@ -157,7 +157,8 @@
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
 | `RCL`/`RCR` (Group 2 /2,/3), BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Big-number арифметика, DOS-era BCD-код |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
-| Реальные устройства: slave PIC (IRQ 8..15), RTC (CMOS), PS/2, IDE/ATA | средний | Загрузочные тракты любого реального дистрибутива |
+| 8042 controller commands (self-test, port disable), keyboard scan-code translation на host-стороне | малый | Совместимость со стандартными KB-драйверами |
+| Реальные устройства: slave PIC (IRQ 8..15), RTC (CMOS), IDE/ATA, VGA | средний | Загрузочные тракты любого реального дистрибутива |
 | Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
 | 32-бит (i386): операнд/адрес-префиксы 0x66/0x67, long-mode позже | большой | Любое 32+ ядро |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |

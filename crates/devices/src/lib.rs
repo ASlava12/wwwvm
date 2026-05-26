@@ -22,21 +22,24 @@ pub trait IoDevice {
     fn write(&mut self, port: u16, value: u8);
 }
 
+mod keyboard;
 mod pic;
 mod pit;
 mod uart;
 
+pub use keyboard::Keyboard;
 pub use pic::Pic;
 pub use pit::Pit;
 pub use uart::Uart;
 
 /// Concrete IO dispatcher. Owns one instance each of UART, PIC, PIT,
-/// routes accesses by port. Unmapped ports read 0xFF (open bus on real
-/// hardware) and accept writes silently.
+/// keyboard; routes accesses by port. Unmapped ports read 0xFF (open
+/// bus on real hardware) and accept writes silently.
 pub struct IoBus {
     pub uart: Uart,
     pub pic: Pic,
     pub pit: Pit,
+    pub kbd: Keyboard,
 }
 
 impl IoBus {
@@ -45,6 +48,7 @@ impl IoBus {
             uart: Uart::com1(),
             pic: Pic::master(),
             pit: Pit::standard(),
+            kbd: Keyboard::new(),
         }
     }
 
@@ -53,6 +57,7 @@ impl IoBus {
             uart,
             pic: Pic::master(),
             pit: Pit::standard(),
+            kbd: Keyboard::new(),
         }
     }
 
@@ -78,6 +83,13 @@ impl IoBus {
             self.pic.irr |= irq4_bit;
         } else {
             self.pic.irr &= !irq4_bit;
+        }
+        // Keyboard — level-triggered on IRQ 1.
+        let irq1_bit = 1u8 << 1;
+        if self.kbd.irq_pending() {
+            self.pic.irr |= irq1_bit;
+        } else {
+            self.pic.irr &= !irq1_bit;
         }
         // PIT — one tick per CPU step. Each terminal count gets
         // translated into a one-shot IRR set on IRQ 0. The PIC keeps
@@ -115,6 +127,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.pit.read(port);
         }
+        let (lo, hi) = self.kbd.port_range();
+        if port >= lo && port <= hi {
+            return self.kbd.read(port);
+        }
         0xFF
     }
 
@@ -132,6 +148,11 @@ impl IoBus {
         let (lo, hi) = self.pit.port_range();
         if port >= lo && port <= hi {
             self.pit.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.kbd.port_range();
+        if port >= lo && port <= hi {
+            self.kbd.write(port, value);
         }
     }
 }
@@ -169,6 +190,25 @@ mod tests {
         assert!(bus.pic.pending_vector().is_none());
         bus.refresh_irqs();
         assert_eq!(bus.pic.pending_vector(), Some(0x08 + 4));
+    }
+
+    #[test]
+    fn refresh_translates_keyboard_assertion_into_pic_irr() {
+        let mut bus = IoBus::new();
+        bus.kbd.push_scancode(0x1E);
+        bus.pic.imr = !(1 << 1); // unmask IRQ 1
+        assert!(bus.pic.pending_vector().is_none());
+        bus.refresh_irqs();
+        assert_eq!(bus.pic.pending_vector(), Some(0x08 + 1));
+    }
+
+    #[test]
+    fn iobus_routes_to_keyboard() {
+        let mut bus = IoBus::new();
+        bus.kbd.push_scancode(0x42);
+        assert_eq!(bus.read(Keyboard::STATUS_PORT) & 1, 1);
+        assert_eq!(bus.read(Keyboard::DATA_PORT), 0x42);
+        assert_eq!(bus.read(Keyboard::STATUS_PORT) & 1, 0);
     }
 
     #[test]

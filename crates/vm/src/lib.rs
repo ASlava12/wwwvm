@@ -138,6 +138,14 @@ impl Vm {
         self.io.uart_mut().push_rx(bytes);
     }
 
+    /// Push a raw scan code byte into the PS/2 keyboard buffer.
+    /// Raises IRQ 1 to a guest that has unmasked it. The translation
+    /// from host keystrokes to scan codes (Set 1 / Set 2) is the
+    /// host's job — this just queues bytes.
+    pub fn push_scancode(&mut self, code: u8) {
+        self.io.kbd.push_scancode(code);
+    }
+
     /// Drain everything the guest has transmitted since the last call.
     pub fn drain_output(&mut self) -> Vec<u8> {
         self.io.uart_mut().drain_tx()
@@ -503,6 +511,44 @@ mod tests {
             other => panic!("expected Halted, got {other:?}"),
         }
         assert_eq!(vm.read_mem_u8(0x900), 4);
+    }
+
+    /// End-to-end keyboard test: guest unmasks IRQ 1, STIs, spins on
+    /// BL == 0. Handler reads port 0x60 into BL, EOIs the PIC. Host
+    /// pushes a scan code; the IRQ should latch and dispatch.
+    #[test]
+    fn ps2_scancode_drives_irq1_handler_through_vm() {
+        let main: &[u8] = &[
+            0xFB,                          // STI
+            0xB0, 0xFD,                    // MOV AL, 0xFD  (unmask IRQ 1)
+            0xE6, 0x21,                    // OUT 0x21, AL
+            0x80, 0xFB, 0x00,              // CMP BL, 0
+            0x74, 0xFB,                    // JZ -5
+            0xF4,                          // HLT
+        ];
+        let handler: &[u8] = &[
+            0x50,                          // PUSH AX
+            0xE4, 0x60,                    // IN AL, 0x60
+            0x88, 0xC3,                    // MOV BL, AL
+            0xB0, 0x20,
+            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
+            0x58,                          // POP AX
+            0xCF,                          // IRET
+        ];
+        let handler_addr: u32 = 0x7C40;
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, main);
+        vm.load_image(handler_addr, handler);
+        // IRQ 1 → vector 0x08 + 1 = 0x09
+        vm.set_ivt(0x09, 0x0000, handler_addr as u16);
+        vm.boot();
+        vm.push_scancode(0x42);
+        let (_, stop) = vm.run_steps(2_000);
+        match stop {
+            Stop::Halted => {}
+            other => panic!("expected Halted, got {other:?}"),
+        }
+        assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX] & 0xFF, 0x42);
     }
 
     #[test]
