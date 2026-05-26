@@ -28,7 +28,7 @@ mod pic;
 mod pit;
 mod uart;
 
-pub use cmos::{Cmos, reg as cmos_reg};
+pub use cmos::{reg as cmos_reg, Cmos};
 pub use keyboard::Keyboard;
 pub use pic::Pic;
 pub use pit::Pit;
@@ -252,30 +252,45 @@ impl IoBus {
             out.extend_from_slice(payload);
         };
         let mut buf = Vec::new();
-        buf.clear(); self.uart.snapshot_into(&mut buf); emit(&mut out, Self::DEV_UART, &buf);
-        buf.clear(); self.pic.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIC_MASTER, &buf);
-        buf.clear(); self.slave_pic.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIC_SLAVE, &buf);
-        buf.clear(); self.pit.snapshot_into(&mut buf); emit(&mut out, Self::DEV_PIT, &buf);
-        buf.clear(); self.kbd.snapshot_into(&mut buf); emit(&mut out, Self::DEV_KBD, &buf);
-        buf.clear(); self.cmos.snapshot_into(&mut buf); emit(&mut out, Self::DEV_CMOS, &buf);
+        buf.clear();
+        self.uart.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_UART, &buf);
+        buf.clear();
+        self.pic.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_PIC_MASTER, &buf);
+        buf.clear();
+        self.slave_pic.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_PIC_SLAVE, &buf);
+        buf.clear();
+        self.pit.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_PIT, &buf);
+        buf.clear();
+        self.kbd.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_KBD, &buf);
+        buf.clear();
+        self.cmos.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_CMOS, &buf);
         out
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.is_empty() { return Err("iobus: empty".into()); }
+        if bytes.is_empty() {
+            return Err("iobus: empty".into());
+        }
         let count = bytes[0];
         let mut p = 1;
         for _ in 0..count {
-            if bytes.len() < p + 4 { return Err("iobus: truncated record header".into()); }
-            let len = u32::from_le_bytes([
-                bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]
-            ]) as usize;
+            if bytes.len() < p + 4 {
+                return Err("iobus: truncated record header".into());
+            }
+            let len =
+                u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]) as usize;
             p += 4;
             if bytes.len() < p + len || len < 1 {
                 return Err("iobus: truncated record body".into());
             }
             let id = bytes[p];
-            let payload = &bytes[p+1..p+len];
+            let payload = &bytes[p + 1..p + len];
             let consumed = match id {
                 Self::DEV_UART => self.uart.restore(payload).map_err(str::to_string)?,
                 Self::DEV_PIC_MASTER => self.pic.restore(payload).map_err(str::to_string)?,
@@ -344,7 +359,7 @@ mod tests {
         let mut bus = IoBus::new();
         bus.slave_pic.imr = 0; // unmask all on slave
         bus.pic.imr = !(1 << 2); // master only sees IRQ 2 (the cascade)
-        // Slave IRQ 0 → vector 0x70
+                                 // Slave IRQ 0 → vector 0x70
         bus.slave_pic.raise_irq(0);
         // Without refresh, master is unaware.
         assert!(bus.pic.pending_vector().is_none());

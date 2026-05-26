@@ -103,7 +103,9 @@ impl Pic {
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        if bytes.len() < 5 { return Err("pic: truncated"); }
+        if bytes.len() < 5 {
+            return Err("pic: truncated");
+        }
         self.vector_base = bytes[0];
         self.imr = bytes[1];
         self.irr = bytes[2];

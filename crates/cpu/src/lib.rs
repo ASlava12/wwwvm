@@ -29,7 +29,12 @@ pub enum CpuError {
     #[error("unimplemented opcode 0x{opcode:02X} at {cs:04X}:{ip:04X}")]
     Unimplemented { opcode: u8, cs: u16, ip: u16 },
     #[error("unimplemented ModR/M mode {mode} (opcode 0x{opcode:02X} at {cs:04X}:{ip:04X})")]
-    UnimplementedModRm { opcode: u8, mode: u8, cs: u16, ip: u16 },
+    UnimplementedModRm {
+        opcode: u8,
+        mode: u8,
+        cs: u16,
+        ip: u16,
+    },
     /// Real x86 raises interrupt #0 (Divide Error) for div-by-zero or
     /// quotient overflow. We surface it as a CPU error so callers see
     /// what happened — future iterations may wire it to an IDT-based
@@ -145,7 +150,11 @@ impl Cpu {
         let idx = (i & 3) as usize;
         let high = i >= 4;
         let word = self.regs[idx];
-        if high { (word >> 8) as u8 } else { word as u8 }
+        if high {
+            (word >> 8) as u8
+        } else {
+            word as u8
+        }
     }
 
     pub fn write_r8(&mut self, i: u8, value: u8) {
@@ -184,7 +193,11 @@ impl Cpu {
     }
 
     fn set_flag(&mut self, mask: u16, value: bool) {
-        if value { self.flags |= mask; } else { self.flags &= !mask; }
+        if value {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
     }
 
     fn has(&self, mask: u16) -> bool {
@@ -366,16 +379,52 @@ impl Cpu {
     /// XOR (writeback) or (result, false) for CMP. `op` is the same
     /// 0..7 encoding used by both the main ALU dispatch and Group 1.
     fn alu_apply8(&mut self, op: u8, a: u8, b: u8) -> (u8, bool) {
-        let cin = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
+        let cin = if (op == 2 || op == 3) && self.has(flag::CF) {
+            1
+        } else {
+            0
+        };
         match op {
-            0 => { let r = a.wrapping_add(b); self.flags_add8(a, b, 0, r); (r, true) }
-            1 => { let r = a | b; self.flags_logic8(r); (r, true) }
-            2 => { let r = a.wrapping_add(b).wrapping_add(cin); self.flags_add8(a, b, cin, r); (r, true) }
-            3 => { let r = a.wrapping_sub(b).wrapping_sub(cin); self.flags_sub8(a, b, cin, r); (r, true) }
-            4 => { let r = a & b; self.flags_logic8(r); (r, true) }
-            5 => { let r = a.wrapping_sub(b); self.flags_sub8(a, b, 0, r); (r, true) }
-            6 => { let r = a ^ b; self.flags_logic8(r); (r, true) }
-            7 => { let r = a.wrapping_sub(b); self.flags_sub8(a, b, 0, r); (r, false) }
+            0 => {
+                let r = a.wrapping_add(b);
+                self.flags_add8(a, b, 0, r);
+                (r, true)
+            }
+            1 => {
+                let r = a | b;
+                self.flags_logic8(r);
+                (r, true)
+            }
+            2 => {
+                let r = a.wrapping_add(b).wrapping_add(cin);
+                self.flags_add8(a, b, cin, r);
+                (r, true)
+            }
+            3 => {
+                let r = a.wrapping_sub(b).wrapping_sub(cin);
+                self.flags_sub8(a, b, cin, r);
+                (r, true)
+            }
+            4 => {
+                let r = a & b;
+                self.flags_logic8(r);
+                (r, true)
+            }
+            5 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub8(a, b, 0, r);
+                (r, true)
+            }
+            6 => {
+                let r = a ^ b;
+                self.flags_logic8(r);
+                (r, true)
+            }
+            7 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub8(a, b, 0, r);
+                (r, false)
+            }
             _ => unreachable!("op is 3 bits"),
         }
     }
@@ -428,7 +477,11 @@ impl Cpu {
             }
             // SHL/SAL — both ops, identical encoding (4 standard, 6 alias)
             4 | 6 => {
-                let cf = if count <= 8 { ((value as u16) >> (8 - count)) & 1 != 0 } else { false };
+                let cf = if count <= 8 {
+                    ((value as u16) >> (8 - count)) & 1 != 0
+                } else {
+                    false
+                };
                 let result = if count >= 8 { 0 } else { value << count };
                 self.set_flag(flag::CF, cf);
                 if count == 1 {
@@ -452,7 +505,11 @@ impl Cpu {
             7 => {
                 let cf = (value >> (count - 1)) & 1 != 0;
                 let result = if count >= 8 {
-                    if value & 0x80 != 0 { 0xFF } else { 0 }
+                    if value & 0x80 != 0 {
+                        0xFF
+                    } else {
+                        0
+                    }
                 } else {
                     ((value as i8) >> count) as u8
                 };
@@ -466,7 +523,11 @@ impl Cpu {
             // RCL (2) / RCR (3): rotate through CF — deferred to a
             // follow-up. They're rare in compiler output but needed
             // for big-number arithmetic and we'll add them with tests.
-            _ => Err(CpuError::Unimplemented { opcode: 0xD0, cs: 0, ip: 0 }),
+            _ => Err(CpuError::Unimplemented {
+                opcode: 0xD0,
+                cs: 0,
+                ip: 0,
+            }),
         }
     }
 
@@ -496,7 +557,11 @@ impl Cpu {
                 Ok(result)
             }
             4 | 6 => {
-                let cf = if count <= 16 { ((value as u32) >> (16 - count)) & 1 != 0 } else { false };
+                let cf = if count <= 16 {
+                    ((value as u32) >> (16 - count)) & 1 != 0
+                } else {
+                    false
+                };
                 let result = if count >= 16 { 0 } else { value << count };
                 self.set_flag(flag::CF, cf);
                 if count == 1 {
@@ -518,7 +583,11 @@ impl Cpu {
             7 => {
                 let cf = (value >> (count - 1)) & 1 != 0;
                 let result = if count >= 16 {
-                    if value & 0x8000 != 0 { 0xFFFF } else { 0 }
+                    if value & 0x8000 != 0 {
+                        0xFFFF
+                    } else {
+                        0
+                    }
                 } else {
                     ((value as i16) >> count) as u16
                 };
@@ -529,14 +598,22 @@ impl Cpu {
                 self.flags_zsp16(result);
                 Ok(result)
             }
-            _ => Err(CpuError::Unimplemented { opcode: 0xD1, cs: 0, ip: 0 }),
+            _ => Err(CpuError::Unimplemented {
+                opcode: 0xD1,
+                cs: 0,
+                ip: 0,
+            }),
         }
     }
 
     /// Common SI/DI delta for string ops, picked by DF (10 → backward).
     fn string_delta(&self, word: bool) -> u16 {
         let step = if word { 2 } else { 1 };
-        if self.has(flag::DF) { 0u16.wrapping_sub(step) } else { step }
+        if self.has(flag::DF) {
+            0u16.wrapping_sub(step)
+        } else {
+            step
+        }
     }
 
     /// Segment used for the SI side of string ops — DS by default, but
@@ -654,16 +731,52 @@ impl Cpu {
     }
 
     fn alu_apply16(&mut self, op: u8, a: u16, b: u16) -> (u16, bool) {
-        let cin: u16 = if (op == 2 || op == 3) && self.has(flag::CF) { 1 } else { 0 };
+        let cin: u16 = if (op == 2 || op == 3) && self.has(flag::CF) {
+            1
+        } else {
+            0
+        };
         match op {
-            0 => { let r = a.wrapping_add(b); self.flags_add16(a, b, 0, r); (r, true) }
-            1 => { let r = a | b; self.flags_logic16(r); (r, true) }
-            2 => { let r = a.wrapping_add(b).wrapping_add(cin); self.flags_add16(a, b, cin, r); (r, true) }
-            3 => { let r = a.wrapping_sub(b).wrapping_sub(cin); self.flags_sub16(a, b, cin, r); (r, true) }
-            4 => { let r = a & b; self.flags_logic16(r); (r, true) }
-            5 => { let r = a.wrapping_sub(b); self.flags_sub16(a, b, 0, r); (r, true) }
-            6 => { let r = a ^ b; self.flags_logic16(r); (r, true) }
-            7 => { let r = a.wrapping_sub(b); self.flags_sub16(a, b, 0, r); (r, false) }
+            0 => {
+                let r = a.wrapping_add(b);
+                self.flags_add16(a, b, 0, r);
+                (r, true)
+            }
+            1 => {
+                let r = a | b;
+                self.flags_logic16(r);
+                (r, true)
+            }
+            2 => {
+                let r = a.wrapping_add(b).wrapping_add(cin);
+                self.flags_add16(a, b, cin, r);
+                (r, true)
+            }
+            3 => {
+                let r = a.wrapping_sub(b).wrapping_sub(cin);
+                self.flags_sub16(a, b, cin, r);
+                (r, true)
+            }
+            4 => {
+                let r = a & b;
+                self.flags_logic16(r);
+                (r, true)
+            }
+            5 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub16(a, b, 0, r);
+                (r, true)
+            }
+            6 => {
+                let r = a ^ b;
+                self.flags_logic16(r);
+                (r, true)
+            }
+            7 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub16(a, b, 0, r);
+                (r, false)
+            }
             _ => unreachable!("op is 3 bits"),
         }
     }
@@ -796,11 +909,21 @@ impl Cpu {
 
         match opcode {
             0x90 => { /* NOP */ }
-            0xF4 => { self.halted = true; }
-            0xFA => { self.set_flag(flag::IF, false); }
-            0xFB => { self.set_flag(flag::IF, true); }
-            0xFC => { self.set_flag(flag::DF, false); }
-            0xFD => { self.set_flag(flag::DF, true); }
+            0xF4 => {
+                self.halted = true;
+            }
+            0xFA => {
+                self.set_flag(flag::IF, false);
+            }
+            0xFB => {
+                self.set_flag(flag::IF, true);
+            }
+            0xFC => {
+                self.set_flag(flag::DF, false);
+            }
+            0xFD => {
+                self.set_flag(flag::DF, true);
+            }
 
             0xB0..=0xB7 => {
                 let imm = self.fetch_u8(mem);
@@ -917,14 +1040,20 @@ impl Cpu {
                 while self.regs[r16::CX] != 0 {
                     if !self.step_string(inner, mem) {
                         return Err(CpuError::Unimplemented {
-                            opcode: inner, cs: op_cs, ip: op_ip,
+                            opcode: inner,
+                            cs: op_cs,
+                            ip: op_ip,
                         });
                     }
                     self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
                     if conditional {
                         let zf = self.has(flag::ZF);
-                        if rep_zero && !zf { break; }
-                        if !rep_zero && zf { break; }
+                        if rep_zero && !zf {
+                            break;
+                        }
+                        if !rep_zero && zf {
+                            break;
+                        }
                     }
                 }
             }
@@ -932,8 +1061,14 @@ impl Cpu {
             // Standard ALU family (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) —
             // opcodes 0x00..0x3F where (opcode & 0x06) != 0x06 (those
             // slots are PUSH/POP sreg / prefixes, handled elsewhere).
-            0x00..=0x05 | 0x08..=0x0D | 0x10..=0x15 | 0x18..=0x1D
-            | 0x20..=0x25 | 0x28..=0x2D | 0x30..=0x35 | 0x38..=0x3D => {
+            0x00..=0x05
+            | 0x08..=0x0D
+            | 0x10..=0x15
+            | 0x18..=0x1D
+            | 0x20..=0x25
+            | 0x28..=0x2D
+            | 0x30..=0x35
+            | 0x38..=0x3D => {
                 self.alu_dispatch(opcode, mem)?;
             }
 
@@ -985,7 +1120,11 @@ impl Cpu {
             0x8C => {
                 let (_, sreg_idx, rm) = self.fetch_modrm(mem);
                 if sreg_idx > 5 {
-                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
                 }
                 let v = self.sregs[sreg_idx as usize];
                 self.write_rm16(rm, mem, v);
@@ -999,7 +1138,9 @@ impl Cpu {
                     Rm::Mem(ea) => self.write_r16(reg, ea.off),
                     Rm::Reg(_) => {
                         return Err(CpuError::Unimplemented {
-                            opcode, cs: op_cs, ip: op_ip,
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
                         });
                     }
                 }
@@ -1011,7 +1152,11 @@ impl Cpu {
             0x8E => {
                 let (_, sreg_idx, rm) = self.fetch_modrm(mem);
                 if sreg_idx > 5 {
-                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
                 }
                 let v = self.read_rm16(rm, mem);
                 self.sregs[sreg_idx as usize] = v;
@@ -1035,15 +1180,16 @@ impl Cpu {
                     Rm::Mem(ea) => ea,
                     Rm::Reg(_) => {
                         return Err(CpuError::Unimplemented {
-                            opcode, cs: op_cs, ip: op_ip,
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
                         });
                     }
                 };
                 let base = Self::linear(self.sregs[ea.seg], ea.off);
                 let off_val = mem.read_u16(base);
-                let seg_val = mem.read_u16(Self::linear(
-                    self.sregs[ea.seg], ea.off.wrapping_add(2),
-                ));
+                let seg_val =
+                    mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.sregs[sreg::ES] = seg_val;
                 let _ = base;
@@ -1056,14 +1202,15 @@ impl Cpu {
                     Rm::Mem(ea) => ea,
                     Rm::Reg(_) => {
                         return Err(CpuError::Unimplemented {
-                            opcode, cs: op_cs, ip: op_ip,
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
                         });
                     }
                 };
                 let off_val = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
-                let seg_val = mem.read_u16(Self::linear(
-                    self.sregs[ea.seg], ea.off.wrapping_add(2),
-                ));
+                let seg_val =
+                    mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.sregs[sreg::DS] = seg_val;
             }
@@ -1076,21 +1223,27 @@ impl Cpu {
                 let imm = self.fetch_u8(mem);
                 let a = self.read_rm8(rm, mem);
                 let (r, wb) = self.alu_apply8(op, a, imm);
-                if wb { self.write_rm8(rm, mem, r); }
+                if wb {
+                    self.write_rm8(rm, mem, r);
+                }
             }
             0x81 => {
                 let (_, op, rm) = self.fetch_modrm(mem);
                 let imm = self.fetch_u16(mem);
                 let a = self.read_rm16(rm, mem);
                 let (r, wb) = self.alu_apply16(op, a, imm);
-                if wb { self.write_rm16(rm, mem, r); }
+                if wb {
+                    self.write_rm16(rm, mem, r);
+                }
             }
             0x83 => {
                 let (_, op, rm) = self.fetch_modrm(mem);
                 let imm = self.fetch_u8(mem) as i8 as i16 as u16;
                 let a = self.read_rm16(rm, mem);
                 let (r, wb) = self.alu_apply16(op, a, imm);
-                if wb { self.write_rm16(rm, mem, r); }
+                if wb {
+                    self.write_rm16(rm, mem, r);
+                }
             }
 
             // Group 3 (0xF6 8-bit, 0xF7 16-bit). reg field selects:
@@ -1143,13 +1296,19 @@ impl Cpu {
                         // DIV r/m8 — AL = AX/v (unsigned), AH = AX%v
                         let v = self.read_rm8(rm, mem);
                         if v == 0 {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         let ax = self.regs[r16::AX];
                         let q = ax / v as u16;
                         let r = ax % v as u16;
                         if q > 0xFF {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         self.write_r8(0, q as u8);
                         self.write_r8(4, r as u8); // AH
@@ -1158,18 +1317,30 @@ impl Cpu {
                         // IDIV r/m8 — signed division of AX by r/m8
                         let v = self.read_rm8(rm, mem) as i8 as i16;
                         if v == 0 {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         let ax = self.regs[r16::AX] as i16;
                         let q = ax / v;
                         let r = ax % v;
                         if !(-128..=127).contains(&q) {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         self.write_r8(0, q as u8);
                         self.write_r8(4, r as u8); // AH
                     }
-                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        })
+                    }
                 }
             }
             0xF7 => {
@@ -1218,14 +1389,20 @@ impl Cpu {
                         // DIV r/m16 — AX = DX:AX / v (unsigned), DX = rem
                         let v = self.read_rm16(rm, mem) as u32;
                         if v == 0 {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
-                        let dividend = ((self.regs[r16::DX] as u32) << 16)
-                            | self.regs[r16::AX] as u32;
+                        let dividend =
+                            ((self.regs[r16::DX] as u32) << 16) | self.regs[r16::AX] as u32;
                         let q = dividend / v;
                         let r = dividend % v;
                         if q > 0xFFFF {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         self.regs[r16::AX] = q as u16;
                         self.regs[r16::DX] = r as u16;
@@ -1234,19 +1411,32 @@ impl Cpu {
                         // IDIV r/m16 — signed division of DX:AX by r/m16
                         let v = self.read_rm16(rm, mem) as i16 as i32;
                         if v == 0 {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         let dividend = (((self.regs[r16::DX] as u32) << 16)
-                            | self.regs[r16::AX] as u32) as i32;
+                            | self.regs[r16::AX] as u32)
+                            as i32;
                         let q = dividend / v;
                         let r = dividend % v;
                         if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
-                            return Err(CpuError::DivideError { cs: op_cs, ip: op_ip });
+                            return Err(CpuError::DivideError {
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
                         }
                         self.regs[r16::AX] = q as u16;
                         self.regs[r16::DX] = r as u16;
                     }
-                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        })
+                    }
                 }
             }
 
@@ -1267,7 +1457,13 @@ impl Cpu {
                         self.flags_sub8(v, 1, 0, r);
                         r
                     }
-                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        })
+                    }
                 };
                 // INC/DEC preserve CF on 8086.
                 self.set_flag(flag::CF, cf_before);
@@ -1314,14 +1510,17 @@ impl Cpu {
                     3 => {
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
-                            Rm::Reg(_) => return Err(CpuError::Unimplemented {
-                                opcode, cs: op_cs, ip: op_ip,
-                            }),
+                            Rm::Reg(_) => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                })
+                            }
                         };
                         let new_ip = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
-                        let new_cs = mem.read_u16(Self::linear(
-                            self.sregs[ea.seg], ea.off.wrapping_add(2),
-                        ));
+                        let new_cs =
+                            mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off.wrapping_add(2)));
                         let cs = self.sregs[sreg::CS];
                         self.push16(mem, cs);
                         let ip = self.ip;
@@ -1337,14 +1536,17 @@ impl Cpu {
                     5 => {
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
-                            Rm::Reg(_) => return Err(CpuError::Unimplemented {
-                                opcode, cs: op_cs, ip: op_ip,
-                            }),
+                            Rm::Reg(_) => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                })
+                            }
                         };
                         let new_ip = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
-                        let new_cs = mem.read_u16(Self::linear(
-                            self.sregs[ea.seg], ea.off.wrapping_add(2),
-                        ));
+                        let new_cs =
+                            mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off.wrapping_add(2)));
                         self.sregs[sreg::CS] = new_cs;
                         self.ip = new_ip;
                     }
@@ -1352,7 +1554,13 @@ impl Cpu {
                         let v = self.read_rm16(rm, mem);
                         self.push16(mem, v);
                     }
-                    _ => return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip }),
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        })
+                    }
                 }
             }
 
@@ -1360,7 +1568,11 @@ impl Cpu {
             0xC6 => {
                 let (_, reg_field, rm) = self.fetch_modrm(mem);
                 if reg_field != 0 {
-                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
                 }
                 let imm = self.fetch_u8(mem);
                 self.write_rm8(rm, mem, imm);
@@ -1369,7 +1581,11 @@ impl Cpu {
             0xC7 => {
                 let (_, reg_field, rm) = self.fetch_modrm(mem);
                 if reg_field != 0 {
-                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
                 }
                 let imm = self.fetch_u16(mem);
                 self.write_rm16(rm, mem, imm);
@@ -1447,7 +1663,11 @@ impl Cpu {
                 let frame_size = self.fetch_u16(mem);
                 let level = self.fetch_u8(mem) & 0x1F;
                 if level != 0 {
-                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
                 }
                 let bp = self.regs[r16::BP];
                 self.push16(mem, bp);
@@ -1466,13 +1686,31 @@ impl Cpu {
             // bits 3..4 select ES/CS/SS/DS in that order. POP CS (0x0F)
             // is the 2-byte opcode escape on 80286+ and undefined as
             // POP on 8086 — we leave it Unimplemented.
-            0x06 => { let v = self.sregs[sreg::ES]; self.push16(mem, v); }
-            0x0E => { let v = self.sregs[sreg::CS]; self.push16(mem, v); }
-            0x16 => { let v = self.sregs[sreg::SS]; self.push16(mem, v); }
-            0x1E => { let v = self.sregs[sreg::DS]; self.push16(mem, v); }
-            0x07 => { self.sregs[sreg::ES] = self.pop16(mem); }
-            0x17 => { self.sregs[sreg::SS] = self.pop16(mem); }
-            0x1F => { self.sregs[sreg::DS] = self.pop16(mem); }
+            0x06 => {
+                let v = self.sregs[sreg::ES];
+                self.push16(mem, v);
+            }
+            0x0E => {
+                let v = self.sregs[sreg::CS];
+                self.push16(mem, v);
+            }
+            0x16 => {
+                let v = self.sregs[sreg::SS];
+                self.push16(mem, v);
+            }
+            0x1E => {
+                let v = self.sregs[sreg::DS];
+                self.push16(mem, v);
+            }
+            0x07 => {
+                self.sregs[sreg::ES] = self.pop16(mem);
+            }
+            0x17 => {
+                self.sregs[sreg::SS] = self.pop16(mem);
+            }
+            0x1F => {
+                self.sregs[sreg::DS] = self.pop16(mem);
+            }
 
             // PUSH r16 (0x50..0x57) — push GPR in standard r16 order.
             // PUSH SP on the 8086 pushes the value *after* the decrement
@@ -1711,9 +1949,16 @@ impl Cpu {
             }
 
             // Carry-flag tweaks.
-            0xF5 => { let c = self.has(flag::CF); self.set_flag(flag::CF, !c); } // CMC
-            0xF8 => { self.set_flag(flag::CF, false); } // CLC
-            0xF9 => { self.set_flag(flag::CF, true); }  // STC
+            0xF5 => {
+                let c = self.has(flag::CF);
+                self.set_flag(flag::CF, !c);
+            } // CMC
+            0xF8 => {
+                self.set_flag(flag::CF, false);
+            } // CLC
+            0xF9 => {
+                self.set_flag(flag::CF, true);
+            } // STC
 
             // LOCK (0xF0) and WAIT (0x9B) prefixes — no-op for a single-
             // CPU emulator without an FPU. Consume the byte and continue;
@@ -1730,7 +1975,9 @@ impl Cpu {
 
             _ => {
                 return Err(CpuError::Unimplemented {
-                    opcode, cs: op_cs, ip: op_ip,
+                    opcode,
+                    cs: op_cs,
+                    ip: op_ip,
                 });
             }
         }
@@ -1745,21 +1992,21 @@ impl Cpu {
         let of = self.has(flag::OF);
         let pf = self.has(flag::PF);
         match code {
-            0x0 => of,             // JO
-            0x1 => !of,            // JNO
-            0x2 => cf,             // JB / JC
-            0x3 => !cf,            // JAE / JNC
-            0x4 => zf,             // JE / JZ
-            0x5 => !zf,            // JNE / JNZ
-            0x6 => cf || zf,       // JBE
-            0x7 => !cf && !zf,     // JA
-            0x8 => sf,             // JS
-            0x9 => !sf,            // JNS
-            0xA => pf,             // JP
-            0xB => !pf,            // JNP
-            0xC => sf != of,       // JL
-            0xD => sf == of,       // JGE
-            0xE => zf || (sf != of), // JLE
+            0x0 => of,                // JO
+            0x1 => !of,               // JNO
+            0x2 => cf,                // JB / JC
+            0x3 => !cf,               // JAE / JNC
+            0x4 => zf,                // JE / JZ
+            0x5 => !zf,               // JNE / JNZ
+            0x6 => cf || zf,          // JBE
+            0x7 => !cf && !zf,        // JA
+            0x8 => sf,                // JS
+            0x9 => !sf,               // JNS
+            0xA => pf,                // JP
+            0xB => !pf,               // JNP
+            0xC => sf != of,          // JL
+            0xD => sf == of,          // JGE
+            0xE => zf || (sf != of),  // JLE
             0xF => !zf && (sf == of), // JG
             _ => false,
         }
@@ -1775,7 +2022,12 @@ mod tests {
         run_with_data(bytes, 0, &[], steps)
     }
 
-    fn run_with_data(bytes: &[u8], data_at: u32, data: &[u8], steps: usize) -> (Cpu, Memory, IoBus) {
+    fn run_with_data(
+        bytes: &[u8],
+        data_at: u32,
+        data: &[u8],
+        steps: usize,
+    ) -> (Cpu, Memory, IoBus) {
         let mut mem = Memory::new(0x10_0000);
         mem.write_slice(0x7C00, bytes);
         if !data.is_empty() {
@@ -1785,7 +2037,9 @@ mod tests {
         cpu.reset_to_boot();
         let mut io = IoBus::new();
         for _ in 0..steps {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         (cpu, mem, io)
@@ -1800,34 +2054,36 @@ mod tests {
 
     #[test]
     fn or_al_al_sets_zf_when_zero() {
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x00,       // MOV AL, 0
-            0x08, 0xC0,       // OR AL, AL
-            0xF4,             // HLT
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x00, // MOV AL, 0
+                0x08, 0xC0, // OR AL, AL
+                0xF4, // HLT
+            ],
+            8,
+        );
         assert!(cpu.has(flag::ZF));
         assert!(cpu.halted);
     }
 
     #[test]
     fn out_writes_to_uart() {
-        let (_, _, mut io) = run_payload(&[
-            0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
-            0xB0, b'X',       // MOV AL, 'X'
-            0xEE,             // OUT DX, AL
-            0xF4,             // HLT
-        ], 8);
+        let (_, _, mut io) = run_payload(
+            &[
+                0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
+                0xB0, b'X', // MOV AL, 'X'
+                0xEE, // OUT DX, AL
+                0xF4, // HLT
+            ],
+            8,
+        );
         assert_eq!(io.uart_mut().drain_tx(), b"X");
     }
 
     #[test]
     fn add_r16_imm16_to_ax_sets_flags() {
         // MOV AX, 0xFFF0 ; ADD AX, 0x0020 → 0x0010 with CF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0xF0, 0xFF,
-            0x05, 0x20, 0x00,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0xB8, 0xF0, 0xFF, 0x05, 0x20, 0x00, 0xF4], 8);
         assert_eq!(cpu.regs[r16::AX], 0x0010);
         assert!(cpu.has(flag::CF));
         assert!(!cpu.has(flag::ZF));
@@ -1836,12 +2092,13 @@ mod tests {
     #[test]
     fn add_r8_to_r8_register_form() {
         // MOV AL, 5 ; MOV BL, 7 ; ADD AL, BL ; HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x05,
-            0xB3, 0x07,
-            0x00, 0xD8,         // ADD AL, BL (0x00 /r, modrm=11 011 000)
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x05, 0xB3, 0x07, 0x00, 0xD8, // ADD AL, BL (0x00 /r, modrm=11 011 000)
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.read_r8(0), 12);
         assert!(!cpu.has(flag::ZF));
         assert!(!cpu.has(flag::CF));
@@ -1850,11 +2107,13 @@ mod tests {
     #[test]
     fn sub_sets_borrow() {
         // MOV AL, 1 ; SUB AL, 2 ; expect AL=0xFF, CF=1, SF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x01,
-            0x2C, 0x02,         // SUB AL, imm8
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x01, 0x2C, 0x02, // SUB AL, imm8
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.read_r8(0), 0xFF);
         assert!(cpu.has(flag::CF));
         assert!(cpu.has(flag::SF));
@@ -1864,11 +2123,13 @@ mod tests {
     #[test]
     fn cmp_does_not_writeback_but_sets_flags() {
         // MOV AX, 7 ; CMP AX, 7 → ZF=1, AX unchanged
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x07, 0x00,
-            0x3D, 0x07, 0x00,   // CMP AX, imm16
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x07, 0x00, 0x3D, 0x07, 0x00, // CMP AX, imm16
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 7);
         assert!(cpu.has(flag::ZF));
         assert!(!cpu.has(flag::CF));
@@ -1877,11 +2138,13 @@ mod tests {
     #[test]
     fn xor_clears_register_and_sets_zf() {
         // MOV AX, 0x1234 ; XOR AX, AX
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x34, 0x12,
-            0x31, 0xC0,          // XOR AX, AX (0x31 /r, modrm=11 000 000)
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x34, 0x12, 0x31, 0xC0, // XOR AX, AX (0x31 /r, modrm=11 000 000)
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 0);
         assert!(cpu.has(flag::ZF));
         assert!(!cpu.has(flag::CF));
@@ -1890,22 +2153,26 @@ mod tests {
     #[test]
     fn inc_dec_r16_preserve_cf() {
         // MOV AX, 0xFFFF ; STC equivalent via ADD overflow ; INC AX ; should wrap to 0, ZF=1, CF preserved
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0xFF, 0xFF,
-            0x40,               // INC AX
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0xFF, 0xFF, 0x40, // INC AX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 0);
         assert!(cpu.has(flag::ZF));
         // CF was 0 going in; INC must not touch it
         assert!(!cpu.has(flag::CF));
 
         // DEC 0 → 0xFFFF, ZF=0, SF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x00, 0x00,
-            0x48,               // DEC AX
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x00, 0x00, 0x48, // DEC AX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 0xFFFF);
         assert!(!cpu.has(flag::ZF));
         assert!(cpu.has(flag::SF));
@@ -1918,14 +2185,12 @@ mod tests {
         // ModR/M for [BX]: mod=00 rm=111
         //   MOV [BX], AL : 0x88 modrm=00 000(AL) 111(BX) = 0x07
         //   MOV CL, [BX] : 0x8A modrm=00 001(CL) 111(BX) = 0x0F
-        let (cpu, mem, _) = run_payload(&[
-            0xBB, 0x00, 0x05,
-            0xB0, 0x42,
-            0x88, 0x07,
-            0xB1, 0x00,
-            0x8A, 0x0F,
-            0xF4,
-        ], 12);
+        let (cpu, mem, _) = run_payload(
+            &[
+                0xBB, 0x00, 0x05, 0xB0, 0x42, 0x88, 0x07, 0xB1, 0x00, 0x8A, 0x0F, 0xF4,
+            ],
+            12,
+        );
         assert_eq!(mem.read_u8(0x500), 0x42);
         assert_eq!(cpu.read_r8(1), 0x42);
     }
@@ -1934,10 +2199,7 @@ mod tests {
     fn mov_word_imm_to_disp16_address() {
         // MOV WORD [0x600], 0xCAFE
         // 0xC7 modrm=00 000 110 = 0x06, then disp16=0x0600, then imm16=0xCAFE
-        let (_, mem, _) = run_payload(&[
-            0xC7, 0x06, 0x00, 0x06, 0xFE, 0xCA,
-            0xF4,
-        ], 4);
+        let (_, mem, _) = run_payload(&[0xC7, 0x06, 0x00, 0x06, 0xFE, 0xCA, 0xF4], 4);
         assert_eq!(mem.read_u16(0x600), 0xCAFE);
     }
 
@@ -1946,13 +2208,13 @@ mod tests {
         // MOV WORD [0x700], 10
         // MOV BX, 0x700 ; MOV AX, 5 ; ADD [BX], AX
         //   ADD r/m16, r16 = 0x01 /r ; mod=00 reg=000(AX) rm=111(BX) = 0x07
-        let (_, mem, _) = run_payload(&[
-            0xC7, 0x06, 0x00, 0x07, 0x0A, 0x00,
-            0xBB, 0x00, 0x07,
-            0xB8, 0x05, 0x00,
-            0x01, 0x07,
-            0xF4,
-        ], 10);
+        let (_, mem, _) = run_payload(
+            &[
+                0xC7, 0x06, 0x00, 0x07, 0x0A, 0x00, 0xBB, 0x00, 0x07, 0xB8, 0x05, 0x00, 0x01, 0x07,
+                0xF4,
+            ],
+            10,
+        );
         assert_eq!(mem.read_u16(0x700), 15);
     }
 
@@ -1963,11 +2225,10 @@ mod tests {
         // address still resolves correctly when both are zero.
         // MOV BP, 0x900 ; MOV WORD [BP], 0x1357 (mod=10 rm=110 disp16=0)
         //   0xC7 modrm=10 000 110 = 0x86 ; disp16=0x0000 ; imm16=0x1357
-        let (_, mem, _) = run_payload(&[
-            0xBD, 0x00, 0x09,
-            0xC7, 0x86, 0x00, 0x00, 0x57, 0x13,
-            0xF4,
-        ], 6);
+        let (_, mem, _) = run_payload(
+            &[0xBD, 0x00, 0x09, 0xC7, 0x86, 0x00, 0x00, 0x57, 0x13, 0xF4],
+            6,
+        );
         assert_eq!(mem.read_u16(0x900), 0x1357);
     }
 
@@ -1986,18 +2247,10 @@ mod tests {
         //   JMP -12 -> loop    ; EB F4
         // done (offset 0x14):
         //   HLT                ; F4
-        let array: &[u8] = &[1,0, 2,0, 3,0, 4,0, 5,0, 0,0];
+        let array: &[u8] = &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 0, 0];
         let bytes = [
-            0xBE, 0x00, 0x08,
-            0xB9, 0x02, 0x00,
-            0x31, 0xC0,
-            0x8B, 0x1C,
-            0x09, 0xDB,
-            0x74, 0x06,
-            0x01, 0xD8,
-            0x01, 0xCE,
-            0xEB, 0xF4,
-            0xF4,
+            0xBE, 0x00, 0x08, 0xB9, 0x02, 0x00, 0x31, 0xC0, 0x8B, 0x1C, 0x09, 0xDB, 0x74, 0x06,
+            0x01, 0xD8, 0x01, 0xCE, 0xEB, 0xF4, 0xF4,
         ];
         let (cpu, _, _) = run_with_data(&bytes, 0x800, array, 200);
         assert_eq!(cpu.regs[r16::AX], 15);
@@ -2014,14 +2267,17 @@ mod tests {
         //   DEC CX
         //   JNZ lp        (rel = -5)
         //   HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB9, 0x05, 0x00,       // MOV CX, 5
-            0x31, 0xDB,             // XOR BX, BX
-            0x01, 0xCB,             // ADD BX, CX  (0x01 /r, modrm=11 001 011)
-            0x49,                   // DEC CX
-            0x75, 0xFB,             // JNZ -5
-            0xF4,                   // HLT
-        ], 50);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB9, 0x05, 0x00, // MOV CX, 5
+                0x31, 0xDB, // XOR BX, BX
+                0x01, 0xCB, // ADD BX, CX  (0x01 /r, modrm=11 001 011)
+                0x49, // DEC CX
+                0x75, 0xFB, // JNZ -5
+                0xF4, // HLT
+            ],
+            50,
+        );
         assert_eq!(cpu.regs[r16::BX], 15);
         assert_eq!(cpu.regs[r16::CX], 0);
         assert!(cpu.halted);
@@ -2030,13 +2286,14 @@ mod tests {
     #[test]
     fn push_pop_round_trip_through_other_reg() {
         // MOV AX, 0x1234 ; PUSH AX ; MOV AX, 0 ; POP BX ; HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x34, 0x12,
-            0x50,                // PUSH AX
-            0xB8, 0x00, 0x00,
-            0x5B,                // POP BX
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x34, 0x12, 0x50, // PUSH AX
+                0xB8, 0x00, 0x00, 0x5B, // POP BX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::BX], 0x1234);
         assert_eq!(cpu.regs[r16::AX], 0);
         // SP must be back to its boot value
@@ -2047,13 +2304,14 @@ mod tests {
     fn push_writes_below_sp_lifo() {
         // PUSH 0xAAAA ; PUSH 0xBBBB ; POP AX ; POP BX
         // After pushes, AX should be the most-recent (0xBBBB), BX older.
-        let (cpu, _, _) = run_payload(&[
-            0x68, 0xAA, 0xAA,
-            0x68, 0xBB, 0xBB,
-            0x58,                // POP AX
-            0x5B,                // POP BX
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0x68, 0xAA, 0xAA, 0x68, 0xBB, 0xBB, 0x58, // POP AX
+                0x5B, // POP BX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 0xBBBB);
         assert_eq!(cpu.regs[r16::BX], 0xAAAA);
     }
@@ -2061,10 +2319,7 @@ mod tests {
     #[test]
     fn push_imm8_sign_extends_to_16_bits() {
         // PUSH 0xFF (imm8) → on the stack as 0xFFFF
-        let (cpu, mem, _) = run_payload(&[
-            0x6A, 0xFF,
-            0xF4,
-        ], 4);
+        let (cpu, mem, _) = run_payload(&[0x6A, 0xFF, 0xF4], 4);
         // Stack top is at SS:SP after the push
         let top = mem.read_u16(((cpu.sregs[sreg::SS] as u32) << 4) + cpu.regs[r16::SP] as u32);
         assert_eq!(top, 0xFFFF);
@@ -2077,13 +2332,12 @@ mod tests {
         // 6: F4           HLT
         // 7: B8 07 00     MOV AX, 7
         // A: C3           RET
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x00, 0x00,
-            0xE8, 0x01, 0x00,
-            0xF4,
-            0xB8, 0x07, 0x00,
-            0xC3,
-        ], 16);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x00, 0x00, 0xE8, 0x01, 0x00, 0xF4, 0xB8, 0x07, 0x00, 0xC3,
+            ],
+            16,
+        );
         assert_eq!(cpu.regs[r16::AX], 7);
         assert!(cpu.halted);
         // SP must be back to its boot value
@@ -2101,13 +2355,12 @@ mod tests {
         // Inv: after RET 2, SP is back to its boot value because the
         // imm16 cleanup popped the argument. Plain RET would leave SP
         // 2 bytes lower.
-        let (cpu, _, _) = run_payload(&[
-            0x68, 0x99, 0x00,
-            0xE8, 0x02, 0x00,
-            0xF4,
-            0x90,
-            0xC2, 0x02, 0x00,
-        ], 16);
+        let (cpu, _, _) = run_payload(
+            &[
+                0x68, 0x99, 0x00, 0xE8, 0x02, 0x00, 0xF4, 0x90, 0xC2, 0x02, 0x00,
+            ],
+            16,
+        );
         assert!(cpu.halted);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
     }
@@ -2122,46 +2375,35 @@ mod tests {
         //   INC AX            ; ZF=0
         //   POPF              ; ZF=1 restored
         //   HLT
-        let (cpu, _, _) = run_payload(&[
-            0x31, 0xC0,
-            0x9C,
-            0x40,
-            0x9D,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0x31, 0xC0, 0x9C, 0x40, 0x9D, 0xF4], 8);
         assert!(cpu.has(flag::ZF));
     }
 
     #[test]
     fn group1_add_imm_to_r16() {
         // ADD AX, 7    via 0x83 /0 (sign-ext imm8) — ModR/M = 11 000 000 = 0xC0
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x05, 0x00,    // MOV AX, 5
-            0x83, 0xC0, 0x07,    // ADD AX, 7
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x05, 0x00, // MOV AX, 5
+                0x83, 0xC0, 0x07, // ADD AX, 7
+                0xF4,
+            ],
+            6,
+        );
         assert_eq!(cpu.regs[r16::AX], 12);
     }
 
     #[test]
     fn group1_sub_r16_imm16() {
         // SUB AX, 0x1000 via 0x81 /5 — ModR/M = 11 101 000 = 0xE8
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x34, 0x12,
-            0x81, 0xE8, 0x00, 0x10,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x34, 0x12, 0x81, 0xE8, 0x00, 0x10, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 0x0234);
     }
 
     #[test]
     fn group1_cmp_imm_does_not_writeback() {
         // CMP AL, 0x42 via 0x80 /7 — ModR/M = 11 111 000 = 0xF8
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x42,
-            0x80, 0xF8, 0x42,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x42, 0x80, 0xF8, 0x42, 0xF4], 6);
         assert_eq!(cpu.read_r8(0), 0x42);
         assert!(cpu.has(flag::ZF));
     }
@@ -2169,44 +2411,47 @@ mod tests {
     #[test]
     fn group3_neg_and_not_r16() {
         // NEG AX where AX=5 -> 0xFFFB, CF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x05, 0x00,
-            0xF7, 0xD8,           // NEG AX (F7 /3, ModR/M = 11 011 000 = 0xD8)
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x05, 0x00, 0xF7, 0xD8, // NEG AX (F7 /3, ModR/M = 11 011 000 = 0xD8)
+                0xF4,
+            ],
+            6,
+        );
         assert_eq!(cpu.regs[r16::AX], 0xFFFB);
         assert!(cpu.has(flag::CF));
 
         // NOT BX where BX=0xAAAA -> 0x5555, flags untouched
-        let (cpu, _, _) = run_payload(&[
-            0xBB, 0xAA, 0xAA,
-            0xF7, 0xD3,           // NOT BX (F7 /2, ModR/M = 11 010 011 = 0xD3)
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xBB, 0xAA, 0xAA, 0xF7, 0xD3, // NOT BX (F7 /2, ModR/M = 11 010 011 = 0xD3)
+                0xF4,
+            ],
+            6,
+        );
         assert_eq!(cpu.regs[r16::BX], 0x5555);
     }
 
     #[test]
     fn group3_test_rm_imm() {
         // TEST AL, 0x80 (F6 /0, modrm=11 000 000 = 0xC0); AL=0x80 → ZF=0, SF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x80,
-            0xF6, 0xC0, 0x80,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x80, 0xF6, 0xC0, 0x80, 0xF4], 6);
         assert!(!cpu.has(flag::ZF));
         assert!(cpu.has(flag::SF));
-        assert_eq!(cpu.read_r8(0), 0x80);   // unchanged
+        assert_eq!(cpu.read_r8(0), 0x80); // unchanged
     }
 
     #[test]
     fn group4_inc_memory_byte() {
         // INC byte [0x900] via FE /0 (modrm=00 000 110 = 0x06, then disp16)
-        let (_, mem, _) = run_payload(&[
-            0xC6, 0x06, 0x00, 0x09, 0x09,  // MOV byte [0x900], 9
-            0xFE, 0x06, 0x00, 0x09,        // INC byte [0x900]
-            0xF4,
-        ], 6);
+        let (_, mem, _) = run_payload(
+            &[
+                0xC6, 0x06, 0x00, 0x09, 0x09, // MOV byte [0x900], 9
+                0xFE, 0x06, 0x00, 0x09, // INC byte [0x900]
+                0xF4,
+            ],
+            6,
+        );
         assert_eq!(mem.read_u8(0x900), 10);
     }
 
@@ -2221,14 +2466,12 @@ mod tests {
         // 7: F4           HLT
         // 8: B3 22        MOV BL, 0x22      ; callee
         // A: C3           RET
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x08, 0x7C,
-            0xFF, 0xD0,
-            0xB3, 0x11,
-            0xF4,
-            0xB3, 0x22,
-            0xC3,
-        ], 24);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x08, 0x7C, 0xFF, 0xD0, 0xB3, 0x11, 0xF4, 0xB3, 0x22, 0xC3,
+            ],
+            24,
+        );
         // The callee ran (BL=0x22), then we returned and the next line
         // overwrote BL with 0x11. So after halt, BL == 0x11. If CALL had
         // gone elsewhere (or RET hadn't returned), this would fail.
@@ -2245,13 +2488,7 @@ mod tests {
         // 5: F4           HLT               ; skipped
         // 6: B3 77        MOV BL, 0x77
         // 8: F4           HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x06, 0x7C,
-            0xFF, 0xE0,
-            0xF4,
-            0xB3, 0x77,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x06, 0x7C, 0xFF, 0xE0, 0xF4, 0xB3, 0x77, 0xF4], 8);
         assert_eq!(cpu.read_r8(3), 0x77);
         assert!(cpu.halted);
     }
@@ -2259,12 +2496,15 @@ mod tests {
     #[test]
     fn group5_push_rm16() {
         // PUSH [0x900] via FF /6 (modrm=00 110 110 = 0x36, disp16)
-        let (cpu, mem, _) = run_payload(&[
-            0xC7, 0x06, 0x00, 0x09, 0xCD, 0xAB,  // MOV WORD [0x900], 0xABCD
-            0xFF, 0x36, 0x00, 0x09,              // PUSH [0x900]
-            0x58,                                 // POP AX
-            0xF4,
-        ], 8);
+        let (cpu, mem, _) = run_payload(
+            &[
+                0xC7, 0x06, 0x00, 0x09, 0xCD, 0xAB, // MOV WORD [0x900], 0xABCD
+                0xFF, 0x36, 0x00, 0x09, // PUSH [0x900]
+                0x58, // POP AX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 0xABCD);
         let _ = mem; // mem is consulted via the POP
     }
@@ -2273,11 +2513,7 @@ mod tests {
     fn shl_by_one_sets_cf_from_top_bit() {
         // MOV AL, 0xC0 ; SHL AL, 1 → 0x80, CF=1, OF=0 (sign unchanged)
         // SHL r/m8, 1 = 0xD0 /4. ModR/M = 11 100 000 = 0xE0
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0xC0,
-            0xD0, 0xE0,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0xC0, 0xD0, 0xE0, 0xF4], 6);
         assert_eq!(cpu.read_r8(0), 0x80);
         assert!(cpu.has(flag::CF));
         assert!(!cpu.has(flag::OF));
@@ -2287,12 +2523,7 @@ mod tests {
     fn shl_by_cl_count() {
         // MOV AX, 1 ; MOV CL, 4 ; SHL AX, CL → 0x10
         // SHL r/m16, CL = 0xD3 /4. ModR/M = 11 100 000 = 0xE0
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x01, 0x00,
-            0xB1, 0x04,
-            0xD3, 0xE0,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x01, 0x00, 0xB1, 0x04, 0xD3, 0xE0, 0xF4], 8);
         assert_eq!(cpu.regs[r16::AX], 0x10);
     }
 
@@ -2300,11 +2531,7 @@ mod tests {
     fn shr_by_one_drops_lsb_into_cf() {
         // MOV AL, 0x03 ; SHR AL, 1 → 0x01, CF=1
         // SHR r/m8, 1 = 0xD0 /5. ModR/M = 11 101 000 = 0xE8
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x03,
-            0xD0, 0xE8,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x03, 0xD0, 0xE8, 0xF4], 4);
         assert_eq!(cpu.read_r8(0), 0x01);
         assert!(cpu.has(flag::CF));
     }
@@ -2313,11 +2540,7 @@ mod tests {
     fn sar_sign_extends_negative() {
         // MOV AL, 0x80 ; SAR AL, 1 → 0xC0 (sign-extended), CF=0
         // SAR r/m8, 1 = 0xD0 /7. ModR/M = 11 111 000 = 0xF8
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x80,
-            0xD0, 0xF8,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x80, 0xD0, 0xF8, 0xF4], 4);
         assert_eq!(cpu.read_r8(0), 0xC0);
         assert!(!cpu.has(flag::CF));
         assert!(cpu.has(flag::SF));
@@ -2327,11 +2550,7 @@ mod tests {
     fn rol_by_one_wraps_msb_to_lsb() {
         // MOV AL, 0x81 ; ROL AL, 1 → 0x03, CF=1, OF=0 (no sign flip)
         // ROL r/m8, 1 = 0xD0 /0. ModR/M = 11 000 000 = 0xC0
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x81,
-            0xD0, 0xC0,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x81, 0xD0, 0xC0, 0xF4], 4);
         assert_eq!(cpu.read_r8(0), 0x03);
         assert!(cpu.has(flag::CF));
     }
@@ -2340,11 +2559,7 @@ mod tests {
     fn ror_by_imm_count() {
         // MOV AX, 0x0001 ; ROR AX, 4 → 0x1000
         // ROR r/m16, imm8 = 0xC1 /1. ModR/M = 11 001 000 = 0xC8
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x01, 0x00,
-            0xC1, 0xC8, 0x04,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x01, 0x00, 0xC1, 0xC8, 0x04, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 0x1000);
     }
 
@@ -2352,12 +2567,12 @@ mod tests {
     fn movsb_copies_one_byte_with_si_di_increment() {
         // src @ 0x800 = 0x77 ; ES already 0, SS=0
         // MOV SI, 0x800 ; MOV DI, 0x900 ; MOVSB
-        let (cpu, mem, _) = run_with_data(&[
-            0xBE, 0x00, 0x08,
-            0xBF, 0x00, 0x09,
-            0xA4,
-            0xF4,
-        ], 0x800, &[0x77], 8);
+        let (cpu, mem, _) = run_with_data(
+            &[0xBE, 0x00, 0x08, 0xBF, 0x00, 0x09, 0xA4, 0xF4],
+            0x800,
+            &[0x77],
+            8,
+        );
         assert_eq!(mem.read_u8(0x900), 0x77);
         assert_eq!(cpu.regs[r16::SI], 0x801);
         assert_eq!(cpu.regs[r16::DI], 0x901);
@@ -2372,15 +2587,18 @@ mod tests {
         //   REP MOVSB   (F3 A4)
         //   HLT
         let src = b"hello";
-        let (cpu, mem, _) = run_with_data(&[
-            0xBE, 0x00, 0x08,
-            0xBF, 0x00, 0x09,
-            0xB9, 0x05, 0x00,
-            0xF3, 0xA4,
-            0xF4,
-        ], 0x800, src, 12);
+        let (cpu, mem, _) = run_with_data(
+            &[
+                0xBE, 0x00, 0x08, 0xBF, 0x00, 0x09, 0xB9, 0x05, 0x00, 0xF3, 0xA4, 0xF4,
+            ],
+            0x800,
+            src,
+            12,
+        );
         let mut got = [0u8; 5];
-        for i in 0..5 { got[i] = mem.read_u8(0x900 + i as u32); }
+        for i in 0..5 {
+            got[i] = mem.read_u8(0x900 + i as u32);
+        }
         assert_eq!(&got, src);
         assert_eq!(cpu.regs[r16::CX], 0);
     }
@@ -2389,13 +2607,12 @@ mod tests {
     fn rep_stosb_fills_buffer() {
         // Fill 4 bytes at 0x900 with 0xAA.
         //   MOV AL, 0xAA ; MOV DI, 0x900 ; MOV CX, 4 ; REP STOSB
-        let (_, mem, _) = run_payload(&[
-            0xB0, 0xAA,
-            0xBF, 0x00, 0x09,
-            0xB9, 0x04, 0x00,
-            0xF3, 0xAA,
-            0xF4,
-        ], 10);
+        let (_, mem, _) = run_payload(
+            &[
+                0xB0, 0xAA, 0xBF, 0x00, 0x09, 0xB9, 0x04, 0x00, 0xF3, 0xAA, 0xF4,
+            ],
+            10,
+        );
         for i in 0..4 {
             assert_eq!(mem.read_u8(0x900 + i), 0xAA);
         }
@@ -2410,13 +2627,14 @@ mod tests {
         // After: DI points one past the NUL; (0xFFFF - 1) - CX = bytes
         // scanned.
         let s = b"abc\0";
-        let (cpu, _, _) = run_with_data(&[
-            0xB0, 0x00,
-            0xBF, 0x00, 0x08,
-            0xB9, 0xFF, 0xFF,
-            0xF2, 0xAE,
-            0xF4,
-        ], 0x800, s, 12);
+        let (cpu, _, _) = run_with_data(
+            &[
+                0xB0, 0x00, 0xBF, 0x00, 0x08, 0xB9, 0xFF, 0xFF, 0xF2, 0xAE, 0xF4,
+            ],
+            0x800,
+            s,
+            12,
+        );
         // Found at byte 3 ('\0'), so DI advanced 4 times.
         assert_eq!(cpu.regs[r16::DI], 0x804);
         assert!(cpu.has(flag::ZF));
@@ -2433,16 +2651,9 @@ mod tests {
         // advances 3 → 0x903, ZF=0 from the last failed compare.
         let bytes = [
             // Write "abYd" to 0x900
-            0xC6, 0x06, 0x00, 0x09, b'a',
-            0xC6, 0x06, 0x01, 0x09, b'b',
-            0xC6, 0x06, 0x02, 0x09, b'Y',
-            0xC6, 0x06, 0x03, 0x09, b'd',
-            // REPE CMPSB setup + run
-            0xBE, 0x00, 0x08,
-            0xBF, 0x00, 0x09,
-            0xB9, 0x04, 0x00,
-            0xF3, 0xA6,
-            0xF4,
+            0xC6, 0x06, 0x00, 0x09, b'a', 0xC6, 0x06, 0x01, 0x09, b'b', 0xC6, 0x06, 0x02, 0x09,
+            b'Y', 0xC6, 0x06, 0x03, 0x09, b'd', // REPE CMPSB setup + run
+            0xBE, 0x00, 0x08, 0xBF, 0x00, 0x09, 0xB9, 0x04, 0x00, 0xF3, 0xA6, 0xF4,
         ];
         let (cpu, _, _) = run_with_data(&bytes, 0x800, b"abXd", 30);
         assert_eq!(cpu.regs[r16::CX], 1);
@@ -2454,12 +2665,7 @@ mod tests {
     fn mul_r8_unsigned_low_byte_only_clears_cf() {
         // MOV AL, 6 ; MOV BL, 7 ; MUL BL → AX=42, CF=0, OF=0
         //   MUL r/m8 = 0xF6 /4, ModR/M = 11 100 011 = 0xE3 (rm=BL)
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x06,
-            0xB3, 0x07,
-            0xF6, 0xE3,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x06, 0xB3, 0x07, 0xF6, 0xE3, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 42);
         assert!(!cpu.has(flag::CF));
         assert!(!cpu.has(flag::OF));
@@ -2468,12 +2674,7 @@ mod tests {
     #[test]
     fn mul_r8_sets_cf_when_ah_nonzero() {
         // MOV AL, 200 ; MOV BL, 200 ; MUL BL → AX=40000=0x9C40, CF=1
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0xC8,
-            0xB3, 0xC8,
-            0xF6, 0xE3,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0xC8, 0xB3, 0xC8, 0xF6, 0xE3, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 40000);
         assert!(cpu.has(flag::CF));
     }
@@ -2482,12 +2683,7 @@ mod tests {
     fn imul_r8_negative_result() {
         // MOV AL, -5 (0xFB) ; MOV BL, 7 ; IMUL BL → AX = -35 (0xFFDD)
         //   IMUL r/m8 = 0xF6 /5, ModR/M = 11 101 011 = 0xEB
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0xFB,
-            0xB3, 0x07,
-            0xF6, 0xEB,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB0, 0xFB, 0xB3, 0x07, 0xF6, 0xEB, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX] as i16, -35);
         // -35 fits in i8, so CF/OF should be clear
         assert!(!cpu.has(flag::CF));
@@ -2498,27 +2694,25 @@ mod tests {
     fn div_r8_quotient_and_remainder() {
         // MOV AX, 100 ; MOV BL, 7 ; DIV BL → AL=14 quotient, AH=2 remainder
         //   DIV r/m8 = 0xF6 /6, ModR/M = 11 110 011 = 0xF3
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x64, 0x00,
-            0xB3, 0x07,
-            0xF6, 0xF3,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x64, 0x00, 0xB3, 0x07, 0xF6, 0xF3, 0xF4], 6);
         assert_eq!(cpu.read_r8(0), 14); // AL
-        assert_eq!(cpu.read_r8(4), 2);  // AH
+        assert_eq!(cpu.read_r8(4), 2); // AH
     }
 
     #[test]
     fn div_r16_dx_ax_dividend() {
         // DX:AX = 0x0001_0000 = 65536, DIV BX where BX=256 → AX=256, DX=0
         //   DIV r/m16 = 0xF7 /6, ModR/M = 11 110 011 = 0xF3
-        let (cpu, _, _) = run_payload(&[
-            0xBA, 0x01, 0x00,      // MOV DX, 1
-            0xB8, 0x00, 0x00,      // MOV AX, 0
-            0xBB, 0x00, 0x01,      // MOV BX, 256
-            0xF7, 0xF3,            // DIV BX
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xBA, 0x01, 0x00, // MOV DX, 1
+                0xB8, 0x00, 0x00, // MOV AX, 0
+                0xBB, 0x00, 0x01, // MOV BX, 256
+                0xF7, 0xF3, // DIV BX
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.regs[r16::AX], 256);
         assert_eq!(cpu.regs[r16::DX], 0);
     }
@@ -2527,11 +2721,7 @@ mod tests {
     fn div_by_zero_returns_cpu_error() {
         let mut mem = Memory::new(0x10_0000);
         // MOV AL, 5 ; MOV BL, 0 ; DIV BL  (no HLT — we expect error first)
-        mem.write_slice(0x7C00, &[
-            0xB0, 0x05,
-            0xB3, 0x00,
-            0xF6, 0xF3,
-        ]);
+        mem.write_slice(0x7C00, &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3]);
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         let mut io = IoBus::new();
@@ -2563,12 +2753,15 @@ mod tests {
         //
         //   MOV BX, 0x800 ; MOV AL, 0 ; (prefix 26) MOV AL, [BX]
         //   F4 HLT
-        let (cpu, _, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xB0, 0x00,
-            0x26, 0x8A, 0x07,   // ES: MOV AL, [BX]
-            0xF4,
-        ], 0x800, &[0x42], 8);
+        let (cpu, _, _) = run_with_data(
+            &[
+                0xBB, 0x00, 0x08, 0xB0, 0x00, 0x26, 0x8A, 0x07, // ES: MOV AL, [BX]
+                0xF4,
+            ],
+            0x800,
+            &[0x42],
+            8,
+        );
         assert_eq!(cpu.read_r8(0), 0x42);
         // seg_override must reset across the boundary
         assert!(cpu.seg_override.is_none());
@@ -2579,13 +2772,17 @@ mod tests {
         // Sequence: (26) MOV AL, [BX] ; MOV AL, [SI]
         // After the first, seg_override should reset to None so the
         // second instruction uses default segments.
-        let (cpu, _, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xBE, 0x01, 0x08,
-            0x26, 0x8A, 0x07,    // ES: MOV AL, [BX]   reads 0x800
-            0x8A, 0x04,           //     MOV AL, [SI]   reads DS:0x801
-            0xF4,
-        ], 0x800, &[0x11, 0x22], 8);
+        let (cpu, _, _) = run_with_data(
+            &[
+                0xBB, 0x00, 0x08, 0xBE, 0x01, 0x08, 0x26, 0x8A,
+                0x07, // ES: MOV AL, [BX]   reads 0x800
+                0x8A, 0x04, //     MOV AL, [SI]   reads DS:0x801
+                0xF4,
+            ],
+            0x800,
+            &[0x11, 0x22],
+            8,
+        );
         // Last read came from DS:0x801 = 0x22
         assert_eq!(cpu.read_r8(0), 0x22);
         assert!(cpu.seg_override.is_none());
@@ -2597,12 +2794,7 @@ mod tests {
         //   MOV sreg, r/m16 = 0x8E /0 (ES). ModR/M = 11 000 000 = 0xC0
         // Then read it back: MOV BX, ES (MOV r/m16, sreg = 0x8C /0)
         //   ModR/M = 11 000 011 = 0xC3
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x34, 0x12,
-            0x8E, 0xC0,
-            0x8C, 0xC3,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x34, 0x12, 0x8E, 0xC0, 0x8C, 0xC3, 0xF4], 6);
         assert_eq!(cpu.sregs[sreg::ES], 0x1234);
         assert_eq!(cpu.regs[r16::BX], 0x1234);
     }
@@ -2612,12 +2804,10 @@ mod tests {
         // MOV BX, 0x100 ; MOV SI, 5 ; LEA AX, [BX+SI+10]
         //   LEA r16, m = 0x8D /r. ModR/M for [BX+SI+disp8]:
         //   mod=01 reg=000(AX) rm=000([BX+SI]) → 01 000 000 = 0x40, disp8=0x0A
-        let (cpu, _, _) = run_payload(&[
-            0xBB, 0x00, 0x01,
-            0xBE, 0x05, 0x00,
-            0x8D, 0x40, 0x0A,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[0xBB, 0x00, 0x01, 0xBE, 0x05, 0x00, 0x8D, 0x40, 0x0A, 0xF4],
+            8,
+        );
         // 0x100 + 5 + 10 = 0x10F
         assert_eq!(cpu.regs[r16::AX], 0x10F);
     }
@@ -2643,12 +2833,7 @@ mod tests {
         // MOV AX, 1 ; MOV BX, 2 ; XCHG AX, BX
         //   XCHG r/m16, r16 = 0x87 /r. ModR/M = 11 000 011 = 0xC3
         //   (reg=AX, rm=BX) — either direction is equivalent for XCHG.
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x01, 0x00,
-            0xBB, 0x02, 0x00,
-            0x87, 0xC3,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x01, 0x00, 0xBB, 0x02, 0x00, 0x87, 0xC3, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 2);
         assert_eq!(cpu.regs[r16::BX], 1);
     }
@@ -2656,12 +2841,7 @@ mod tests {
     #[test]
     fn xchg_ax_r16_short_form() {
         // MOV AX, 0xAAAA ; MOV CX, 0xCCCC ; XCHG AX, CX  (0x91)
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0xAA, 0xAA,
-            0xB9, 0xCC, 0xCC,
-            0x91,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xB8, 0xAA, 0xAA, 0xB9, 0xCC, 0xCC, 0x91, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX], 0xCCCC);
         assert_eq!(cpu.regs[r16::CX], 0xAAAA);
     }
@@ -2670,12 +2850,12 @@ mod tests {
     fn xchg_rm8_with_memory_operand() {
         // Memory at 0x800 = 0xAA; AL = 0xBB; XCHG [BX], AL → mem becomes 0xBB, AL becomes 0xAA
         //   XCHG r/m8, r8 = 0x86 /r. ModR/M = 00 000 111 = 0x07  (reg=AL, rm=[BX])
-        let (cpu, mem, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xB0, 0xBB,
-            0x86, 0x07,
-            0xF4,
-        ], 0x800, &[0xAA], 6);
+        let (cpu, mem, _) = run_with_data(
+            &[0xBB, 0x00, 0x08, 0xB0, 0xBB, 0x86, 0x07, 0xF4],
+            0x800,
+            &[0xAA],
+            6,
+        );
         assert_eq!(cpu.read_r8(0), 0xAA);
         assert_eq!(mem.read_u8(0x800), 0xBB);
     }
@@ -2686,11 +2866,7 @@ mod tests {
         // LES BX, [SI]  — SI=0x800
         //   LES r16, m = 0xC4 /r. ModR/M = 00 011 100 = 0x1C
         let far_ptr = &[0x34, 0x12, 0x78, 0x56];
-        let (cpu, _, _) = run_with_data(&[
-            0xBE, 0x00, 0x08,
-            0xC4, 0x1C,
-            0xF4,
-        ], 0x800, far_ptr, 6);
+        let (cpu, _, _) = run_with_data(&[0xBE, 0x00, 0x08, 0xC4, 0x1C, 0xF4], 0x800, far_ptr, 6);
         assert_eq!(cpu.regs[r16::BX], 0x1234);
         assert_eq!(cpu.sregs[sreg::ES], 0x5678);
     }
@@ -2698,11 +2874,15 @@ mod tests {
     #[test]
     fn lds_loads_far_pointer_into_reg_and_ds() {
         let far_ptr = &[0xCD, 0xAB, 0x21, 0x43];
-        let (cpu, _, _) = run_with_data(&[
-            0xBE, 0x00, 0x08,
-            0xC5, 0x1C,      // LDS BX, [SI]
-            0xF4,
-        ], 0x800, far_ptr, 6);
+        let (cpu, _, _) = run_with_data(
+            &[
+                0xBE, 0x00, 0x08, 0xC5, 0x1C, // LDS BX, [SI]
+                0xF4,
+            ],
+            0x800,
+            far_ptr,
+            6,
+        );
         assert_eq!(cpu.regs[r16::BX], 0xABCD);
         assert_eq!(cpu.sregs[sreg::DS], 0x4321);
     }
@@ -2710,33 +2890,21 @@ mod tests {
     #[test]
     fn cbw_sign_extends_negative_al() {
         // MOV AL, 0x80 ; CBW → AX=0xFF80
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x80,
-            0x98,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x80, 0x98, 0xF4], 4);
         assert_eq!(cpu.regs[r16::AX], 0xFF80);
     }
 
     #[test]
     fn cbw_preserves_positive_al() {
         // MOV AL, 0x42 ; CBW → AX=0x0042
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x42,
-            0x98,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB0, 0x42, 0x98, 0xF4], 4);
         assert_eq!(cpu.regs[r16::AX], 0x0042);
     }
 
     #[test]
     fn cwd_sign_extends_negative_ax_into_dx() {
         // MOV AX, 0x8000 ; CWD → DX=0xFFFF, AX unchanged
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x00, 0x80,
-            0x99,
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(&[0xB8, 0x00, 0x80, 0x99, 0xF4], 4);
         assert_eq!(cpu.regs[r16::AX], 0x8000);
         assert_eq!(cpu.regs[r16::DX], 0xFFFF);
     }
@@ -2761,16 +2929,19 @@ mod tests {
         //   MOV AH, BL         ; restore raw byte
         //   SAHF               → flags reloaded
         //   HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0xFF,
-            0x04, 0x01,       // ADD AL, 1
-            0x9F,              // LAHF
-            0x88, 0xE3,        // MOV BL, AH (8A or 88? 88 stores reg→r/m, reg=AH(4), rm=BL(3) → 11 100 011 = 0xE3)
-            0xB4, 0x00,        // MOV AH, 0
-            0x88, 0xDC,        // MOV AH, BL (reg=BL(3), rm=AH(4) → 11 011 100 = 0xDC)
-            0x9E,              // SAHF
-            0xF4,
-        ], 10);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0xFF, 0x04, 0x01, // ADD AL, 1
+                0x9F, // LAHF
+                0x88,
+                0xE3, // MOV BL, AH (8A or 88? 88 stores reg→r/m, reg=AH(4), rm=BL(3) → 11 100 011 = 0xE3)
+                0xB4, 0x00, // MOV AH, 0
+                0x88, 0xDC, // MOV AH, BL (reg=BL(3), rm=AH(4) → 11 011 100 = 0xDC)
+                0x9E, // SAHF
+                0xF4,
+            ],
+            10,
+        );
         assert!(cpu.has(flag::CF));
         assert!(cpu.has(flag::ZF));
         assert!(cpu.has(flag::PF));
@@ -2783,22 +2954,16 @@ mod tests {
         // Program prints a marker, calls INT 0x30, then a second
         // marker after IRET. The handler tweaks AL and IRETs.
         let mut mem = Memory::new(0x10_0000);
-        mem.write_u16(0xC0, 0x7C10);  // offset of handler
-        mem.write_u16(0xC2, 0x0000);  // segment
+        mem.write_u16(0xC0, 0x7C10); // offset of handler
+        mem.write_u16(0xC2, 0x0000); // segment
         let program = &[
             // 0x00: MOV AX, 0xBEEF
-            0xB8, 0xEF, 0xBE,
-            // 0x03: INT 0x30
-            0xCD, 0x30,
-            // 0x05: MOV BL, 0x22   (runs after IRET)
-            0xB3, 0x22,
-            // 0x07: HLT
-            0xF4,
-            // 0x08..0x0F: padding so handler lands at 0x7C10
-            0, 0, 0, 0, 0, 0, 0, 0,
-            // 0x10: MOV AL, 0x42
-            0xB0, 0x42,
-            // 0x12: IRET
+            0xB8, 0xEF, 0xBE, // 0x03: INT 0x30
+            0xCD, 0x30, // 0x05: MOV BL, 0x22   (runs after IRET)
+            0xB3, 0x22, // 0x07: HLT
+            0xF4, // 0x08..0x0F: padding so handler lands at 0x7C10
+            0, 0, 0, 0, 0, 0, 0, 0, // 0x10: MOV AL, 0x42
+            0xB0, 0x42, // 0x12: IRET
             0xCF,
         ];
         mem.write_slice(0x7C00, program);
@@ -2806,7 +2971,9 @@ mod tests {
         cpu.reset_to_boot();
         let mut io = IoBus::new();
         for _ in 0..50 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         // AH untouched by handler (was 0xBE from initial MOV); AL set
@@ -2839,20 +3006,22 @@ mod tests {
         mem.write_u16(0x40 * 4, 0x7C10);
         mem.write_u16(0x40 * 4 + 2, 0);
         let program = &[
-            0xFB,              // STI
-            0xCD, 0x40,        // INT 0x40
-            0xF4,              // HLT
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
-            0x9C,              // PUSHF
-            0x5B,              // POP BX
-            0xCF,              // IRET
+            0xFB, // STI
+            0xCD, 0x40, // INT 0x40
+            0xF4, // HLT
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // pad to 0x10
+            0x9C, // PUSHF
+            0x5B, // POP BX
+            0xCF, // IRET
         ];
         mem.write_slice(0x7C00, program);
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         let mut io = IoBus::new();
         for _ in 0..50 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         // BX captured the FLAGS the handler saw. IF bit must be 0.
@@ -2866,13 +3035,14 @@ mod tests {
         // Case A: OF=0 → INTO is a no-op.
         // We provoke an arithmetic op that *clears* OF (e.g. ADD 1+1)
         // and check that INTO doesn't transfer.
-        let (cpu, _, _) = run_payload(&[
-            0xB0, 0x01,
-            0x04, 0x01,       // ADD AL, 1 → OF=0
-            0xCE,              // INTO
-            0xB3, 0x77,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB0, 0x01, 0x04, 0x01, // ADD AL, 1 → OF=0
+                0xCE, // INTO
+                0xB3, 0x77, 0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.read_r8(3), 0x77);
         assert!(!cpu.has(flag::OF));
 
@@ -2881,38 +3051,41 @@ mod tests {
         mem.write_u16(4 * 4, 0x7C10);
         mem.write_u16(4 * 4 + 2, 0);
         let program = &[
-            0xB0, 0x7F,
-            0x04, 0x01,       // ADD AL, 1 → 0x80, OF=1
-            0xCE,              // INTO → should fire
-            0xB3, 0x11,        // runs after IRET
-            0xF4,
-            0, 0, 0, 0, 0, 0, 0, 0,    // pad to 0x10
+            0xB0, 0x7F, 0x04, 0x01, // ADD AL, 1 → 0x80, OF=1
+            0xCE, // INTO → should fire
+            0xB3, 0x11, // runs after IRET
+            0xF4, 0, 0, 0, 0, 0, 0, 0, 0, // pad to 0x10
             // 0x10: handler
-            0xB7, 0x99,        // MOV BH, 0x99
-            0xCF,              // IRET
+            0xB7, 0x99, // MOV BH, 0x99
+            0xCF, // IRET
         ];
         mem.write_slice(0x7C00, program);
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         let mut io = IoBus::new();
         for _ in 0..50 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
-        assert_eq!(cpu.read_r8(7), 0x99);  // BH set by handler
-        assert_eq!(cpu.read_r8(3), 0x11);  // BL set after IRET
+        assert_eq!(cpu.read_r8(7), 0x99); // BH set by handler
+        assert_eq!(cpu.read_r8(3), 0x11); // BL set after IRET
     }
 
     #[test]
     fn push_ds_pop_es_copies_segment_through_stack() {
         // Set DS via AX, then PUSH DS / POP ES, verify ES picked it up.
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0x34, 0x12,      // MOV AX, 0x1234
-            0x8E, 0xD8,            // MOV DS, AX (8E /3 = DS, modrm=11 011 000)
-            0x1E,                  // PUSH DS
-            0x07,                  // POP ES
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB8, 0x34, 0x12, // MOV AX, 0x1234
+                0x8E, 0xD8, // MOV DS, AX (8E /3 = DS, modrm=11 011 000)
+                0x1E, // PUSH DS
+                0x07, // POP ES
+                0xF4,
+            ],
+            8,
+        );
         assert_eq!(cpu.sregs[sreg::DS], 0x1234);
         assert_eq!(cpu.sregs[sreg::ES], 0x1234);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
@@ -2926,16 +3099,14 @@ mod tests {
         // 8: 90               NOP (padding)
         // 9: B7 88            MOV BH, 0x88           ; callee
         // B: CB               RETF
-        let (cpu, _, _) = run_payload(&[
-            0x9A, 0x09, 0x7C, 0x00, 0x00,
-            0xB3, 0x22,
-            0xF4,
-            0x90,
-            0xB7, 0x88,
-            0xCB,
-        ], 16);
-        assert_eq!(cpu.read_r8(7), 0x88);  // BH set by callee
-        assert_eq!(cpu.read_r8(3), 0x22);  // BL set after RETF
+        let (cpu, _, _) = run_payload(
+            &[
+                0x9A, 0x09, 0x7C, 0x00, 0x00, 0xB3, 0x22, 0xF4, 0x90, 0xB7, 0x88, 0xCB,
+            ],
+            16,
+        );
+        assert_eq!(cpu.read_r8(7), 0x88); // BH set by callee
+        assert_eq!(cpu.read_r8(3), 0x22); // BL set after RETF
         assert!(cpu.halted);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
     }
@@ -2946,12 +3117,7 @@ mod tests {
         // 5: F4               HLT (skipped)
         // 6: B3 77            MOV BL, 0x77
         // 8: F4               HLT
-        let (cpu, _, _) = run_payload(&[
-            0xEA, 0x06, 0x7C, 0x00, 0x00,
-            0xF4,
-            0xB3, 0x77,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0xEA, 0x06, 0x7C, 0x00, 0x00, 0xF4, 0xB3, 0x77, 0xF4], 8);
         assert_eq!(cpu.read_r8(3), 0x77);
         assert!(cpu.halted);
         // No PUSH happened — SP unchanged
@@ -2969,13 +3135,13 @@ mod tests {
         // 9: 90 90 90          NOP padding
         // C: C2 not — we want RETF, so:
         // C: CA 02 00          RETF 2
-        let (cpu, _, _) = run_payload(&[
-            0x68, 0x99, 0x00,
-            0x9A, 0x0C, 0x7C, 0x00, 0x00,
-            0xF4,
-            0x90, 0x90, 0x90,
-            0xCA, 0x02, 0x00,
-        ], 16);
+        let (cpu, _, _) = run_payload(
+            &[
+                0x68, 0x99, 0x00, 0x9A, 0x0C, 0x7C, 0x00, 0x00, 0xF4, 0x90, 0x90, 0x90, 0xCA, 0x02,
+                0x00,
+            ],
+            16,
+        );
         assert!(cpu.halted);
         // Argument popped by RETF 2 — SP back to boot value.
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
@@ -2992,15 +3158,14 @@ mod tests {
         // A: B7 55             MOV BH, 0x55
         // C: CB                RETF
         let far_ptr = &[0x0A, 0x7C, 0x00, 0x00];
-        let (cpu, _, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xFF, 0x1F,
-            0xB3, 0x11,
-            0xF4,
-            0x90, 0x90,
-            0xB7, 0x55,
-            0xCB,
-        ], 0x800, far_ptr, 16);
+        let (cpu, _, _) = run_with_data(
+            &[
+                0xBB, 0x00, 0x08, 0xFF, 0x1F, 0xB3, 0x11, 0xF4, 0x90, 0x90, 0xB7, 0x55, 0xCB,
+            ],
+            0x800,
+            far_ptr,
+            16,
+        );
         assert_eq!(cpu.read_r8(7), 0x55);
         assert_eq!(cpu.read_r8(3), 0x11);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
@@ -3015,13 +3180,12 @@ mod tests {
         // 6: B3 99             MOV BL, 0x99
         // 8: F4                HLT
         let far_ptr = &[0x06, 0x7C, 0x00, 0x00];
-        let (cpu, _, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xFF, 0x2F,
-            0xF4,
-            0xB3, 0x99,
-            0xF4,
-        ], 0x800, far_ptr, 8);
+        let (cpu, _, _) = run_with_data(
+            &[0xBB, 0x00, 0x08, 0xFF, 0x2F, 0xF4, 0xB3, 0x99, 0xF4],
+            0x800,
+            far_ptr,
+            8,
+        );
         assert_eq!(cpu.read_r8(3), 0x99);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
     }
@@ -3042,13 +3206,10 @@ mod tests {
         //   F4             HLT
         // After-instr IP of LOOP is at offset 9. Target back to ADD at
         // offset 5. Delta = 5 - 9 = -4 = 0xFC.
-        let (cpu, _, _) = run_payload(&[
-            0xB9, 0x05, 0x00,
-            0x31, 0xDB,
-            0x01, 0xCB,
-            0xE2, 0xFC,
-            0xF4,
-        ], 100);
+        let (cpu, _, _) = run_payload(
+            &[0xB9, 0x05, 0x00, 0x31, 0xDB, 0x01, 0xCB, 0xE2, 0xFC, 0xF4],
+            100,
+        );
         assert_eq!(cpu.regs[r16::BX], 15);
         assert_eq!(cpu.regs[r16::CX], 0);
         assert!(cpu.halted);
@@ -3064,13 +3225,14 @@ mod tests {
         //   LOOPE lp      ; jumps while ZF=1 and CX != 0
         // After 4 iterations CX=1 and the 5th decrement brings CX to 0
         // — LOOPE stops on CX=0 even though ZF is still 1.
-        let (cpu, _, _) = run_payload(&[
-            0xB9, 0x05, 0x00,
-            0xB0, 0x07,
-            0x3C, 0x07,      // CMP AL, 7
-            0xE1, 0xFC,      // LOOPE -4
-            0xF4,
-        ], 50);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB9, 0x05, 0x00, 0xB0, 0x07, 0x3C, 0x07, // CMP AL, 7
+                0xE1, 0xFC, // LOOPE -4
+                0xF4,
+            ],
+            50,
+        );
         assert_eq!(cpu.regs[r16::CX], 0);
         assert!(cpu.halted);
     }
@@ -3083,13 +3245,13 @@ mod tests {
         // lp: CMP AL, 7   ; ZF=1 on first iter (we want LOOPNE to exit)
         //   LOOPNE lp     ; keeps going while ZF=0 (and CX != 0)
         // Since ZF=1 right away, LOOPNE decrements CX to 4 then exits.
-        let (cpu, _, _) = run_payload(&[
-            0xB9, 0x05, 0x00,
-            0xB0, 0x07,
-            0x3C, 0x07,
-            0xE0, 0xFC,      // LOOPNE -4
-            0xF4,
-        ], 20);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xB9, 0x05, 0x00, 0xB0, 0x07, 0x3C, 0x07, 0xE0, 0xFC, // LOOPNE -4
+                0xF4,
+            ],
+            20,
+        );
         assert_eq!(cpu.regs[r16::CX], 4);
         assert!(cpu.halted);
     }
@@ -3104,13 +3266,16 @@ mod tests {
         // over:
         //   MOV AX, 0x5678
         //   HLT
-        let (cpu, _, _) = run_payload(&[
-            0x31, 0xC9,        // XOR CX, CX (modrm 11 001 001 = 0xC9)
-            0xE3, 0x03,        // JCXZ +3
-            0xBB, 0x34, 0x12,  // MOV BX, 0x1234 (skipped)
-            0xB8, 0x78, 0x56,  // MOV AX, 0x5678
-            0xF4,
-        ], 10);
+        let (cpu, _, _) = run_payload(
+            &[
+                0x31, 0xC9, // XOR CX, CX (modrm 11 001 001 = 0xC9)
+                0xE3, 0x03, // JCXZ +3
+                0xBB, 0x34, 0x12, // MOV BX, 0x1234 (skipped)
+                0xB8, 0x78, 0x56, // MOV AX, 0x5678
+                0xF4,
+            ],
+            10,
+        );
         assert_eq!(cpu.regs[r16::AX], 0x5678);
         assert_eq!(cpu.regs[r16::BX], 0);
         assert_eq!(cpu.regs[r16::CX], 0);
@@ -3121,12 +3286,15 @@ mod tests {
         // OUT 0x3F8 (THR), AX writes the low byte to 0x3F8 (UART tx)
         // and the high byte to 0x3F9 (IER on the UART — accepted and
         // dropped by our model). Verify the UART captured the low byte.
-        let (_, _, mut io) = run_payload(&[
-            0xB8, b'Y' as u8, b'Z' as u8,  // MOV AX, "ZY" → AL='Y', AH='Z'
-            0xBA, 0xF8, 0x03,              // MOV DX, 0x3F8
-            0xEF,                           // OUT DX, AX
-            0xF4,
-        ], 6);
+        let (_, _, mut io) = run_payload(
+            &[
+                0xB8, b'Y' as u8, b'Z' as u8, // MOV AX, "ZY" → AL='Y', AH='Z'
+                0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
+                0xEF, // OUT DX, AX
+                0xF4,
+            ],
+            6,
+        );
         // UART tx should have received the low byte 'Y'.
         assert_eq!(io.uart_mut().drain_tx(), b"Y");
     }
@@ -3139,19 +3307,24 @@ mod tests {
         let mut io = IoBus::new();
         io.uart_mut().push_rx(b"X");
         let mut mem = Memory::new(0x10_0000);
-        mem.write_slice(0x7C00, &[
-            0xBA, 0xF8, 0x03,    // MOV DX, 0x3F8
-            0xED,                 // IN AX, DX
-            0xF4,
-        ]);
+        mem.write_slice(
+            0x7C00,
+            &[
+                0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
+                0xED, // IN AX, DX
+                0xF4,
+            ],
+        );
         let mut cpu = Cpu::new();
         cpu.reset_to_boot();
         for _ in 0..6 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
-        assert_eq!(cpu.read_r8(0), b'X');  // AL
-        assert_eq!(cpu.read_r8(4), 0);     // AH (IER reads zero)
+        assert_eq!(cpu.read_r8(0), b'X'); // AL
+        assert_eq!(cpu.read_r8(4), 0); // AH (IER reads zero)
     }
 
     #[test]
@@ -3162,38 +3335,43 @@ mod tests {
         //   XLAT
         //   HLT
         let table = b"abcdef";
-        let (cpu, _, _) = run_with_data(&[
-            0xBB, 0x00, 0x08,
-            0xB0, 0x02,
-            0xD7,
-            0xF4,
-        ], 0x800, table, 6);
+        let (cpu, _, _) =
+            run_with_data(&[0xBB, 0x00, 0x08, 0xB0, 0x02, 0xD7, 0xF4], 0x800, table, 6);
         assert_eq!(cpu.read_r8(0), b'c');
     }
 
     #[test]
     fn clc_stc_cmc_drive_carry_flag() {
         // STC ; CMC ; (CF=0) ; STC ; (CF=1) ; CLC ; (CF=0) ; HLT
-        let (cpu, _, _) = run_payload(&[
-            0xF9,     // STC
-            0xF5,     // CMC
-            0xF9,     // STC
-            0xF5,     // CMC again → CF=0
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xF5, // CMC
+                0xF9, // STC
+                0xF5, // CMC again → CF=0
+                0xF4,
+            ],
+            6,
+        );
         assert!(!cpu.has(flag::CF));
 
-        let (cpu, _, _) = run_payload(&[
-            0xF9,     // STC
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xF4,
+            ],
+            4,
+        );
         assert!(cpu.has(flag::CF));
 
-        let (cpu, _, _) = run_payload(&[
-            0xF9,     // STC
-            0xF8,     // CLC
-            0xF4,
-        ], 4);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF9, // STC
+                0xF8, // CLC
+                0xF4,
+            ],
+            4,
+        );
         assert!(!cpu.has(flag::CF));
     }
 
@@ -3203,13 +3381,16 @@ mod tests {
         // Per our model the LOCK byte counts as one no-op step; the
         // next step() executes the MOV.
         // WAIT (0x9B) is treated the same way.
-        let (cpu, _, _) = run_payload(&[
-            0xF0,                         // LOCK
-            0xB8, 0xEF, 0xBE,             // MOV AX, 0xBEEF
-            0x9B,                         // WAIT
-            0xBB, 0x42, 0x42,             // MOV BX, 0x4242
-            0xF4,
-        ], 10);
+        let (cpu, _, _) = run_payload(
+            &[
+                0xF0, // LOCK
+                0xB8, 0xEF, 0xBE, // MOV AX, 0xBEEF
+                0x9B, // WAIT
+                0xBB, 0x42, 0x42, // MOV BX, 0x4242
+                0xF4,
+            ],
+            10,
+        );
         assert_eq!(cpu.regs[r16::AX], 0xBEEF);
         assert_eq!(cpu.regs[r16::BX], 0x4242);
     }
@@ -3222,27 +3403,30 @@ mod tests {
         // that side too: SP returns to the value it had right after the
         // clobber's PUSHA (because POPA restores it implicitly via its
         // own pop count).
-        let (cpu, _, _) = run_payload(&[
-            // Distinct register seeds
-            0xB8, 0x01, 0x00,     // MOV AX, 1
-            0xB9, 0x02, 0x00,     // MOV CX, 2
-            0xBA, 0x03, 0x00,     // MOV DX, 3
-            0xBB, 0x04, 0x00,     // MOV BX, 4
-            0xBD, 0x05, 0x00,     // MOV BP, 5
-            0xBE, 0x06, 0x00,     // MOV SI, 6
-            0xBF, 0x07, 0x00,     // MOV DI, 7
-            0x60,                  // PUSHA
-            // Clobber everything
-            0x31, 0xC0,           // XOR AX, AX
-            0x31, 0xC9,           // XOR CX, CX
-            0x31, 0xD2,           // XOR DX, DX
-            0x31, 0xDB,           // XOR BX, BX
-            0x31, 0xED,           // XOR BP, BP
-            0x31, 0xF6,           // XOR SI, SI
-            0x31, 0xFF,           // XOR DI, DI
-            0x61,                  // POPA
-            0xF4,                  // HLT
-        ], 50);
+        let (cpu, _, _) = run_payload(
+            &[
+                // Distinct register seeds
+                0xB8, 0x01, 0x00, // MOV AX, 1
+                0xB9, 0x02, 0x00, // MOV CX, 2
+                0xBA, 0x03, 0x00, // MOV DX, 3
+                0xBB, 0x04, 0x00, // MOV BX, 4
+                0xBD, 0x05, 0x00, // MOV BP, 5
+                0xBE, 0x06, 0x00, // MOV SI, 6
+                0xBF, 0x07, 0x00, // MOV DI, 7
+                0x60, // PUSHA
+                // Clobber everything
+                0x31, 0xC0, // XOR AX, AX
+                0x31, 0xC9, // XOR CX, CX
+                0x31, 0xD2, // XOR DX, DX
+                0x31, 0xDB, // XOR BX, BX
+                0x31, 0xED, // XOR BP, BP
+                0x31, 0xF6, // XOR SI, SI
+                0x31, 0xFF, // XOR DI, DI
+                0x61, // POPA
+                0xF4, // HLT
+            ],
+            50,
+        );
         assert_eq!(cpu.regs[r16::AX], 1);
         assert_eq!(cpu.regs[r16::CX], 2);
         assert_eq!(cpu.regs[r16::DX], 3);
@@ -3258,11 +3442,7 @@ mod tests {
     fn imul_three_operand_imm16() {
         // MOV BX, 3 ; IMUL AX, BX, 7  → AX = 21
         //   IMUL r16, r/m16, imm16 = 0x69 /r ; modrm 11 000(AX) 011(BX) = 0xC3
-        let (cpu, _, _) = run_payload(&[
-            0xBB, 0x03, 0x00,
-            0x69, 0xC3, 0x07, 0x00,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xBB, 0x03, 0x00, 0x69, 0xC3, 0x07, 0x00, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX] as i16, 21);
         // 21 fits in i16, no overflow
         assert!(!cpu.has(flag::CF));
@@ -3274,11 +3454,7 @@ mod tests {
         // MOV BX, 1000 ; IMUL AX, BX, -10 → AX = -10000
         //   IMUL r16, r/m16, imm8 = 0x6B /r ; modrm 11 000 011 = 0xC3
         //   imm8 = -10 = 0xF6
-        let (cpu, _, _) = run_payload(&[
-            0xBB, 0xE8, 0x03,
-            0x6B, 0xC3, 0xF6,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xBB, 0xE8, 0x03, 0x6B, 0xC3, 0xF6, 0xF4], 6);
         assert_eq!(cpu.regs[r16::AX] as i16, -10000);
         assert!(!cpu.has(flag::CF));
     }
@@ -3287,11 +3463,7 @@ mod tests {
     fn imul_three_operand_sets_overflow_when_result_truncates() {
         // 1000 * 1000 = 1_000_000, won't fit in i16 (max 32767).
         //   MOV BX, 1000 ; IMUL AX, BX, 1000 → CF=OF=1
-        let (cpu, _, _) = run_payload(&[
-            0xBB, 0xE8, 0x03,
-            0x69, 0xC3, 0xE8, 0x03,
-            0xF4,
-        ], 6);
+        let (cpu, _, _) = run_payload(&[0xBB, 0xE8, 0x03, 0x69, 0xC3, 0xE8, 0x03, 0xF4], 6);
         assert!(cpu.has(flag::CF));
         assert!(cpu.has(flag::OF));
     }
@@ -3305,12 +3477,7 @@ mod tests {
         // 3: C8 08 00 00  ENTER 8, 0
         // 7: C9           LEAVE
         // 8: F4           HLT
-        let (cpu, _, _) = run_payload(&[
-            0xB8, 0xEF, 0xBE,
-            0xC8, 0x08, 0x00, 0x00,
-            0xC9,
-            0xF4,
-        ], 8);
+        let (cpu, _, _) = run_payload(&[0xB8, 0xEF, 0xBE, 0xC8, 0x08, 0x00, 0x00, 0xC9, 0xF4], 8);
         assert_eq!(cpu.regs[r16::BP], 0);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
     }
@@ -3340,16 +3507,14 @@ mod tests {
         mem.write_u16(0x08 * 4, 0x7C10);
         mem.write_u16(0x08 * 4 + 2, 0);
         let program = &[
-            0xFB,                // STI                       offset 0
-            0x90, 0x90, 0x90,    // NOPs we never reach pre-handler
-            0xF4,                // HLT
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
+            0xFB, // STI                       offset 0
+            0x90, 0x90, 0x90, // NOPs we never reach pre-handler
+            0xF4, // HLT
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // pad to 0x10
             // 0x10: handler
-            0xB3, 0xAB,          // MOV BL, 0xAB
+            0xB3, 0xAB, // MOV BL, 0xAB
             // EOI to master PIC: OUT 0x20, AL where AL=0x20
-            0xB0, 0x20,
-            0xE6, 0x20,
-            0xCF,                // IRET
+            0xB0, 0x20, 0xE6, 0x20, 0xCF, // IRET
         ];
         mem.write_slice(0x7C00, program);
         let mut cpu = Cpu::new();
@@ -3360,7 +3525,9 @@ mod tests {
         io.pic_mut().raise_irq(0);
 
         for _ in 0..40 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         assert_eq!(cpu.read_r8(3), 0xAB);
@@ -3380,14 +3547,12 @@ mod tests {
         mem.write_u16(0x08 * 4, 0x7C10);
         mem.write_u16(0x08 * 4 + 2, 0);
         let program = &[
-            0x90, 0x90, 0x90,    // 3 NOPs while IF=0
-            0xFB,                // STI                  offset 3
-            0x90, 0x90,          // these *might* be replaced by IRQ
-            0xF4,
-            0, 0, 0, 0, 0, 0, 0, 0, 0,  // pad to 0x10
-            0xB3, 0xCD,          // MOV BL, 0xCD          handler
-            0xB0, 0x20, 0xE6, 0x20,
-            0xCF,
+            0x90, 0x90, 0x90, // 3 NOPs while IF=0
+            0xFB, // STI                  offset 3
+            0x90, 0x90, // these *might* be replaced by IRQ
+            0xF4, 0, 0, 0, 0, 0, 0, 0, 0, 0, // pad to 0x10
+            0xB3, 0xCD, // MOV BL, 0xCD          handler
+            0xB0, 0x20, 0xE6, 0x20, 0xCF,
         ];
         mem.write_slice(0x7C00, program);
         let mut cpu = Cpu::new();
@@ -3403,7 +3568,9 @@ mod tests {
         assert_ne!(cpu.read_r8(3), 0xCD);
         // STI then run to completion.
         for _ in 0..40 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         assert_eq!(cpu.read_r8(3), 0xCD);
@@ -3416,17 +3583,11 @@ mod tests {
         mem.write_u16(0x08 * 4, 0x7C10);
         mem.write_u16(0x08 * 4 + 2, 0);
         let program = &[
-            0xFB,                // STI
-            0x90, 0x90, 0x90, 0x90,
-            // Unmask IRQ 0 via OUT 0x21, 0xFE
-            0xB0, 0xFE,
-            0xE6, 0x21,
-            0x90, 0x90, 0x90,
-            0xF4,
-            0, 0, 0,            // pad to 0x10
-            0xB3, 0x11,          // handler: MOV BL, 0x11
-            0xB0, 0x20, 0xE6, 0x20,
-            0xCF,
+            0xFB, // STI
+            0x90, 0x90, 0x90, 0x90, // Unmask IRQ 0 via OUT 0x21, 0xFE
+            0xB0, 0xFE, 0xE6, 0x21, 0x90, 0x90, 0x90, 0xF4, 0, 0, 0, // pad to 0x10
+            0xB3, 0x11, // handler: MOV BL, 0x11
+            0xB0, 0x20, 0xE6, 0x20, 0xCF,
         ];
         mem.write_slice(0x7C00, program);
         let mut cpu = Cpu::new();
@@ -3438,7 +3599,9 @@ mod tests {
         // Run a few steps. Until OUT 0x21, 0xFE runs the handler stays
         // blocked. After it, IRQ should be delivered.
         for _ in 0..50 {
-            if cpu.halted { break; }
+            if cpu.halted {
+                break;
+            }
             cpu.step(&mut mem, &mut io).expect("step");
         }
         assert_eq!(cpu.read_r8(3), 0x11);

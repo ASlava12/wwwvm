@@ -36,7 +36,10 @@ pub struct WwwVm {
 impl WwwVm {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: Vm::new(), last_error: None }
+        Self {
+            inner: Vm::new(),
+            last_error: None,
+        }
     }
 
     /// Load the bundled hello guest at the standard boot-sector address.
@@ -92,7 +95,9 @@ impl WwwVm {
     /// on rejection; on success the VM is exactly where the snapshot
     /// was taken, devices excluded.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), JsError> {
-        self.inner.restore(bytes).map_err(|e| JsError::new(&e.to_string()))
+        self.inner
+            .restore(bytes)
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Pre-queue commands to be delivered to the guest at boot. Pass an
@@ -121,10 +126,14 @@ impl WwwVm {
     }
 
     /// True if the CPU is parked on HLT.
-    pub fn is_halted(&self) -> bool { self.inner.is_halted() }
+    pub fn is_halted(&self) -> bool {
+        self.inner.is_halted()
+    }
 
     /// True if `boot()` has been called at least once.
-    pub fn is_booted(&self) -> bool { self.inner.is_booted() }
+    pub fn is_booted(&self) -> bool {
+        self.inner.is_booted()
+    }
 
     /// Last CPU error message (e.g. "unimplemented opcode 0x0F at
     /// 0000:7C20"), or null if the run loop has not failed.
@@ -168,7 +177,8 @@ impl WwwVm {
         minute: u8,
         second: u8,
     ) {
-        self.inner.set_cmos_time(year, month, day, hour, minute, second);
+        self.inner
+            .set_cmos_time(year, month, day, hour, minute, second);
     }
 
     /// Drain everything the guest has emitted since the previous call.
@@ -182,7 +192,9 @@ impl WwwVm {
 }
 
 impl Default for WwwVm {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

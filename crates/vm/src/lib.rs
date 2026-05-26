@@ -51,7 +51,10 @@ pub mod snapshot {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::TooSmall { got, need } => {
-                    write!(f, "snapshot too small: got {got} bytes, need at least {need}")
+                    write!(
+                        f,
+                        "snapshot too small: got {got} bytes, need at least {need}"
+                    )
                 }
                 Self::BadMagic => write!(f, "snapshot magic mismatch"),
                 Self::UnsupportedVersion(v) => {
@@ -155,7 +158,7 @@ impl Vm {
         buf.push(snapshot::VERSION);
         buf.push(0); // flags (reserved)
         buf.extend_from_slice(&[0u8; 8]); // reserved padding
-        // CPU
+                                          // CPU
         for r in &self.cpu.regs {
             buf.extend_from_slice(&r.to_le_bytes());
         }
@@ -209,18 +212,12 @@ impl Vm {
         // can't half-overwrite live CPU state.
         let mut regs = [0u16; 8];
         for (i, r) in regs.iter_mut().enumerate() {
-            *r = u16::from_le_bytes([
-                bytes[cpu_start + i * 2],
-                bytes[cpu_start + i * 2 + 1],
-            ]);
+            *r = u16::from_le_bytes([bytes[cpu_start + i * 2], bytes[cpu_start + i * 2 + 1]]);
         }
         let sregs_off = cpu_start + 16;
         let mut sregs = [0u16; 6];
         for (i, s) in sregs.iter_mut().enumerate() {
-            *s = u16::from_le_bytes([
-                bytes[sregs_off + i * 2],
-                bytes[sregs_off + i * 2 + 1],
-            ]);
+            *s = u16::from_le_bytes([bytes[sregs_off + i * 2], bytes[sregs_off + i * 2 + 1]]);
         }
         let ip = u16::from_le_bytes([bytes[cpu_start + 28], bytes[cpu_start + 29]]);
         let flags = u16::from_le_bytes([bytes[cpu_start + 30], bytes[cpu_start + 31]]);
@@ -243,10 +240,16 @@ impl Vm {
         if version == 2 {
             let dev_off = mem_start + Self::RAM_SIZE;
             if bytes.len() < dev_off + 4 {
-                return Err(SnapshotError::TooSmall { got: bytes.len(), need: dev_off + 4 });
+                return Err(SnapshotError::TooSmall {
+                    got: bytes.len(),
+                    need: dev_off + 4,
+                });
             }
             let dev_len = u32::from_le_bytes([
-                bytes[dev_off], bytes[dev_off+1], bytes[dev_off+2], bytes[dev_off+3],
+                bytes[dev_off],
+                bytes[dev_off + 1],
+                bytes[dev_off + 2],
+                bytes[dev_off + 3],
             ]) as usize;
             if bytes.len() < dev_off + 4 + dev_len {
                 return Err(SnapshotError::TooSmall {
@@ -370,7 +373,9 @@ impl Vm {
         minute: u8,
         second: u8,
     ) {
-        self.io.cmos.set_time(year, month, day, hour, minute, second);
+        self.io
+            .cmos
+            .set_time(year, month, day, hour, minute, second);
     }
 
     /// Drain everything the guest has transmitted since the last call.
@@ -396,8 +401,12 @@ impl Vm {
         (executed, Stop::StepBudget)
     }
 
-    pub fn cpu(&self) -> &Cpu { &self.cpu }
-    pub fn mem(&self) -> &Memory { &self.mem }
+    pub fn cpu(&self) -> &Cpu {
+        &self.cpu
+    }
+    pub fn mem(&self) -> &Memory {
+        &self.mem
+    }
 }
 
 /// Hand-assembled real-mode guest. Layout:
@@ -421,23 +430,22 @@ impl Vm {
 /// 1D: "wwwvm: ready\n\0"
 /// ```
 pub const HELLO_GUEST: &[u8] = &[
-    0xBE, 0x1D, 0x7C,                   // mov si, 0x7C1D
-    0xAC,                                // lodsb
-    0x08, 0xC0,                          // or al, al
-    0x74, 0x06,                          // jz +6
-    0xBA, 0xF8, 0x03,                    // mov dx, 0x3F8
-    0xEE,                                // out dx, al
-    0xEB, 0xF5,                          // jmp -11
-    0xBA, 0xFD, 0x03,                    // mov dx, 0x3FD
-    0xEC,                                // in al, dx
-    0xA8, 0x01,                          // test al, 1
-    0x74, 0xF8,                          // jz -8
-    0xBA, 0xF8, 0x03,                    // mov dx, 0x3F8
-    0xEC,                                // in al, dx
-    0xEE,                                // out dx, al
-    0xEB, 0xF1,                          // jmp -15
-    b'w', b'w', b'w', b'v', b'm', b':', b' ',
-    b'r', b'e', b'a', b'd', b'y', 0x0A, 0x00,
+    0xBE, 0x1D, 0x7C, // mov si, 0x7C1D
+    0xAC, // lodsb
+    0x08, 0xC0, // or al, al
+    0x74, 0x06, // jz +6
+    0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+    0xEE, // out dx, al
+    0xEB, 0xF5, // jmp -11
+    0xBA, 0xFD, 0x03, // mov dx, 0x3FD
+    0xEC, // in al, dx
+    0xA8, 0x01, // test al, 1
+    0x74, 0xF8, // jz -8
+    0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+    0xEC, // in al, dx
+    0xEE, // out dx, al
+    0xEB, 0xF1, // jmp -15
+    b'w', b'w', b'w', b'v', b'm', b':', b' ', b'r', b'e', b'a', b'd', b'y', 0x0A, 0x00,
 ];
 
 /// Interrupt-driven interactive demo. Unlike [`HELLO_GUEST`], which
@@ -474,20 +482,8 @@ pub mod interactive_demo {
     /// 0x19 EB FE       JMP -2                       ; spin
     /// ```
     pub const MAIN: &[u8] = &[
-        0xBE, 0x50, 0x7C,
-        0xAC,
-        0x08, 0xC0,
-        0x74, 0x06,
-        0xBA, 0xF8, 0x03,
-        0xEE,
-        0xEB, 0xF5,
-        0xBA, 0xF9, 0x03,
-        0xB0, 0x01,
-        0xEE,
-        0xB0, 0xEF,
-        0xE6, 0x21,
-        0xFB,
-        0xEB, 0xFE,
+        0xBE, 0x50, 0x7C, 0xAC, 0x08, 0xC0, 0x74, 0x06, 0xBA, 0xF8, 0x03, 0xEE, 0xEB, 0xF5, 0xBA,
+        0xF9, 0x03, 0xB0, 0x01, 0xEE, 0xB0, 0xEF, 0xE6, 0x21, 0xFB, 0xEB, 0xFE,
     ];
 
     /// UART IRQ 4 handler. Reads RBR into AL, writes it straight back
@@ -506,16 +502,7 @@ pub mod interactive_demo {
     /// 0x0D CF          IRET
     /// ```
     pub const HANDLER: &[u8] = &[
-        0x50,
-        0x52,
-        0xBA, 0xF8, 0x03,
-        0xEC,
-        0xEE,
-        0xB0, 0x20,
-        0xE6, 0x20,
-        0x5A,
-        0x58,
-        0xCF,
+        0x50, 0x52, 0xBA, 0xF8, 0x03, 0xEC, 0xEE, 0xB0, 0x20, 0xE6, 0x20, 0x5A, 0x58, 0xCF,
     ];
 
     /// NUL-terminated banner printed once on boot. The trailing newline
@@ -591,13 +578,7 @@ mod tests {
     #[test]
     fn loop_counted_print_via_uart() {
         let program: &[u8] = &[
-            0xB9, 0x05, 0x00,
-            0xB0, 0x41,
-            0xBA, 0xF8, 0x03,
-            0xEE,
-            0xFE, 0xC0,
-            0xE2, 0xFB,
-            0xF4,
+            0xB9, 0x05, 0x00, 0xB0, 0x41, 0xBA, 0xF8, 0x03, 0xEE, 0xFE, 0xC0, 0xE2, 0xFB, 0xF4,
         ];
         let mut vm = Vm::new();
         vm.load_image(BOOT_LOAD_ADDR, program);
@@ -631,17 +612,8 @@ mod tests {
     #[test]
     fn mul_byte_squarer_round_trip() {
         let program: &[u8] = &[
-            0xBA, 0xFD, 0x03,
-            0xEC,
-            0xA8, 0x01,
-            0x74, 0xF8,
-            0xBA, 0xF8, 0x03,
-            0xEC,
-            0x88, 0xC3,
-            0xF6, 0xE3,
-            0xBA, 0xF8, 0x03,
-            0xEE,
-            0xEB, 0xEA,
+            0xBA, 0xFD, 0x03, 0xEC, 0xA8, 0x01, 0x74, 0xF8, 0xBA, 0xF8, 0x03, 0xEC, 0x88, 0xC3,
+            0xF6, 0xE3, 0xBA, 0xF8, 0x03, 0xEE, 0xEB, 0xEA,
         ];
         let mut vm = Vm::new();
         vm.load_image(BOOT_LOAD_ADDR, program);
@@ -662,25 +634,22 @@ mod tests {
     #[test]
     fn uart_rx_drives_irq4_handler_through_vm() {
         let main: &[u8] = &[
-            0xFB,                          // STI
-            0xBA, 0xF9, 0x03,              // MOV DX, 0x3F9 (UART IER)
-            0xB0, 0x01,
-            0xEE,                          // OUT DX, AL
-            0xB0, 0xEF,
-            0xE6, 0x21,                    // OUT 0x21, AL (PIC IMR)
-            0x80, 0xFB, 0x00,              // CMP BL, 0
-            0x74, 0xFB,                    // JZ -5
-            0xF4,                          // HLT
+            0xFB, // STI
+            0xBA, 0xF9, 0x03, // MOV DX, 0x3F9 (UART IER)
+            0xB0, 0x01, 0xEE, // OUT DX, AL
+            0xB0, 0xEF, 0xE6, 0x21, // OUT 0x21, AL (PIC IMR)
+            0x80, 0xFB, 0x00, // CMP BL, 0
+            0x74, 0xFB, // JZ -5
+            0xF4, // HLT
         ];
         let handler: &[u8] = &[
-            0x50,                          // PUSH AX
-            0xBA, 0xF8, 0x03,              // MOV DX, 0x3F8 (RBR)
-            0xEC,                          // IN AL, DX
-            0x88, 0xC3,                    // MOV BL, AL
-            0xB0, 0x20,
-            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
-            0x58,                          // POP AX
-            0xCF,                          // IRET
+            0x50, // PUSH AX
+            0xBA, 0xF8, 0x03, // MOV DX, 0x3F8 (RBR)
+            0xEC, // IN AL, DX
+            0x88, 0xC3, // MOV BL, AL
+            0xB0, 0x20, 0xE6, 0x20, // OUT 0x20, AL (EOI)
+            0x58, // POP AX
+            0xCF, // IRET
         ];
         let handler_addr: u32 = 0x7C40;
         let mut vm = Vm::new();
@@ -705,26 +674,25 @@ mod tests {
     #[test]
     fn pit_timer_drives_irq0_handler_through_vm() {
         let main: &[u8] = &[
-            0xB0, 0x34,                   // MOV AL, 0x34   (PIT mode 2, RW=3)
-            0xE6, 0x43,                   // OUT 0x43, AL
-            0xB0, 0x32,                   // MOV AL, 50     (reload LSB)
-            0xE6, 0x40,                   // OUT 0x40, AL
-            0x30, 0xC0,                   // XOR AL, AL     (reload MSB = 0)
-            0xE6, 0x40,                   // OUT 0x40, AL
-            0xB0, 0xFE,                   // MOV AL, 0xFE   (unmask IRQ 0)
-            0xE6, 0x21,                   // OUT 0x21, AL
-            0xFB,                          // STI
-            0x80, 0x3E, 0x00, 0x09, 0x04,  // CMP byte [0x900], 4
-            0x75, 0xF9,                   // JNZ -7
-            0xF4,                          // HLT
+            0xB0, 0x34, // MOV AL, 0x34   (PIT mode 2, RW=3)
+            0xE6, 0x43, // OUT 0x43, AL
+            0xB0, 0x32, // MOV AL, 50     (reload LSB)
+            0xE6, 0x40, // OUT 0x40, AL
+            0x30, 0xC0, // XOR AL, AL     (reload MSB = 0)
+            0xE6, 0x40, // OUT 0x40, AL
+            0xB0, 0xFE, // MOV AL, 0xFE   (unmask IRQ 0)
+            0xE6, 0x21, // OUT 0x21, AL
+            0xFB, // STI
+            0x80, 0x3E, 0x00, 0x09, 0x04, // CMP byte [0x900], 4
+            0x75, 0xF9, // JNZ -7
+            0xF4, // HLT
         ];
         let handler: &[u8] = &[
-            0x50,                          // PUSH AX
-            0xFE, 0x06, 0x00, 0x09,        // INC byte [0x900]
-            0xB0, 0x20,
-            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
-            0x58,                          // POP AX
-            0xCF,                          // IRET
+            0x50, // PUSH AX
+            0xFE, 0x06, 0x00, 0x09, // INC byte [0x900]
+            0xB0, 0x20, 0xE6, 0x20, // OUT 0x20, AL (EOI)
+            0x58, // POP AX
+            0xCF, // IRET
         ];
         let handler_addr: u32 = 0x7C50;
         let mut vm = Vm::new();
@@ -759,17 +727,15 @@ mod tests {
         //
         // ES: prefix (0x26) before each MOV byte, with mod=00 rm=110
         // (disp16) ModR/M = 0x06; Group-11 /0 = 0xC6.
-        let mut program: Vec<u8> = vec![
-            0xB8, 0x00, 0xB8,
-            0x8E, 0xC0,
-        ];
+        let mut program: Vec<u8> = vec![0xB8, 0x00, 0xB8, 0x8E, 0xC0];
         // Write "HELLO VGA" — each character at offset col*2 in the
         // VGA cell array (so the attribute byte at col*2 + 1 stays 0).
         for (i, &c) in b"HELLO VGA".iter().enumerate() {
             let off = (i * 2) as u16;
             program.extend_from_slice(&[
-                0x26,                       // ES: prefix
-                0xC6, 0x06,                 // MOV BYTE [disp16], imm8
+                0x26, // ES: prefix
+                0xC6,
+                0x06, // MOV BYTE [disp16], imm8
                 (off & 0xFF) as u8,
                 (off >> 8) as u8,
                 c,
@@ -803,27 +769,25 @@ mod tests {
     #[test]
     fn slave_pic_cascade_delivers_irq_through_vm() {
         let main: &[u8] = &[
-            0xB0, 0xFB,                    // MOV AL, 0xFB  (master: unmask IRQ 2 cascade)
-            0xE6, 0x21,                    // OUT 0x21, AL
-            0xB0, 0xFE,                    // MOV AL, 0xFE  (slave: unmask IRQ 0)
-            0xE6, 0xA1,                    // OUT 0xA1, AL
-            0xFB,                          // STI
-            0x80, 0xFB, 0x00,              // CMP BL, 0
-            0x74, 0xFB,                    // JZ -5
-            0xF4,                          // HLT
+            0xB0, 0xFB, // MOV AL, 0xFB  (master: unmask IRQ 2 cascade)
+            0xE6, 0x21, // OUT 0x21, AL
+            0xB0, 0xFE, // MOV AL, 0xFE  (slave: unmask IRQ 0)
+            0xE6, 0xA1, // OUT 0xA1, AL
+            0xFB, // STI
+            0x80, 0xFB, 0x00, // CMP BL, 0
+            0x74, 0xFB, // JZ -5
+            0xF4, // HLT
         ];
         // Handler: EOI slave first (0xA0), then master (0x20). The
         // order matters on real hardware — slave's ISR must clear
         // before master's so the cascade line deasserts cleanly.
         let handler: &[u8] = &[
-            0x50,                          // PUSH AX
-            0xB3, 0x77,                    // MOV BL, 0x77   (proof we ran)
-            0xB0, 0x20,
-            0xE6, 0xA0,                    // OUT 0xA0, AL   (slave EOI)
-            0xB0, 0x20,
-            0xE6, 0x20,                    // OUT 0x20, AL   (master EOI)
-            0x58,                          // POP AX
-            0xCF,                          // IRET
+            0x50, // PUSH AX
+            0xB3, 0x77, // MOV BL, 0x77   (proof we ran)
+            0xB0, 0x20, 0xE6, 0xA0, // OUT 0xA0, AL   (slave EOI)
+            0xB0, 0x20, 0xE6, 0x20, // OUT 0x20, AL   (master EOI)
+            0x58, // POP AX
+            0xCF, // IRET
         ];
         let handler_addr: u32 = 0x7C40;
         let mut vm = Vm::new();
@@ -851,21 +815,20 @@ mod tests {
     #[test]
     fn ps2_scancode_drives_irq1_handler_through_vm() {
         let main: &[u8] = &[
-            0xFB,                          // STI
-            0xB0, 0xFD,                    // MOV AL, 0xFD  (unmask IRQ 1)
-            0xE6, 0x21,                    // OUT 0x21, AL
-            0x80, 0xFB, 0x00,              // CMP BL, 0
-            0x74, 0xFB,                    // JZ -5
-            0xF4,                          // HLT
+            0xFB, // STI
+            0xB0, 0xFD, // MOV AL, 0xFD  (unmask IRQ 1)
+            0xE6, 0x21, // OUT 0x21, AL
+            0x80, 0xFB, 0x00, // CMP BL, 0
+            0x74, 0xFB, // JZ -5
+            0xF4, // HLT
         ];
         let handler: &[u8] = &[
-            0x50,                          // PUSH AX
-            0xE4, 0x60,                    // IN AL, 0x60
-            0x88, 0xC3,                    // MOV BL, AL
-            0xB0, 0x20,
-            0xE6, 0x20,                    // OUT 0x20, AL (EOI)
-            0x58,                          // POP AX
-            0xCF,                          // IRET
+            0x50, // PUSH AX
+            0xE4, 0x60, // IN AL, 0x60
+            0x88, 0xC3, // MOV BL, AL
+            0xB0, 0x20, 0xE6, 0x20, // OUT 0x20, AL (EOI)
+            0x58, // POP AX
+            0xCF, // IRET
         ];
         let handler_addr: u32 = 0x7C40;
         let mut vm = Vm::new();
@@ -923,11 +886,11 @@ mod tests {
     fn snapshot_restore_round_trips_mid_execution() {
         // Simple loop guest summing 1..=10 in BX. Loaded at 0x7C00.
         let program: &[u8] = &[
-            0xB9, 0x0A, 0x00,           // MOV CX, 10
-            0x31, 0xDB,                  // XOR BX, BX
-            0x01, 0xCB,                  // ADD BX, CX
-            0xE2, 0xFC,                  // LOOP -4
-            0xF4,                        // HLT
+            0xB9, 0x0A, 0x00, // MOV CX, 10
+            0x31, 0xDB, // XOR BX, BX
+            0x01, 0xCB, // ADD BX, CX
+            0xE2, 0xFC, // LOOP -4
+            0xF4, // HLT
         ];
 
         let mut vm = Vm::new();
@@ -1019,8 +982,8 @@ mod tests {
         v1.push(1); // version 1
         v1.push(0); // flags
         v1.extend_from_slice(&[0u8; 8]); // reserved
-        // CPU image — 36 bytes of zero. (regs=0, sregs=0, IP=0,
-        // flags=0, halted=0, seg_override=0xFF, 2 reserved.)
+                                         // CPU image — 36 bytes of zero. (regs=0, sregs=0, IP=0,
+                                         // flags=0, halted=0, seg_override=0xFF, 2 reserved.)
         let mut cpu = vec![0u8; snapshot::CPU_LEN];
         cpu[33] = 0xFF;
         v1.extend_from_slice(&cpu);
@@ -1056,12 +1019,7 @@ mod tests {
     #[test]
     fn div_by_zero_surfaces_through_vm_stop() {
         // MOV AL, 5 ; MOV BL, 0 ; DIV BL ; HLT (unreached)
-        let program: &[u8] = &[
-            0xB0, 0x05,
-            0xB3, 0x00,
-            0xF6, 0xF3,
-            0xF4,
-        ];
+        let program: &[u8] = &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3, 0xF4];
         let mut vm = Vm::new();
         vm.load_image(BOOT_LOAD_ADDR, program);
         vm.boot();

@@ -87,17 +87,26 @@ impl Uart {
     /// number of bytes consumed.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
         let mut p = 0;
-        if bytes.len() < 1 + 4 { return Err("uart: truncated"); }
-        self.ier = bytes[p]; p += 1;
-        let tx_len = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]) as usize;
+        if bytes.len() < 1 + 4 {
+            return Err("uart: truncated");
+        }
+        self.ier = bytes[p];
+        p += 1;
+        let tx_len =
+            u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]) as usize;
         p += 4;
-        if bytes.len() < p + tx_len + 4 { return Err("uart: truncated tx"); }
-        self.tx_buffer = bytes[p..p+tx_len].to_vec();
+        if bytes.len() < p + tx_len + 4 {
+            return Err("uart: truncated tx");
+        }
+        self.tx_buffer = bytes[p..p + tx_len].to_vec();
         p += tx_len;
-        let rx_len = u32::from_le_bytes([bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]]) as usize;
+        let rx_len =
+            u32::from_le_bytes([bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3]]) as usize;
         p += 4;
-        if bytes.len() < p + rx_len { return Err("uart: truncated rx"); }
-        self.rx_buffer = bytes[p..p+rx_len].iter().copied().collect();
+        if bytes.len() < p + rx_len {
+            return Err("uart: truncated rx");
+        }
+        self.rx_buffer = bytes[p..p + rx_len].iter().copied().collect();
         p += rx_len;
         Ok(p)
     }

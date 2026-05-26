@@ -78,15 +78,7 @@ impl Cmos {
     /// Seed the date/time bytes in binary format. Year is 2-digit
     /// (00..99) per the MC146818 convention; everything else is the
     /// natural numeric value.
-    pub fn set_time(
-        &mut self,
-        year: u8,
-        month: u8,
-        day: u8,
-        hour: u8,
-        minute: u8,
-        second: u8,
-    ) {
+    pub fn set_time(&mut self, year: u8, month: u8, day: u8, hour: u8, minute: u8, second: u8) {
         self.storage[reg::SECONDS as usize] = second;
         self.storage[reg::MINUTES as usize] = minute;
         self.storage[reg::HOURS as usize] = hour;
@@ -114,9 +106,11 @@ impl Cmos {
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        if bytes.len() < 1 + 128 { return Err("cmos: truncated"); }
+        if bytes.len() < 1 + 128 {
+            return Err("cmos: truncated");
+        }
         self.index = bytes[0];
-        self.storage.copy_from_slice(&bytes[1..1+128]);
+        self.storage.copy_from_slice(&bytes[1..1 + 128]);
         Ok(1 + 128)
     }
 }

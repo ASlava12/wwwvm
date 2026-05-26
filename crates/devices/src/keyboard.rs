@@ -65,10 +65,14 @@ impl Keyboard {
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        if bytes.len() < 4 { return Err("kbd: truncated"); }
+        if bytes.len() < 4 {
+            return Err("kbd: truncated");
+        }
         let n = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if bytes.len() < 4 + n { return Err("kbd: truncated queue"); }
-        self.queue = bytes[4..4+n].iter().copied().collect();
+        if bytes.len() < 4 + n {
+            return Err("kbd: truncated queue");
+        }
+        self.queue = bytes[4..4 + n].iter().copied().collect();
         Ok(4 + n)
     }
 }

@@ -109,7 +109,9 @@ impl Pit {
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        if bytes.len() < 10 { return Err("pit: truncated"); }
+        if bytes.len() < 10 {
+            return Err("pit: truncated");
+        }
         self.ch0_reload = u16::from_le_bytes([bytes[0], bytes[1]]);
         self.ch0_counter = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
         self.ch0_mode = bytes[6];

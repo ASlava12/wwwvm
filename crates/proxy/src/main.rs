@@ -58,9 +58,15 @@ impl Allowlist {
                 }
                 if let Some((h, p)) = s.rsplit_once(':') {
                     let port = if p == "*" { None } else { p.parse().ok() };
-                    AllowEntry::Host { host: h.to_string(), port }
+                    AllowEntry::Host {
+                        host: h.to_string(),
+                        port,
+                    }
                 } else {
-                    AllowEntry::Host { host: s.to_string(), port: None }
+                    AllowEntry::Host {
+                        host: s.to_string(),
+                        port: None,
+                    }
                 }
             })
             .collect();
@@ -203,9 +209,15 @@ mod tests {
                 }
                 if let Some((h, p)) = s.rsplit_once(':') {
                     let port = if p == "*" { None } else { p.parse().ok() };
-                    AllowEntry::Host { host: h.to_string(), port }
+                    AllowEntry::Host {
+                        host: h.to_string(),
+                        port,
+                    }
                 } else {
-                    AllowEntry::Host { host: s.to_string(), port: None }
+                    AllowEntry::Host {
+                        host: s.to_string(),
+                        port: None,
+                    }
                 }
             })
             .collect();

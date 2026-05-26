@@ -11,7 +11,9 @@ pub struct Memory {
 
 impl Memory {
     pub fn new(size: usize) -> Self {
-        Self { bytes: vec![0; size] }
+        Self {
+            bytes: vec![0; size],
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -20,7 +22,11 @@ impl Memory {
 
     pub fn read_u8(&self, addr: u32) -> u8 {
         let a = addr as usize;
-        if a < self.bytes.len() { self.bytes[a] } else { 0 }
+        if a < self.bytes.len() {
+            self.bytes[a]
+        } else {
+            0
+        }
     }
 
     pub fn write_u8(&mut self, addr: u32, value: u8) {
