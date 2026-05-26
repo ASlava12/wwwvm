@@ -862,6 +862,23 @@ impl Cpu {
                 self.alu_dispatch(opcode, mem)?;
             }
 
+            // XCHG r/m8, r8 — swap byte operands.
+            0x86 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let a = self.read_rm8(rm, mem);
+                let b = self.read_r8(reg);
+                self.write_rm8(rm, mem, b);
+                self.write_r8(reg, a);
+            }
+            // XCHG r/m16, r16 — swap word operands.
+            0x87 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let a = self.read_rm16(rm, mem);
+                let b = self.read_r16(reg);
+                self.write_rm16(rm, mem, b);
+                self.write_r16(reg, a);
+            }
+
             // MOV r/m8, r8 — direction = r/m
             0x88 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
@@ -885,6 +902,95 @@ impl Cpu {
                 let (_, reg, rm) = self.fetch_modrm(mem);
                 let v = self.read_rm16(rm, mem);
                 self.write_r16(reg, v);
+            }
+
+            // MOV r/m16, sreg — store segment register to r/m.
+            // reg field encodes the segment: 0=ES, 1=CS, 2=SS, 3=DS,
+            // 4=FS, 5=GS. Values 6-7 are invalid.
+            0x8C => {
+                let (_, sreg_idx, rm) = self.fetch_modrm(mem);
+                if sreg_idx > 5 {
+                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                }
+                let v = self.sregs[sreg_idx as usize];
+                self.write_rm16(rm, mem, v);
+            }
+
+            // LEA r16, m — load effective address (no memory access).
+            // mod=11 (register operand) is undefined on real x86.
+            0x8D => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                match rm {
+                    Rm::Mem(ea) => self.write_r16(reg, ea.off),
+                    Rm::Reg(_) => {
+                        return Err(CpuError::Unimplemented {
+                            opcode, cs: op_cs, ip: op_ip,
+                        });
+                    }
+                }
+            }
+
+            // MOV sreg, r/m16 — load segment register from r/m.
+            // Loading CS is normally illegal but we allow it for now;
+            // a future iteration may reject it like real x86.
+            0x8E => {
+                let (_, sreg_idx, rm) = self.fetch_modrm(mem);
+                if sreg_idx > 5 {
+                    return Err(CpuError::Unimplemented { opcode, cs: op_cs, ip: op_ip });
+                }
+                let v = self.read_rm16(rm, mem);
+                self.sregs[sreg_idx as usize] = v;
+            }
+
+            // XCHG AX, r16 — short form. 0x90 (XCHG AX, AX) is NOP and
+            // is handled by the dedicated NOP arm above.
+            0x91..=0x97 => {
+                let i = (opcode - 0x90) as usize;
+                let ax = self.regs[r16::AX];
+                let other = self.regs[i];
+                self.regs[r16::AX] = other;
+                self.regs[i] = ax;
+            }
+
+            // LES r16, m — load far pointer into reg + ES.
+            // The memory operand is 32 bits: low word -> reg, high word -> ES.
+            0xC4 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let ea = match rm {
+                    Rm::Mem(ea) => ea,
+                    Rm::Reg(_) => {
+                        return Err(CpuError::Unimplemented {
+                            opcode, cs: op_cs, ip: op_ip,
+                        });
+                    }
+                };
+                let base = Self::linear(self.sregs[ea.seg], ea.off);
+                let off_val = mem.read_u16(base);
+                let seg_val = mem.read_u16(Self::linear(
+                    self.sregs[ea.seg], ea.off.wrapping_add(2),
+                ));
+                self.write_r16(reg, off_val);
+                self.sregs[sreg::ES] = seg_val;
+                let _ = base;
+            }
+
+            // LDS r16, m — same as LES but loads DS.
+            0xC5 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let ea = match rm {
+                    Rm::Mem(ea) => ea,
+                    Rm::Reg(_) => {
+                        return Err(CpuError::Unimplemented {
+                            opcode, cs: op_cs, ip: op_ip,
+                        });
+                    }
+                };
+                let off_val = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
+                let seg_val = mem.read_u16(Self::linear(
+                    self.sregs[ea.seg], ea.off.wrapping_add(2),
+                ));
+                self.write_r16(reg, off_val);
+                self.sregs[sreg::DS] = seg_val;
             }
             // Group 1: ALU r/m, imm.  reg field of ModR/M = op (0=ADD..7=CMP)
             //   0x80: r/m8, imm8
@@ -2134,6 +2240,122 @@ mod tests {
         // Last read came from DS:0x801 = 0x22
         assert_eq!(cpu.read_r8(0), 0x22);
         assert!(cpu.seg_override.is_none());
+    }
+
+    #[test]
+    fn mov_sreg_round_trip_through_ax() {
+        // Set ES via AX: MOV AX, 0x1234 ; MOV ES, AX
+        //   MOV sreg, r/m16 = 0x8E /0 (ES). ModR/M = 11 000 000 = 0xC0
+        // Then read it back: MOV BX, ES (MOV r/m16, sreg = 0x8C /0)
+        //   ModR/M = 11 000 011 = 0xC3
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x34, 0x12,
+            0x8E, 0xC0,
+            0x8C, 0xC3,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.sregs[sreg::ES], 0x1234);
+        assert_eq!(cpu.regs[r16::BX], 0x1234);
+    }
+
+    #[test]
+    fn lea_computes_address_without_memory_read() {
+        // MOV BX, 0x100 ; MOV SI, 5 ; LEA AX, [BX+SI+10]
+        //   LEA r16, m = 0x8D /r. ModR/M for [BX+SI+disp8]:
+        //   mod=01 reg=000(AX) rm=000([BX+SI]) → 01 000 000 = 0x40, disp8=0x0A
+        let (cpu, _, _) = run_payload(&[
+            0xBB, 0x00, 0x01,
+            0xBE, 0x05, 0x00,
+            0x8D, 0x40, 0x0A,
+            0xF4,
+        ], 8);
+        // 0x100 + 5 + 10 = 0x10F
+        assert_eq!(cpu.regs[r16::AX], 0x10F);
+    }
+
+    #[test]
+    fn lea_register_form_returns_unimplemented() {
+        // LEA AX, AX (mod=11) is undefined on real x86 — we surface it
+        // as an error so we notice if anyone tries.
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, &[0x8D, 0xC0]);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        let err = cpu.step(&mut mem, &mut io).unwrap_err();
+        match err {
+            CpuError::Unimplemented { opcode: 0x8D, .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xchg_r16_r16_swaps_values() {
+        // MOV AX, 1 ; MOV BX, 2 ; XCHG AX, BX
+        //   XCHG r/m16, r16 = 0x87 /r. ModR/M = 11 000 011 = 0xC3
+        //   (reg=AX, rm=BX) — either direction is equivalent for XCHG.
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x01, 0x00,
+            0xBB, 0x02, 0x00,
+            0x87, 0xC3,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 2);
+        assert_eq!(cpu.regs[r16::BX], 1);
+    }
+
+    #[test]
+    fn xchg_ax_r16_short_form() {
+        // MOV AX, 0xAAAA ; MOV CX, 0xCCCC ; XCHG AX, CX  (0x91)
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0xAA, 0xAA,
+            0xB9, 0xCC, 0xCC,
+            0x91,
+            0xF4,
+        ], 6);
+        assert_eq!(cpu.regs[r16::AX], 0xCCCC);
+        assert_eq!(cpu.regs[r16::CX], 0xAAAA);
+    }
+
+    #[test]
+    fn xchg_rm8_with_memory_operand() {
+        // Memory at 0x800 = 0xAA; AL = 0xBB; XCHG [BX], AL → mem becomes 0xBB, AL becomes 0xAA
+        //   XCHG r/m8, r8 = 0x86 /r. ModR/M = 00 000 111 = 0x07  (reg=AL, rm=[BX])
+        let (cpu, mem, _) = run_with_data(&[
+            0xBB, 0x00, 0x08,
+            0xB0, 0xBB,
+            0x86, 0x07,
+            0xF4,
+        ], 0x800, &[0xAA], 6);
+        assert_eq!(cpu.read_r8(0), 0xAA);
+        assert_eq!(mem.read_u8(0x800), 0xBB);
+    }
+
+    #[test]
+    fn les_loads_far_pointer_into_reg_and_es() {
+        // 4-byte far pointer at 0x800: offset=0x1234, segment=0x5678
+        // LES BX, [SI]  — SI=0x800
+        //   LES r16, m = 0xC4 /r. ModR/M = 00 011 100 = 0x1C
+        let far_ptr = &[0x34, 0x12, 0x78, 0x56];
+        let (cpu, _, _) = run_with_data(&[
+            0xBE, 0x00, 0x08,
+            0xC4, 0x1C,
+            0xF4,
+        ], 0x800, far_ptr, 6);
+        assert_eq!(cpu.regs[r16::BX], 0x1234);
+        assert_eq!(cpu.sregs[sreg::ES], 0x5678);
+    }
+
+    #[test]
+    fn lds_loads_far_pointer_into_reg_and_ds() {
+        let far_ptr = &[0xCD, 0xAB, 0x21, 0x43];
+        let (cpu, _, _) = run_with_data(&[
+            0xBE, 0x00, 0x08,
+            0xC5, 0x1C,      // LDS BX, [SI]
+            0xF4,
+        ], 0x800, far_ptr, 6);
+        assert_eq!(cpu.regs[r16::BX], 0xABCD);
+        assert_eq!(cpu.sregs[sreg::DS], 0x4321);
     }
 
     #[test]

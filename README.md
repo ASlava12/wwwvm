@@ -68,6 +68,12 @@
   для любой инструкции с памятью; работают и до, и после REP-префикса;
   автоматически сбрасываются после каждой инструкции (state — в
   `Cpu::seg_override`);
+  **сегментные регистры из гостя** — `MOV sreg, r/m16` / `MOV r/m16, sreg`
+  (0x8E/0x8C), `LES`/`LDS` (0xC4/0xC5) для загрузки 32-битного far-указателя
+  в регистр и ES/DS одной инструкцией;
+  **LEA** `r16, m` (0x8D) — вычисляет EA, не читает память;
+  **XCHG** — полная семья: `r/m, r` 8/16-бит (0x86/0x87), short-form
+  `XCHG AX, r16` (0x91..0x97), плюс 0x90 (NOP = XCHG AX,AX);
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -86,7 +92,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **68 зелёных** (mem 4 + devices 5 + cpu 50 + vm 3 + wasm 1
+* Тестов — **76 зелёных** (mem 4 + devices 5 + cpu 58 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
