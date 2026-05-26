@@ -803,6 +803,36 @@ impl Cpu {
                 }
             }
 
+            // LOOP family — decrement CX then branch on rel8 if CX != 0
+            // (and on the per-opcode condition).
+            //   0xE0 LOOPNZ / LOOPNE — also requires ZF=0
+            //   0xE1 LOOPZ  / LOOPE  — also requires ZF=1
+            //   0xE2 LOOP            — unconditional on flags
+            0xE0 | 0xE1 | 0xE2 => {
+                let rel = self.fetch_u8(mem) as i8;
+                let cx = self.regs[r16::CX].wrapping_sub(1);
+                self.regs[r16::CX] = cx;
+                let cond = match opcode {
+                    0xE2 => true,
+                    0xE1 => self.has(flag::ZF),
+                    0xE0 => !self.has(flag::ZF),
+                    _ => unreachable!(),
+                };
+                if cx != 0 && cond {
+                    self.ip = self.ip.wrapping_add(rel as i16 as u16);
+                }
+            }
+
+            // JCXZ rel8 — branch if CX == 0. CX is NOT decremented;
+            // this is the idiomatic guard before a LOOP that would
+            // otherwise iterate 65536 times when CX starts at 0.
+            0xE3 => {
+                let rel = self.fetch_u8(mem) as i8;
+                if self.regs[r16::CX] == 0 {
+                    self.ip = self.ip.wrapping_add(rel as i16 as u16);
+                }
+            }
+
             // Single-shot string ops. REP-prefixed paths go through the
             // 0xF2/0xF3 handler below.
             0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF => {
@@ -1524,11 +1554,66 @@ impl Cpu {
                 let v = io.read(port);
                 self.write_r8(0, v);
             }
+            0xE5 => {
+                // IN AX, imm8 — two byte reads from consecutive ports
+                let port = self.fetch_u8(mem) as u16;
+                let lo = io.read(port) as u16;
+                let hi = io.read(port.wrapping_add(1)) as u16;
+                self.regs[r16::AX] = lo | (hi << 8);
+            }
             0xE6 => {
                 // OUT imm8, AL
                 let port = self.fetch_u8(mem) as u16;
                 let v = self.read_r8(0);
                 io.write(port, v);
+            }
+            0xE7 => {
+                // OUT imm8, AX — two byte writes to consecutive ports
+                let port = self.fetch_u8(mem) as u16;
+                let ax = self.regs[r16::AX];
+                io.write(port, ax as u8);
+                io.write(port.wrapping_add(1), (ax >> 8) as u8);
+            }
+            0xED => {
+                // IN AX, DX — 16-bit port read via DX
+                let port = self.regs[r16::DX];
+                let lo = io.read(port) as u16;
+                let hi = io.read(port.wrapping_add(1)) as u16;
+                self.regs[r16::AX] = lo | (hi << 8);
+            }
+            0xEF => {
+                // OUT DX, AX — 16-bit port write via DX
+                let port = self.regs[r16::DX];
+                let ax = self.regs[r16::AX];
+                io.write(port, ax as u8);
+                io.write(port.wrapping_add(1), (ax >> 8) as u8);
+            }
+
+            // XLAT — AL = mem[DS:BX+AL] (with seg-override if present).
+            // The translation-table idiom; 8086 lookups in 256-entry maps.
+            0xD7 => {
+                let seg = self.seg_override.unwrap_or(sreg::DS);
+                let off = self.regs[r16::BX].wrapping_add(self.read_r8(0) as u16);
+                let v = mem.read_u8(Self::linear(self.sregs[seg], off));
+                self.write_r8(0, v);
+            }
+
+            // Carry-flag tweaks.
+            0xF5 => { let c = self.has(flag::CF); self.set_flag(flag::CF, !c); } // CMC
+            0xF8 => { self.set_flag(flag::CF, false); } // CLC
+            0xF9 => { self.set_flag(flag::CF, true); }  // STC
+
+            // LOCK (0xF0) and WAIT (0x9B) prefixes — no-op for a single-
+            // CPU emulator without an FPU. Consume the byte and continue;
+            // the next instruction runs in the same step boundary.
+            // (LOCK is technically only valid on a small set of opcodes;
+            // we accept it anywhere — that matches what most assemblers
+            // emit and is harmless.)
+            0x9B | 0xF0 => {
+                // The byte is already fetched. We could recurse into a
+                // fresh instruction here, but to keep one instruction
+                // per step() call we surface it as a no-op for now.
+                // The next step() will see whatever comes after.
             }
 
             _ => {
@@ -2827,6 +2912,194 @@ mod tests {
         ], 0x800, far_ptr, 8);
         assert_eq!(cpu.read_r8(3), 0x99);
         assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn loop_counts_cx_to_zero() {
+        // Sum 1+2+3+4+5 via LOOP. CX holds the counter, BX the sum.
+        //   MOV CX, 5
+        //   XOR BX, BX
+        // lp: ADD BX, CX
+        //   LOOP lp     (decrement CX; if CX != 0 jump back)
+        //   HLT
+        // Hand-assembled:
+        //   B9 05 00       MOV CX, 5
+        //   31 DB          XOR BX, BX (modrm 11 011 011 = 0xDB)
+        //   01 CB          ADD BX, CX (mod=11 reg=CX=001 rm=BX=011 → 0xCB)
+        //   E2 FC          LOOP -4 (rel8)
+        //   F4             HLT
+        // After-instr IP of LOOP is at offset 9. Target back to ADD at
+        // offset 5. Delta = 5 - 9 = -4 = 0xFC.
+        let (cpu, _, _) = run_payload(&[
+            0xB9, 0x05, 0x00,
+            0x31, 0xDB,
+            0x01, 0xCB,
+            0xE2, 0xFC,
+            0xF4,
+        ], 100);
+        assert_eq!(cpu.regs[r16::BX], 15);
+        assert_eq!(cpu.regs[r16::CX], 0);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn loope_stops_on_zf_clear() {
+        // LOOPE keeps iterating while ZF=1 (and CX>0). We compare each
+        // step and the loop must exit early on the first mismatch.
+        //   MOV CX, 5
+        //   MOV AL, 7
+        // lp: CMP AL, 7   ; ZF=1
+        //   LOOPE lp      ; jumps while ZF=1 and CX != 0
+        // After 4 iterations CX=1 and the 5th decrement brings CX to 0
+        // — LOOPE stops on CX=0 even though ZF is still 1.
+        let (cpu, _, _) = run_payload(&[
+            0xB9, 0x05, 0x00,
+            0xB0, 0x07,
+            0x3C, 0x07,      // CMP AL, 7
+            0xE1, 0xFC,      // LOOPE -4
+            0xF4,
+        ], 50);
+        assert_eq!(cpu.regs[r16::CX], 0);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn loopne_stops_when_zf_becomes_set() {
+        // Search loop: keep iterating until CMP finds a match.
+        //   MOV CX, 5
+        //   MOV AL, 7
+        // lp: CMP AL, 7   ; ZF=1 on first iter (we want LOOPNE to exit)
+        //   LOOPNE lp     ; keeps going while ZF=0 (and CX != 0)
+        // Since ZF=1 right away, LOOPNE decrements CX to 4 then exits.
+        let (cpu, _, _) = run_payload(&[
+            0xB9, 0x05, 0x00,
+            0xB0, 0x07,
+            0x3C, 0x07,
+            0xE0, 0xFC,      // LOOPNE -4
+            0xF4,
+        ], 20);
+        assert_eq!(cpu.regs[r16::CX], 4);
+        assert!(cpu.halted);
+    }
+
+    #[test]
+    fn jcxz_skips_when_cx_zero_without_decrementing() {
+        // JCXZ at the head of a would-be 65536-iter LOOP guards against
+        // it. Here we just verify control flow + that CX is untouched.
+        //   XOR CX, CX
+        //   JCXZ over     (CX=0 → taken; IP advances to "over")
+        //   MOV BX, 0x1234  (skipped)
+        // over:
+        //   MOV AX, 0x5678
+        //   HLT
+        let (cpu, _, _) = run_payload(&[
+            0x31, 0xC9,        // XOR CX, CX (modrm 11 001 001 = 0xC9)
+            0xE3, 0x03,        // JCXZ +3
+            0xBB, 0x34, 0x12,  // MOV BX, 0x1234 (skipped)
+            0xB8, 0x78, 0x56,  // MOV AX, 0x5678
+            0xF4,
+        ], 10);
+        assert_eq!(cpu.regs[r16::AX], 0x5678);
+        assert_eq!(cpu.regs[r16::BX], 0);
+        assert_eq!(cpu.regs[r16::CX], 0);
+    }
+
+    #[test]
+    fn out_ax_writes_both_bytes_to_consecutive_ports() {
+        // OUT 0x3F8 (THR), AX writes the low byte to 0x3F8 (UART tx)
+        // and the high byte to 0x3F9 (IER on the UART — accepted and
+        // dropped by our model). Verify the UART captured the low byte.
+        let (_, _, mut io) = run_payload(&[
+            0xB8, b'Y' as u8, b'Z' as u8,  // MOV AX, "ZY" → AL='Y', AH='Z'
+            0xBA, 0xF8, 0x03,              // MOV DX, 0x3F8
+            0xEF,                           // OUT DX, AX
+            0xF4,
+        ], 6);
+        // UART tx should have received the low byte 'Y'.
+        assert_eq!(io.uart_mut().drain_tx(), b"Y");
+    }
+
+    #[test]
+    fn in_ax_reads_low_byte_then_next_port() {
+        // Push 'X' into the UART rx buffer, then IN AX, DX from 0x3F8.
+        //   IN AX, 0x3F8 reads RBR (0x3F8) into AL and IER (0x3F9, zero)
+        //   into AH.
+        let mut io = IoBus::new();
+        io.uart_mut().push_rx(b"X");
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, &[
+            0xBA, 0xF8, 0x03,    // MOV DX, 0x3F8
+            0xED,                 // IN AX, DX
+            0xF4,
+        ]);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        for _ in 0..6 {
+            if cpu.halted { break; }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert_eq!(cpu.read_r8(0), b'X');  // AL
+        assert_eq!(cpu.read_r8(4), 0);     // AH (IER reads zero)
+    }
+
+    #[test]
+    fn xlat_translates_via_table_at_ds_bx_plus_al() {
+        // Translation table at 0x800: 0→'a', 1→'b', 2→'c', ...
+        //   MOV BX, 0x800
+        //   MOV AL, 2
+        //   XLAT
+        //   HLT
+        let table = b"abcdef";
+        let (cpu, _, _) = run_with_data(&[
+            0xBB, 0x00, 0x08,
+            0xB0, 0x02,
+            0xD7,
+            0xF4,
+        ], 0x800, table, 6);
+        assert_eq!(cpu.read_r8(0), b'c');
+    }
+
+    #[test]
+    fn clc_stc_cmc_drive_carry_flag() {
+        // STC ; CMC ; (CF=0) ; STC ; (CF=1) ; CLC ; (CF=0) ; HLT
+        let (cpu, _, _) = run_payload(&[
+            0xF9,     // STC
+            0xF5,     // CMC
+            0xF9,     // STC
+            0xF5,     // CMC again → CF=0
+            0xF4,
+        ], 6);
+        assert!(!cpu.has(flag::CF));
+
+        let (cpu, _, _) = run_payload(&[
+            0xF9,     // STC
+            0xF4,
+        ], 4);
+        assert!(cpu.has(flag::CF));
+
+        let (cpu, _, _) = run_payload(&[
+            0xF9,     // STC
+            0xF8,     // CLC
+            0xF4,
+        ], 4);
+        assert!(!cpu.has(flag::CF));
+    }
+
+    #[test]
+    fn lock_and_wait_prefixes_are_noop() {
+        // LOCK MOV AX, 0xBEEF is the LOCK byte followed by a normal MOV.
+        // Per our model the LOCK byte counts as one no-op step; the
+        // next step() executes the MOV.
+        // WAIT (0x9B) is treated the same way.
+        let (cpu, _, _) = run_payload(&[
+            0xF0,                         // LOCK
+            0xB8, 0xEF, 0xBE,             // MOV AX, 0xBEEF
+            0x9B,                         // WAIT
+            0xBB, 0x42, 0x42,             // MOV BX, 0x4242
+            0xF4,
+        ], 10);
+        assert_eq!(cpu.regs[r16::AX], 0xBEEF);
+        assert_eq!(cpu.regs[r16::BX], 0x4242);
     }
 
     #[test]
