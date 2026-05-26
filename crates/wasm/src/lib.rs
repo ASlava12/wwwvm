@@ -44,6 +44,12 @@ impl WwwVm {
         self.inner.load_default_guest();
     }
 
+    /// Load the interrupt-driven interactive demo (banner + UART
+    /// echo through IRQ 4). Sets up the IVT itself.
+    pub fn load_interactive_demo(&mut self) {
+        self.inner.load_interactive_demo();
+    }
+
     /// Load arbitrary bytes (e.g. a future kernel/initrd) at `addr`.
     pub fn load_image(&mut self, addr: u32, bytes: &[u8]) {
         self.inner.load_image(addr, bytes);

@@ -19,6 +19,18 @@
 
       <aside id="controls">
         <fieldset>
+          <legend>Guest</legend>
+          <label>
+            <input type="radio" name="guest" value="default" checked />
+            Default (poll LSR + echo)
+          </label>
+          <br />
+          <label>
+            <input type="radio" name="guest" value="interactive" />
+            Interactive (IRQ-driven echo + banner)
+          </label>
+        </fieldset>
+        <fieldset>
           <legend>Autorun (one command per line)</legend>
           <textarea id="autorun" rows="4" placeholder="echo hello&#10;uname -a"></textarea>
         </fieldset>

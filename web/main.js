@@ -65,7 +65,12 @@ $("boot").addEventListener("click", () => {
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
-  vm.load_default_guest();
+  const guestKind = document.querySelector('input[name="guest"]:checked')?.value || "default";
+  if (guestKind === "interactive") {
+    vm.load_interactive_demo();
+  } else {
+    vm.load_default_guest();
+  }
   vm.set_autorun(autorun);
   vm.boot();
   setStatus("running", "running");

@@ -88,6 +88,18 @@ impl Vm {
         self.load_image(BOOT_LOAD_ADDR, HELLO_GUEST);
     }
 
+    /// Load the bundled interactive demo: an interrupt-driven UART
+    /// echo with a banner. Installs main + handler + greeting in
+    /// memory and wires the IRQ-4 vector through the IVT — JS just
+    /// has to call `boot()` afterwards.
+    pub fn load_interactive_demo(&mut self) {
+        use interactive_demo as d;
+        self.load_image(d::MAIN_ADDR, d::MAIN);
+        self.load_image(d::HANDLER_ADDR, d::HANDLER);
+        self.load_image(d::GREETING_ADDR, d::GREETING);
+        self.set_ivt(d::IRQ4_VECTOR, 0, d::HANDLER_ADDR as u16);
+    }
+
     /// Queue commands to be delivered to the guest the moment it boots.
     /// Each command is terminated with `\n` and they are concatenated in
     /// order — `["ls", "cat /etc/os-release"]` becomes `"ls\ncat …\n"`.
@@ -192,6 +204,89 @@ pub const HELLO_GUEST: &[u8] = &[
     b'w', b'w', b'w', b'v', b'm', b':', b' ',
     b'r', b'e', b'a', b'd', b'y', 0x0A, 0x00,
 ];
+
+/// Interrupt-driven interactive demo. Unlike [`HELLO_GUEST`], which
+/// polls the UART LSR in a tight loop, this one wires the UART to
+/// IRQ 4 and lets the CPU spin in `JMP -2` — characters typed by the
+/// host are delivered to the guest via an interrupt and echoed back
+/// from the handler. Demonstrates the IDT + PIC + UART pipeline on
+/// the same `Vm` API used by JS.
+pub mod interactive_demo {
+    pub const MAIN_ADDR: u32 = 0x7C00;
+    pub const HANDLER_ADDR: u32 = 0x7C30;
+    pub const GREETING_ADDR: u32 = 0x7C50;
+    /// COM1 → IRQ 4 → vector 0x0C with the default PIC vector base 8.
+    pub const IRQ4_VECTOR: u8 = 0x0C;
+
+    /// Main entry. Prints the greeting via LODSB+OUT, configures
+    /// UART IER, unmasks IRQ 4, STIs, then sits in an infinite
+    /// `JMP -2` so refresh_irqs keeps polling between interrupts.
+    ///
+    /// ```text
+    /// 0x00 BE 50 7C    MOV SI, 0x7C50              ; greeting string
+    /// 0x03 AC          LODSB
+    /// 0x04 08 C0       OR  AL, AL
+    /// 0x06 74 06       JZ  +6  -> 0x0E (banner done)
+    /// 0x08 BA F8 03    MOV DX, 0x3F8
+    /// 0x0B EE          OUT DX, AL
+    /// 0x0C EB F5       JMP -11 -> 0x03 (next char)
+    /// 0x0E BA F9 03    MOV DX, 0x3F9               ; UART IER
+    /// 0x11 B0 01       MOV AL, 1
+    /// 0x13 EE          OUT DX, AL
+    /// 0x14 B0 EF       MOV AL, 0xEF                ; unmask IRQ 4 only
+    /// 0x16 E6 21       OUT 0x21, AL                ; PIC IMR
+    /// 0x18 FB          STI
+    /// 0x19 EB FE       JMP -2                       ; spin
+    /// ```
+    pub const MAIN: &[u8] = &[
+        0xBE, 0x50, 0x7C,
+        0xAC,
+        0x08, 0xC0,
+        0x74, 0x06,
+        0xBA, 0xF8, 0x03,
+        0xEE,
+        0xEB, 0xF5,
+        0xBA, 0xF9, 0x03,
+        0xB0, 0x01,
+        0xEE,
+        0xB0, 0xEF,
+        0xE6, 0x21,
+        0xFB,
+        0xEB, 0xFE,
+    ];
+
+    /// UART IRQ 4 handler. Reads RBR into AL, writes it straight back
+    /// to THR (echo), EOIs the PIC, IRETs.
+    ///
+    /// ```text
+    /// 0x00 50          PUSH AX
+    /// 0x01 52          PUSH DX
+    /// 0x02 BA F8 03    MOV DX, 0x3F8
+    /// 0x05 EC          IN  AL, DX
+    /// 0x06 EE          OUT DX, AL                  ; echo
+    /// 0x07 B0 20       MOV AL, 0x20
+    /// 0x09 E6 20       OUT 0x20, AL                ; non-specific EOI
+    /// 0x0B 5A          POP DX
+    /// 0x0C 58          POP AX
+    /// 0x0D CF          IRET
+    /// ```
+    pub const HANDLER: &[u8] = &[
+        0x50,
+        0x52,
+        0xBA, 0xF8, 0x03,
+        0xEC,
+        0xEE,
+        0xB0, 0x20,
+        0xE6, 0x20,
+        0x5A,
+        0x58,
+        0xCF,
+    ];
+
+    /// NUL-terminated banner printed once on boot. The trailing newline
+    /// matters: terminals only flush a line when they see `\n`.
+    pub const GREETING: &[u8] = b"wwwvm interactive\n\0";
+}
 
 #[cfg(test)]
 mod tests {
@@ -408,6 +503,38 @@ mod tests {
             other => panic!("expected Halted, got {other:?}"),
         }
         assert_eq!(vm.read_mem_u8(0x900), 4);
+    }
+
+    #[test]
+    fn interactive_demo_prints_banner_and_echoes_via_irq() {
+        let mut vm = Vm::new();
+        vm.load_interactive_demo();
+        vm.boot();
+        // Let the banner-printing loop run; main lands in JMP -2 spin
+        // and the test never halts on its own.
+        let (_, stop) = vm.run_steps(500);
+        match stop {
+            Stop::StepBudget => {}
+            other => panic!("expected StepBudget, got {other:?}"),
+        }
+        let banner = vm.drain_output();
+        assert!(
+            String::from_utf8_lossy(&banner).contains("wwwvm interactive"),
+            "got: {banner:?}",
+        );
+
+        // Now drive an IRQ-4-driven echo. The handler reads RBR and
+        // writes back to THR; main is still spinning in JMP -2.
+        vm.send_input(b"Q");
+        vm.run_steps(500);
+        let echo = vm.drain_output();
+        assert_eq!(echo, b"Q");
+
+        // Multiple bytes work too — each generates a fresh IRQ.
+        vm.send_input(b"abc");
+        vm.run_steps(2_000);
+        let echo = vm.drain_output();
+        assert_eq!(echo, b"abc");
     }
 
     /// Divide-by-zero in the guest must surface as `Stop::CpuError`

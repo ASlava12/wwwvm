@@ -124,9 +124,12 @@
   флаги корректно обновляются для арифметики и логики;
   `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
   `CpuError::Unimplemented { opcode, cs, ip }`.
-* **vm** — `load_default_guest`, `set_autorun_commands`, `boot`,
-  `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`.
-  Встроенный гость `HELLO_GUEST` печатает банер и эхом отвечает.
+* **vm** — `load_default_guest`, `load_interactive_demo`, `set_autorun_commands`,
+  `boot`, `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`,
+  `set_ivt(vec, seg, off)`, `read_mem_u8/u16`. Два встроенных гостя:
+  `HELLO_GUEST` (~43 байта, polling LSR + echo) и `interactive_demo`
+  (~60 байт суммарно, banner через LODSB + interrupt-driven UART echo
+  через IRQ 4 — настраивает IVT, IER, IMR, STI, спит в `JMP -2`).
 * **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
   `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
   `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
