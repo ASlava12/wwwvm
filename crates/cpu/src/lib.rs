@@ -1252,9 +1252,46 @@ impl Cpu {
                         self.push16(mem, ret_ip);
                         self.ip = target;
                     }
+                    // CALL m16:16 — far indirect. The operand must be
+                    // memory (a 4-byte pointer). We re-fetch the linear
+                    // base from the resolved Rm::Mem so both words come
+                    // from the same segment + base address.
+                    3 => {
+                        let ea = match rm {
+                            Rm::Mem(ea) => ea,
+                            Rm::Reg(_) => return Err(CpuError::Unimplemented {
+                                opcode, cs: op_cs, ip: op_ip,
+                            }),
+                        };
+                        let new_ip = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
+                        let new_cs = mem.read_u16(Self::linear(
+                            self.sregs[ea.seg], ea.off.wrapping_add(2),
+                        ));
+                        let cs = self.sregs[sreg::CS];
+                        self.push16(mem, cs);
+                        let ip = self.ip;
+                        self.push16(mem, ip);
+                        self.sregs[sreg::CS] = new_cs;
+                        self.ip = new_ip;
+                    }
                     4 => {
                         let target = self.read_rm16(rm, mem);
                         self.ip = target;
+                    }
+                    // JMP m16:16 — far indirect (no stack activity).
+                    5 => {
+                        let ea = match rm {
+                            Rm::Mem(ea) => ea,
+                            Rm::Reg(_) => return Err(CpuError::Unimplemented {
+                                opcode, cs: op_cs, ip: op_ip,
+                            }),
+                        };
+                        let new_ip = mem.read_u16(Self::linear(self.sregs[ea.seg], ea.off));
+                        let new_cs = mem.read_u16(Self::linear(
+                            self.sregs[ea.seg], ea.off.wrapping_add(2),
+                        ));
+                        self.sregs[sreg::CS] = new_cs;
+                        self.ip = new_ip;
                     }
                     6 => {
                         let v = self.read_rm16(rm, mem);
@@ -1282,6 +1319,18 @@ impl Cpu {
                 let imm = self.fetch_u16(mem);
                 self.write_rm16(rm, mem, imm);
             }
+
+            // PUSH/POP segment registers. Encoding 0b000sss11{0,1} where
+            // bits 3..4 select ES/CS/SS/DS in that order. POP CS (0x0F)
+            // is the 2-byte opcode escape on 80286+ and undefined as
+            // POP on 8086 — we leave it Unimplemented.
+            0x06 => { let v = self.sregs[sreg::ES]; self.push16(mem, v); }
+            0x0E => { let v = self.sregs[sreg::CS]; self.push16(mem, v); }
+            0x16 => { let v = self.sregs[sreg::SS]; self.push16(mem, v); }
+            0x1E => { let v = self.sregs[sreg::DS]; self.push16(mem, v); }
+            0x07 => { self.sregs[sreg::ES] = self.pop16(mem); }
+            0x17 => { self.sregs[sreg::SS] = self.pop16(mem); }
+            0x1F => { self.sregs[sreg::DS] = self.pop16(mem); }
 
             // PUSH r16 (0x50..0x57) — push GPR in standard r16 order.
             // PUSH SP on the 8086 pushes the value *after* the decrement
@@ -1318,6 +1367,25 @@ impl Cpu {
                 self.push16(mem, ret_ip);
                 self.ip = self.ip.wrapping_add(rel as u16);
             }
+            // CALL ptr16:16 — direct far call. Pushes CS then IP, then
+            // loads CS:IP from the 4-byte immediate.
+            0x9A => {
+                let new_ip = self.fetch_u16(mem);
+                let new_cs = self.fetch_u16(mem);
+                let cs = self.sregs[sreg::CS];
+                self.push16(mem, cs);
+                let ip = self.ip;
+                self.push16(mem, ip);
+                self.sregs[sreg::CS] = new_cs;
+                self.ip = new_ip;
+            }
+            // JMP ptr16:16 — direct far jump. No stack activity.
+            0xEA => {
+                let new_ip = self.fetch_u16(mem);
+                let new_cs = self.fetch_u16(mem);
+                self.sregs[sreg::CS] = new_cs;
+                self.ip = new_ip;
+            }
             // RET (near) — pop IP.
             0xC3 => {
                 self.ip = self.pop16(mem);
@@ -1327,6 +1395,18 @@ impl Cpu {
             0xC2 => {
                 let extra = self.fetch_u16(mem);
                 self.ip = self.pop16(mem);
+                self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
+            }
+            // RETF — pop IP then CS (far return).
+            0xCB => {
+                self.ip = self.pop16(mem);
+                self.sregs[sreg::CS] = self.pop16(mem);
+            }
+            // RETF imm16 — far return with callee-side stack cleanup.
+            0xCA => {
+                let extra = self.fetch_u16(mem);
+                self.ip = self.pop16(mem);
+                self.sregs[sreg::CS] = self.pop16(mem);
                 self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
             }
 
@@ -2624,6 +2704,129 @@ mod tests {
         }
         assert_eq!(cpu.read_r8(7), 0x99);  // BH set by handler
         assert_eq!(cpu.read_r8(3), 0x11);  // BL set after IRET
+    }
+
+    #[test]
+    fn push_ds_pop_es_copies_segment_through_stack() {
+        // Set DS via AX, then PUSH DS / POP ES, verify ES picked it up.
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x34, 0x12,      // MOV AX, 0x1234
+            0x8E, 0xD8,            // MOV DS, AX (8E /3 = DS, modrm=11 011 000)
+            0x1E,                  // PUSH DS
+            0x07,                  // POP ES
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.sregs[sreg::DS], 0x1234);
+        assert_eq!(cpu.sregs[sreg::ES], 0x1234);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn call_far_pushes_cs_ip_then_retf_restores() {
+        // 0: 9A 09 00 00 00   CALL 0x0000:0x0009     ; far call to offset 9
+        // 5: B3 22            MOV BL, 0x22           ; runs after RETF
+        // 7: F4               HLT
+        // 8: 90               NOP (padding)
+        // 9: B7 88            MOV BH, 0x88           ; callee
+        // B: CB               RETF
+        let (cpu, _, _) = run_payload(&[
+            0x9A, 0x09, 0x7C, 0x00, 0x00,
+            0xB3, 0x22,
+            0xF4,
+            0x90,
+            0xB7, 0x88,
+            0xCB,
+        ], 16);
+        assert_eq!(cpu.read_r8(7), 0x88);  // BH set by callee
+        assert_eq!(cpu.read_r8(3), 0x22);  // BL set after RETF
+        assert!(cpu.halted);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn jmp_far_loads_cs_ip_without_stack_activity() {
+        // 0: EA 06 7C 00 00   JMP 0x0000:0x7C06
+        // 5: F4               HLT (skipped)
+        // 6: B3 77            MOV BL, 0x77
+        // 8: F4               HLT
+        let (cpu, _, _) = run_payload(&[
+            0xEA, 0x06, 0x7C, 0x00, 0x00,
+            0xF4,
+            0xB3, 0x77,
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.read_r8(3), 0x77);
+        assert!(cpu.halted);
+        // No PUSH happened — SP unchanged
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn retf_imm16_cleans_extra_stack_bytes() {
+        // PUSH an argument, CALL far, callee RETF 2 — SP must roll back
+        // through both the return-pair and the arg.
+        //
+        // 0: 68 99 00          PUSH 0x99
+        // 3: 9A 0C 7C 00 00    CALL 0x0000:0x7C0C
+        // 8: F4                HLT
+        // 9: 90 90 90          NOP padding
+        // C: C2 not — we want RETF, so:
+        // C: CA 02 00          RETF 2
+        let (cpu, _, _) = run_payload(&[
+            0x68, 0x99, 0x00,
+            0x9A, 0x0C, 0x7C, 0x00, 0x00,
+            0xF4,
+            0x90, 0x90, 0x90,
+            0xCA, 0x02, 0x00,
+        ], 16);
+        assert!(cpu.halted);
+        // Argument popped by RETF 2 — SP back to boot value.
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn group5_far_call_indirect_via_pointer_in_memory() {
+        // Far pointer at 0x800: offset=0x7C0A, segment=0x0000.
+        // 0: BB 00 08          MOV BX, 0x800
+        // 3: FF 1F             CALL FAR [BX]   (FF /3, modrm=00 011 111 = 0x1F)
+        // 5: B3 11             MOV BL, 0x11
+        // 7: F4                HLT
+        // 8: 90 90             NOP padding
+        // A: B7 55             MOV BH, 0x55
+        // C: CB                RETF
+        let far_ptr = &[0x0A, 0x7C, 0x00, 0x00];
+        let (cpu, _, _) = run_with_data(&[
+            0xBB, 0x00, 0x08,
+            0xFF, 0x1F,
+            0xB3, 0x11,
+            0xF4,
+            0x90, 0x90,
+            0xB7, 0x55,
+            0xCB,
+        ], 0x800, far_ptr, 16);
+        assert_eq!(cpu.read_r8(7), 0x55);
+        assert_eq!(cpu.read_r8(3), 0x11);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn group5_far_jmp_indirect_no_return() {
+        // Like above but with FF /5 — far JMP, no stack push.
+        // 0: BB 00 08          MOV BX, 0x800
+        // 3: FF 2F             JMP FAR [BX]   (FF /5, modrm=00 101 111 = 0x2F)
+        // 5: F4                HLT             (skipped)
+        // 6: B3 99             MOV BL, 0x99
+        // 8: F4                HLT
+        let far_ptr = &[0x06, 0x7C, 0x00, 0x00];
+        let (cpu, _, _) = run_with_data(&[
+            0xBB, 0x00, 0x08,
+            0xFF, 0x2F,
+            0xF4,
+            0xB3, 0x99,
+            0xF4,
+        ], 0x800, far_ptr, 8);
+        assert_eq!(cpu.read_r8(3), 0x99);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
     }
 
     #[test]

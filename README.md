@@ -82,6 +82,13 @@
   **sign-extension** `CBW` (0x98) AL→AX, `CWD` (0x99) AX→DX:AX —
   обязательны перед `IDIV` для корректного знакового деления;
   **flag transfer** `LAHF` (0x9F) FLAGS-low→AH, `SAHF` (0x9E) AH→FLAGS-low;
+  **far-инструкции**: `CALL ptr16:16` (0x9A, push CS+IP, load CS:IP из imm),
+  `JMP ptr16:16` (0xEA, без стека), `RETF`/`RETF imm16` (0xCB/0xCA),
+  `CALL m16:16`/`JMP m16:16` (Group 5 FF /3, /5 — far indirect через
+  4-байтный указатель в памяти);
+  **PUSH/POP сегментных регистров** — `PUSH ES/CS/SS/DS` (0x06/0x0E/0x16/0x1E),
+  `POP ES/SS/DS` (0x07/0x17/0x1F). `POP CS` (0x0F) намеренно не реализован
+  — на 80286+ это префикс 2-байтных опкодов;
   **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
   (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
   `RET`/`RET imm16` (0xC3/0xC2);
@@ -100,7 +107,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **83 зелёных** (mem 4 + devices 5 + cpu 65 + vm 3 + wasm 1
+* Тестов — **89 зелёных** (mem 4 + devices 5 + cpu 71 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -114,8 +121,8 @@
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
 | `RCL`/`RCR` (Group 2 /2,/3) | малый | Big-number арифметика, идиомы битовой блокировки |
 | `XLAT`, BCD (`AAA`/`AAS`/`AAM`/`AAD`/`DAA`/`DAS`) | малый | Полнота 8086 ISA для старого DOS-кода |
-| Far-инструкции: `CALL ptr16:16`/`RETF`/`JMP FAR`, `PUSH`/`POP sreg` | малый | Переходы и стек через сегменты; нужны для далёких хендлеров |
 | BIOS-хендлеры по векторам (0x10 — VGA, 0x13 — диск, 0x16 — клавиатура, 0x19 — boot) | средний | Гость, ожидающий стандартного PC BIOS API |
+| Protected mode (CR0.PE, GDT, дескрипторы, прерывания через IDT-gates) | большой | Любое современное ядро |
 | Прерывания: `INT`, `IRET`, IDT, BIOS-вектора 0x10/0x13/0x16 | средний | Гости, использующие BIOS-калбэки |
 | Protected mode + paging | большой | Любое современное ядро |
 | Long mode (x86_64) | большой | 64-битные ядра |
