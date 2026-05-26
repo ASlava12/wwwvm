@@ -47,6 +47,24 @@ impl Memory {
         let n = end.saturating_sub(start);
         self.bytes[start..start + n].copy_from_slice(&data[..n]);
     }
+
+    /// Borrow the entire backing buffer. Used by the VM's snapshot
+    /// helper to write 1 MB out in a single pass.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Replace the entire backing buffer in one shot. Returns Err if
+    /// `data.len()` does not match the configured RAM size — restoring
+    /// a snapshot from a VM built with different memory sizing would
+    /// otherwise silently truncate or leave stale tail bytes.
+    pub fn restore_full(&mut self, data: &[u8]) -> Result<(), usize> {
+        if data.len() != self.bytes.len() {
+            return Err(self.bytes.len());
+        }
+        self.bytes.copy_from_slice(data);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -82,5 +100,22 @@ mod tests {
         m.write_slice(6, &[1, 2, 3, 4]);
         assert_eq!(m.read_u8(6), 1);
         assert_eq!(m.read_u8(7), 2);
+    }
+
+    #[test]
+    fn restore_full_round_trips() {
+        let mut m = Memory::new(16);
+        m.write_u8(0, 0xAA);
+        let snap = m.as_slice().to_vec();
+        let mut m2 = Memory::new(16);
+        m2.restore_full(&snap).unwrap();
+        assert_eq!(m2.read_u8(0), 0xAA);
+    }
+
+    #[test]
+    fn restore_full_rejects_size_mismatch() {
+        let mut m = Memory::new(16);
+        let err = m.restore_full(&[0u8; 8]).unwrap_err();
+        assert_eq!(err, 16);
     }
 }

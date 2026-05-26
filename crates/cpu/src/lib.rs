@@ -116,6 +116,18 @@ impl Cpu {
         }
     }
 
+    /// Read the CPU's segment-override prefix. Exposed so the VM
+    /// snapshot helper can persist transient state without crates
+    /// having to make the field itself public.
+    pub fn seg_override(&self) -> Option<usize> {
+        self.seg_override
+    }
+
+    /// Counterpart to `seg_override()`. Used only by snapshot restore.
+    pub fn set_seg_override(&mut self, value: Option<usize>) {
+        self.seg_override = value;
+    }
+
     /// Reset to a sensible boot state: CS:IP = 0000:7C00 (where BIOS
     /// loads the first sector), stack at the bottom of conventional
     /// memory, all data segments = 0.

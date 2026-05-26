@@ -132,10 +132,15 @@
 * **vm** — `load_default_guest`, `load_interactive_demo`, `set_autorun_commands`,
   `boot`, `run_steps(budget) -> (executed, Stop)`, `send_input`, `drain_output`,
   `push_scancode`, `set_cmos_time`, `set_ivt(vec, seg, off)`, `read_mem_u8/u16`,
-  `vga_text_snapshot()`. Два встроенных гостя: `HELLO_GUEST` (~43 байта,
-  polling LSR + echo) и `interactive_demo` (banner + IRQ-driven UART
-  echo). Гость пишет в VGA-text напрямую в RAM на 0xB8000 — host
-  читает обратно через `vga_text_snapshot` (25 строк × 80 ASCII-символов).
+  `vga_text_snapshot()`, `snapshot()`/`restore(bytes)`. Два встроенных
+  гостя: `HELLO_GUEST` (~43 байта, polling LSR + echo) и
+  `interactive_demo` (banner + IRQ-driven UART echo). Гость пишет в
+  VGA-text напрямую в RAM на 0xB8000 — host читает обратно через
+  `vga_text_snapshot` (25 строк × 80 ASCII-символов). Snapshot v1
+  ≈ 1 MiB + 52 байта: 16-байтный header (`WWWVM\x00` + version + reserved),
+  36-байтный CPU image, 1 МБ memory dump. v1 захватывает CPU + RAM;
+  device-state (UART очереди, PIC/PIT/keyboard/CMOS) сбрасывается при
+  restore — снимать stay-rest-point'ы (boot, idle `JMP -2`, HLT).
 * **wasm** — `WwwVm` для JS: `load_default_guest`, `load_image`,
   `set_autorun([…])`, `boot`, `run(cycles)`, `send_command`,
   `send_input`, `read_output`, `is_halted`, `is_booted`, `last_error`.
@@ -144,7 +149,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **140 зелёных** (mem 4 + devices 29 + cpu 89 + vm 12 + wasm 1
+* Тестов — **146 зелёных** (mem 6 + devices 29 + cpu 89 + vm 16 + wasm 1
   + proxy 5). VM-уровень включает E2E-тесты `LOOP+OUT` (печать "ABCDE"),
   `MUL` (квадрат байта от UART), `DIV`-by-zero → `Stop::CpuError`,
   **interrupt-driven serial** (UART rx → IRQ 4 → handler читает RBR → EOI)

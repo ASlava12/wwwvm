@@ -23,6 +23,48 @@ pub const VGA_TEXT_BASE: u32 = 0xB8000;
 pub const VGA_TEXT_COLS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
 
+/// Snapshot format constants and the error type used by `restore`.
+pub mod snapshot {
+    /// 6-byte format magic. Suitable for identifying the file from a
+    /// hex dump.
+    pub const MAGIC: &[u8] = b"WWWVM\x00";
+    /// Current snapshot format version. Bumped whenever fields are
+    /// added (e.g. when device state lands in v2).
+    pub const VERSION: u8 = 1;
+    /// Bytes consumed by header: magic + version + flags + reserved.
+    pub const HEADER_LEN: usize = 16;
+    /// Bytes consumed by the CPU image: 8 r16 + 6 sreg + ip + flags +
+    /// halted byte + seg_override byte (rounded up).
+    pub const CPU_LEN: usize = 36;
+
+    #[derive(Debug)]
+    pub enum SnapshotError {
+        TooSmall { got: usize, need: usize },
+        BadMagic,
+        UnsupportedVersion(u8),
+        MemorySizeMismatch { expected: usize, actual: usize },
+    }
+
+    impl std::fmt::Display for SnapshotError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::TooSmall { got, need } => {
+                    write!(f, "snapshot too small: got {got} bytes, need at least {need}")
+                }
+                Self::BadMagic => write!(f, "snapshot magic mismatch"),
+                Self::UnsupportedVersion(v) => {
+                    write!(f, "unsupported snapshot version {v}")
+                }
+                Self::MemorySizeMismatch { expected, actual } => {
+                    write!(f, "memory size mismatch: expected {expected}, got {actual}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for SnapshotError {}
+}
+
 /// Why the run loop stopped this turn.
 #[derive(Debug)]
 pub enum Stop {
@@ -89,6 +131,114 @@ impl Vm {
     /// Read a 16-bit little-endian word from guest RAM.
     pub fn read_mem_u16(&self, addr: u32) -> u16 {
         self.mem.read_u16(addr)
+    }
+
+    /// Capture the VM's state as a compact byte buffer for later
+    /// `restore()`. Format v1: 16-byte header (magic + version +
+    /// reserved) + 36-byte CPU image + 1 MB memory image. Total
+    /// ≈ 1 MiB + 52 bytes.
+    ///
+    /// **Scope of v1**: CPU and RAM only. Device state (UART buffers,
+    /// PIC IMR/IRR/ISR, PIT counter, keyboard queue, CMOS storage)
+    /// is *not* preserved — restored snapshots come back with fresh
+    /// devices. A snapshot taken mid-handler can therefore land in a
+    /// surprising place after restore. Use snapshots when the guest
+    /// is at a clean rest point (boot, JMP -2 idle, HLT).
+    pub fn snapshot(&self) -> Vec<u8> {
+        let total = snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE;
+        let mut buf = Vec::with_capacity(total);
+        // Header
+        buf.extend_from_slice(snapshot::MAGIC);
+        buf.push(snapshot::VERSION);
+        buf.push(0); // flags (reserved)
+        buf.extend_from_slice(&[0u8; 8]); // reserved padding
+        // CPU
+        for r in &self.cpu.regs {
+            buf.extend_from_slice(&r.to_le_bytes());
+        }
+        for s in &self.cpu.sregs {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.cpu.ip.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.flags.to_le_bytes());
+        buf.push(self.cpu.halted as u8);
+        buf.push(match self.cpu.seg_override() {
+            None => 0xFF,
+            Some(i) => i as u8,
+        });
+        // 2 reserved CPU-state bytes so the block stays a round 36;
+        // future fields (TF, A20 gate, etc.) can land here without
+        // bumping the snapshot version.
+        buf.extend_from_slice(&[0u8; 2]);
+        // Memory
+        buf.extend_from_slice(self.mem.as_slice());
+        buf
+    }
+
+    /// Restore VM state from a buffer produced by `snapshot()`. On
+    /// error the VM's state is unchanged (we validate first, mutate
+    /// only on success). Devices are *not* restored — they keep
+    /// whatever state they had before the call.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), snapshot::SnapshotError> {
+        use snapshot::SnapshotError;
+        let min = snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE;
+        if bytes.len() < min {
+            return Err(SnapshotError::TooSmall {
+                got: bytes.len(),
+                need: min,
+            });
+        }
+        if &bytes[..snapshot::MAGIC.len()] != snapshot::MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        let version = bytes[snapshot::MAGIC.len()];
+        if version != snapshot::VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let cpu_start = snapshot::HEADER_LEN;
+        let mem_start = cpu_start + snapshot::CPU_LEN;
+        // Decode CPU image into temporaries first so a malformed body
+        // can't half-overwrite live CPU state.
+        let mut regs = [0u16; 8];
+        for (i, r) in regs.iter_mut().enumerate() {
+            *r = u16::from_le_bytes([
+                bytes[cpu_start + i * 2],
+                bytes[cpu_start + i * 2 + 1],
+            ]);
+        }
+        let sregs_off = cpu_start + 16;
+        let mut sregs = [0u16; 6];
+        for (i, s) in sregs.iter_mut().enumerate() {
+            *s = u16::from_le_bytes([
+                bytes[sregs_off + i * 2],
+                bytes[sregs_off + i * 2 + 1],
+            ]);
+        }
+        let ip = u16::from_le_bytes([bytes[cpu_start + 28], bytes[cpu_start + 29]]);
+        let flags = u16::from_le_bytes([bytes[cpu_start + 30], bytes[cpu_start + 31]]);
+        let halted = bytes[cpu_start + 32] != 0;
+        let seg_override = match bytes[cpu_start + 33] {
+            0xFF => None,
+            i if (i as usize) < 6 => Some(i as usize),
+            _ => None,
+        };
+        // Memory restore — `restore_full` validates size again as a
+        // defense-in-depth check, but we already verified above.
+        self.mem
+            .restore_full(&bytes[mem_start..mem_start + Self::RAM_SIZE])
+            .map_err(|expected| SnapshotError::MemorySizeMismatch {
+                expected,
+                actual: bytes.len() - mem_start,
+            })?;
+        // Now that validation passed, commit CPU state.
+        self.cpu.regs = regs;
+        self.cpu.sregs = sregs;
+        self.cpu.ip = ip;
+        self.cpu.flags = flags;
+        self.cpu.halted = halted;
+        self.cpu.set_seg_override(seg_override);
+        self.booted = true;
+        Ok(())
     }
 
     /// Snapshot the VGA text-mode buffer as a plain string: 25 rows
@@ -732,6 +882,81 @@ mod tests {
         vm.run_steps(2_000);
         let echo = vm.drain_output();
         assert_eq!(echo, b"abc");
+    }
+
+    /// Snapshot CPU+RAM mid-execution, restore into a fresh VM,
+    /// verify the program produces the same final result whether it
+    /// runs straight through or is interrupted by a snapshot/restore
+    /// round-trip.
+    #[test]
+    fn snapshot_restore_round_trips_mid_execution() {
+        // Simple loop guest summing 1..=10 in BX. Loaded at 0x7C00.
+        let program: &[u8] = &[
+            0xB9, 0x0A, 0x00,           // MOV CX, 10
+            0x31, 0xDB,                  // XOR BX, BX
+            0x01, 0xCB,                  // ADD BX, CX
+            0xE2, 0xFC,                  // LOOP -4
+            0xF4,                        // HLT
+        ];
+
+        let mut vm = Vm::new();
+        vm.load_image(BOOT_LOAD_ADDR, program);
+        vm.boot();
+        // Run a handful of steps so we land mid-iteration.
+        vm.run_steps(8);
+        assert!(!vm.is_halted());
+
+        let snap = vm.snapshot();
+
+        // Continue the original to completion.
+        vm.run_steps(200);
+        assert!(vm.is_halted());
+        let original_bx = vm.cpu().regs[wwwvm_cpu::r16::BX];
+
+        // Restore into a fresh VM and continue from the snapshot point.
+        let mut vm2 = Vm::new();
+        vm2.restore(&snap).expect("restore");
+        vm2.run_steps(200);
+        assert!(vm2.is_halted());
+        assert_eq!(vm2.cpu().regs[wwwvm_cpu::r16::BX], original_bx);
+        assert_eq!(original_bx, 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10);
+    }
+
+    #[test]
+    fn restore_rejects_bad_magic() {
+        let mut bytes = vec![0u8; snapshot::HEADER_LEN + snapshot::CPU_LEN + Vm::RAM_SIZE];
+        bytes[..6].copy_from_slice(b"NOPE!\x00");
+        bytes[6] = snapshot::VERSION;
+        let mut vm = Vm::new();
+        let err = vm.restore(&bytes).unwrap_err();
+        match err {
+            snapshot::SnapshotError::BadMagic => {}
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn restore_rejects_unknown_version() {
+        let mut bytes = vec![0u8; snapshot::HEADER_LEN + snapshot::CPU_LEN + Vm::RAM_SIZE];
+        bytes[..snapshot::MAGIC.len()].copy_from_slice(snapshot::MAGIC);
+        bytes[snapshot::MAGIC.len()] = 99;
+        let mut vm = Vm::new();
+        match vm.restore(&bytes).unwrap_err() {
+            snapshot::SnapshotError::UnsupportedVersion(99) => {}
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let vm = Vm::new();
+        let mut snap = vm.snapshot();
+        snap.truncate(snap.len() / 2);
+        let mut vm2 = Vm::new();
+        match vm2.restore(&snap).unwrap_err() {
+            snapshot::SnapshotError::TooSmall { .. } => {}
+            other => panic!("unexpected: {other}"),
+        }
     }
 
     /// Divide-by-zero in the guest must surface as `Stop::CpuError`

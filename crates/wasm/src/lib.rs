@@ -80,6 +80,21 @@ impl WwwVm {
         self.inner.vga_text_snapshot()
     }
 
+    /// Capture CPU + RAM as a byte blob the host can persist (IndexedDB,
+    /// download as file, etc.) and later feed to `restore`. ~1 MiB.
+    /// Device state is *not* preserved in this version.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.inner.snapshot()
+    }
+
+    /// Restore CPU + RAM from a `snapshot()` blob. Returns a JS Error
+    /// describing the failure (bad magic, wrong version, truncated)
+    /// on rejection; on success the VM is exactly where the snapshot
+    /// was taken, devices excluded.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        self.inner.restore(bytes).map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Pre-queue commands to be delivered to the guest at boot. Pass an
     /// array of strings from JS — each is appended with `\n`.
     pub fn set_autorun(&mut self, commands: Vec<String>) {
