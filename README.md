@@ -49,6 +49,9 @@
   `[BX]`), включая исключение `mod=00,rm=110 → [disp16]`, с правильным
   выбором сегмента по умолчанию (SS для `[BP*]`, иначе DS), и disp8/disp16.
   `INC`/`DEC r16`; `TEST AL/AX, imm`; `IN/OUT` через DX и imm8;
+  **стек SS:SP** — `PUSH`/`POP r16` (0x50–0x5F), `PUSH imm8/imm16`
+  (0x68/0x6A), `PUSHF`/`POPF` (0x9C/0x9D), `CALL rel16` (0xE8),
+  `RET`/`RET imm16` (0xC3/0xC2);
   `JMP rel8/rel16`; весь набор `Jcc rel8` (использует CF/ZF/SF/OF/PF);
   флаги корректно обновляются для арифметики и логики;
   `CLI/STI/CLD/STD/NOP/HLT`. Неподдержанные опкоды возвращают
@@ -64,7 +67,7 @@
   Allow-list — `WWWVM_PROXY_ALLOWLIST` (`*` / `host:port` / `host:*`).
 * **web** — демо-страница с xterm.js и `window.runCommand(text)`,
   возвращающим `Promise<string>`.
-* Тестов — **34 зелёных** (mem 4 + devices 5 + cpu 16 + vm 3 + wasm 1
+* Тестов — **40 зелёных** (mem 4 + devices 5 + cpu 22 + vm 3 + wasm 1
   + proxy 5).
 
 ## Что НЕ работает (намеренно, дорожная карта)
@@ -74,7 +77,7 @@
 
 | Этап | Объём | Зачем |
 |------|-------|-------|
-| `PUSH`/`POP r16` (со стеком SS:SP), `PUSH/POP sreg`, `CALL`/`RET` | средний | Подпрограммы, любой `_start` от линкера |
+| `PUSH/POP sreg`, `CALL ptr16:16` (far), `RETF` | малый | Переходы через сегменты, далёкий ret |
 | Префиксы сегмента (`CS:`, `DS:`, `ES:`, `SS:`) | малый | `MOV ES:[DI], …` и т.п. |
 | Group 1/3 (`ADD r/m, imm`, `MUL`, `DIV`, `NEG`, `NOT`, `SHL`/`SHR`) | средний | Запускать что-то сложнее эхо-цикла |
 | `MOVS`, `STOS`, `SCAS`, `CMPS`, `REP`-префиксы | малый | `memcpy`/`memset` в гостях |

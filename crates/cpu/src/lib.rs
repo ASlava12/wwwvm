@@ -295,6 +295,23 @@ impl Cpu {
         }
     }
 
+    /// Push a 16-bit value onto the SS:SP stack. SP decrements *before*
+    /// the write — matching real x86 — so after a push SP points at the
+    /// new top word.
+    fn push16(&mut self, mem: &mut Memory, value: u16) {
+        let sp = self.regs[r16::SP].wrapping_sub(2);
+        self.regs[r16::SP] = sp;
+        mem.write_u16(Self::linear(self.sregs[sreg::SS], sp), value);
+    }
+
+    /// Pop a 16-bit value from SS:SP. SP increments *after* the read.
+    fn pop16(&mut self, mem: &Memory) -> u16 {
+        let sp = self.regs[r16::SP];
+        let v = mem.read_u16(Self::linear(self.sregs[sreg::SS], sp));
+        self.regs[r16::SP] = sp.wrapping_add(2);
+        v
+    }
+
     /// Execute one of the 8 standard ALU operations encoded in opcode
     /// 0x00..0x3F. `op` is the operation (0=ADD … 7=CMP) and `variant`
     /// (opcode & 7) selects operand form. Supports all 16-bit ModR/M
@@ -506,6 +523,63 @@ impl Cpu {
                 }
                 let imm = self.fetch_u16(mem);
                 self.write_rm16(rm, mem, imm);
+            }
+
+            // PUSH r16 (0x50..0x57) — push GPR in standard r16 order.
+            // PUSH SP on the 8086 pushes the value *after* the decrement
+            // (an 80186 quirk fixed by Intel later). We push the original
+            // SP — the 80286+ behaviour — because it is what every modern
+            // toolchain assumes.
+            0x50..=0x57 => {
+                let i = opcode - 0x50;
+                let v = self.read_r16(i);
+                self.push16(mem, v);
+            }
+            // POP r16 (0x58..0x5F)
+            0x58..=0x5F => {
+                let i = opcode - 0x58;
+                let v = self.pop16(mem);
+                self.write_r16(i, v);
+            }
+
+            // PUSH imm16
+            0x68 => {
+                let imm = self.fetch_u16(mem);
+                self.push16(mem, imm);
+            }
+            // PUSH imm8 (sign-extended to 16 bits)
+            0x6A => {
+                let imm = self.fetch_u8(mem) as i8 as i16 as u16;
+                self.push16(mem, imm);
+            }
+
+            // CALL rel16 — push return IP, then jump.
+            0xE8 => {
+                let rel = self.fetch_u16(mem) as i16;
+                let ret_ip = self.ip;
+                self.push16(mem, ret_ip);
+                self.ip = self.ip.wrapping_add(rel as u16);
+            }
+            // RET (near) — pop IP.
+            0xC3 => {
+                self.ip = self.pop16(mem);
+            }
+            // RET imm16 (near) — pop IP, then SP += imm16. Used by
+            // callee-cleanup conventions.
+            0xC2 => {
+                let extra = self.fetch_u16(mem);
+                self.ip = self.pop16(mem);
+                self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
+            }
+
+            // PUSHF — push the FLAGS register.
+            0x9C => {
+                let f = self.flags;
+                self.push16(mem, f);
+            }
+            // POPF — pop FLAGS.
+            0x9D => {
+                self.flags = self.pop16(mem);
             }
 
             // INC r16 (0x40-0x47) / DEC r16 (0x48-0x4F). Per the 8086,
@@ -864,6 +938,111 @@ mod tests {
         assert_eq!(cpu.regs[r16::BX], 15);
         assert_eq!(cpu.regs[r16::CX], 0);
         assert!(cpu.halted);
+    }
+
+    #[test]
+    fn push_pop_round_trip_through_other_reg() {
+        // MOV AX, 0x1234 ; PUSH AX ; MOV AX, 0 ; POP BX ; HLT
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x34, 0x12,
+            0x50,                // PUSH AX
+            0xB8, 0x00, 0x00,
+            0x5B,                // POP BX
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.regs[r16::BX], 0x1234);
+        assert_eq!(cpu.regs[r16::AX], 0);
+        // SP must be back to its boot value
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn push_writes_below_sp_lifo() {
+        // PUSH 0xAAAA ; PUSH 0xBBBB ; POP AX ; POP BX
+        // After pushes, AX should be the most-recent (0xBBBB), BX older.
+        let (cpu, _, _) = run_payload(&[
+            0x68, 0xAA, 0xAA,
+            0x68, 0xBB, 0xBB,
+            0x58,                // POP AX
+            0x5B,                // POP BX
+            0xF4,
+        ], 8);
+        assert_eq!(cpu.regs[r16::AX], 0xBBBB);
+        assert_eq!(cpu.regs[r16::BX], 0xAAAA);
+    }
+
+    #[test]
+    fn push_imm8_sign_extends_to_16_bits() {
+        // PUSH 0xFF (imm8) → on the stack as 0xFFFF
+        let (cpu, mem, _) = run_payload(&[
+            0x6A, 0xFF,
+            0xF4,
+        ], 4);
+        // Stack top is at SS:SP after the push
+        let top = mem.read_u16(((cpu.sregs[sreg::SS] as u32) << 4) + cpu.regs[r16::SP] as u32);
+        assert_eq!(top, 0xFFFF);
+    }
+
+    #[test]
+    fn call_pushes_return_ip_and_ret_restores_it() {
+        // 0: B8 00 00     MOV AX, 0
+        // 3: E8 01 00     CALL +1  (target offset 7)
+        // 6: F4           HLT
+        // 7: B8 07 00     MOV AX, 7
+        // A: C3           RET
+        let (cpu, _, _) = run_payload(&[
+            0xB8, 0x00, 0x00,
+            0xE8, 0x01, 0x00,
+            0xF4,
+            0xB8, 0x07, 0x00,
+            0xC3,
+        ], 16);
+        assert_eq!(cpu.regs[r16::AX], 7);
+        assert!(cpu.halted);
+        // SP must be back to its boot value
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn ret_imm16_pops_extra_bytes() {
+        // 0: 68 99 00       PUSH 0x99           ; "argument"
+        // 3: E8 02 00       CALL +2             ; -> 8
+        // 6: F4             HLT
+        // 7: 90             NOP (filler)
+        // 8: C2 02 00       RET 2               ; pop IP, then SP+=2
+        //
+        // Inv: after RET 2, SP is back to its boot value because the
+        // imm16 cleanup popped the argument. Plain RET would leave SP
+        // 2 bytes lower.
+        let (cpu, _, _) = run_payload(&[
+            0x68, 0x99, 0x00,
+            0xE8, 0x02, 0x00,
+            0xF4,
+            0x90,
+            0xC2, 0x02, 0x00,
+        ], 16);
+        assert!(cpu.halted);
+        assert_eq!(cpu.regs[r16::SP], 0x7C00);
+    }
+
+    #[test]
+    fn pushf_popf_round_trips_flags() {
+        // Set ZF via XOR AX, AX ; PUSHF ; clear ZF via MOV AX, 1 (no
+        // flag changes…) — we need an op that touches ZF. Use INC AX
+        // which clears ZF when AX!=0.
+        //   XOR AX, AX        ; ZF=1
+        //   PUSHF
+        //   INC AX            ; ZF=0
+        //   POPF              ; ZF=1 restored
+        //   HLT
+        let (cpu, _, _) = run_payload(&[
+            0x31, 0xC0,
+            0x9C,
+            0x40,
+            0x9D,
+            0xF4,
+        ], 8);
+        assert!(cpu.has(flag::ZF));
     }
 
     #[test]
