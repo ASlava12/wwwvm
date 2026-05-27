@@ -2466,6 +2466,59 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x66 0xC1 /4 — SHL r/m32, imm8. 32-bit shift through Group 2.
+/// CF after SHL is the *last* bit shifted out — i.e. bit (32-count)
+/// of the original. For value=0x80000001 and count=1, the last (and
+/// only) bit shifted out is bit 31 = 1, so CF=1.
+#[test]
+fn shl_r32_imm8_shifts_and_sets_cf_from_shifted_out_bit() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x80, // MOV EAX, 0x80000001
+            0x66, 0xC1, 0xE0, 0x01, // SHL EAX, 1
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0x0000_0002);
+    assert!(cpu.has(flag::CF));
+}
+
+/// 0x66 0xC1 /7 — SAR r/m32, imm8. Signed shift preserves the
+/// sign bit.
+#[test]
+fn sar_r32_imm8_preserves_sign_bit() {
+    // MOV EAX, 0xFFFF_FF80 ; SAR EAX, 3 ; HLT
+    //   -128 >> 3 = -16 → 0xFFFF_FFF0
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x80, 0xFF, 0xFF, 0xFF, // MOV EAX, 0xFFFFFF80
+            0x66, 0xC1, 0xF8, 0x03, // SAR EAX, 3 (sub=7, rm=EAX)
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0xFFFF_FFF0);
+    assert!(cpu.has(flag::SF));
+}
+
+/// 0x66 0xC1 /0 — ROL r/m32, imm8. CF takes the bit rotated out.
+#[test]
+fn rol_r32_imm8_rotates_dword() {
+    // MOV EAX, 0x8000_0001 ; ROL EAX, 1 ; HLT
+    //   ROL by 1 → 0x0000_0003 (top bit wraps to bit 0); CF = old bit 31 = 1
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x80, // MOV EAX, 0x80000001
+            0x66, 0xC1, 0xC0, 0x01, // ROL EAX, 1
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0x0000_0003);
+    assert!(cpu.has(flag::CF));
+}
+
 /// 0x66 0xF7 /4 — MUL r/m32. EDX:EAX = EAX * r/m32 unsigned.
 #[test]
 fn mul_r32_unsigned_produces_64_bit_product_in_edx_eax() {

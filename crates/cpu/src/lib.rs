@@ -1048,6 +1048,12 @@ impl Cpu {
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
     }
 
+    fn flags_zsp32(&mut self, result: u32) {
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x8000_0000 != 0);
+        self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
+    }
+
     /// Group 2 shift/rotate on an 8-bit operand. `sub` is the ModR/M
     /// reg field: 0=ROL, 1=ROR, 2=RCL, 3=RCR, 4=SHL, 5=SHR, 7=SAR.
     /// RCL/RCR are intentionally not implemented yet.
@@ -1264,6 +1270,118 @@ impl Cpu {
                 if count == 1 {
                     let msb = v & 0x8000 != 0;
                     let msb1 = v & 0x4000 != 0;
+                    self.set_flag(flag::OF, msb != msb1);
+                }
+                Ok(v)
+            }
+            _ => Err(CpuError::Unimplemented {
+                opcode: 0xD1,
+                cs: 0,
+                ip: 0,
+            }),
+        }
+    }
+
+    /// 32-bit shift/rotate dispatch. Mirrors `shift_apply16` with a
+    /// wider operand. Count is masked to 5 bits per Intel.
+    fn shift_apply32(&mut self, sub: u8, value: u32, count_raw: u8) -> Result<u32, CpuError> {
+        let count = count_raw & 0x1F;
+        if count == 0 {
+            return Ok(value);
+        }
+        match sub {
+            0 => {
+                // ROL
+                let result = value.rotate_left(count as u32);
+                let cf = result & 1 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x8000_0000 != 0) != cf);
+                }
+                Ok(result)
+            }
+            1 => {
+                // ROR
+                let result = value.rotate_right(count as u32);
+                let cf = result & 0x8000_0000 != 0;
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb1 = result & 0x4000_0000 != 0;
+                    self.set_flag(flag::OF, cf != msb1);
+                }
+                Ok(result)
+            }
+            4 | 6 => {
+                // SHL / SAL
+                let cf = ((value as u64) >> (32 - count as u64)) & 1 != 0;
+                let result = if count >= 32 { 0 } else { value << count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (result & 0x8000_0000 != 0) != cf);
+                }
+                self.flags_zsp32(result);
+                Ok(result)
+            }
+            5 => {
+                // SHR
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 32 { 0 } else { value >> count };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, value & 0x8000_0000 != 0);
+                }
+                self.flags_zsp32(result);
+                Ok(result)
+            }
+            7 => {
+                // SAR
+                let cf = (value >> (count - 1)) & 1 != 0;
+                let result = if count >= 32 {
+                    if value & 0x8000_0000 != 0 {
+                        0xFFFF_FFFF
+                    } else {
+                        0
+                    }
+                } else {
+                    ((value as i32) >> count) as u32
+                };
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, false);
+                }
+                self.flags_zsp32(result);
+                Ok(result)
+            }
+            // RCL — 33-bit cycle (32 data + CF).
+            2 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = (count as u32) % 33;
+                for _ in 0..n {
+                    let new_cf = v & 0x8000_0000 != 0;
+                    v = (v << 1) | (cf as u32);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    self.set_flag(flag::OF, (v & 0x8000_0000 != 0) != cf);
+                }
+                Ok(v)
+            }
+            // RCR
+            3 => {
+                let mut v = value;
+                let mut cf = self.has(flag::CF);
+                let n = (count as u32) % 33;
+                for _ in 0..n {
+                    let new_cf = v & 1 != 0;
+                    v = (v >> 1) | ((cf as u32) << 31);
+                    cf = new_cf;
+                }
+                self.set_flag(flag::CF, cf);
+                if count == 1 {
+                    let msb = v & 0x8000_0000 != 0;
+                    let msb1 = v & 0x4000_0000 != 0;
                     self.set_flag(flag::OF, msb != msb1);
                 }
                 Ok(v)
@@ -1909,7 +2027,7 @@ impl Cpu {
             //   0xC1: r/m16 by imm8
             // ModR/M reg field selects ROL/ROR/RCL/RCR/SHL/SHR/SAR.
             0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1 => {
-                let is_word = matches!(opcode, 0xD1 | 0xD3 | 0xC1);
+                let is_wide = matches!(opcode, 0xD1 | 0xD3 | 0xC1);
                 let (_, sub, rm) = self.fetch_modrm(mem);
                 let count = match opcode {
                     0xD0 | 0xD1 => 1,
@@ -1917,10 +2035,14 @@ impl Cpu {
                     0xC0 | 0xC1 => self.fetch_u8(mem),
                     _ => unreachable!(),
                 };
-                if !is_word {
+                if !is_wide {
                     let v = self.read_rm8(rm, mem);
                     let r = self.shift_apply8(sub, v, count)?;
                     self.write_rm8(rm, mem, r);
+                } else if self.op_size_32 {
+                    let v = self.read_rm32(rm, mem);
+                    let r = self.shift_apply32(sub, v, count)?;
+                    self.write_rm32(rm, mem, r);
                 } else {
                     let v = self.read_rm16(rm, mem);
                     let r = self.shift_apply16(sub, v, count)?;
