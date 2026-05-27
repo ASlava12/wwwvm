@@ -69,6 +69,86 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// Full end-to-end protected-mode kernel boot. A 16 MiB VM gets:
+///
+///   1. An ELF kernel whose single PT_LOAD lands at vaddr 0x10_0000
+///      (just past the 1 MiB boundary). The kernel is `MOV AL,0xAB;
+///      HLT` — three bytes that prove execution actually reached
+///      the high-memory entry point.
+///   2. A 16-byte GDT in low memory: null + flat code segment with
+///      base=0x10_0000, limit=0xFFFF, access=0x9A (P=1, DPL=0,
+///      code, R/X). A 6-byte LGDT pseudo-descriptor next to it.
+///   3. A boot stub at 0x7C00 that LGDTs, flips CR0.PE=1 via the
+///      idiom, then `JMP FAR 0x08:0x0000`. With CS selector 0x08
+///      pointing at the GDT[1] code segment (base 0x10_0000), the
+///      next instruction fetch lands inside the kernel.
+///
+/// The trick that lets us avoid a 32-bit IP is the descriptor base:
+/// `linear = seg_cache[CS].base + IP` already does the right thing
+/// when base = 0x10_0000 and IP = 0.
+#[test]
+fn end_to_end_pm_kernel_boot_from_elf_above_one_mebibyte() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+
+    // 1. Kernel ELF at vaddr 0x10_0000.
+    let entry: u32 = 0x0010_0000;
+    let mut elf = make_elf_header(entry, 52, 1);
+    elf.extend_from_slice(&make_pt_load(84, entry, 3));
+    elf.extend_from_slice(&[0xB0, 0xAB, 0xF4]); // MOV AL, 0xAB; HLT
+    vm.load_elf_image(&elf).expect("ELF load");
+
+    // 2. GDT pseudo-descriptor at 0x0500 (limit=0x000F, base=0x0508).
+    //    GDT itself at 0x0508. Two 8-byte entries.
+    vm.load_image(
+        0x0500,
+        &[
+            // pseudo-descriptor: limit (2) + base (4)
+            0x0F, 0x00, 0x08, 0x05, 0x00, 0x00, // pad (2) to align GDT at 0x0508
+            0x00, 0x00, // GDT[0] = null descriptor
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // GDT[1] = flat code segment, base=0x0010_0000, limit=0xFFFF,
+            //          access=0x9A (P|DPL=0|S=1|type=A: code, R/X), G=0.
+            //   limit_lo  = 0xFFFF
+            //   base_lo   = 0x0000
+            //   base_mid  = 0x10              (byte 4)
+            //   access    = 0x9A              (byte 5)
+            //   limit_hi  = 0x00 | flags 0x00 (byte 6)
+            //   base_hi   = 0x00              (byte 7)
+            0xFF, 0xFF, 0x00, 0x00, 0x10, 0x9A, 0x00, 0x00,
+        ],
+    );
+
+    // 3. Boot stub at 0x7C00.
+    //   LGDT [0x0500]    -> 0F 01 16 00 05
+    //   MOV EAX, CR0     -> 0F 20 C0
+    //   OR AX, 1         -> 83 C8 01
+    //   MOV CR0, EAX     -> 0F 22 C0
+    //   JMP FAR 0x08:0   -> EA 00 00 08 00
+    //   HLT (unreached)  -> F4
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0x0F, 0x01, 0x16, 0x00, 0x05, 0x0F, 0x20, 0xC0, 0x83, 0xC8, 0x01, 0x0F, 0x22, 0xC0,
+            0xEA, 0x00, 0x00, 0x08, 0x00, 0xF4,
+        ],
+    );
+
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted), "stop: {stop:?}");
+    assert_eq!(vm.cpu().cr0 & 1, 1, "bootstrap must have set CR0.PE");
+    assert_eq!(
+        vm.cpu().seg_cache[wwwvm_cpu::sreg::CS].base,
+        0x0010_0000,
+        "CS cache base must come from GDT[1] (kernel segment)"
+    );
+    assert_eq!(
+        vm.cpu().read_r8(0),
+        0xAB,
+        "kernel at 0x100000 must have run and set AL=0xAB"
+    );
+}
+
 /// `Vm::with_ram_size` lets a VM hold a kernel image whose PT_LOAD
 /// targets memory above the 1 MiB boundary. We allocate 16 MiB and
 /// load a tiny ELF whose segment is at vaddr 0x10_8000 (just past
