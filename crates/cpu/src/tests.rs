@@ -2466,6 +2466,60 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0xAF — two-operand IMUL r, r/m. The `a * b` a C compiler
+/// emits.
+#[test]
+fn imul_two_operand_r32() {
+    // MOV EAX, 7 ; MOV EBX, 6 ; IMUL EAX, EBX ; HLT → EAX=42
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x07, 0x00, 0x00, 0x00, // MOV EAX, 7
+            0x66, 0xBB, 0x06, 0x00, 0x00, 0x00, // MOV EBX, 6
+            0x66, 0x0F, 0xAF, 0xC3, // IMUL EAX, EBX (modrm 11 000 011)
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 42);
+    assert!(!cpu.has(flag::OF), "no overflow for 7*6");
+}
+
+/// IMUL two-operand with a product that overflows 32 bits sets OF/CF.
+#[test]
+fn imul_two_operand_r32_overflow_sets_of() {
+    // EAX = 0x10000, EBX = 0x10000 → product 0x1_0000_0000 overflows.
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x01, 0x00, // MOV EAX, 0x10000
+            0x66, 0xBB, 0x00, 0x00, 0x01, 0x00, // MOV EBX, 0x10000
+            0x66, 0x0F, 0xAF, 0xC3, // IMUL EAX, EBX
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0, "low 32 bits of 0x1_0000_0000");
+    assert!(cpu.has(flag::OF), "overflow flagged");
+    assert!(cpu.has(flag::CF));
+}
+
+/// 0x66 0x98 / 0x66 0x99 — CWDE / CDQ sign-extension.
+#[test]
+fn cwde_cdq_sign_extend() {
+    // MOV AX, 0xFFFF (=-1) ; CWDE → EAX = 0xFFFFFFFF
+    // CDQ → EDX = 0xFFFFFFFF
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0xFF, 0xFF, // MOV AX, 0xFFFF
+            0x66, 0x98, // CWDE
+            0x66, 0x99, // CDQ
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
+    assert_eq!(cpu.read_r32(2), 0xFFFF_FFFF);
+}
+
 /// 0x85 — TEST r/m, r. `test ax, ax` sets ZF when AX is zero.
 #[test]
 fn test_rm16_r16_sets_zf_when_anding_to_zero() {

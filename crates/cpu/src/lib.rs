@@ -3235,13 +3235,25 @@ impl Cpu {
 
             // CBW — sign-extend AL into AX. AH = AL & 0x80 ? 0xFF : 0x00.
             0x98 => {
-                let al = self.read_r8(0);
-                self.regs[r16::AX] = al as i8 as i16 as u16;
+                if self.op_size_32 {
+                    // CWDE — sign-extend AX into EAX.
+                    let ax = self.regs[r16::AX] as i16 as i32 as u32;
+                    self.write_r32(0, ax);
+                } else {
+                    let al = self.read_r8(0);
+                    self.regs[r16::AX] = al as i8 as i16 as u16;
+                }
             }
-            // CWD — sign-extend AX into DX:AX.
+            // CWD — sign-extend AX into DX:AX. Under 0x66 becomes CDQ:
+            // sign-extend EAX into EDX:EAX.
             0x99 => {
-                let ax = self.regs[r16::AX] as i16;
-                self.regs[r16::DX] = if ax < 0 { 0xFFFF } else { 0 };
+                if self.op_size_32 {
+                    let eax = self.read_r32(0) as i32;
+                    self.write_r32(2, if eax < 0 { 0xFFFF_FFFF } else { 0 });
+                } else {
+                    let ax = self.regs[r16::AX] as i16;
+                    self.regs[r16::DX] = if ax < 0 { 0xFFFF } else { 0 };
+                }
             }
 
             // SAHF — copy AH into the low byte of FLAGS (SF/ZF/AF/PF/CF).
@@ -4073,6 +4085,34 @@ impl Cpu {
                         }
                     }
 
+                    // IMUL r16/32, r/m16/32 — 0x0F 0xAF. Two-operand
+                    // signed multiply: reg *= r/m, truncated to the
+                    // operand width. CF/OF set when the full product
+                    // doesn't fit the destination. This is the form a
+                    // C compiler emits for `a * b`, so it shows up
+                    // everywhere.
+                    0xAF => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let a = self.read_r32(reg) as i32 as i64;
+                            let b = self.read_rm32(rm, mem) as i32 as i64;
+                            let full = a.wrapping_mul(b);
+                            let trunc = full as i32;
+                            self.write_r32(reg, trunc as u32);
+                            let overflow = i64::from(trunc) != full;
+                            self.set_flag(flag::CF, overflow);
+                            self.set_flag(flag::OF, overflow);
+                        } else {
+                            let a = self.read_r16(reg) as i16 as i32;
+                            let b = self.read_rm16(rm, mem) as i16 as i32;
+                            let full = a.wrapping_mul(b);
+                            let trunc = full as i16;
+                            self.write_r16(reg, trunc as u16);
+                            let overflow = i32::from(trunc) != full;
+                            self.set_flag(flag::CF, overflow);
+                            self.set_flag(flag::OF, overflow);
+                        }
+                    }
                     // MOVZX r16/32, r/m8 — 0x0F 0xB6. Zero-extend a
                     // byte into the dest. Under 0x66 dest is r32, else r16.
                     0xB6 => {
