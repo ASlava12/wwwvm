@@ -2466,6 +2466,50 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0xBA /5 — BTS r/m16, imm8. Sets a bit, returns old in CF.
+#[test]
+fn bts_imm8_sets_bit_and_writes_cf_with_old_value() {
+    // MOV AX, 0x0100 ; BTS AX, 1 ; HLT
+    //   AX bit 1 is currently 0 → CF=0, AX afterwards = 0x0102.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x00, 0x01, // MOV AX, 0x0100
+            0x0F, 0xBA, 0xE8, 0x01, // BTS AX, 1
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x0102);
+    assert!(!cpu.has(flag::CF));
+}
+
+/// 0x0F 0xBA /4 — BT r/m16, imm8. Reads CF from the bit, no write.
+#[test]
+fn bt_imm8_reads_bit_into_cf() {
+    // MOV AX, 0x0080 ; BT AX, 7 ; HLT — bit 7 set → CF=1.
+    let (cpu, _, _) = run_payload(&[0xB8, 0x80, 0x00, 0x0F, 0xBA, 0xE0, 0x07, 0xF4], 12);
+    assert!(cpu.has(flag::CF));
+    assert_eq!(cpu.regs[r16::AX], 0x0080, "BT must not modify the operand");
+}
+
+/// 0x0F 0xB3 — BTR r/m16, r16. Clears bit.
+#[test]
+fn btr_r16_clears_bit_taking_index_from_reg() {
+    // MOV AX, 0x0303 ; MOV CX, 1 ; BTR AX, CX ; HLT
+    //   bit 1 was set → CF=1, AX afterwards = 0x0301.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x03, 0x03, // MOV AX, 0x0303
+            0xB9, 0x01, 0x00, // MOV CX, 1
+            0x0F, 0xB3, 0xC8, // BTR AX, CX (modrm 11 001 000)
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x0301);
+    assert!(cpu.has(flag::CF));
+}
+
 /// Kernel-shaped integration: boot stub calls a 32-bit subroutine via
 /// CALL rel32. Subroutine uses ENTER, REP MOVSD, CMPXCHG-on-memory,
 /// LEAVE, RET. Asserts copy + counter update + ESP unchanged.

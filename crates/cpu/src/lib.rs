@@ -3315,6 +3315,97 @@ impl Cpu {
                         }
                     }
 
+                    // Bit-test family — 0x0F 0xA3 (BT), 0xAB (BTS),
+                    // 0xB3 (BTR), 0xBB (BTC). Reads/modifies bit
+                    // `r` within `r/m`. CF takes the old value of
+                    // the tested bit.
+                    // Simplified: we ignore the "address advances
+                    // by bit/8 on memory operand" semantics — the
+                    // bit index is taken modulo operand width, and
+                    // we operate on the existing r/m word/dword.
+                    // That matches every Linux set_bit / test_bit
+                    // call where the bitmap word index is computed
+                    // before the instruction.
+                    0xA3 | 0xAB | 0xB3 | 0xBB => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            let bit = self.read_r32(reg) & 31;
+                            let mask = 1u32 << bit;
+                            self.set_flag(flag::CF, v & mask != 0);
+                            let new = match op2 {
+                                0xA3 => v,         // BT — no write
+                                0xAB => v | mask,  // BTS
+                                0xB3 => v & !mask, // BTR
+                                0xBB => v ^ mask,  // BTC
+                                _ => unreachable!(),
+                            };
+                            if op2 != 0xA3 {
+                                self.write_rm32(rm, mem, new);
+                            }
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            let bit = self.read_r16(reg) & 15;
+                            let mask = 1u16 << bit;
+                            self.set_flag(flag::CF, v & mask != 0);
+                            let new = match op2 {
+                                0xA3 => v,
+                                0xAB => v | mask,
+                                0xB3 => v & !mask,
+                                0xBB => v ^ mask,
+                                _ => unreachable!(),
+                            };
+                            if op2 != 0xA3 {
+                                self.write_rm16(rm, mem, new);
+                            }
+                        }
+                    }
+
+                    // BT/BTS/BTR/BTC r/m, imm8 — 0x0F 0xBA /reg.
+                    //   reg=4 BT, 5 BTS, 6 BTR, 7 BTC.
+                    0xBA => {
+                        let (_, sub, rm) = self.fetch_modrm(mem);
+                        let imm = self.fetch_u8(mem);
+                        if !matches!(sub, 4..=7) {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            let bit = (imm & 31) as u32;
+                            let mask = 1u32 << bit;
+                            self.set_flag(flag::CF, v & mask != 0);
+                            let new = match sub {
+                                4 => v,
+                                5 => v | mask,
+                                6 => v & !mask,
+                                7 => v ^ mask,
+                                _ => unreachable!(),
+                            };
+                            if sub != 4 {
+                                self.write_rm32(rm, mem, new);
+                            }
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            let bit = (imm & 15) as u16;
+                            let mask = 1u16 << bit;
+                            self.set_flag(flag::CF, v & mask != 0);
+                            let new = match sub {
+                                4 => v,
+                                5 => v | mask,
+                                6 => v & !mask,
+                                7 => v ^ mask,
+                                _ => unreachable!(),
+                            };
+                            if sub != 4 {
+                                self.write_rm16(rm, mem, new);
+                            }
+                        }
+                    }
+
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
                     // into the destination only if the condition
