@@ -69,6 +69,53 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// `Vm::with_ram_size` lets a VM hold a kernel image whose PT_LOAD
+/// targets memory above the 1 MiB boundary. We allocate 16 MiB and
+/// load a tiny ELF whose segment is at vaddr 0x10_8000 (just past
+/// 1 MiB). The loader must place the bytes there — and the address
+/// must actually exist (a default 1 MiB VM would have rejected this
+/// via ElfError::DestOutOfBounds).
+///
+/// Executing code that high requires protected-mode addressing
+/// (real-mode CS:IP can only reach ≈ 1 MiB + 64 KiB). That part is
+/// exercised by the existing PM tests; this test confirms only the
+/// load path.
+#[test]
+fn with_ram_size_loads_elf_segment_above_one_mebibyte() {
+    let entry: u32 = 0x0010_8000;
+    let mut elf = make_elf_header(entry, 52, 1);
+    elf.extend_from_slice(&make_pt_load(84, entry, 5));
+    elf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xF4]);
+
+    // Default 1 MiB VM must refuse the load.
+    let mut small_vm = Vm::new();
+    assert!(matches!(
+        small_vm.load_elf_image(&elf),
+        Err(ElfError::DestOutOfBounds { .. })
+    ));
+
+    // 16 MiB VM accepts it and places the bytes at the right address.
+    let mut vm = Vm::with_ram_size(0x0100_0000);
+    let loaded = vm.load_elf_image(&elf).expect("ELF load above 1 MiB");
+    assert_eq!(loaded, entry);
+    assert_eq!(vm.read_mem_u8(entry), 0xDE);
+    assert_eq!(vm.read_mem_u8(entry + 4), 0xF4);
+}
+
+/// Snapshot taken from a 16 MiB VM must restore cleanly into another
+/// 16 MiB VM. Confirms that snapshot now follows `self.mem.size()`
+/// rather than the 1 MiB `Vm::RAM_SIZE` constant.
+#[test]
+fn snapshot_round_trips_with_custom_ram_size() {
+    let mut vm = Vm::with_ram_size(0x0020_0000); // 2 MiB
+    vm.boot();
+    vm.mem.write_u8(0x0018_0000, 0xA5);
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::with_ram_size(0x0020_0000);
+    vm2.restore(&snap).expect("restore 2 MiB snapshot");
+    assert_eq!(vm2.read_mem_u8(0x0018_0000), 0xA5);
+}
+
 /// load_elf_image() parses an ELF32 image and copies its PT_LOAD
 /// segments into memory. We craft a tiny ELF whose single segment is
 /// `MOV AL,'A'; HLT` at vaddr 0x7C00 (so a plain `boot()` lands the

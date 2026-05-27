@@ -274,14 +274,24 @@ impl Default for Vm {
 }
 
 impl Vm {
-    /// One megabyte of conventional + low memory. Enough for the embedded
-    /// guest; will grow as we support bigger images.
+    /// Default 1 MiB of conventional + low memory. Real-mode guests
+    /// and the bundled demos fit here. For loading ELF kernels with
+    /// entries above 0x100000, construct via [`Vm::with_ram_size`].
     pub const RAM_SIZE: usize = 0x10_0000;
 
     pub fn new() -> Self {
+        Self::with_ram_size(Self::RAM_SIZE)
+    }
+
+    /// Construct a VM with a non-default RAM size. Use this when
+    /// loading kernel images whose entry point lives above 1 MiB
+    /// (typical Linux/BSD/Hobby-OS ELF kernels are linked at
+    /// 0x00100000 or higher). Snapshot/restore still works as long
+    /// as both ends use the *same* RAM size.
+    pub fn with_ram_size(size: usize) -> Self {
         Self {
             cpu: Cpu::new(),
-            mem: Memory::new(Self::RAM_SIZE),
+            mem: Memory::new(size),
             io: IoBus::new(),
             autorun: Vec::new(),
             booted: false,
@@ -328,7 +338,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V5_LEN + Self::RAM_SIZE;
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V5_LEN + self.mem.size();
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -387,10 +397,11 @@ impl Vm {
     /// whatever state they had before the call.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), snapshot::SnapshotError> {
         use snapshot::SnapshotError;
-        if bytes.len() < snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE {
+        let ram_size = self.mem.size();
+        if bytes.len() < snapshot::HEADER_LEN + snapshot::CPU_LEN + ram_size {
             return Err(SnapshotError::TooSmall {
                 got: bytes.len(),
-                need: snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE,
+                need: snapshot::HEADER_LEN + snapshot::CPU_LEN + ram_size,
             });
         }
         if &bytes[..snapshot::MAGIC.len()] != snapshot::MAGIC {
@@ -407,10 +418,10 @@ impl Vm {
             _ => snapshot::CPU_LEN,
         };
         // Re-validate min size against the version-specific CPU image.
-        if bytes.len() < snapshot::HEADER_LEN + cpu_len + Self::RAM_SIZE {
+        if bytes.len() < snapshot::HEADER_LEN + cpu_len + ram_size {
             return Err(SnapshotError::TooSmall {
                 got: bytes.len(),
-                need: snapshot::HEADER_LEN + cpu_len + Self::RAM_SIZE,
+                need: snapshot::HEADER_LEN + cpu_len + ram_size,
             });
         }
         let cpu_start = snapshot::HEADER_LEN;
@@ -481,14 +492,14 @@ impl Vm {
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
         self.mem
-            .restore_full(&bytes[mem_start..mem_start + Self::RAM_SIZE])
+            .restore_full(&bytes[mem_start..mem_start + ram_size])
             .map_err(|expected| SnapshotError::MemorySizeMismatch {
                 expected,
                 actual: bytes.len() - mem_start,
             })?;
         // Device section (v2 and v3). v1 snapshots have nothing here.
         if version >= 2 {
-            let dev_off = mem_start + Self::RAM_SIZE;
+            let dev_off = mem_start + ram_size;
             if bytes.len() < dev_off + 4 {
                 return Err(SnapshotError::TooSmall {
                     got: bytes.len(),
