@@ -163,6 +163,12 @@ pub struct Cpu {
     /// Task Register selector. Same shape: LTR sets, STR reads.
     /// We don't yet walk the TSS for ring transitions.
     pub tr: u16,
+    /// FPU status word. Bits 0..5 = exception flags, 6 = SF, 7 = ES,
+    /// 8..10 = C0..C2, 11..13 = TOP, 14 = C3, 15 = busy. We only
+    /// track the value for FNSTSW; no actual FPU arithmetic yet.
+    pub fpu_sw: u16,
+    /// FPU control word. Default 0x037F after FNINIT.
+    pub fpu_cw: u16,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -277,6 +283,8 @@ impl Cpu {
             tsc: 0,
             ldtr: 0,
             tr: 0,
+            fpu_sw: 0,
+            fpu_cw: 0x037F,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -317,6 +325,8 @@ impl Cpu {
         self.tsc = 0;
         self.ldtr = 0;
         self.tr = 0;
+        self.fpu_sw = 0;
+        self.fpu_cw = 0x037F;
         self.pending_fault.set(None);
         self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
@@ -4080,6 +4090,78 @@ impl Cpu {
                             ip: op_ip,
                         });
                     }
+                }
+            }
+
+            // FPU escape opcodes 0xD8..0xDF. We don't model the FP
+            // register stack — these are minimal stubs to keep Linux's
+            // FPU probe from faulting. The patterns we handle:
+            //   DB E3        FNINIT
+            //   DB E2        FNCLEX
+            //   DF E0        FNSTSW AX
+            //   D9 /5 m16    FLDCW
+            //   D9 /7 m16    FNSTCW
+            // Other 0xD8..0xDF forms surface as Unimplemented so we
+            // notice when a real FPU instruction matters.
+            0xDB => {
+                let modrm = self.fetch_u8(mem);
+                match modrm {
+                    0xE3 => {
+                        // FNINIT — reset SW to 0, CW to 0x037F.
+                        self.fpu_sw = 0;
+                        self.fpu_cw = 0x037F;
+                    }
+                    0xE2 => {
+                        // FNCLEX — clear exception flags (bits 0..7 of SW).
+                        self.fpu_sw &= !0x00FF;
+                    }
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        });
+                    }
+                }
+            }
+            0xDF => {
+                let modrm = self.fetch_u8(mem);
+                if modrm == 0xE0 {
+                    // FNSTSW AX — copy FPU status into AX.
+                    self.regs[r16::AX] = self.fpu_sw;
+                } else {
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
+                }
+            }
+            0xD9 => {
+                // Peek modrm. We accept /5 (FLDCW m16) and /7 (FNSTCW m16);
+                // anything else returns Unimplemented.
+                let modrm = self.fetch_u8(mem);
+                let mode = modrm >> 6;
+                let sub = (modrm >> 3) & 0x07;
+                let rm_field = modrm & 0x07;
+                if mode == 0b11 || !matches!(sub, 5 | 7) {
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
+                }
+                let ea = if self.addr_size_32 {
+                    self.compute_ea_32(mode, rm_field, mem)
+                } else {
+                    self.compute_ea(mode, rm_field, mem)
+                };
+                let addr = self.linear_seg(ea.seg, ea.off);
+                if sub == 5 {
+                    self.fpu_cw = self.mem_read_u16(mem, addr);
+                } else {
+                    let cw = self.fpu_cw;
+                    self.mem_write_u16(mem, addr, cw);
                 }
             }
 

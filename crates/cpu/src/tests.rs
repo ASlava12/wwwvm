@@ -2466,6 +2466,54 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// FNINIT + FNSTSW AX — Linux probes the FPU's existence with this
+/// pair. After FNINIT the status word is 0 and FNSTSW must copy it
+/// into AX. The "FPU present" check is `(AX & 0xB8FF) == 0`.
+#[test]
+fn fninit_then_fnstsw_returns_zero_status() {
+    // Seed AX with garbage so we can prove FNSTSW overwrote it.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0xFF, 0xAA, // MOV AX, 0xAAFF
+            0xDB, 0xE3, // FNINIT
+            0xDF, 0xE0, // FNSTSW AX
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0);
+}
+
+/// FLDCW / FNSTCW round-trip the FPU control word through memory.
+#[test]
+fn fldcw_fnstcw_round_trip_through_memory() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u16(0x600, 0x027F); // seed CW image
+                                  // FLDCW [0x600]  → D9 2D 00 06 (modrm 00 101 101)
+                                  // ... actually mod=00 rm=110 = disp16 → modrm = 00 101 110 = 0x2E
+                                  // FNSTCW [0x602] → D9 3E 02 06
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x2E, 0x00, 0x06, // FLDCW [0x600]
+            0xD9, 0x3E, 0x02, 0x06, // FNSTCW [0x602]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.fpu_cw, 0x027F);
+    assert_eq!(mem.read_u16(0x602), 0x027F);
+}
+
 /// 0x0F 0x00 /2 / /0 — LLDT / SLDT round-trip via AX.
 #[test]
 fn lldt_sldt_round_trip_via_register() {
