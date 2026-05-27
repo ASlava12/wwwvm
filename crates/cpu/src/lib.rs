@@ -2574,33 +2574,67 @@ impl Cpu {
             // order (AX, CX, DX, BX, SP_orig, BP, SI, DI) — the SP
             // value captured before the first push. POPA pops in
             // reverse and ignores the SP slot.
+            //
+            // Under the 0x66 prefix becomes PUSHAD / POPAD: each slot
+            // is 4 bytes wide and the GPRs are read/written through
+            // read_r32 / write_r32 so the full register file is saved.
             0x60 => {
-                let sp_orig = self.regs[r16::SP];
-                let ax = self.regs[r16::AX];
-                self.push16(mem, ax);
-                let cx = self.regs[r16::CX];
-                self.push16(mem, cx);
-                let dx = self.regs[r16::DX];
-                self.push16(mem, dx);
-                let bx = self.regs[r16::BX];
-                self.push16(mem, bx);
-                self.push16(mem, sp_orig);
-                let bp = self.regs[r16::BP];
-                self.push16(mem, bp);
-                let si = self.regs[r16::SI];
-                self.push16(mem, si);
-                let di = self.regs[r16::DI];
-                self.push16(mem, di);
+                if self.op_size_32 {
+                    let esp_orig = self.read_r32(r16::SP as u8);
+                    self.push32(mem, self.read_r32(0)); // EAX
+                    self.push32(mem, self.read_r32(1)); // ECX
+                    self.push32(mem, self.read_r32(2)); // EDX
+                    self.push32(mem, self.read_r32(3)); // EBX
+                    self.push32(mem, esp_orig);
+                    self.push32(mem, self.read_r32(5)); // EBP
+                    self.push32(mem, self.read_r32(6)); // ESI
+                    self.push32(mem, self.read_r32(7)); // EDI
+                } else {
+                    let sp_orig = self.regs[r16::SP];
+                    let ax = self.regs[r16::AX];
+                    self.push16(mem, ax);
+                    let cx = self.regs[r16::CX];
+                    self.push16(mem, cx);
+                    let dx = self.regs[r16::DX];
+                    self.push16(mem, dx);
+                    let bx = self.regs[r16::BX];
+                    self.push16(mem, bx);
+                    self.push16(mem, sp_orig);
+                    let bp = self.regs[r16::BP];
+                    self.push16(mem, bp);
+                    let si = self.regs[r16::SI];
+                    self.push16(mem, si);
+                    let di = self.regs[r16::DI];
+                    self.push16(mem, di);
+                }
             }
             0x61 => {
-                self.regs[r16::DI] = self.pop16(mem);
-                self.regs[r16::SI] = self.pop16(mem);
-                self.regs[r16::BP] = self.pop16(mem);
-                let _ignored_sp = self.pop16(mem);
-                self.regs[r16::BX] = self.pop16(mem);
-                self.regs[r16::DX] = self.pop16(mem);
-                self.regs[r16::CX] = self.pop16(mem);
-                self.regs[r16::AX] = self.pop16(mem);
+                if self.op_size_32 {
+                    let edi = self.pop32(mem);
+                    self.write_r32(7, edi);
+                    let esi = self.pop32(mem);
+                    self.write_r32(6, esi);
+                    let ebp = self.pop32(mem);
+                    self.write_r32(5, ebp);
+                    let _ignored_esp = self.pop32(mem);
+                    let ebx = self.pop32(mem);
+                    self.write_r32(3, ebx);
+                    let edx = self.pop32(mem);
+                    self.write_r32(2, edx);
+                    let ecx = self.pop32(mem);
+                    self.write_r32(1, ecx);
+                    let eax = self.pop32(mem);
+                    self.write_r32(0, eax);
+                } else {
+                    self.regs[r16::DI] = self.pop16(mem);
+                    self.regs[r16::SI] = self.pop16(mem);
+                    self.regs[r16::BP] = self.pop16(mem);
+                    let _ignored_sp = self.pop16(mem);
+                    self.regs[r16::BX] = self.pop16(mem);
+                    self.regs[r16::DX] = self.pop16(mem);
+                    self.regs[r16::CX] = self.pop16(mem);
+                    self.regs[r16::AX] = self.pop16(mem);
+                }
             }
 
             // IMUL r16, r/m16, imm (80186+ three-operand form).
@@ -2831,14 +2865,24 @@ impl Cpu {
                 self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
             }
 
-            // PUSHF — push the FLAGS register.
+            // PUSHF / PUSHFD — push FLAGS / EFLAGS. Under 0x66 the
+            // pushed value widens to a dword; we only model the low
+            // 16 bits of EFLAGS, so the high half pushes as zero.
             0x9C => {
-                let f = self.flags;
-                self.push16(mem, f);
+                if self.op_size_32 {
+                    self.push32(mem, self.flags as u32);
+                } else {
+                    self.push16(mem, self.flags);
+                }
             }
-            // POPF — pop FLAGS.
+            // POPF / POPFD — pop FLAGS / EFLAGS.
             0x9D => {
-                self.flags = self.pop16(mem);
+                if self.op_size_32 {
+                    let eflags = self.pop32(mem);
+                    self.flags = eflags as u16;
+                } else {
+                    self.flags = self.pop16(mem);
+                }
             }
 
             // CBW — sign-extend AL into AX. AH = AL & 0x80 ? 0xFF : 0x00.

@@ -2427,6 +2427,71 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
 }
 
 /// 32-bit IDT gate (type 0xE) — the architectural form Linux 32-bit
+/// 0x66 0x60 / 0x66 0x61 — PUSHAD / POPAD.
+#[test]
+fn pushad_popad_round_trip_preserves_all_32_bit_gprs() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.write_r32(0, 0xAAAA_AAAA);
+    cpu.write_r32(1, 0xCCCC_CCCC);
+    cpu.write_r32(2, 0xDDDD_DDDD);
+    cpu.write_r32(3, 0xBBBB_BBBB);
+    cpu.write_r32(5, 0xBEBE_BEBE);
+    cpu.write_r32(6, 0x5151_5151);
+    cpu.write_r32(7, 0xD1D1_D1D1);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x60, // PUSHAD
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // trample EAX
+            0x66, 0xBB, 0x00, 0x00, 0x00, 0x00, // trample EBX
+            0x66, 0x61, // POPAD
+            0xF4,
+        ],
+    );
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(0), 0xAAAA_AAAA);
+    assert_eq!(cpu.read_r32(1), 0xCCCC_CCCC);
+    assert_eq!(cpu.read_r32(2), 0xDDDD_DDDD);
+    assert_eq!(cpu.read_r32(3), 0xBBBB_BBBB);
+    assert_eq!(cpu.read_r32(5), 0xBEBE_BEBE);
+    assert_eq!(cpu.read_r32(6), 0x5151_5151);
+    assert_eq!(cpu.read_r32(7), 0xD1D1_D1D1);
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000);
+}
+
+/// 0x66 0x9C / 0x66 0x9D — PUSHFD / POPFD.
+#[test]
+fn pushfd_popfd_round_trip_through_32_bit_stack() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    // STC; PUSHFD; CLC; POPFD; HLT
+    mem.write_slice(0x7C00, &[0xF9, 0x66, 0x9C, 0xF8, 0x66, 0x9D, 0xF4]);
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert!(cpu.has(flag::CF));
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000);
+}
+
 /// kernels install. INT pushes EFLAGS, CS, and the full 32-bit EIP
 /// as dwords; IRETD pops them back. Round-trip: INT 0x21 dispatches
 /// through a 32-bit gate; the handler does IRETD (66 CF) and the
