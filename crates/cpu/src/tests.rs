@@ -598,6 +598,65 @@ fn rep_stosb_fills_buffer() {
     assert_eq!(mem.read_u8(0x904), 0);
 }
 
+/// 0x66 0xF3 0xA5 → REP MOVSD. Copies CX *dwords* (4 bytes each)
+/// from DS:SI to ES:DI. Linux memcpy is shaped like this for the
+/// dword-aligned bulk path.
+#[test]
+fn rep_movsd_copies_dwords_under_0x66() {
+    // 16 bytes (= 4 dwords) of source at 0x800.
+    let src: &[u8] = &[
+        0x11, 0x22, 0x33, 0x44, 0xAA, 0xBB, 0xCC, 0xDD, 0x55, 0x66, 0x77, 0x88, 0x99, 0xEE, 0xFF,
+        0x00,
+    ];
+    // MOV SI, 0x800; MOV DI, 0x900; MOV CX, 4; 66 F3 A5; HLT
+    let (cpu, mem, _) = run_with_data(
+        &[
+            0xBE, 0x00, 0x08, 0xBF, 0x00, 0x09, 0xB9, 0x04, 0x00, 0x66, 0xF3, 0xA5, 0xF4,
+        ],
+        0x800,
+        src,
+        16,
+    );
+    for (i, &b) in src.iter().enumerate() {
+        assert_eq!(mem.read_u8(0x900 + i as u32), b, "byte {i}");
+    }
+    assert_eq!(cpu.regs[r16::CX], 0);
+    // SI advanced 4*4 = 16 bytes.
+    assert_eq!(cpu.regs[r16::SI], 0x810);
+    assert_eq!(cpu.regs[r16::DI], 0x910);
+}
+
+/// 0x66 0xF3 0xAB → REP STOSD. Fills CX dwords with EAX. Linux
+/// memset is shaped like this for the bulk path.
+#[test]
+fn rep_stosd_fills_dwords_under_0x66() {
+    // MOV EAX, 0xCAFEBABE  → 66 B8 BE BA FE CA
+    // MOV DI, 0x900        → BF 00 09
+    // MOV CX, 3            → B9 03 00
+    // 66 F3 AB             → REP STOSD
+    // HLT
+    let (_, mem, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // MOV EAX, 0xCAFEBABE
+            0xBF, 0x00, 0x09, // MOV DI, 0x900
+            0xB9, 0x03, 0x00, // MOV CX, 3
+            0x66, 0xF3, 0xAB, // REP STOSD
+            0xF4,
+        ],
+        16,
+    );
+    // Three dwords of 0xCAFEBABE = BE BA FE CA repeated.
+    for i in 0..3 {
+        let base = 0x900 + (i * 4) as u32;
+        assert_eq!(mem.read_u8(base), 0xBE);
+        assert_eq!(mem.read_u8(base + 1), 0xBA);
+        assert_eq!(mem.read_u8(base + 2), 0xFE);
+        assert_eq!(mem.read_u8(base + 3), 0xCA);
+    }
+    // Byte at offset 12 must be untouched.
+    assert_eq!(mem.read_u8(0x90C), 0);
+}
+
 #[test]
 fn repne_scasb_finds_terminator() {
     // Search a NUL-terminated string for NUL using REPNE SCASB.

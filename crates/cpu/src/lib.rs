@@ -1141,13 +1141,18 @@ impl Cpu {
     }
 
     /// Common SI/DI delta for string ops, picked by DF (10 → backward).
-    fn string_delta(&self, word: bool) -> u16 {
-        let step = if word { 2 } else { 1 };
+    /// `width` is the operand size in bytes (1, 2, or 4).
+    fn string_delta_n(&self, width: u16) -> u16 {
         if self.has(flag::DF) {
-            0u16.wrapping_sub(step)
+            0u16.wrapping_sub(width)
         } else {
-            step
+            width
         }
+    }
+
+    /// Back-compat shim: byte ops pass false, word ops pass true.
+    fn string_delta(&self, word: bool) -> u16 {
+        self.string_delta_n(if word { 2 } else { 1 })
     }
 
     /// Segment used for the SI side of string ops — DS by default, but
@@ -1244,21 +1249,101 @@ impl Cpu {
         self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
     }
 
+    // 32-bit string ops — selected by the 0x66 prefix on top of the
+    // word-form opcodes (0xA5/0xA7/0xAB/0xAD/0xAF). Linux memcpy uses
+    // `REP MOVSL` (= REP MOVSD) for bulk dword copies; memset uses
+    // `REP STOSL` similarly.
+    fn step_movsd(&mut self, mem: &mut Memory) {
+        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
+        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
+        let v = self.mem_read_u32(mem, src);
+        self.mem_write_u32(mem, dst, v);
+        let d = self.string_delta_n(4);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_stosd(&mut self, mem: &mut Memory) {
+        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
+        let eax = self.read_r32(0);
+        self.mem_write_u32(mem, dst, eax);
+        let d = self.string_delta_n(4);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_lodsd(&mut self, mem: &Memory) {
+        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
+        let v = self.mem_read_u32(mem, src);
+        self.write_r32(0, v);
+        let d = self.string_delta_n(4);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+    }
+    fn step_scasd(&mut self, mem: &Memory) {
+        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
+        let a = self.read_r32(0);
+        let b = self.mem_read_u32(mem, d_addr);
+        let r = a.wrapping_sub(b);
+        self.flags_sub32(a, b, 0, r);
+        let d = self.string_delta_n(4);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+    }
+    fn step_cmpsd(&mut self, mem: &Memory) {
+        let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
+        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
+        let a = self.mem_read_u32(mem, s);
+        let b = self.mem_read_u32(mem, d_addr);
+        let r = a.wrapping_sub(b);
+        self.flags_sub32(a, b, 0, r);
+        let delta = self.string_delta_n(4);
+        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
+        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+    }
+
     /// Dispatch a single string op by primary opcode. Returns true if
     /// the opcode is a recognized string op (callers like the REP
     /// prefix handler use this to know whether the prefix is valid).
+    /// Word-form opcodes (0xA5/0xA7/0xAB/0xAD/0xAF) become their
+    /// dword equivalents when `op_size_32` is set by a 0x66 prefix.
     fn step_string(&mut self, inner: u8, mem: &mut Memory) -> bool {
         match inner {
             0xA4 => self.step_movsb(mem),
-            0xA5 => self.step_movsw(mem),
+            0xA5 => {
+                if self.op_size_32 {
+                    self.step_movsd(mem)
+                } else {
+                    self.step_movsw(mem)
+                }
+            }
             0xA6 => self.step_cmpsb(mem),
-            0xA7 => self.step_cmpsw(mem),
+            0xA7 => {
+                if self.op_size_32 {
+                    self.step_cmpsd(mem)
+                } else {
+                    self.step_cmpsw(mem)
+                }
+            }
             0xAA => self.step_stosb(mem),
-            0xAB => self.step_stosw(mem),
+            0xAB => {
+                if self.op_size_32 {
+                    self.step_stosd(mem)
+                } else {
+                    self.step_stosw(mem)
+                }
+            }
             0xAC => self.step_lodsb(mem),
-            0xAD => self.step_lodsw(mem),
+            0xAD => {
+                if self.op_size_32 {
+                    self.step_lodsd(mem)
+                } else {
+                    self.step_lodsw(mem)
+                }
+            }
             0xAE => self.step_scasb(mem),
-            0xAF => self.step_scasw(mem),
+            0xAF => {
+                if self.op_size_32 {
+                    self.step_scasd(mem)
+                } else {
+                    self.step_scasw(mem)
+                }
+            }
             _ => return false,
         }
         true
