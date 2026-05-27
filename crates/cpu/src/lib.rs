@@ -107,14 +107,19 @@ pub struct Cpu {
     /// `MOV CR0, r` / `MOV r, CR0` (0x0F 0x22 / 0x0F 0x20).
     pub cr0: u32,
     /// GDT pseudo-descriptor: 16-bit limit + 32-bit base. Loaded by
-    /// `LGDT` (0x0F 0x01 /2). The CPU doesn't consult it yet — that
-    /// arrives with protected-mode segmentation.
+    /// `LGDT` (0x0F 0x01 /2). Consulted by `write_sreg` in PM to
+    /// fetch the 8-byte segment descriptor that populates the
+    /// matching `seg_cache` entry.
     pub gdtr: DescriptorTable,
     /// IDT pseudo-descriptor — loaded by `LIDT` (0x0F 0x01 /3). In
     /// real mode the IDT is fixed at linear 0 with 4-byte entries;
-    /// once we honor `gdtr` we'll also start using `idtr` for
-    /// protected-mode 8-byte IDT gates.
+    /// once we honor PM-style interrupt gates we'll consult this.
     pub idtr: DescriptorTable,
+    /// Shadow descriptor cache for each segment register. The CPU
+    /// addresses memory through `seg_cache[idx].base`, *not*
+    /// `sregs[idx] << 4`, so once PM is on, the visible selector
+    /// and the active translation base diverge — same as real x86.
+    pub seg_cache: [SegmentCache; 6],
 }
 
 /// 6-byte pseudo-descriptor loaded by LGDT/LIDT: 16-bit limit
@@ -123,6 +128,20 @@ pub struct Cpu {
 pub struct DescriptorTable {
     pub limit: u16,
     pub base: u32,
+}
+
+/// "Hidden" portion of a segment register — loaded from a GDT/LDT
+/// descriptor on every selector write in protected mode, and from
+/// `selector << 4` in real mode. Address translation reads `base`
+/// directly from here, which is why a snapshot of the selector
+/// alone doesn't capture the active translation once we're in PM.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentCache {
+    pub base: u32,
+    pub limit: u32,
+    /// Access-rights byte from the descriptor (P|DPL|S|type). In
+    /// real mode we synthesize 0x93 (present, ring 0, data, R/W).
+    pub access: u8,
 }
 
 /// Decoded 16-bit effective address: linear = (sregs[seg] << 4) + off.
@@ -159,6 +178,7 @@ impl Cpu {
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
+            seg_cache: [SegmentCache::default(); 6],
         }
     }
 
@@ -189,6 +209,13 @@ impl Cpu {
         self.cr0 = 0;
         self.gdtr = DescriptorTable::default();
         self.idtr = DescriptorTable::default();
+        // Real-mode default: every cache mirrors `sregs[i] << 4`.
+        // Since sregs reset to 0, base is 0 for everything.
+        self.seg_cache = [SegmentCache {
+            base: 0,
+            limit: 0xFFFF,
+            access: 0x93,
+        }; 6];
     }
 
     pub fn read_r8(&self, i: u8) -> u8 {
@@ -236,6 +263,61 @@ impl Cpu {
         let idx = (i & 7) as usize;
         self.regs[idx] = value as u16;
         self.regs_high[idx] = (value >> 16) as u16;
+    }
+
+    /// Write a segment register *and* refresh its hidden descriptor
+    /// cache. In real mode the cache is `value << 4`. In protected
+    /// mode the selector is split into RPL/TI/index, the 8-byte
+    /// descriptor at `gdtr.base + index*8` is read, and its base,
+    /// limit (with granularity expanded), and access byte populate
+    /// the cache.
+    ///
+    /// We bypass protection / NULL-selector checks for now — the
+    /// goal of this step is just to wire the cache. Limit
+    /// violations and #GP faults arrive in a later iteration.
+    pub fn write_sreg(&mut self, idx: usize, value: u16, mem: &Memory) {
+        if idx >= 6 {
+            return;
+        }
+        self.sregs[idx] = value;
+        if self.cr0 & 1 == 0 {
+            self.seg_cache[idx] = SegmentCache {
+                base: (value as u32) << 4,
+                limit: 0xFFFF,
+                access: 0x93,
+            };
+            return;
+        }
+        // Protected mode — fetch and decode the descriptor.
+        let table_base = self.gdtr.base; // TI=LDT not modeled
+        let desc_addr = table_base.wrapping_add((value & 0xFFF8) as u32);
+        let d0 = mem.read_u16(desc_addr) as u32;
+        let d1 = mem.read_u16(desc_addr.wrapping_add(2)) as u32;
+        let d2 = mem.read_u16(desc_addr.wrapping_add(4)) as u32;
+        let d3 = mem.read_u16(desc_addr.wrapping_add(6)) as u32;
+        let base = d1 | ((d2 & 0x00FF) << 16) | ((d3 & 0xFF00) << 16);
+        let access = ((d2 >> 8) & 0xFF) as u8;
+        let raw_limit = (d0 & 0xFFFF) | ((d3 & 0x000F) << 16);
+        let granularity = (d3 >> 7) & 1;
+        let limit = if granularity != 0 {
+            (raw_limit << 12) | 0x0FFF
+        } else {
+            raw_limit
+        };
+        self.seg_cache[idx] = SegmentCache {
+            base,
+            limit,
+            access,
+        };
+    }
+
+    /// PE-aware linear-address translation. In real mode the cache
+    /// base is `sregs[idx] << 4` so this matches the legacy
+    /// `Self::linear` math. In PM the cache holds the descriptor's
+    /// base directly. Existing call sites still use `Self::linear`
+    /// pending a workspace-wide refactor in the next iteration.
+    pub fn linear_seg(&self, seg_idx: usize, off: u16) -> u32 {
+        self.seg_cache[seg_idx].base.wrapping_add(off as u32)
     }
 
     fn linear(seg: u16, off: u16) -> u32 {
@@ -1437,7 +1519,7 @@ impl Cpu {
                     });
                 }
                 let v = self.read_rm16(rm, mem);
-                self.sregs[sreg_idx as usize] = v;
+                self.write_sreg(sreg_idx as usize, v, mem);
             }
 
             // XCHG AX, r16 — short form. 0x90 (XCHG AX, AX) is NOP and

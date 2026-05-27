@@ -1813,6 +1813,85 @@ fn add_r32_r32_with_operand_size_prefix() {
     assert!(!cpu.has(flag::ZF));
 }
 
+/// In real mode `write_sreg` mirrors `selector << 4` into the cache.
+/// Same as the legacy linear computation — verifies the helper
+/// preserves existing semantics for RM code.
+#[test]
+fn write_sreg_in_real_mode_synthesizes_cache_from_shift() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mem = Memory::new(0x10_0000);
+    cpu.write_sreg(sreg::DS, 0x1234, &mem);
+    assert_eq!(cpu.sregs[sreg::DS], 0x1234);
+    assert_eq!(cpu.seg_cache[sreg::DS].base, 0x1_2340);
+    assert_eq!(cpu.seg_cache[sreg::DS].limit, 0xFFFF);
+    assert_eq!(cpu.linear_seg(sreg::DS, 0x10), 0x1_2350);
+}
+
+/// In protected mode `write_sreg` decodes an 8-byte GDT descriptor.
+/// Build a descriptor at GDT[1] with base=0x0010_0000, limit=0xFFFF,
+/// access=0x92 (data, R/W, present, ring 0), granularity=0. Load
+/// DS with selector 0x08 (RPL=0, TI=0, index=1) and check that the
+/// hidden cache matches.
+#[test]
+fn write_sreg_in_protected_mode_loads_descriptor_from_gdt() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // CR0.PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    let mut mem = Memory::new(0x10_0000);
+    // GDT[0] = null (zeros). GDT[1] at offset 8 inside GDT:
+    //   limit_lo  = 0xFFFF
+    //   base_lo   = 0x0000
+    //   base_mid  = 0x10              (byte 4)
+    //   access    = 0x92              (byte 5)
+    //   limit_hi  = 0x00              (byte 6 low nibble) + flags 0x00
+    //   base_hi   = 0x00              (byte 7)
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x00, // base 15:0
+            0x10, // base 23:16
+            0x92, // access
+            0x00, // limit 19:16 | flags
+            0x00, // base 31:24
+        ],
+    );
+    cpu.write_sreg(sreg::DS, 0x08, &mem);
+    assert_eq!(cpu.sregs[sreg::DS], 0x08);
+    assert_eq!(cpu.seg_cache[sreg::DS].base, 0x0010_0000);
+    assert_eq!(cpu.seg_cache[sreg::DS].limit, 0xFFFF);
+    assert_eq!(cpu.seg_cache[sreg::DS].access, 0x92);
+    // Cache-based linear lookup gives base + offset.
+    assert_eq!(cpu.linear_seg(sreg::DS, 0x100), 0x0010_0100);
+}
+
+/// Granularity bit (G=1) shifts limit left by 12 and fills the low
+/// 12 with ones — turning 0xFFFFF into 0xFFFF_FFFF (a 4 GiB segment).
+#[test]
+fn write_sreg_decodes_page_granularity_limit() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x00, // base 15:0
+            0x00, // base 23:16
+            0x92, // access
+            0x8F, // limit 19:16 = 0xF, flags = 0x8 (G=1)
+            0x00, // base 31:24
+        ],
+    );
+    cpu.write_sreg(sreg::DS, 0x08, &mem);
+    assert_eq!(cpu.seg_cache[sreg::DS].limit, 0xFFFF_FFFF);
+}
+
 /// PM-transition idiom: `MOV EAX, CR0 ; OR EAX, 1 ; MOV CR0, EAX`.
 /// Sets CR0.PE — the actual real-mode → protected-mode transition.
 #[test]

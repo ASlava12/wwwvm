@@ -338,6 +338,17 @@ impl Vm {
         self.cpu.cr0 = cr0;
         self.cpu.gdtr = gdtr;
         self.cpu.idtr = idtr;
+        // Re-derive seg_cache from the visible selectors. For real-
+        // mode snapshots this is exact (cache = sel << 4). For a
+        // future PM snapshot the cache values would diverge from
+        // sel<<4 and need their own section in a v4 layout.
+        for (slot, sel) in self.cpu.seg_cache.iter_mut().zip(sregs.iter()) {
+            *slot = wwwvm_cpu::SegmentCache {
+                base: (*sel as u32) << 4,
+                limit: 0xFFFF,
+                access: 0x93,
+            };
+        }
         self.booted = true;
         Ok(())
     }
