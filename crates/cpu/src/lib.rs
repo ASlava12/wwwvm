@@ -2959,6 +2959,119 @@ impl Cpu {
                             }
                         }
                     }
+                    // BSWAP r32 — 0x0F 0xC8..0xCF. Reverses byte
+                    // order in a 32-bit register. Linux uses this
+                    // for network byte-order conversions.
+                    0xC8..=0xCF => {
+                        let i = op2 - 0xC8;
+                        let v = self.read_r32(i);
+                        let swapped = v.swap_bytes();
+                        self.write_r32(i, swapped);
+                    }
+
+                    // BSF r16/32, r/m16/32 — 0x0F 0xBC. Find the
+                    // index of the lowest set bit in source; result
+                    // in dest. ZF=1 if source is zero (dest is
+                    // architecturally undefined; we leave it).
+                    0xBC => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            if v == 0 {
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.set_flag(flag::ZF, false);
+                                self.write_r32(reg, v.trailing_zeros());
+                            }
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            if v == 0 {
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.set_flag(flag::ZF, false);
+                                self.write_r16(reg, v.trailing_zeros() as u16);
+                            }
+                        }
+                    }
+
+                    // BSR r16/32, r/m16/32 — 0x0F 0xBD. Same but
+                    // scans from the high end (highest set bit).
+                    0xBD => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            if v == 0 {
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.set_flag(flag::ZF, false);
+                                self.write_r32(reg, 31 - v.leading_zeros());
+                            }
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            if v == 0 {
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.set_flag(flag::ZF, false);
+                                self.write_r16(reg, 15 - v.leading_zeros() as u16);
+                            }
+                        }
+                    }
+
+                    // CMPXCHG r/m8, r8 — 0x0F 0xB0. If AL == r/m8:
+                    // store src reg into r/m, set ZF=1. Else load
+                    // r/m into AL, ZF=0. The atomic primitive
+                    // underneath Linux spinlock_t and friends.
+                    0xB0 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let dest = self.read_rm8(rm, mem);
+                        let al = self.read_r8(0);
+                        if al == dest {
+                            let src = self.read_r8(reg);
+                            self.write_rm8(rm, mem, src);
+                            self.set_flag(flag::ZF, true);
+                        } else {
+                            self.write_r8(0, dest);
+                            self.set_flag(flag::ZF, false);
+                        }
+                        // Flags as if CMP AL, dest (so SF/PF/CF/AF/OF
+                        // also reflect the comparison).
+                        let cmp = al.wrapping_sub(dest);
+                        self.flags_sub8(al, dest, 0, cmp);
+                    }
+
+                    // CMPXCHG r/m16/32, r16/32 — 0x0F 0xB1. AX/EAX
+                    // is the accumulator.
+                    0xB1 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let dest = self.read_rm32(rm, mem);
+                            let eax = self.read_r32(0);
+                            if eax == dest {
+                                let src = self.read_r32(reg);
+                                self.write_rm32(rm, mem, src);
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.write_r32(0, dest);
+                                self.set_flag(flag::ZF, false);
+                            }
+                            let cmp = eax.wrapping_sub(dest);
+                            self.flags_sub32(eax, dest, 0, cmp);
+                        } else {
+                            let dest = self.read_rm16(rm, mem);
+                            let ax = self.read_r16(0);
+                            if ax == dest {
+                                let src = self.read_r16(reg);
+                                self.write_rm16(rm, mem, src);
+                                self.set_flag(flag::ZF, true);
+                            } else {
+                                self.write_r16(0, dest);
+                                self.set_flag(flag::ZF, false);
+                            }
+                            let cmp = ax.wrapping_sub(dest);
+                            self.flags_sub16(ax, dest, 0, cmp);
+                        }
+                    }
+
                     _ => {
                         return Err(CpuError::Unimplemented {
                             opcode: op2,

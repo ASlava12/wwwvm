@@ -2400,6 +2400,90 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x0F 0xC8 — BSWAP EAX. Reverses byte order in EAX. Linux uses
+/// this for converting between host and network byte order on
+/// 32-bit fields.
+#[test]
+fn bswap_eax_reverses_dword_byte_order() {
+    // MOV EAX, 0x11223344  → 66 B8 44 33 22 11
+    // BSWAP EAX            → 0F C8
+    // HLT
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x44, 0x33, 0x22, 0x11, 0x0F, 0xC8, 0xF4], 12);
+    // 0x11223344 byte-reversed = 0x44332211
+    assert_eq!(cpu.regs[r16::AX], 0x2211);
+    assert_eq!(cpu.regs_high[r16::AX], 0x4433);
+}
+
+/// 0x0F 0xBC — BSF. Finds lowest set bit in r/m and writes index
+/// to dest. ZF=1 when src is zero.
+#[test]
+fn bsf_r16_finds_lowest_set_bit() {
+    // MOV BX, 0x0080  ; BB 80 00 (bit 7)
+    // BSF AX, BX      ; 0F BC C3 (modrm 11 000 011 = reg AX, rm BX)
+    // HLT
+    let (cpu, _, _) = run_payload(&[0xBB, 0x80, 0x00, 0x0F, 0xBC, 0xC3, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 7);
+    assert!(!cpu.has(flag::ZF));
+}
+
+#[test]
+fn bsf_r16_with_zero_source_sets_zf() {
+    // MOV BX, 0; BSF AX, BX; HLT
+    let (cpu, _, _) = run_payload(&[0xBB, 0x00, 0x00, 0x0F, 0xBC, 0xC3, 0xF4], 8);
+    assert!(cpu.has(flag::ZF));
+}
+
+/// 0x0F 0xBD — BSR. Finds highest set bit.
+#[test]
+fn bsr_r16_finds_highest_set_bit() {
+    // MOV BX, 0x4001  ; BB 01 40  (bits 0 and 14)
+    // BSR AX, BX      ; 0F BD C3
+    // HLT
+    let (cpu, _, _) = run_payload(&[0xBB, 0x01, 0x40, 0x0F, 0xBD, 0xC3, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 14);
+    assert!(!cpu.has(flag::ZF));
+}
+
+/// 0x0F 0xB0 — CMPXCHG r/m8, r8. Equal case: writes the source
+/// reg into r/m and sets ZF.
+#[test]
+fn cmpxchg_r8_equal_case_writes_source() {
+    // MOV BYTE [0x500], 0x42 (C6 06 00 05 42)  ; seed memory with 0x42
+    // MOV AL, 0x42  (B0 42)                    ; expected value in AL
+    // MOV BL, 0x99  (B3 99)                    ; replacement in BL
+    // CMPXCHG [0x500], BL (0F B0 1E 00 05)
+    // HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0xC6, 0x06, 0x00, 0x05, 0x42, 0xB0, 0x42, 0xB3, 0x99, 0x0F, 0xB0, 0x1E, 0x00, 0x05,
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(mem.read_u8(0x500), 0x99);
+    assert!(cpu.has(flag::ZF));
+}
+
+/// CMPXCHG mismatch case: writes the memory value into AL, ZF clear.
+#[test]
+fn cmpxchg_r8_mismatch_case_loads_memory_into_al() {
+    // MOV AL, 0x42 ; MOV BL, 0x99 ; MOV BYTE [0x500], 0x77 ;
+    // CMPXCHG [0x500], BL ; HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0xB0, 0x42, // MOV AL, 0x42
+            0xB3, 0x99, // MOV BL, 0x99
+            0xC6, 0x06, 0x00, 0x05, 0x77, // MOV BYTE [0x500], 0x77
+            0x0F, 0xB0, 0x1E, 0x00, 0x05, // CMPXCHG [0x500], BL
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(mem.read_u8(0x500), 0x77, "memory unchanged on mismatch");
+    assert_eq!(cpu.read_r8(0), 0x77, "AL loaded with memory value");
+    assert!(!cpu.has(flag::ZF));
+}
+
 /// 0x0F 0x22 /2 (MOV CR2, r32) and 0x0F 0x20 /2 (MOV r32, CR2) — used
 /// by a #PF handler to (re)write or read the faulting linear address.
 #[test]
