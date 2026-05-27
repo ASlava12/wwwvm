@@ -1882,12 +1882,23 @@ impl Cpu {
                 self.write_rm16(rm, mem, v);
             }
 
-            // LEA r16, m — load effective address (no memory access).
-            // mod=11 (register operand) is undefined on real x86.
+            // LEA r16/32, m — load effective address (no memory
+            // access). mod=11 (register operand) is undefined on
+            // real x86. Under 0x66, the destination is r32; the
+            // computed EA still comes from 16-bit address arithmetic
+            // unless a 0x67 prefix changes the address-size attribute
+            // (not yet modelled — when it lands, LEA picks up 32-bit
+            // EAs for free).
             0x8D => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
                 match rm {
-                    Rm::Mem(ea) => self.write_r16(reg, ea.off),
+                    Rm::Mem(ea) => {
+                        if self.op_size_32 {
+                            self.write_r32(reg, ea.off as u32);
+                        } else {
+                            self.write_r16(reg, ea.off);
+                        }
+                    }
                     Rm::Reg(_) => {
                         return Err(CpuError::Unimplemented {
                             opcode,

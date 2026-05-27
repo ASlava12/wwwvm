@@ -850,6 +850,32 @@ fn lea_computes_address_without_memory_read() {
 }
 
 #[test]
+fn lea_r32_zero_extends_ea_under_0x66() {
+    // MOV BX, 0x1234
+    // 0x66 LEA EAX, [BX+0x10]
+    //   modrm 00 000 111 = 0x07 (rm=[BX], reg=AX). With disp8 the
+    //   modrm becomes 01 000 111 = 0x47; then one disp8 byte.
+    //   Sequence: 0x66 0x8D 0x47 0x10
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0xBB, 0x34, 0x12, // MOV BX, 0x1234
+            0x66, 0x8D, 0x47, 0x10, // LEA EAX, [BX+0x10]
+            0xF4,
+        ],
+        12,
+    );
+    // EA = BX + 0x10 = 0x1244. With 16-bit address mode, EA stays
+    // 16-bit; we zero-extend it into EAX.
+    assert_eq!(cpu.regs[r16::AX], 0x1244);
+    assert_eq!(
+        cpu.regs_high[r16::AX],
+        0,
+        "LEA r32 must zero-extend the 16-bit EA"
+    );
+}
+
+#[test]
 fn lea_register_form_returns_unimplemented() {
     // LEA AX, AX (mod=11) is undefined on real x86 — we surface it
     // as an error so we notice if anyone tries.
