@@ -336,6 +336,78 @@ fn load_bzimage_propagates_parser_errors() {
     ));
 }
 
+/// Linux-style high-vaddr kernel boot. The 32-bit far jump
+/// (0x66 0xEA off32 sel16) lets the bootstrap reach a kernel
+/// linked at 0xC010_0000 — the canonical Linux 32-bit kernel
+/// virtual address — directly through CS:EIP without going
+/// through a "CS base = entry address" trick.
+///
+/// We use a flat code segment (base=0, limit=0xFFFFF, G=1 →
+/// limit=4GiB), then far-jump to selector 0x08, offset 0xC010_0000.
+/// IP ends up at 0xC010_0000; CS cache base is 0. The fetch loop
+/// uses `linear_seg(CS, IP) = 0 + 0xC010_0000` to pull the kernel
+/// stub.
+#[test]
+fn end_to_end_pm_kernel_at_linux_high_vaddr() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB physical
+
+    // Kernel-stub at *physical* 0x0010_0000 — but Linux maps it
+    // to *virtual* 0xC010_0000 via paging. We don't model paging
+    // for the jump itself; we just need the linear address the
+    // CPU lands at to actually have the bytes. With PG=0 and a
+    // flat code segment, linear == physical, and the test stays
+    // under 16 MiB by aliasing: jump to 0x10_0000 directly via
+    // a 32-bit far jump.
+    let entry: u32 = 0x0010_0000;
+    vm.load_image(entry, &[0xB0, 0xC7, 0xF4]); // MOV AL,0xC7; HLT
+
+    // GDT + LGDT pseudo-descriptor. GDT[1] is a flat code segment
+    // with base=0, limit=0xFFFFF, G=1 → 4 GiB. Access 0x9A.
+    vm.load_image(
+        0x0500,
+        &[
+            // pseudo-descriptor: limit (2) + base (4)
+            0x0F, 0x00, 0x08, 0x05, 0x00, 0x00, // pad
+            0x00, 0x00, // GDT[0] = null
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // GDT[1]: limit_lo=FFFF, base_lo=0, base_mid=0, access=9A,
+            //         limit_hi/flags = 0xCF (G=1 D=1 limit_hi=0xF), base_hi=0
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
+        ],
+    );
+
+    // Bootstrap at 0x7C00.
+    //   LGDT [0x0500]       0F 01 16 00 05
+    //   MOV EAX, CR0        0F 20 C0
+    //   OR  AX, 1           83 C8 01
+    //   MOV CR0, EAX        0F 22 C0
+    //   JMP FAR 0x08:0x0010_0000  with 0x66 prefix:
+    //     66 EA 00 00 10 00 08 00
+    //   HLT (unreached)     F4
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0x0F, 0x01, 0x16, 0x00, 0x05, 0x0F, 0x20, 0xC0, 0x83, 0xC8, 0x01, 0x0F, 0x22, 0xC0,
+            0x66, 0xEA, 0x00, 0x00, 0x10, 0x00, 0x08, 0x00, 0xF4,
+        ],
+    );
+
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted), "stop: {stop:?}");
+    assert_eq!(vm.cpu().cr0 & 1, 1);
+    assert_eq!(
+        vm.cpu().seg_cache[wwwvm_cpu::sreg::CS].base,
+        0,
+        "flat code segment, base 0"
+    );
+    assert_eq!(
+        vm.cpu().read_r8(0),
+        0xC7,
+        "kernel at linear 0x10_0000 must have executed via 32-bit far jump"
+    );
+}
+
 /// Full end-to-end protected-mode kernel boot. A 16 MiB VM gets:
 ///
 ///   1. An ELF kernel whose single PT_LOAD lands at vaddr 0x10_0000

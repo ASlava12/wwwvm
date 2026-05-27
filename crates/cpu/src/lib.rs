@@ -2539,21 +2539,46 @@ impl Cpu {
             // CALL ptr16:16 — direct far call. Pushes CS then IP, then
             // loads CS:IP from the 4-byte immediate.
             0x9A => {
-                let new_ip = self.fetch_u16(mem);
-                let new_cs = self.fetch_u16(mem);
+                let (new_ip, new_cs) = if self.op_size_32 {
+                    // ptr16:32 layout: offset (4) then selector (2).
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    let off = lo | (hi << 16);
+                    let sel = self.fetch_u16(mem);
+                    (off, sel)
+                } else {
+                    let off = self.fetch_u16(mem) as u32;
+                    let sel = self.fetch_u16(mem);
+                    (off, sel)
+                };
                 let cs = self.sregs[sreg::CS];
                 self.push16(mem, cs);
+                // 16-bit gate convention: only low 16 of return IP go
+                // on the stack. A 32-bit-gate path (when we add it)
+                // pushes the full dword.
                 let ip = self.ip as u16;
                 self.push16(mem, ip);
                 self.write_sreg(sreg::CS, new_cs, mem);
-                self.ip = new_ip as u32;
+                self.ip = new_ip;
             }
-            // JMP ptr16:16 — direct far jump. No stack activity.
+            // JMP ptr16:16 — direct far jump. Under 0x66 the offset
+            // becomes 32-bit (ptr16:32), the encoding Linux's PM
+            // trampoline uses to enter the kernel at e.g.
+            // 0xC0100000.
             0xEA => {
-                let new_ip = self.fetch_u16(mem);
-                let new_cs = self.fetch_u16(mem);
+                let (new_ip, new_cs) = if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    let off = lo | (hi << 16);
+                    let sel = self.fetch_u16(mem);
+                    (off, sel)
+                } else {
+                    let off = self.fetch_u16(mem) as u32;
+                    let sel = self.fetch_u16(mem);
+                    (off, sel)
+                };
                 self.write_sreg(sreg::CS, new_cs, mem);
-                self.ip = new_ip as u32;
+                self.ip = new_ip;
             }
             // RET (near) — pop IP.
             0xC3 => {
