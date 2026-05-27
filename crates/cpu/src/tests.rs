@@ -1748,6 +1748,51 @@ fn r8_write_preserves_upper_24_of_r32() {
     assert_eq!(cpu.read_r32(0), 0x1122_AAFF);
 }
 
+/// 0x66 0xB8 imm32 → MOV EAX, imm32. Full 32 bits land in EAX.
+#[test]
+fn mov_eax_imm32_with_operand_size_prefix() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x78, 0x56, 0x34, 0x12, // MOV EAX, 0x12345678
+            0xF4,
+        ],
+        4,
+    );
+    assert_eq!(cpu.read_r32(0), 0x1234_5678);
+    assert_eq!(cpu.read_r16(0), 0x5678); // AX = low 16
+    assert_eq!(cpu.regs_high[0], 0x1234); // upper 16 in regs_high
+}
+
+/// 0x66 prefix is per-instruction — the next opcode without it
+/// reverts to 16-bit semantics, leaving the upper 16 alone.
+#[test]
+fn operand_size_prefix_resets_after_one_instruction() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xBB, 0xEF, 0xBE, 0xAD, 0xDE, // MOV EBX, 0xDEADBEEF
+            0xBB, 0x34, 0x12, // MOV BX, 0x1234  (no 0x66 — 16-bit)
+            0xF4,
+        ],
+        6,
+    );
+    // Lower 16 = 0x1234, upper 16 preserved from EBX assignment.
+    assert_eq!(cpu.read_r32(3), 0xDEAD_1234);
+}
+
+/// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
+#[test]
+fn mov_rm32_imm32_writes_dword_to_memory() {
+    // MOV DWORD [0x500], 0xAABBCCDD
+    //   0x66 0xC7 0x06 imm16_lo imm16_hi (modrm 00 000 110 = [disp16])
+    //   disp16 = 0x0500, imm32 = 0xAABBCCDD (LE)
+    let (_, mem, _) = run_payload(
+        &[0x66, 0xC7, 0x06, 0x00, 0x05, 0xDD, 0xCC, 0xBB, 0xAA, 0xF4],
+        4,
+    );
+    assert_eq!(mem.read_u16(0x500), 0xCCDD);
+    assert_eq!(mem.read_u16(0x502), 0xAABB);
+}
+
 #[test]
 fn mov_cr0_round_trip_through_ax() {
     // MOV AX, CR0 → CR0 (=0) flows into AX. Set PE bit via OR AL, 1.

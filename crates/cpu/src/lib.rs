@@ -95,6 +95,11 @@ pub struct Cpu {
     /// `0x26`/`0x2E`/`0x36`/`0x3E` prefix byte. Reads through
     /// `compute_ea` and string-op source addresses honor it.
     pub(crate) seg_override: Option<usize>,
+    /// Operand-size override for the current instruction. 0x66
+    /// prefix flips the default size — in real mode default is 16,
+    /// so this means "32-bit operand" while set. Reset at the top
+    /// of each `step()` just like `seg_override`.
+    pub(crate) op_size_32: bool,
     /// Control Register 0. On real x86 it's 32 bits; we store the
     /// full width but only bit 0 (PE — Protection Enable) and bit 31
     /// (PG — Paging) will gain semantic meaning once those modes
@@ -150,6 +155,7 @@ impl Cpu {
             flags: 0,
             halted: false,
             seg_override: None,
+            op_size_32: false,
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
@@ -390,6 +396,20 @@ impl Cpu {
         match rm {
             Rm::Reg(i) => self.write_r16(i, value),
             Rm::Mem(ea) => mem.write_u16(Self::linear(self.sregs[ea.seg], ea.off), value),
+        }
+    }
+
+    /// Write 32-bit value through an `Rm`. Memory dword = two 16-bit
+    /// writes at `off` and `off+2`. Symmetric `read_rm32` will land
+    /// in the next iteration when r/m32-source MOVs need it.
+    fn write_rm32(&mut self, rm: Rm, mem: &mut Memory, value: u32) {
+        match rm {
+            Rm::Reg(i) => self.write_r32(i, value),
+            Rm::Mem(ea) => {
+                let base = Self::linear(self.sregs[ea.seg], ea.off);
+                mem.write_u16(base, value as u16);
+                mem.write_u16(base.wrapping_add(2), (value >> 16) as u16);
+            }
         }
     }
 
@@ -1015,6 +1035,7 @@ impl Cpu {
             }
         }
         self.seg_override = None;
+        self.op_size_32 = false;
         let op_cs = self.sregs[sreg::CS];
         let op_ip = self.ip;
         let opcode = loop {
@@ -1024,6 +1045,9 @@ impl Cpu {
                 0x2E => self.seg_override = Some(sreg::CS),
                 0x36 => self.seg_override = Some(sreg::SS),
                 0x3E => self.seg_override = Some(sreg::DS),
+                // 0x66 — operand-size override. Flips default
+                // operand width from 16 to 32 for this instruction.
+                0x66 => self.op_size_32 = true,
                 _ => break b,
             }
         };
@@ -1051,8 +1075,18 @@ impl Cpu {
                 self.write_r8(opcode - 0xB0, imm);
             }
             0xB8..=0xBF => {
-                let imm = self.fetch_u16(mem);
-                self.write_r16(opcode - 0xB8, imm);
+                // MOV r16/r32, imm. With operand-size override (0x66)
+                // it loads a 32-bit immediate into E?X; otherwise the
+                // 16-bit form into ?X.
+                let reg = opcode - 0xB8;
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    self.write_r32(reg, lo | (hi << 16));
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    self.write_r16(reg, imm);
+                }
             }
 
             0xEB => {
@@ -1698,7 +1732,8 @@ impl Cpu {
                 let imm = self.fetch_u8(mem);
                 self.write_rm8(rm, mem, imm);
             }
-            // MOV r/m16, imm16
+            // MOV r/m16, imm16  — or r/m32, imm32 when 0x66 prefix
+            // is in effect.
             0xC7 => {
                 let (_, reg_field, rm) = self.fetch_modrm(mem);
                 if reg_field != 0 {
@@ -1708,8 +1743,14 @@ impl Cpu {
                         ip: op_ip,
                     });
                 }
-                let imm = self.fetch_u16(mem);
-                self.write_rm16(rm, mem, imm);
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    self.write_rm32(rm, mem, lo | (hi << 16));
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    self.write_rm16(rm, mem, imm);
+                }
             }
 
             // PUSHA / POPA (80186+). Push all 8 GPRs in standard r16
