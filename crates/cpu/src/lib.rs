@@ -3731,6 +3731,20 @@ impl Cpu {
                             }
                         }
                     }
+                    // 0x0F 0x18 — PREFETCH hints (NTA/T0/T1/T2 per
+                    // reg field). Also covers HINT_NOP forms on
+                    // older CPUs. We just consume the ModR/M and
+                    // do nothing.
+                    0x18 => {
+                        let _ = self.fetch_modrm(mem);
+                    }
+                    // 0x0F 0x1F — multi-byte NOP. Standard modern
+                    // compiler NOP padding (`NOP DWORD PTR [rax]`
+                    // and friends). Decode the ModR/M but otherwise
+                    // do nothing.
+                    0x1F => {
+                        let _ = self.fetch_modrm(mem);
+                    }
                     // CLTS — 0x0F 0x06. Clear Task-Switched flag in
                     // CR0 (bit 3). Used by FPU context-switch code.
                     0x06 => self.cr0 &= !(1 << 3),
@@ -3753,8 +3767,14 @@ impl Cpu {
                     // treats this as "feature disabled" rather than
                     // probing further, which is what we want.
                     0x32 => {
-                        self.write_r32(0, 0); // EAX
-                        self.write_r32(2, 0); // EDX
+                        let msr = self.read_r32(1); // ECX
+                        let value: u64 = match msr {
+                            0x10 => self.tsc,    // IA32_TSC
+                            0x1B => 0xFEE0_0000, // IA32_APIC_BASE (canonical)
+                            _ => 0,
+                        };
+                        self.write_r32(0, value as u32);
+                        self.write_r32(2, (value >> 32) as u32);
                     }
                     // WRMSR — 0x0F 0x30. Write MSR. Stubbed (drop).
                     0x30 => {

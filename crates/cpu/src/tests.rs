@@ -2466,6 +2466,52 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0x1F — multi-byte NOP. Verifies the dispatch consumes the
+/// ModR/M (and disp here) without touching architectural state.
+#[test]
+fn multibyte_nop_does_nothing_and_consumes_bytes() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x42, 0x00, // MOV AX, 0x42
+            0x67, 0x0F, 0x1F, 0x44, 0x00, 0x00, // NOP DWORD PTR [eax+eax+0]
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x42);
+    assert!(cpu.halted);
+}
+
+/// RDMSR with ECX=0x10 (IA32_TSC) returns the current TSC.
+#[test]
+fn rdmsr_for_ia32_tsc_returns_tsc() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x10, 0x00, 0x00, 0x00, // MOV ECX, 0x10
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        12,
+    );
+    let full = ((cpu.read_r32(2) as u64) << 32) | cpu.read_r32(0) as u64;
+    assert!(full > 0);
+}
+
+/// RDMSR for IA32_APIC_BASE returns the canonical 0xFEE0_0000.
+#[test]
+fn rdmsr_for_ia32_apic_base_returns_canonical_value() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x1B, 0x00, 0x00, 0x00, // MOV ECX, 0x1B
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0xFEE0_0000);
+    assert_eq!(cpu.read_r32(2), 0);
+}
+
 /// 0x0F 0xAE /0 — FXSAVE m512. Stub writes 512 zeros at EA.
 #[test]
 fn fxsave_writes_512_zero_bytes() {
@@ -2680,26 +2726,22 @@ fn mov_cr4_round_trip_carries_feature_bits() {
     assert_eq!(cpu.regs[r16::BX], 0x20);
 }
 
-/// 0x0F 0x32 — RDMSR returns zeros for every MSR (stub).
+/// 0x0F 0x32 — RDMSR returns zeros for unknown MSRs.
 #[test]
-fn rdmsr_returns_zero_for_any_msr() {
-    // MOV ECX, 0x1B (IA32_APIC_BASE) — 66 B9 1B 00 00 00
-    // MOV EAX, 0xDEAD                 — 66 B8 AD DE 00 00
-    // MOV EDX, 0xBEEF                 — 66 BA EF BE 00 00
-    // RDMSR                           — 0F 32
-    // HLT
+fn rdmsr_returns_zero_for_unknown_msr() {
+    // Pick an MSR we have no special case for (0xDEAD).
     let (cpu, _, _) = run_payload(
         &[
-            0x66, 0xB9, 0x1B, 0x00, 0x00, 0x00, // MOV ECX, 0x1B
-            0x66, 0xB8, 0xAD, 0xDE, 0x00, 0x00, // MOV EAX, 0xDEAD
-            0x66, 0xBA, 0xEF, 0xBE, 0x00, 0x00, // MOV EDX, 0xBEEF
+            0x66, 0xB9, 0xAD, 0xDE, 0x00, 0x00, // MOV ECX, 0xDEAD
+            0x66, 0xB8, 0xAD, 0xDE, 0x00, 0x00, // MOV EAX, 0xDEAD (poison)
+            0x66, 0xBA, 0xEF, 0xBE, 0x00, 0x00, // MOV EDX, 0xBEEF (poison)
             0x0F, 0x32, // RDMSR
             0xF4,
         ],
         16,
     );
-    assert_eq!(cpu.read_r32(0), 0, "RDMSR clears EAX");
-    assert_eq!(cpu.read_r32(2), 0, "RDMSR clears EDX");
+    assert_eq!(cpu.read_r32(0), 0, "unknown MSR → EAX = 0");
+    assert_eq!(cpu.read_r32(2), 0, "unknown MSR → EDX = 0");
 }
 
 /// 0x66 0xFF /0 — INC r/m32.
