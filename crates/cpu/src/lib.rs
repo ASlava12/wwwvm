@@ -137,6 +137,13 @@ pub struct Cpu {
     /// sets CR2 to the faulting address, and clears the slot.
     /// `Cell` so translate can flag a fault through `&self`.
     pending_fault: Cell<Option<PageFault>>,
+    /// State of the A20 address line. On real hardware A20 starts
+    /// gated *off* at reset — addresses with bit 20 set wrap into
+    /// the low 1 MiB, the 8086 compatibility quirk. Modern BIOSes
+    /// enable it before handing off, so we default to `true` to
+    /// match the typical post-BIOS state. Toggle via port 0x92
+    /// bit 1 (the "fast A20" gate).
+    pub a20: bool,
     /// Optional intercept for software interrupts. When `INT imm8`
     /// fires, the CPU calls this with (cpu, mem, vector). If the hook
     /// returns `true`, the dispatch is skipped — the host already did
@@ -229,6 +236,7 @@ impl Cpu {
             cr3: 0,
             cr2: 0,
             pending_fault: Cell::new(None),
+            a20: true,
             bios_hook: None,
             seg_cache: [SegmentCache::default(); 6],
         }
@@ -264,6 +272,7 @@ impl Cpu {
         self.cr3 = 0;
         self.cr2 = 0;
         self.pending_fault.set(None);
+        self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
         // Since sregs reset to 0, base is 0 for everything.
         self.seg_cache = [SegmentCache {
@@ -405,29 +414,60 @@ impl Cpu {
     }
 
     fn translate_inner(&self, mem: &Memory, linear: u32, write: bool) -> u32 {
-        if self.cr0 & 0x8000_0000 == 0 {
-            return linear;
+        let phys = if self.cr0 & 0x8000_0000 == 0 {
+            linear
+        } else {
+            let pd_index = (linear >> 22) & 0x3FF;
+            let pt_index = (linear >> 12) & 0x3FF;
+            let page_offset = linear & 0xFFF;
+            let pd_base = self.cr3 & 0xFFFF_F000;
+            let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
+            let w_bit: u32 = if write { 0b10 } else { 0 };
+            // Present bit (bit 0) clear -> #PF with P=0. W bit reflects
+            // the access type. U/S stays zero (always supervisor for now).
+            if pde & 1 == 0 {
+                self.raise_fault(linear, w_bit);
+                return 0;
+            }
+            let pt_base = pde & 0xFFFF_F000;
+            let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
+            if pte & 1 == 0 {
+                self.raise_fault(linear, w_bit);
+                return 0;
+            }
+            let frame = pte & 0xFFFF_F000;
+            frame | page_offset
+        };
+        // A20 line gating happens *after* paging — it's a property of
+        // the physical address bus. With A20 off (the 8086-compat
+        // mode), bit 20 of every physical address is forced to zero.
+        if self.a20 {
+            phys
+        } else {
+            phys & 0xFFEF_FFFF
         }
-        let pd_index = (linear >> 22) & 0x3FF;
-        let pt_index = (linear >> 12) & 0x3FF;
-        let page_offset = linear & 0xFFF;
-        let pd_base = self.cr3 & 0xFFFF_F000;
-        let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
-        let w_bit: u32 = if write { 0b10 } else { 0 };
-        // Present bit (bit 0) clear -> #PF with P=0. W bit reflects
-        // the access type. U/S stays zero (always supervisor for now).
-        if pde & 1 == 0 {
-            self.raise_fault(linear, w_bit);
-            return 0;
+    }
+
+    /// Centralized port-read shim. Special-cases port 0x92 (System
+    /// Control Port A) because bit 1 of that port toggles the A20
+    /// gate, which lives on Cpu — IoBus can't service it. Every
+    /// other port falls through to the regular IoBus dispatch.
+    fn port_read(&mut self, io: &mut IoBus, port: u16) -> u8 {
+        if port == 0x92 {
+            // Bit 1 = A20 enable. Bit 0 (system reset) reads 0.
+            return if self.a20 { 0b10 } else { 0 };
         }
-        let pt_base = pde & 0xFFFF_F000;
-        let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
-        if pte & 1 == 0 {
-            self.raise_fault(linear, w_bit);
-            return 0;
+        io.read(port)
+    }
+
+    /// Counterpart to `port_read`. A write to 0x92 with bit 1 set
+    /// enables A20; clearing the bit gates A20 off.
+    fn port_write(&mut self, io: &mut IoBus, port: u16, value: u8) {
+        if port == 0x92 {
+            self.a20 = value & 0b10 != 0;
+            return;
         }
-        let frame = pte & 0xFFFF_F000;
-        frame | page_offset
+        io.write(port, value);
     }
 
     /// Record a pending #PF. `step()` consumes this at the top of the
@@ -2558,54 +2598,54 @@ impl Cpu {
             0xEC => {
                 // IN AL, DX
                 let port = self.regs[r16::DX];
-                let v = io.read(port);
+                let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xEE => {
                 // OUT DX, AL
                 let port = self.regs[r16::DX];
                 let v = self.read_r8(0);
-                io.write(port, v);
+                self.port_write(io, port, v);
             }
             0xE4 => {
                 // IN AL, imm8
                 let port = self.fetch_u8(mem) as u16;
-                let v = io.read(port);
+                let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xE5 => {
                 // IN AX, imm8 — two byte reads from consecutive ports
                 let port = self.fetch_u8(mem) as u16;
-                let lo = io.read(port) as u16;
-                let hi = io.read(port.wrapping_add(1)) as u16;
+                let lo = self.port_read(io, port) as u16;
+                let hi = self.port_read(io, port.wrapping_add(1)) as u16;
                 self.regs[r16::AX] = lo | (hi << 8);
             }
             0xE6 => {
                 // OUT imm8, AL
                 let port = self.fetch_u8(mem) as u16;
                 let v = self.read_r8(0);
-                io.write(port, v);
+                self.port_write(io, port, v);
             }
             0xE7 => {
                 // OUT imm8, AX — two byte writes to consecutive ports
                 let port = self.fetch_u8(mem) as u16;
                 let ax = self.regs[r16::AX];
-                io.write(port, ax as u8);
-                io.write(port.wrapping_add(1), (ax >> 8) as u8);
+                self.port_write(io, port, ax as u8);
+                self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
             }
             0xED => {
                 // IN AX, DX — 16-bit port read via DX
                 let port = self.regs[r16::DX];
-                let lo = io.read(port) as u16;
-                let hi = io.read(port.wrapping_add(1)) as u16;
+                let lo = self.port_read(io, port) as u16;
+                let hi = self.port_read(io, port.wrapping_add(1)) as u16;
                 self.regs[r16::AX] = lo | (hi << 8);
             }
             0xEF => {
                 // OUT DX, AX — 16-bit port write via DX
                 let port = self.regs[r16::DX];
                 let ax = self.regs[r16::AX];
-                io.write(port, ax as u8);
-                io.write(port.wrapping_add(1), (ax >> 8) as u8);
+                self.port_write(io, port, ax as u8);
+                self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
             }
 
             // XLAT — AL = mem[DS:BX+AL] (with seg-override if present).

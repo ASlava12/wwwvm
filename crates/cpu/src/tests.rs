@@ -2278,6 +2278,69 @@ fn page_fault_dispatches_int14_and_latches_cr2() {
     );
 }
 
+/// CPU comes up with the A20 line enabled (matching post-BIOS state)
+/// and reads port 0x92 with bit 1 set to expose this.
+#[test]
+fn a20_defaults_enabled_and_port_0x92_reflects_state() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    assert!(cpu.a20);
+    let mut io = IoBus::new();
+    // IN AL, imm8 (0xE4) — read port 0x92.
+    assert_eq!(cpu.port_read(&mut io, 0x92), 0b10);
+    cpu.a20 = false;
+    assert_eq!(cpu.port_read(&mut io, 0x92), 0);
+}
+
+/// With A20 enabled (default), a write to linear 0x10_0000 lands at
+/// physical 0x10_0000 and reads back unchanged. With A20 gated off,
+/// the address wraps into the low 1 MiB — writing to 0x10_0000
+/// actually writes to 0 (bit 20 forced clear), and a follow-up read
+/// from linear 0x10_0000 sees the value that lives at 0.
+///
+/// Drives this through the standard `mem_write_u8`/`mem_read_u8`
+/// helpers so we exercise the same translate() path the CPU uses
+/// for every guest memory access.
+#[test]
+fn a20_gating_wraps_high_addresses_into_low_mebibyte() {
+    let mut mem = Memory::new(0x0020_0000); // 2 MiB
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    // A20 on: write at 0x100000 stays there.
+    cpu.mem_write_u8(&mut mem, 0x0010_0000, 0xCA);
+    assert_eq!(cpu.mem_read_u8(&mem, 0x0010_0000), 0xCA);
+    // A20 off: the same store wraps to 0.
+    cpu.a20 = false;
+    cpu.mem_write_u8(&mut mem, 0x0010_0000, 0xFE);
+    assert_eq!(cpu.mem_read_u8(&mem, 0), 0xFE);
+    assert_eq!(
+        cpu.mem_read_u8(&mem, 0x0010_0000),
+        0xFE,
+        "read of 0x100000 with A20 off must alias to 0"
+    );
+    // Bit 19 is *not* masked — addresses < 1 MiB still address
+    // themselves even with A20 off.
+    cpu.mem_write_u8(&mut mem, 0x0008_0000, 0x42);
+    assert_eq!(cpu.mem_read_u8(&mem, 0x0008_0000), 0x42);
+}
+
+/// Boot stub: `IN AL, 0x92; AND AL, ~2; OUT 0x92, AL; HLT` flips
+/// A20 off via the fast gate. Confirms the CPU's IN/OUT dispatch
+/// actually routes through `port_read`/`port_write`.
+#[test]
+fn out_to_port_0x92_with_bit1_clear_disables_a20() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xE4, 0x92, // IN AL, 0x92
+            0x24, 0xFD, // AND AL, 0xFD (clear bit 1)
+            0xE6, 0x92, // OUT 0x92, AL
+            0xF4, // HLT
+        ],
+        16,
+    );
+    assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
+}
+
 /// 0x0F 0x22 /2 (MOV CR2, r32) and 0x0F 0x20 /2 (MOV r32, CR2) — used
 /// by a #PF handler to (re)write or read the faulting linear address.
 #[test]
