@@ -2466,6 +2466,48 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0x22 /4 / 0x0F 0x20 /4 — MOV CR4, r32 / MOV r32, CR4.
+#[test]
+fn mov_cr4_round_trip_carries_feature_bits() {
+    // MOV EAX, 0x0000_0020 (PSE bit) — 66 B8 imm32
+    // MOV CR4, EAX                   — 0F 22 E0 (reg=4=CR4, rm=0=EAX)
+    // MOV EBX, CR4                   — 0F 20 E3 (reg=4, rm=3=EBX)
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x20, 0x00, 0x00, 0x00, // MOV EAX, 0x20
+            0x0F, 0x22, 0xE0, // MOV CR4, EAX
+            0x0F, 0x20, 0xE3, // MOV EBX, CR4
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.cr4, 0x20);
+    assert_eq!(cpu.regs[r16::BX], 0x20);
+}
+
+/// 0x0F 0x32 — RDMSR returns zeros for every MSR (stub).
+#[test]
+fn rdmsr_returns_zero_for_any_msr() {
+    // MOV ECX, 0x1B (IA32_APIC_BASE) — 66 B9 1B 00 00 00
+    // MOV EAX, 0xDEAD                 — 66 B8 AD DE 00 00
+    // MOV EDX, 0xBEEF                 — 66 BA EF BE 00 00
+    // RDMSR                           — 0F 32
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x1B, 0x00, 0x00, 0x00, // MOV ECX, 0x1B
+            0x66, 0xB8, 0xAD, 0xDE, 0x00, 0x00, // MOV EAX, 0xDEAD
+            0x66, 0xBA, 0xEF, 0xBE, 0x00, 0x00, // MOV EDX, 0xBEEF
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0, "RDMSR clears EAX");
+    assert_eq!(cpu.read_r32(2), 0, "RDMSR clears EDX");
+}
+
 /// 0x66 0xFF /0 — INC r/m32.
 #[test]
 fn inc_r32_increments_dword_preserving_cf() {

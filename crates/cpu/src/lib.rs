@@ -147,6 +147,11 @@ pub struct Cpu {
     /// address to fix up. We don't model the MOV opcode yet — it
     /// will be added when a guest needs it.
     pub cr2: u32,
+    /// Control Register 4 — feature-enable bits added past i486 (VME,
+    /// PSE, PAE, PGE, OSFXSR, etc.). We don't act on any of them yet;
+    /// the value is just stored so a kernel can read/write it via
+    /// `MOV CR4, r32` / `MOV r32, CR4` without faulting.
+    pub cr4: u32,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -257,6 +262,7 @@ impl Cpu {
             idtr: DescriptorTable::default(),
             cr3: 0,
             cr2: 0,
+            cr4: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -293,6 +299,7 @@ impl Cpu {
         self.idtr = DescriptorTable::default();
         self.cr3 = 0;
         self.cr2 = 0;
+        self.cr4 = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
@@ -3521,6 +3528,7 @@ impl Cpu {
                             0 => self.cr0,
                             2 => self.cr2,
                             3 => self.cr3,
+                            4 => self.cr4,
                             _ => {
                                 return Err(CpuError::Unimplemented {
                                     opcode: op2,
@@ -3541,6 +3549,7 @@ impl Cpu {
                             0 => self.cr0 = value,
                             2 => self.cr2 = value,
                             3 => self.cr3 = value,
+                            4 => self.cr4 = value,
                             _ => {
                                 return Err(CpuError::Unimplemented {
                                     opcode: op2,
@@ -3549,6 +3558,19 @@ impl Cpu {
                                 });
                             }
                         }
+                    }
+                    // RDMSR — 0x0F 0x32. Reads MSR named by ECX into
+                    // EDX:EAX. We return 0 for everything; Linux setup
+                    // treats this as "feature disabled" rather than
+                    // probing further, which is what we want.
+                    0x32 => {
+                        self.write_r32(0, 0); // EAX
+                        self.write_r32(2, 0); // EDX
+                    }
+                    // WRMSR — 0x0F 0x30. Write MSR. Stubbed (drop).
+                    0x30 => {
+                        // No-op — neither side has any persistent MSR
+                        // state we'd want to update.
                     }
                     // Jcc rel16/rel32 — 0x0F 0x80..0x8F. Long-form
                     // conditional jump. Real-mode + no 0x66 = rel16;
