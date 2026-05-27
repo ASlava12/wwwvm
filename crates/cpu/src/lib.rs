@@ -869,40 +869,58 @@ impl Cpu {
     /// word, which is the 16-bit-handler convention; a future 32-bit
     /// handler path will widen to a 32-bit push.
     fn do_interrupt_with_error(&mut self, n: u8, error_code: Option<u32>, mem: &mut Memory) {
-        let (new_cs, new_ip) = if self.cr0 & 1 == 0 {
+        // In PE, the gate's type bits (low nibble of the access byte
+        // at descriptor offset 5) pick the frame width:
+        //   0x6 / 0x7 → 16-bit interrupt / trap gate
+        //   0xE / 0xF → 32-bit interrupt / trap gate
+        // Real-mode (PE=0) IVT is always the 16-bit 4-byte form.
+        let (new_cs, new_ip, gate_is_32) = if self.cr0 & 1 == 0 {
             let ivt_addr = (n as u32) * 4;
             (
                 self.mem_read_u16(mem, ivt_addr + 2),
-                self.mem_read_u16(mem, ivt_addr),
+                self.mem_read_u16(mem, ivt_addr) as u32,
+                false,
             )
         } else {
             let gate_addr = self.idtr.base.wrapping_add((n as u32) * 8);
-            let off_lo = self.mem_read_u16(mem, gate_addr);
+            let off_lo = self.mem_read_u16(mem, gate_addr) as u32;
             let selector = self.mem_read_u16(mem, gate_addr.wrapping_add(2));
-            // High 16 bits of offset live in bytes 6-7 — zero for the
-            // 16-bit gates we currently emit. We still read them so
-            // that 32-bit gates (the upgrade path) just slot in by
-            // widening `self.ip`.
-            let _off_hi = self.mem_read_u16(mem, gate_addr.wrapping_add(6));
-            (selector, off_lo)
+            let access = self.mem_read_u8(mem, gate_addr.wrapping_add(5));
+            let off_hi = self.mem_read_u16(mem, gate_addr.wrapping_add(6)) as u32;
+            let is_32 = (access & 0x0F) >= 0x0E;
+            let off = if is_32 {
+                off_lo | (off_hi << 16)
+            } else {
+                off_lo
+            };
+            (selector, off, is_32)
         };
         let flags = self.flags;
-        self.push16(mem, flags);
         let cs = self.sregs[sreg::CS];
-        self.push16(mem, cs);
-        // 16-bit gate convention — only the low 16 of IP go on the
-        // stack. A 32-bit-gate path will push the full 32 when we
-        // land it.
-        let ip = self.ip as u16;
-        self.push16(mem, ip);
-        if let Some(ec) = error_code {
-            self.push16(mem, ec as u16);
+        if gate_is_32 {
+            // 32-bit frame: push EFLAGS, CS (zero-extended to dword),
+            // and the full 32-bit EIP. The error code (when present)
+            // gets a dword push too.
+            self.push32(mem, flags as u32);
+            self.push32(mem, cs as u32);
+            self.push32(mem, self.ip);
+            if let Some(ec) = error_code {
+                self.push32(mem, ec);
+            }
+        } else {
+            // 16-bit frame: word pushes. IP truncated to low 16.
+            self.push16(mem, flags);
+            self.push16(mem, cs);
+            self.push16(mem, self.ip as u16);
+            if let Some(ec) = error_code {
+                self.push16(mem, ec as u16);
+            }
         }
         self.set_flag(flag::IF, false);
         // TF is not modeled yet — when it is, this is also where it
         // gets cleared.
         self.write_sreg(sreg::CS, new_cs, mem);
-        self.ip = new_ip as u32;
+        self.ip = new_ip;
     }
 
     /// Read the stack pointer at its current width. Returns the
@@ -2880,13 +2898,26 @@ impl Cpu {
                     self.do_interrupt(4, mem);
                 }
             }
-            // IRET — pop IP, CS, FLAGS (in that order). The IF/TF state
-            // before the original INT is restored as part of FLAGS.
+            // IRET — pop EIP, CS, EFLAGS (in that order). Under the
+            // 0x66 prefix (IRETD), pops a dword frame; otherwise a
+            // word frame. The IF/TF state before the original INT is
+            // restored as part of FLAGS.
             0xCF => {
-                self.ip = self.pop16(mem) as u32;
-                let cs = self.pop16(mem);
-                self.write_sreg(sreg::CS, cs, mem);
-                self.flags = self.pop16(mem);
+                if self.op_size_32 {
+                    self.ip = self.pop32(mem);
+                    let cs = self.pop32(mem) as u16;
+                    self.write_sreg(sreg::CS, cs, mem);
+                    // EFLAGS pop — only the low 16 are modelled; the
+                    // upper half (resume / V86 / AC bits) reads back
+                    // but isn't acted upon yet.
+                    let eflags = self.pop32(mem);
+                    self.flags = eflags as u16;
+                } else {
+                    self.ip = self.pop16(mem) as u32;
+                    let cs = self.pop16(mem);
+                    self.write_sreg(sreg::CS, cs, mem);
+                    self.flags = self.pop16(mem);
+                }
             }
 
             // INC r16 (0x40-0x47) / DEC r16 (0x48-0x4F). Per the 8086,

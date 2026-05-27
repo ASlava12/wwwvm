@@ -2426,6 +2426,56 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 32-bit IDT gate (type 0xE) — the architectural form Linux 32-bit
+/// kernels install. INT pushes EFLAGS, CS, and the full 32-bit EIP
+/// as dwords; IRETD pops them back. Round-trip: INT 0x21 dispatches
+/// through a 32-bit gate; the handler does IRETD (66 CF) and the
+/// CPU returns exactly where it was before the INT.
+#[test]
+fn pm_interrupt_through_32_bit_gate_and_iretd() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x4000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+
+    // GDT[1] = flat code segment base=0, limit=0xFFFFF, G=1, access=0x9A.
+    mem.write_slice(0x0508, &[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00]);
+    // IDT gate 0x21 at 0x4000+0x21*8 = 0x4108. 32-bit interrupt gate
+    // type=0xE, P=1, DPL=0 → access byte = 0x8E.
+    //   offset_lo = 0x0900, selector = 0x0008, type = 0x8E,
+    //   offset_hi = 0x0000.
+    mem.write_slice(0x4108, &[0x00, 0x09, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00]);
+    // Handler at linear 0x0900: MOV BL,0x55; 66 CF (IRETD); HLT
+    mem.write_slice(0x0900, &[0xB3, 0x55, 0x66, 0xCF, 0xF4]);
+
+    // Boot stub at 0x7C00:
+    //   INT 0x21 (CD 21)
+    //   MOV CL, 0x99   (B1 99)    ; runs after IRETD
+    //   HLT
+    mem.write_slice(0x7C00, &[0xCD, 0x21, 0xB1, 0x99, 0xF4]);
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Handler ran (BL=0x55) and IRETD returned to MOV CL,0x99 (CL=0x99).
+    assert_eq!(cpu.read_r8(3), 0x55);
+    assert_eq!(cpu.read_r8(1), 0x99);
+    // ESP must be back to 0x0008_0000 — IRETD un-pushed the 3 dword
+    // frame, restoring the stack precisely.
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000);
+}
+
 /// With `stack_size_32 = true` (i.e. running on a 32-bit kernel
 /// stack), push/pop drive the full ESP register — not just SP —
 /// so a stack that lives above the 64 KiB boundary works.
