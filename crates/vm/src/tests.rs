@@ -1,5 +1,57 @@
 use super::*;
 
+/// load_elf_image() parses an ELF32 image and copies its PT_LOAD
+/// segments into memory. We craft a tiny ELF whose single segment is
+/// `MOV AL,'A'; HLT` at vaddr 0x7C00 (so a plain `boot()` lands the
+/// CPU at the entry point with no further setup). Verifies the
+/// loader+VM chain runs end-to-end on a real ELF binary structure.
+#[test]
+fn vm_loads_and_runs_tiny_elf32_image() {
+    let entry: u32 = 0x7C00;
+    let mut elf = make_elf_header(entry, 52, 1);
+    // PT_LOAD at file offset 84, vaddr 0x7C00, filesz=3.
+    elf.extend_from_slice(&make_pt_load(84, entry, 3));
+    elf.extend_from_slice(&[0xB0, 0x41, 0xF4]); // MOV AL,'A'; HLT
+
+    let mut vm = Vm::new();
+    let loaded_entry = vm.load_elf_image(&elf).expect("ELF load");
+    assert_eq!(loaded_entry, entry);
+    vm.boot(); // resets CS=0, IP=0x7C00
+    let (_, stop) = vm.run_steps(8);
+    assert!(matches!(stop, Stop::Halted));
+    assert_eq!(vm.cpu().read_r8(0), b'A');
+}
+
+fn make_elf_header(e_entry: u32, e_phoff: u32, e_phnum: u16) -> Vec<u8> {
+    let mut h = vec![0u8; 52];
+    h[..4].copy_from_slice(b"\x7FELF");
+    h[4] = 1; // ELFCLASS32
+    h[5] = 1; // ELFDATA2LSB
+    h[6] = 1; // EI_VERSION
+    h[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    h[0x12..0x14].copy_from_slice(&3u16.to_le_bytes()); // EM_386
+    h[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    h[0x18..0x1C].copy_from_slice(&e_entry.to_le_bytes());
+    h[0x1C..0x20].copy_from_slice(&e_phoff.to_le_bytes());
+    h[0x28..0x2A].copy_from_slice(&52u16.to_le_bytes()); // e_ehsize
+    h[0x2A..0x2C].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
+    h[0x2C..0x2E].copy_from_slice(&e_phnum.to_le_bytes());
+    h
+}
+
+fn make_pt_load(p_offset: u32, p_vaddr: u32, p_size: u32) -> Vec<u8> {
+    let mut p = vec![0u8; 32];
+    p[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    p[4..8].copy_from_slice(&p_offset.to_le_bytes());
+    p[8..12].copy_from_slice(&p_vaddr.to_le_bytes());
+    p[12..16].copy_from_slice(&p_vaddr.to_le_bytes()); // p_paddr
+    p[16..20].copy_from_slice(&p_size.to_le_bytes()); // p_filesz
+    p[20..24].copy_from_slice(&p_size.to_le_bytes()); // p_memsz
+    p[24..28].copy_from_slice(&7u32.to_le_bytes()); // R|W|X
+    p[28..32].copy_from_slice(&0x1000u32.to_le_bytes());
+    p
+}
+
 /// INT 0x13 with AL > 1 reads multiple sectors contiguously. Verifies
 /// the per-byte mem_write_u8 loop in `bios_int13` doesn't truncate
 /// after the first sector. Disk has 4 marker sectors (0xAA / 0xBB /

@@ -8,6 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod elf;
+
+pub use elf::{load_elf, ElfError};
 use wwwvm_cpu::{Cpu, CpuError};
 use wwwvm_devices::IoBus;
 use wwwvm_mem::Memory;
@@ -586,6 +589,17 @@ impl Vm {
     /// multiple; bytes past the end read as zero.
     pub fn load_disk_image(&mut self, bytes: &[u8]) {
         self.io.disk.load(bytes);
+    }
+
+    /// Parse an ELF32 image and copy its PT_LOAD segments into guest
+    /// memory. After this returns, the caller should call [`boot`]
+    /// (which resets the CPU) and then position CS:IP at the entry
+    /// point — typically by writing the IP register directly. The
+    /// loader doesn't touch CS:IP itself because the caller might
+    /// want to construct a different initial state (e.g. PM-up
+    /// already, GDT pre-installed) before jumping to entry.
+    pub fn load_elf_image(&mut self, bytes: &[u8]) -> Result<u32, ElfError> {
+        elf::load_elf(&mut self.mem, bytes)
     }
 
     /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
