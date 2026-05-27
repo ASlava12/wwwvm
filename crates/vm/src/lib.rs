@@ -33,7 +33,9 @@ pub mod snapshot {
     /// * v2 — adds device state (UART/PIC/PIT/KBD/CMOS) after RAM.
     /// * v3 — adds i386 fields to the CPU image: upper 16 bits of
     ///   each GPR (regs_high), CR0, GDTR, IDTR.
-    pub const VERSION: u8 = 3;
+    /// * v4 — appends CR3 (4 bytes) past the v3 layout — needed once
+    ///   paging is in use, since CR3 names the page directory.
+    pub const VERSION: u8 = 4;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -44,6 +46,10 @@ pub mod snapshot {
     pub const CPU_V3_EXTRA: usize = 32;
     /// Total bytes a v3 CPU image takes.
     pub const CPU_V3_LEN: usize = CPU_LEN + CPU_V3_EXTRA;
+    /// Extra bytes v4 adds past the v3 image: 4 (cr3 u32).
+    pub const CPU_V4_EXTRA: usize = 4;
+    /// Total bytes a v4 CPU image takes.
+    pub const CPU_V4_LEN: usize = CPU_V3_LEN + CPU_V4_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -158,7 +164,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE;
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V4_LEN + Self::RAM_SIZE;
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -194,6 +200,9 @@ impl Vm {
         buf.extend_from_slice(&self.cpu.idtr.limit.to_le_bytes());
         buf.extend_from_slice(&self.cpu.idtr.base.to_le_bytes());
 
+        // v4 CPU extension — CR3 (page directory physical base).
+        buf.extend_from_slice(&self.cpu.cr3.to_le_bytes());
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
@@ -221,24 +230,22 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=3) {
+        if !matches!(version, 1..=4) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
-        // v3 CPU image is 32 bytes larger; revalidate min size.
-        if version == 3
-            && bytes.len() < snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE
-        {
+        let cpu_len = match version {
+            4 => snapshot::CPU_V4_LEN,
+            3 => snapshot::CPU_V3_LEN,
+            _ => snapshot::CPU_LEN,
+        };
+        // Re-validate min size against the version-specific CPU image.
+        if bytes.len() < snapshot::HEADER_LEN + cpu_len + Self::RAM_SIZE {
             return Err(SnapshotError::TooSmall {
                 got: bytes.len(),
-                need: snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE,
+                need: snapshot::HEADER_LEN + cpu_len + Self::RAM_SIZE,
             });
         }
         let cpu_start = snapshot::HEADER_LEN;
-        let cpu_len = if version == 3 {
-            snapshot::CPU_V3_LEN
-        } else {
-            snapshot::CPU_LEN
-        };
         let mem_start = cpu_start + cpu_len;
 
         // Decode v1/v2 prefix (always present in any version).
@@ -266,7 +273,8 @@ impl Vm {
         let mut cr0: u32 = 0;
         let mut gdtr = wwwvm_cpu::DescriptorTable::default();
         let mut idtr = wwwvm_cpu::DescriptorTable::default();
-        if version == 3 {
+        let mut cr3: u32 = 0;
+        if version >= 3 {
             let ext = cpu_start + snapshot::CPU_LEN;
             for (i, h) in regs_high.iter_mut().enumerate() {
                 *h = u16::from_le_bytes([bytes[ext + i * 2], bytes[ext + i * 2 + 1]]);
@@ -291,6 +299,10 @@ impl Vm {
                 bytes[ext + 30],
                 bytes[ext + 31],
             ]);
+        }
+        if version >= 4 {
+            let ext = cpu_start + snapshot::CPU_V3_LEN;
+            cr3 = u32::from_le_bytes([bytes[ext], bytes[ext + 1], bytes[ext + 2], bytes[ext + 3]]);
         }
 
         // Memory restore — `restore_full` validates size again as a
@@ -338,6 +350,7 @@ impl Vm {
         self.cpu.cr0 = cr0;
         self.cpu.gdtr = gdtr;
         self.cpu.idtr = idtr;
+        self.cpu.cr3 = cr3;
         // Re-derive seg_cache from the visible selectors. For real-
         // mode snapshots this is exact (cache = sel << 4). For a
         // future PM snapshot the cache values would diverge from

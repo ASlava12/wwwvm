@@ -2119,6 +2119,70 @@ fn mov_cr0_round_trip_through_ax() {
     assert_eq!(cpu.regs[r16::BX], 1);
 }
 
+/// 0x0F 0x22 /3 (MOV CR3, r32) and 0x0F 0x20 /3 (MOV r32, CR3) must
+/// route the full 32-bit page-directory base. We use the operand-size
+/// prefix 0x66 to fill EAX, write it into CR3, then read it back into
+/// EBX. The high 16 bits live in `regs_high`.
+#[test]
+fn mov_cr3_round_trip_preserves_32_bit_page_directory_base() {
+    // MOV EAX, 0xCAFEB000  → 66 B8 imm32
+    // MOV CR3, EAX         → 0F 22 D8 (modrm = 11 011 000 → reg=3=CR3, rm=0=EAX)
+    // MOV EBX, CR3         → 0F 20 DB (modrm = 11 011 011 → reg=3=CR3, rm=3=EBX)
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0xB0, 0xFE, 0xCA, // MOV EAX, 0xCAFEB000
+            0x0F, 0x22, 0xD8, // MOV CR3, EAX
+            0x0F, 0x20, 0xDB, // MOV EBX, CR3
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.cr3, 0xCAFE_B000);
+    assert_eq!(cpu.regs[r16::BX], 0xB000);
+    assert_eq!(cpu.regs_high[r16::BX], 0xCAFE);
+}
+
+/// translate() is identity whenever CR0.PG=0 — both real mode and
+/// "PE but not yet paged" boot stages must keep using linear addresses
+/// unchanged.
+#[test]
+fn translate_is_identity_without_paging() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mem = Memory::new(0x10_0000);
+    cpu.cr0 = 1; // PE on but PG off
+    assert_eq!(cpu.translate(&mem, 0x0000_0000), 0x0000_0000);
+    assert_eq!(cpu.translate(&mem, 0x0007_C000), 0x0007_C000);
+    assert_eq!(cpu.translate(&mem, 0x000F_FFFF), 0x000F_FFFF);
+}
+
+/// With CR0.PG=1 a linear address walks two levels of i386 page
+/// tables. We map linear 0x0040_0123 -> physical 0x0008_0123 by
+/// placing a page directory at 0x1000, PDE[1] (linear[31:22] = 1)
+/// pointing at the PT at 0x2000, and PTE[0] (linear[21:12] = 0)
+/// pointing at frame 0x80 — then assert the page offset (0x123)
+/// flows through unchanged.
+#[test]
+fn paged_translation_resolves_through_two_level_walk() {
+    let mut mem = Memory::new(0x10_0000);
+    // Page directory at 0x1000. PDE[1] (offset 4) = PT_base 0x2000 | P|RW = 0x03.
+    mem.write_u32(0x1000 + 4, 0x0000_2000 | 0x03);
+    // Page table at 0x2000. PTE[0] (offset 0) = frame 0x80000 | P|RW = 0x03.
+    mem.write_u32(0x2000, 0x0008_0000 | 0x03);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0001; // PE + PG
+    cpu.cr3 = 0x0000_1000;
+
+    // Linear 0x0040_0123: pd_idx = 1, pt_idx = 0, off = 0x123.
+    let phys = cpu.translate(&mem, 0x0040_0123);
+    assert_eq!(phys, 0x0008_0123);
+    // Sanity: offset bits flow through untouched.
+    assert_eq!(cpu.translate(&mem, 0x0040_0FFF), 0x0008_0FFF);
+}
+
 #[test]
 fn lgdt_loads_gdt_descriptor_table_pseudo_register() {
     // 6-byte pseudo-descriptor at 0x800: limit=0x00FF, base=0x0010_2030

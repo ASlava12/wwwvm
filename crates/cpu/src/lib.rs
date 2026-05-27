@@ -115,6 +115,12 @@ pub struct Cpu {
     /// real mode the IDT is fixed at linear 0 with 4-byte entries;
     /// once we honor PM-style interrupt gates we'll consult this.
     pub idtr: DescriptorTable,
+    /// Control Register 3 — physical base of the page directory.
+    /// Bits 11..0 hold attributes (PWT/PCD on real x86, ignored here);
+    /// bits 31..12 are the 4 KiB-aligned PD base. Active only when
+    /// `cr0 & 0x8000_0000` (PG). Loaded via `MOV CR3, r32` (0x0F 0x22
+    /// /3) and read via `MOV r32, CR3` (0x0F 0x20 /3).
+    pub cr3: u32,
     /// Shadow descriptor cache for each segment register. The CPU
     /// addresses memory through `seg_cache[idx].base`, *not*
     /// `sregs[idx] << 4`, so once PM is on, the visible selector
@@ -178,6 +184,7 @@ impl Cpu {
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
+            cr3: 0,
             seg_cache: [SegmentCache::default(); 6],
         }
     }
@@ -209,6 +216,7 @@ impl Cpu {
         self.cr0 = 0;
         self.gdtr = DescriptorTable::default();
         self.idtr = DescriptorTable::default();
+        self.cr3 = 0;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
         // Since sregs reset to 0, base is 0 for everything.
         self.seg_cache = [SegmentCache {
@@ -318,6 +326,36 @@ impl Cpu {
     /// access that routes through here.
     pub fn linear_seg(&self, seg_idx: usize, off: u16) -> u32 {
         self.seg_cache[seg_idx].base.wrapping_add(off as u32)
+    }
+
+    /// Translate a linear address to a physical address. When
+    /// `CR0.PG = 0` this is identity (real mode and unpaged PM).
+    /// When `CR0.PG = 1` it walks the 2-level i386 page tables
+    /// rooted at `cr3`:
+    ///
+    /// ```text
+    ///   linear[31:22] -> PD index   (PDE at cr3[31:12] + idx*4)
+    ///   linear[21:12] -> PT index   (PTE at PDE[31:12] + idx*4)
+    ///   linear[11: 0] -> page offset
+    /// ```
+    ///
+    /// Not yet modelled (these become work for the page-fault tick):
+    /// the Present bit (P), Read/Write (R/W), User/Supervisor (U/S),
+    /// or a TLB. We assume every entry is present and writable.
+    /// 4 MiB pages (PSE) are also out of scope for the moment.
+    pub fn translate(&self, mem: &Memory, linear: u32) -> u32 {
+        if self.cr0 & 0x8000_0000 == 0 {
+            return linear;
+        }
+        let pd_index = (linear >> 22) & 0x3FF;
+        let pt_index = (linear >> 12) & 0x3FF;
+        let page_offset = linear & 0xFFF;
+        let pd_base = self.cr3 & 0xFFFF_F000;
+        let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
+        let pt_base = pde & 0xFFFF_F000;
+        let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
+        let frame = pte & 0xFFFF_F000;
+        frame | page_offset
     }
 
     fn fetch_u8(&mut self, mem: &Memory) -> u8 {
@@ -2513,17 +2551,16 @@ impl Cpu {
                             }
                         }
                     }
-                    // MOV r32, CRn — 0x0F 0x20 /reg. We don't have
-                    // 32-bit GPRs yet, so the low 16 bits of CRn land
-                    // in the r16 indicated by rm. The high 16 of CRn
-                    // are dropped for now (they're zero in any state
-                    // we currently reach anyway).
+                    // MOV r32, CRn — 0x0F 0x20 /reg. CR0 and CR3 are
+                    // routed to the full 32-bit GPR (via write_r32) so
+                    // page-directory bases survive the round-trip.
                     0x20 => {
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
                         let value = match reg {
                             0 => self.cr0,
+                            3 => self.cr3,
                             _ => {
                                 return Err(CpuError::Unimplemented {
                                     opcode: op2,
@@ -2532,16 +2569,17 @@ impl Cpu {
                                 });
                             }
                         };
-                        self.write_r16(rm, value as u16);
+                        self.write_r32(rm, value);
                     }
                     // MOV CRn, r32 — 0x0F 0x22 /reg.
                     0x22 => {
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
-                        let value = self.read_r16(rm) as u32;
+                        let value = self.read_r32(rm);
                         match reg {
                             0 => self.cr0 = value,
+                            3 => self.cr3 = value,
                             _ => {
                                 return Err(CpuError::Unimplemented {
                                     opcode: op2,

@@ -47,6 +47,17 @@ impl Memory {
         self.write_u8(addr.wrapping_add(1), (value >> 8) as u8);
     }
 
+    pub fn read_u32(&self, addr: u32) -> u32 {
+        let lo = self.read_u16(addr) as u32;
+        let hi = self.read_u16(addr.wrapping_add(2)) as u32;
+        lo | (hi << 16)
+    }
+
+    pub fn write_u32(&mut self, addr: u32, value: u32) {
+        self.write_u16(addr, value as u16);
+        self.write_u16(addr.wrapping_add(2), (value >> 16) as u16);
+    }
+
     pub fn write_slice(&mut self, addr: u32, data: &[u8]) {
         let start = addr as usize;
         let end = start.saturating_add(data.len()).min(self.bytes.len());
