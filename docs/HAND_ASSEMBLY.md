@@ -226,16 +226,139 @@ print its banner — see
 [`crates/vm/src/lib.rs`](../crates/vm/src/lib.rs) for the byte-by-byte
 expansion.
 
-## Interrupts in one paragraph
+## Example 3 — interrupt-driven timer counter
 
-Real PC software is interrupt-driven. wwwvm honors the standard real-
-mode IVT at linear 0: each 4-byte entry is `offset, segment`. When IRQ
-n fires (and `IF=1` in FLAGS), the CPU pushes FLAGS/CS/IP, clears IF,
-and jumps to `IVT[n]`. The handler does its work and returns with
-`IRET` (`0xCF`), which pops IP/CS/FLAGS back. Use
-`vm.set_ivt(vector, segment, offset)` from JS to install a handler
-without writing the IVT bytes yourself; see the `uart_rx_drives_irq4`
-integration test in `crates/vm/src/lib.rs` for a fully worked example.
+So far our guests have *polled* — the read-byte example sat in a tight
+loop on the UART line-status register, asking "is there data yet?"
+forever. Real systems don't do that. They configure a device to raise
+an interrupt when it has work, then let the CPU sleep or do something
+useful in between.
+
+This example sets up the 8254 PIT (the PC's interval timer) to fire
+IRQ 0 every 50 CPU steps. A handler increments a counter in memory.
+Main code spins until the counter hits 4 and then halts. The PIT
+keeps firing — *we'd never know about it* from the main code if not
+for the IDT.
+
+### The machinery you need to set up
+
+Three things have to happen at boot before the first interrupt can
+land in a handler:
+
+1. **Install the handler in the IVT** so the CPU knows where to jump
+   when IRQ 0 arrives. IRQ 0 maps to vector 0x08 (master PIC default
+   base = 0x08). The IVT lives at linear 0, each entry is 4 bytes
+   `offset, segment`. Use `vm.set_ivt(8, 0, handler_addr)` from JS
+   instead of emitting `MOV WORD [0x20]` bytes — same effect, much
+   less noise in the guest.
+2. **Program the PIT** — write a control word to port 0x43 picking
+   the channel, mode, and access pattern, then write the reload value
+   (LSB first, then MSB) to port 0x40.
+3. **Unmask IRQ 0 in the PIC** — port 0x21 holds the master Interrupt
+   Mask Register; bit 0 = IRQ 0. Write `0xFE` to clear bit 0 and leave
+   the others masked.
+4. **`STI`** so the CPU starts honoring IRQs.
+
+### Main, 25 bytes
+
+```
+0x00 B0 34            MOV AL, 0x34        ; SC=0, RW=3 (LSB then MSB), mode=2
+0x02 E6 43            OUT 0x43, AL        ; PIT control word
+0x04 B0 32            MOV AL, 50          ; reload LSB = 50 ticks
+0x06 E6 40            OUT 0x40, AL
+0x08 30 C0            XOR AL, AL          ; reload MSB = 0
+0x0A E6 40            OUT 0x40, AL
+0x0C B0 FE            MOV AL, 0xFE        ; PIC IMR — unmask IRQ 0 only
+0x0E E6 21            OUT 0x21, AL
+0x10 FB               STI
+0x11 80 3E 00 09 04   CMP byte [0x900], 4 ; counter location, compare to 4
+0x16 75 F9            JNZ -7 -> 0x11      ; spin until counter == 4
+0x18 F4               HLT
+```
+
+A few notes:
+
+- The PIT runs in *mode 2* (rate generator): every time the counter
+  reaches zero it raises an edge on IRQ 0 *and* reloads itself, so the
+  IRQ fires periodically forever. Mode 0 (one-shot) halts after the
+  first terminal count.
+- The `CMP byte [0x900], 4` uses the `[disp16]` form of ModR/M
+  (mod=00, rm=110), which is why the bytes start `80 3E` — `3E` is the
+  ModR/M byte `00 111 110` (op = CMP via Group 1 reg=7, rm=110).
+- The displacement comes next: `00 09` = 0x0900 little-endian.
+
+### Handler, 11 bytes, lives at 0x7C50
+
+```
+0x50 50              PUSH AX               ; preserve caller's AX
+0x51 FE 06 00 09     INC byte [0x900]      ; advance the counter
+0x55 B0 20           MOV AL, 0x20
+0x57 E6 20           OUT 0x20, AL          ; non-specific EOI to master PIC
+0x59 58              POP AX                ; restore AX
+0x5A CF              IRET
+```
+
+Everything the handler clobbers, it saves first and restores on the
+way out — that's what `PUSH AX` / `POP AX` are for. If we forgot, the
+main loop's `CMP` would see a stale value next iteration.
+
+The `OUT 0x20, AL` with `AL=0x20` is the canonical end-of-interrupt
+signal to the master PIC. Without it, the PIC would keep IRQ 0 marked
+in-service and refuse to deliver a second one — your timer would
+"work" exactly once.
+
+`IRET` pops IP, CS, and FLAGS — that last one restores `IF=1`, so the
+next interrupt can fire as soon as we're back in the main loop.
+
+### Wire it up from JS
+
+```js
+import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
+await init();
+const vm = new WwwVm();
+
+vm.load_image(0x7C00, new Uint8Array([
+  0xB0, 0x34, 0xE6, 0x43,
+  0xB0, 0x32, 0xE6, 0x40,
+  0x30, 0xC0, 0xE6, 0x40,
+  0xB0, 0xFE, 0xE6, 0x21,
+  0xFB,
+  0x80, 0x3E, 0x00, 0x09, 0x04,
+  0x75, 0xF9,
+  0xF4,
+]));
+
+vm.load_image(0x7C50, new Uint8Array([
+  0x50,
+  0xFE, 0x06, 0x00, 0x09,
+  0xB0, 0x20, 0xE6, 0x20,
+  0x58,
+  0xCF,
+]));
+
+// IRQ 0 → vector 0x08 (master PIC vector base) → handler at 0:0x7C50
+vm.set_ivt(0x08, 0x0000, 0x7C50);
+
+vm.boot();
+vm.run(5000);
+console.log("counter:", vm.read_mem_u8(0x900));  // 4
+console.log("halted:", vm.is_halted());           // true
+```
+
+The same pattern works for any device IRQ: install the handler in the
+right vector slot (UART is IRQ 4 → vector 0x0C, keyboard is IRQ 1 →
+vector 0x09), unmask the corresponding bit in the PIC IMR, and EOI at
+the end of the handler. See the `pit_timer_drives_irq0_handler_through_vm`
+and `uart_rx_drives_irq4_handler_through_vm` integration tests in
+`crates/vm/src/lib.rs` for fully worked references.
+
+## Interrupts in two more sentences
+
+When IRQ n fires *and* `IF=1` in FLAGS, the CPU pushes FLAGS/CS/IP,
+clears IF (so the handler runs with interrupts masked by default),
+and jumps to whichever address you stored in IVT[n]. The handler
+does its job, EOIs the relevant PIC(s), and `IRET`s — which pops
+IP/CS/FLAGS in that order and resumes the interrupted instruction.
 
 ## Where to go from here
 
