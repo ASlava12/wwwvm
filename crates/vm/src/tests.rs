@@ -69,6 +69,61 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// `Vm::load_bzimage` parses a synthetic bzImage and places its setup
+/// blob at linear 0x90000 and its 32-bit payload at code32_start.
+/// We craft a minimal valid header with setup_sects=1 (so payload
+/// starts at file offset 1024), code32_start=0x10_0000, and a
+/// recognizable payload signature. Verifies the bytes landed in the
+/// right places and that the returned `BzImage` carries the right
+/// metadata.
+#[test]
+fn load_bzimage_places_setup_at_90000_and_payload_at_code32_start() {
+    let payload = b"PAYLOAD12";
+    let mut bz_bytes = vec![0u8; 1024];
+    // Mark setup byte 0 with a sentinel so we can detect setup landed
+    // at 0x90000.
+    bz_bytes[0] = 0xC5;
+    // Header fields.
+    bz_bytes[0x1F1] = 1; // setup_sects = 1 (payload at offset 1024)
+    bz_bytes[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz_bytes[0x202..0x206].copy_from_slice(b"HdrS");
+    bz_bytes[0x206..0x208].copy_from_slice(&0x020Du16.to_le_bytes());
+    bz_bytes[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    bz_bytes.extend_from_slice(payload);
+
+    let mut vm = Vm::with_ram_size(0x0100_0000);
+    let bz = vm.load_bzimage(&bz_bytes).expect("bzImage load");
+    assert_eq!(bz.setup_sects, 1);
+    assert_eq!(bz.code32_start, 0x0010_0000);
+    assert_eq!(bz.payload_offset, 1024);
+
+    // Setup sentinel at 0x90000.
+    assert_eq!(vm.read_mem_u8(0x9_0000), 0xC5);
+    // boot_flag still in place — it's part of setup, so it should be
+    // at 0x90000 + 0x1FE.
+    assert_eq!(vm.read_mem_u8(0x9_0000 + 0x1FE), 0x55);
+    assert_eq!(vm.read_mem_u8(0x9_0000 + 0x1FF), 0xAA);
+    // HdrS at 0x90000 + 0x202.
+    assert_eq!(vm.read_mem_u8(0x9_0000 + 0x202), b'H');
+
+    // Payload bytes at code32_start.
+    for (i, &b) in payload.iter().enumerate() {
+        assert_eq!(vm.read_mem_u8(0x0010_0000 + i as u32), b);
+    }
+}
+
+/// load_bzimage propagates parser errors instead of leaving guest
+/// memory partially populated.
+#[test]
+fn load_bzimage_propagates_parser_errors() {
+    let mut vm = Vm::with_ram_size(0x0010_0000);
+    let too_small = vec![0u8; 512];
+    assert!(matches!(
+        vm.load_bzimage(&too_small),
+        Err(BzImageError::TooSmall(512))
+    ));
+}
+
 /// Full end-to-end protected-mode kernel boot. A 16 MiB VM gets:
 ///
 ///   1. An ELF kernel whose single PT_LOAD lands at vaddr 0x10_0000

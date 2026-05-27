@@ -655,6 +655,31 @@ impl Vm {
         elf::load_elf(&mut self.mem, bytes)
     }
 
+    /// Parse a Linux bzImage and lay it out at the canonical addresses:
+    /// the setup blob (boot-sector + setup sectors, `payload_offset`
+    /// bytes total) lands at linear 0x90000 — the historical "SETUPSEG"
+    /// = 0x9000:0000 — and the protected-mode kernel payload lands at
+    /// `code32_start` from the header (typically 0x10_0000).
+    ///
+    /// Returns the parsed [`BzImage`] so the caller can read fields it
+    /// also needs (entry, ramdisk pointers, etc.).
+    ///
+    /// Loader-only: this does *not* boot the kernel — see the bzImage
+    /// integration test for the rest of the dance. A future tick will
+    /// add an end-to-end `boot_bzimage` once we have the matching
+    /// real-mode setup execution flow.
+    pub fn load_bzimage(&mut self, bytes: &[u8]) -> Result<BzImage, BzImageError> {
+        let bz = bzimage::parse(bytes)?;
+        // Setup blob at linear 0x90000.
+        self.mem.write_slice(0x9_0000, &bytes[..bz.payload_offset]);
+        // 32-bit payload at code32_start.
+        if bz.payload_offset < bytes.len() {
+            self.mem
+                .write_slice(bz.code32_start, &bytes[bz.payload_offset..]);
+        }
+        Ok(bz)
+    }
+
     /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
     /// disk image to linear `0x7C00` (the standard boot-sector load
     /// address), then continue with the same autorun/UART setup as
