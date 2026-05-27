@@ -2087,6 +2087,101 @@ fn cpu_pe_setup(mem: &mut Memory) {
     );
 }
 
+/// With paging on, a data load through MOV AL,[disp16] must resolve
+/// the operand address through the page tables. We put the program
+/// in physical memory at 0x7C00 (PG is off during fetch since CS
+/// cache base = 0 + IP = 0x7C00 maps identity-ish... we instead
+/// avoid pagewalk-through-CS by pre-translating CS to a frame where
+/// PDE/PTE-walking identity-maps 0x7C00 → 0x7C00). To make that
+/// reliable we use an identity-mapped first 4 MiB.
+#[test]
+fn paged_data_load_routes_through_page_tables() {
+    let mut mem = Memory::new(0x10_0000);
+    // Boot stub: MOV AL,[0x0100]; HLT. The linear operand address
+    // becomes 0x0100. We're going to remap that frame.
+    mem.write_slice(0x7C00, &[0x8A, 0x06, 0x00, 0x01, 0xF4]);
+
+    // Identity-map the first 4 MiB (PD[0] -> PT0, PT0[i] -> frame i).
+    // PD at 0x1000, PT0 at 0x2000.
+    mem.write_u32(0x1000, 0x0000_2000 | 0x03); // PDE[0] = PT0 | P|RW
+    for i in 0..1024u32 {
+        mem.write_u32(0x2000 + i * 4, (i << 12) | 0x03);
+    }
+    // Remap PTE for linear 0x0000 (first 4 KiB) to physical 0x9000
+    // instead of 0x0000. The boot code accesses linear 0x0100,
+    // which should now read from physical 0x9100.
+    mem.write_u32(0x2000, 0x0000_9000 | 0x03);
+    // Sentinel at the remapped frame: physical 0x9100 = 0xC5.
+    mem.write_u8(0x9100, 0xC5);
+    // Wrong sentinel at the original linear address: physical 0x0100 = 0x42.
+    mem.write_u8(0x0100, 0x42);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    // CR0.PE not strictly required for paging-on-translate; we keep
+    // PE off so CS cache stays at base 0 and the code at linear
+    // 0x7C00 still fetches (linear 0x7C00 → through paging → PT0
+    // identity-maps everything except the remapped first frame, so
+    // 0x7C00 fetches from physical 0x7C00 unchanged).
+    cpu.cr0 = 0x8000_0000; // PG only
+    cpu.cr3 = 0x0000_1000;
+
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        cpu.read_r8(0),
+        0xC5,
+        "MOV AL,[0x100] under PG=1 must read from PTE-mapped frame 0x9100, not linear 0x0100"
+    );
+}
+
+/// Code fetch goes through paging too. With the first frame remapped,
+/// instructions whose linear address falls inside that frame have to
+/// come from the new physical frame. We place the boot stub at linear
+/// 0x0200 (inside the first 4 KiB) and remap PTE[0] so its physical
+/// home is at 0xA000 — the bytes at 0xA200 are MOV AL,0xD7; HLT.
+#[test]
+fn paged_code_fetch_routes_through_page_tables() {
+    let mut mem = Memory::new(0x10_0000);
+    // Identity-map first 4 MiB. PD at 0x1000, PT0 at 0x2000.
+    mem.write_u32(0x1000, 0x0000_2000 | 0x03);
+    for i in 0..1024u32 {
+        mem.write_u32(0x2000 + i * 4, (i << 12) | 0x03);
+    }
+    // Remap frame 0 → physical 0xA000.
+    mem.write_u32(0x2000, 0x0000_A000 | 0x03);
+    // Real code lives at physical 0xA200 (the remapped image of linear 0x0200).
+    mem.write_slice(0xA200, &[0xB0, 0xD7, 0xF4]); // MOV AL,0xD7; HLT
+                                                  // Decoy code at physical 0x0200 — would set AL=0x11.
+    mem.write_slice(0x0200, &[0xB0, 0x11, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.ip = 0x0200; // start fetching from linear 0x0200
+    cpu.cr0 = 0x8000_0000;
+    cpu.cr3 = 0x0000_1000;
+
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        cpu.read_r8(0),
+        0xD7,
+        "fetch_u8 under PG=1 must pull opcodes from PTE-mapped frame 0xA200"
+    );
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {

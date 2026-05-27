@@ -299,10 +299,10 @@ impl Cpu {
         // Protected mode — fetch and decode the descriptor.
         let table_base = self.gdtr.base; // TI=LDT not modeled
         let desc_addr = table_base.wrapping_add((value & 0xFFF8) as u32);
-        let d0 = mem.read_u16(desc_addr) as u32;
-        let d1 = mem.read_u16(desc_addr.wrapping_add(2)) as u32;
-        let d2 = mem.read_u16(desc_addr.wrapping_add(4)) as u32;
-        let d3 = mem.read_u16(desc_addr.wrapping_add(6)) as u32;
+        let d0 = self.mem_read_u16(mem, desc_addr) as u32;
+        let d1 = self.mem_read_u16(mem, desc_addr.wrapping_add(2)) as u32;
+        let d2 = self.mem_read_u16(mem, desc_addr.wrapping_add(4)) as u32;
+        let d3 = self.mem_read_u16(mem, desc_addr.wrapping_add(6)) as u32;
         let base = d1 | ((d2 & 0x00FF) << 16) | ((d3 & 0xFF00) << 16);
         let access = ((d2 >> 8) & 0xFF) as u8;
         let raw_limit = (d0 & 0xFFFF) | ((d3 & 0x000F) << 16);
@@ -358,10 +358,50 @@ impl Cpu {
         frame | page_offset
     }
 
+    /// Paging-aware memory read. Returns the byte that lives at the
+    /// physical address `translate(linear)` resolves to. When PG=0
+    /// this is exactly `self.mem_read_u8(mem,linear)`. Used by every guest-
+    /// visible memory access (instruction fetch, ModR/M reads, stack
+    /// pops, string ops) so toggling CR0.PG actually changes which
+    /// page-frame the guest sees.
+    pub fn mem_read_u8(&self, m: &Memory, linear: u32) -> u8 {
+        m.read_u8(self.translate(m, linear))
+    }
+
+    pub fn mem_write_u8(&self, m: &mut Memory, linear: u32, value: u8) {
+        let phys = self.translate(m, linear);
+        m.write_u8(phys, value);
+    }
+
+    /// Read a 16-bit word at `linear`. We translate each byte
+    /// independently so the rare case of a read that straddles a
+    /// page boundary picks up the second byte from the right frame.
+    pub fn mem_read_u16(&self, m: &Memory, linear: u32) -> u16 {
+        let lo = self.mem_read_u8(m, linear) as u16;
+        let hi = self.mem_read_u8(m, linear.wrapping_add(1)) as u16;
+        lo | (hi << 8)
+    }
+
+    pub fn mem_write_u16(&self, m: &mut Memory, linear: u32, value: u16) {
+        self.mem_write_u8(m, linear, value as u8);
+        self.mem_write_u8(m, linear.wrapping_add(1), (value >> 8) as u8);
+    }
+
+    pub fn mem_read_u32(&self, m: &Memory, linear: u32) -> u32 {
+        let lo = self.mem_read_u16(m, linear) as u32;
+        let hi = self.mem_read_u16(m, linear.wrapping_add(2)) as u32;
+        lo | (hi << 16)
+    }
+
+    pub fn mem_write_u32(&self, m: &mut Memory, linear: u32, value: u32) {
+        self.mem_write_u16(m, linear, value as u16);
+        self.mem_write_u16(m, linear.wrapping_add(2), (value >> 16) as u16);
+    }
+
     fn fetch_u8(&mut self, mem: &Memory) -> u8 {
         let addr = self.linear_seg(sreg::CS, self.ip);
         self.ip = self.ip.wrapping_add(1);
-        mem.read_u8(addr)
+        self.mem_read_u8(mem, addr)
     }
 
     fn fetch_u16(&mut self, mem: &Memory) -> u16 {
@@ -519,25 +559,25 @@ impl Cpu {
     fn read_rm8(&self, rm: Rm, mem: &Memory) -> u8 {
         match rm {
             Rm::Reg(i) => self.read_r8(i),
-            Rm::Mem(ea) => mem.read_u8(self.linear_seg(ea.seg, ea.off)),
+            Rm::Mem(ea) => self.mem_read_u8(mem, self.linear_seg(ea.seg, ea.off)),
         }
     }
     fn write_rm8(&mut self, rm: Rm, mem: &mut Memory, value: u8) {
         match rm {
             Rm::Reg(i) => self.write_r8(i, value),
-            Rm::Mem(ea) => mem.write_u8(self.linear_seg(ea.seg, ea.off), value),
+            Rm::Mem(ea) => self.mem_write_u8(mem, self.linear_seg(ea.seg, ea.off), value),
         }
     }
     fn read_rm16(&self, rm: Rm, mem: &Memory) -> u16 {
         match rm {
             Rm::Reg(i) => self.read_r16(i),
-            Rm::Mem(ea) => mem.read_u16(self.linear_seg(ea.seg, ea.off)),
+            Rm::Mem(ea) => self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off)),
         }
     }
     fn write_rm16(&mut self, rm: Rm, mem: &mut Memory, value: u16) {
         match rm {
             Rm::Reg(i) => self.write_r16(i, value),
-            Rm::Mem(ea) => mem.write_u16(self.linear_seg(ea.seg, ea.off), value),
+            Rm::Mem(ea) => self.mem_write_u16(mem, self.linear_seg(ea.seg, ea.off), value),
         }
     }
 
@@ -548,8 +588,8 @@ impl Cpu {
             Rm::Reg(i) => self.read_r32(i),
             Rm::Mem(ea) => {
                 let base = self.linear_seg(ea.seg, ea.off);
-                let lo = mem.read_u16(base) as u32;
-                let hi = mem.read_u16(base.wrapping_add(2)) as u32;
+                let lo = self.mem_read_u16(mem, base) as u32;
+                let hi = self.mem_read_u16(mem, base.wrapping_add(2)) as u32;
                 lo | (hi << 16)
             }
         }
@@ -562,8 +602,8 @@ impl Cpu {
             Rm::Reg(i) => self.write_r32(i, value),
             Rm::Mem(ea) => {
                 let base = self.linear_seg(ea.seg, ea.off);
-                mem.write_u16(base, value as u16);
-                mem.write_u16(base.wrapping_add(2), (value >> 16) as u16);
+                self.mem_write_u16(mem, base, value as u16);
+                self.mem_write_u16(mem, base.wrapping_add(2), (value >> 16) as u16);
             }
         }
     }
@@ -588,16 +628,19 @@ impl Cpu {
     fn do_interrupt(&mut self, n: u8, mem: &mut Memory) {
         let (new_cs, new_ip) = if self.cr0 & 1 == 0 {
             let ivt_addr = (n as u32) * 4;
-            (mem.read_u16(ivt_addr + 2), mem.read_u16(ivt_addr))
+            (
+                self.mem_read_u16(mem, ivt_addr + 2),
+                self.mem_read_u16(mem, ivt_addr),
+            )
         } else {
             let gate_addr = self.idtr.base.wrapping_add((n as u32) * 8);
-            let off_lo = mem.read_u16(gate_addr);
-            let selector = mem.read_u16(gate_addr.wrapping_add(2));
+            let off_lo = self.mem_read_u16(mem, gate_addr);
+            let selector = self.mem_read_u16(mem, gate_addr.wrapping_add(2));
             // High 16 bits of offset live in bytes 6-7 — zero for the
             // 16-bit gates we currently emit. We still read them so
             // that 32-bit gates (the upgrade path) just slot in by
             // widening `self.ip`.
-            let _off_hi = mem.read_u16(gate_addr.wrapping_add(6));
+            let _off_hi = self.mem_read_u16(mem, gate_addr.wrapping_add(6));
             (selector, off_lo)
         };
         let flags = self.flags;
@@ -619,13 +662,13 @@ impl Cpu {
     fn push16(&mut self, mem: &mut Memory, value: u16) {
         let sp = self.regs[r16::SP].wrapping_sub(2);
         self.regs[r16::SP] = sp;
-        mem.write_u16(self.linear_seg(sreg::SS, sp), value);
+        self.mem_write_u16(mem, self.linear_seg(sreg::SS, sp), value);
     }
 
     /// Pop a 16-bit value from SS:SP. SP increments *after* the read.
     fn pop16(&mut self, mem: &Memory) -> u16 {
         let sp = self.regs[r16::SP];
-        let v = mem.read_u16(self.linear_seg(sreg::SS, sp));
+        let v = self.mem_read_u16(mem, self.linear_seg(sreg::SS, sp));
         self.regs[r16::SP] = sp.wrapping_add(2);
         v
     }
@@ -947,8 +990,8 @@ impl Cpu {
     fn step_movsb(&mut self, mem: &mut Memory) {
         let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
         let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let v = mem.read_u8(src);
-        mem.write_u8(dst, v);
+        let v = self.mem_read_u8(mem, src);
+        self.mem_write_u8(mem, dst, v);
         let d = self.string_delta(false);
         self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
         self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
@@ -956,8 +999,8 @@ impl Cpu {
     fn step_movsw(&mut self, mem: &mut Memory) {
         let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
         let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let v = mem.read_u16(src);
-        mem.write_u16(dst, v);
+        let v = self.mem_read_u16(mem, src);
+        self.mem_write_u16(mem, dst, v);
         let d = self.string_delta(true);
         self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
         self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
@@ -965,34 +1008,34 @@ impl Cpu {
     fn step_stosb(&mut self, mem: &mut Memory) {
         let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
         let al = self.read_r8(0);
-        mem.write_u8(dst, al);
+        self.mem_write_u8(mem, dst, al);
         let d = self.string_delta(false);
         self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
     }
     fn step_stosw(&mut self, mem: &mut Memory) {
         let dst = self.linear_seg(sreg::ES, self.regs[r16::DI]);
         let ax = self.regs[r16::AX];
-        mem.write_u16(dst, ax);
+        self.mem_write_u16(mem, dst, ax);
         let d = self.string_delta(true);
         self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
     }
     fn step_lodsb(&mut self, mem: &Memory) {
         let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
-        let v = mem.read_u8(src);
+        let v = self.mem_read_u8(mem, src);
         self.write_r8(0, v);
         let d = self.string_delta(false);
         self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
     }
     fn step_lodsw(&mut self, mem: &Memory) {
         let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
-        let v = mem.read_u16(src);
+        let v = self.mem_read_u16(mem, src);
         self.regs[r16::AX] = v;
         let d = self.string_delta(true);
         self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
     }
     fn step_scasb(&mut self, mem: &Memory) {
         let addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let v = mem.read_u8(addr);
+        let v = self.mem_read_u8(mem, addr);
         let al = self.read_r8(0);
         let r = al.wrapping_sub(v);
         self.flags_sub8(al, v, 0, r);
@@ -1001,7 +1044,7 @@ impl Cpu {
     }
     fn step_scasw(&mut self, mem: &Memory) {
         let addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let v = mem.read_u16(addr);
+        let v = self.mem_read_u16(mem, addr);
         let ax = self.regs[r16::AX];
         let r = ax.wrapping_sub(v);
         self.flags_sub16(ax, v, 0, r);
@@ -1011,8 +1054,8 @@ impl Cpu {
     fn step_cmpsb(&mut self, mem: &Memory) {
         let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
         let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let a = mem.read_u8(s);
-        let b = mem.read_u8(d_addr);
+        let a = self.mem_read_u8(mem, s);
+        let b = self.mem_read_u8(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub8(a, b, 0, r);
         let delta = self.string_delta(false);
@@ -1022,8 +1065,8 @@ impl Cpu {
     fn step_cmpsw(&mut self, mem: &Memory) {
         let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI]);
         let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI]);
-        let a = mem.read_u16(s);
-        let b = mem.read_u16(d_addr);
+        let a = self.mem_read_u16(mem, s);
+        let b = self.mem_read_u16(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub16(a, b, 0, r);
         let delta = self.string_delta(true);
@@ -1606,8 +1649,9 @@ impl Cpu {
                     }
                 };
                 let base = self.linear_seg(ea.seg, ea.off);
-                let off_val = mem.read_u16(base);
-                let seg_val = mem.read_u16(self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                let off_val = self.mem_read_u16(mem, base);
+                let seg_val =
+                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::ES, seg_val, mem);
                 let _ = base;
@@ -1626,8 +1670,9 @@ impl Cpu {
                         });
                     }
                 };
-                let off_val = mem.read_u16(self.linear_seg(ea.seg, ea.off));
-                let seg_val = mem.read_u16(self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                let off_val = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
+                let seg_val =
+                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::DS, seg_val, mem);
             }
@@ -1935,8 +1980,9 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = mem.read_u16(self.linear_seg(ea.seg, ea.off));
-                        let new_cs = mem.read_u16(self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
+                        let new_cs =
+                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                         let cs = self.sregs[sreg::CS];
                         self.push16(mem, cs);
                         let ip = self.ip;
@@ -1960,8 +2006,9 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = mem.read_u16(self.linear_seg(ea.seg, ea.off));
-                        let new_cs = mem.read_u16(self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
+                        let new_cs =
+                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                         self.write_sreg(sreg::CS, new_cs, mem);
                         self.ip = new_ip;
                     }
@@ -2372,7 +2419,7 @@ impl Cpu {
             0xD7 => {
                 let seg = self.seg_override.unwrap_or(sreg::DS);
                 let off = self.regs[r16::BX].wrapping_add(self.read_r8(0) as u16);
-                let v = mem.read_u8(self.linear_seg(seg, off));
+                let v = self.mem_read_u8(mem, self.linear_seg(seg, off));
                 self.write_r8(0, v);
             }
 
@@ -2535,9 +2582,9 @@ impl Cpu {
                         };
                         let base_linear = self.linear_seg(ea.seg, ea.off);
                         // 6-byte pseudo-descriptor: limit u16 + base u32
-                        let limit = mem.read_u16(base_linear);
-                        let base_lo = mem.read_u16(base_linear.wrapping_add(2));
-                        let base_hi = mem.read_u16(base_linear.wrapping_add(4));
+                        let limit = self.mem_read_u16(mem, base_linear);
+                        let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
+                        let base_hi = self.mem_read_u16(mem, base_linear.wrapping_add(4));
                         let base = (base_lo as u32) | ((base_hi as u32) << 16);
                         match sub {
                             2 => self.gdtr = DescriptorTable { limit, base }, // LGDT
