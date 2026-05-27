@@ -2466,6 +2466,60 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// Kernel-shaped integration: boot stub calls a 32-bit subroutine via
+/// CALL rel32. Subroutine uses ENTER, REP MOVSD, CMPXCHG-on-memory,
+/// LEAVE, RET. Asserts copy + counter update + ESP unchanged.
+#[test]
+fn kernel_shaped_routine_combines_enter_repmovsd_cmpxchg_leave() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    mem.write_u32(0x0001_0000, 0x1111_1111);
+    mem.write_u32(0x0001_0004, 0x2222_2222);
+    mem.write_u32(0x0001_0008, 0x3333_3333);
+    mem.write_u32(0x0001_000C, 0x4444_4444);
+    mem.write_u32(0x0001_4000, 7);
+    // Boot stub: 30 bytes of MOV imm32 + 6-byte CALL + 1-byte HLT.
+    // CALL at 0x7C00+30=0x7C1E. After 6 bytes IP=0x7C24. Target=0x9000.
+    let rel32: u32 = 0x9000u32.wrapping_sub(0x7C24);
+    let mut boot = vec![
+        0x66, 0xBE, 0x00, 0x00, 0x01, 0x00, // MOV ESI, 0x10000
+        0x66, 0xBF, 0x00, 0x00, 0x02, 0x00, // MOV EDI, 0x20000
+        0x66, 0xB9, 0x04, 0x00, 0x00, 0x00, // MOV ECX, 4
+        0x66, 0xB8, 0x07, 0x00, 0x00, 0x00, // MOV EAX, 7
+        0x66, 0xBB, 0x09, 0x00, 0x00, 0x00, // MOV EBX, 9
+        0x66, 0xE8,
+    ];
+    boot.extend_from_slice(&rel32.to_le_bytes());
+    boot.push(0xF4);
+    mem.write_slice(0x7C00, &boot);
+    // Subroutine.
+    let sub = [
+        0x66, 0xC8, 0x00, 0x00, 0x00, // ENTER 0, 0
+        0x67, 0x66, 0xF3, 0xA5, // REP MOVSD
+        0x67, 0x0F, 0xB1, 0x1D, 0x00, 0x40, 0x01, 0x00, // CMPXCHG [0x14000], EBX
+        0x66, 0xC9, // LEAVE
+        0xC3, // RET near
+    ];
+    mem.write_slice(0x9000, &sub);
+    let mut io = IoBus::new();
+    for _ in 0..96 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x0002_0000), 0x1111_1111);
+    assert_eq!(mem.read_u32(0x0002_0004), 0x2222_2222);
+    assert_eq!(mem.read_u32(0x0002_0008), 0x3333_3333);
+    assert_eq!(mem.read_u32(0x0002_000C), 0x4444_4444);
+    assert_eq!(mem.read_u32(0x0001_4000), 9);
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000);
+}
+
 /// 0x66 0x60 / 0x66 0x61 — PUSHAD / POPAD.
 #[test]
 fn pushad_popad_round_trip_preserves_all_32_bit_gprs() {
