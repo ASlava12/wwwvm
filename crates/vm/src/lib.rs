@@ -50,11 +50,23 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
     match vector {
         0x10 => bios_int10(cpu, mem),
+        0x12 => bios_int12(cpu),
         0x13 => bios_int13(cpu, mem, io),
         0x15 => bios_int15(cpu, mem),
         0x16 => bios_int16(cpu, io),
         _ => false,
     }
+}
+
+/// INT 0x12 — Get Conventional Memory Size. Returns AX = number of
+/// contiguous KiB of memory below 1 MiB. We always return 640 (the
+/// historical "640 K below DOS" answer) regardless of actual VM
+/// size, because real PCs always reserved 0xA0000-0xFFFFF for
+/// VGA/ROM regardless of installed RAM.
+fn bios_int12(cpu: &mut Cpu) -> bool {
+    cpu.regs[wwwvm_cpu::r16::AX] = 640;
+    cpu.flags &= !wwwvm_cpu::flag::CF;
+    true
 }
 
 fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
@@ -159,6 +171,22 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
 /// space looks.
 fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
     let ax = cpu.regs[wwwvm_cpu::r16::AX];
+    // AH=0x88 — legacy "Get Extended Memory Size" fallback. Returns
+    // AX = number of contiguous KiB above 1 MiB, capped at 0xFFFF
+    // (≈ 64 MiB - 1 KiB). Linux setup falls back to this when E820
+    // isn't supported. Real BIOSes returned 0 if there's no
+    // extended memory; we compute (RAM_SIZE - 1 MiB) / 1024.
+    if ax >> 8 == 0x88 {
+        let ram = mem.size() as u64;
+        let extended = if ram > 0x10_0000 {
+            ((ram - 0x10_0000) / 1024).min(0xFFFF)
+        } else {
+            0
+        };
+        cpu.regs[wwwvm_cpu::r16::AX] = extended as u16;
+        cpu.flags &= !wwwvm_cpu::flag::CF;
+        return true;
+    }
     if ax != 0xE820 {
         return false;
     }

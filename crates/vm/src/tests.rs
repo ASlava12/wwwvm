@@ -69,6 +69,58 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// INT 0x12 — Returns AX = conventional memory KiB below 1 MiB.
+/// Always 640 regardless of actual VM size (the historical PC
+/// reservation for VGA/ROM above 0xA0000 holds even if the VM has
+/// more RAM than that).
+#[test]
+fn bios_int12_returns_640_kib_conventional_memory() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    vm.install_bios();
+    vm.load_image(BOOT_LOAD_ADDR, &[0xCD, 0x12, 0xF4]); // INT 0x12; HLT
+    vm.boot();
+    vm.run_steps(8);
+    assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::AX], 640);
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// INT 0x15 AH=0x88 — legacy fallback for "how much extended memory
+/// is there". Returns AX = KiB above 1 MiB, capped at 0xFFFF. With
+/// a 16 MiB VM, expected value is (16 - 1) * 1024 = 15360.
+#[test]
+fn bios_int15_88_returns_extended_memory_kib() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    vm.install_bios();
+    // MOV AX, 0x8800; INT 0x15; HLT
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB8, 0x00, 0x88, 0xCD, 0x15, 0xF4]);
+    vm.boot();
+    vm.run_steps(16);
+    assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::AX], 15360);
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// INT 0x15 AH=0x88 with a VM ≤ 1 MiB returns 0 (no extended memory).
+#[test]
+fn bios_int15_88_returns_zero_when_no_extended_memory() {
+    let mut vm = Vm::new(); // default 1 MiB
+    vm.install_bios();
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB8, 0x00, 0x88, 0xCD, 0x15, 0xF4]);
+    vm.boot();
+    vm.run_steps(16);
+    assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::AX], 0);
+}
+
+/// INT 0x15 AH=0x88 with a huge VM caps at 0xFFFF (≈ 64 MiB - 1 KiB).
+#[test]
+fn bios_int15_88_caps_at_0xffff() {
+    let mut vm = Vm::with_ram_size(0x0800_0000); // 128 MiB
+    vm.install_bios();
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB8, 0x00, 0x88, 0xCD, 0x15, 0xF4]);
+    vm.boot();
+    vm.run_steps(16);
+    assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::AX], 0xFFFF);
+}
+
 /// INT 0x15 AX=0xE820 — Linux setup uses this to discover usable
 /// RAM ranges. Our shim returns a single entry covering the whole
 /// VM RAM (base=0, length=mem.size(), type=1) and signals "no more
