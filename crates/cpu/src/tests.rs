@@ -2400,6 +2400,69 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x66 0xE9 — JMP rel32. Under operand-size 0x66 the relative
+/// offset is 32-bit, so the jump can reach anywhere in the address
+/// space, not just ±32 KiB. We put the target at linear 0x00C0_0000
+/// and rely on a sign-magnitude rel32 to land there from 0x7C00.
+#[test]
+fn jmp_rel32_under_0x66_reaches_high_address() {
+    let mut mem = Memory::new(0x0100_0000); // 16 MiB
+                                            // Compute the rel32 from the address right after the JMP's
+                                            // 6 bytes (0x66 E9 imm32) back at 0x7C00.
+                                            // IP after fetch = 0x7C06. Target = 0x00C0_0000. rel = target - IP.
+    let target: u32 = 0x00C0_0000;
+    let after_jmp_ip: u32 = 0x7C06;
+    let rel32: u32 = target.wrapping_sub(after_jmp_ip);
+    let mut payload = vec![0x66, 0xE9];
+    payload.extend_from_slice(&rel32.to_le_bytes());
+    mem.write_slice(0x7C00, &payload);
+    mem.write_slice(target, &[0xB0, 0x5A, 0xF4]); // MOV AL,0x5A; HLT
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0x5A);
+}
+
+/// 0x66 0xE8 — CALL rel32. Same idea, but pushes the return IP.
+#[test]
+fn call_rel32_under_0x66_pushes_return_and_jumps_far() {
+    let mut mem = Memory::new(0x0100_0000);
+    let target: u32 = 0x0040_0000;
+    let after_call_ip: u32 = 0x7C06;
+    let rel32: u32 = target.wrapping_sub(after_call_ip);
+    let mut payload = vec![0x66, 0xE8];
+    payload.extend_from_slice(&rel32.to_le_bytes());
+    payload.push(0xF4); // fallthrough HLT, shouldn't run
+    mem.write_slice(0x7C00, &payload);
+    mem.write_slice(target, &[0xB0, 0x77, 0xF4]); // MOV AL,0x77; HLT
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0x77);
+    // Stack top must hold the low 16 of the return IP (= 0x7C06).
+    let sp = cpu.regs[r16::SP];
+    let lo = mem.read_u8(sp as u32);
+    let hi = mem.read_u8(sp as u32 + 1);
+    let ret_ip = u16::from_le_bytes([lo, hi]);
+    assert_eq!(ret_ip, 0x7C06);
+}
+
 /// 0x0F 0x84 — JE rel16. Tests the long-form conditional jump.
 /// Uses a 16-bit relative offset that's bigger than the rel8 range
 /// (±127), so the short-form Jcc couldn't reach.

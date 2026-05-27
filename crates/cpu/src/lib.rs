@@ -1671,9 +1671,18 @@ impl Cpu {
                 let rel = self.fetch_u8(mem) as i8;
                 self.ip = self.ip.wrapping_add(rel as i32 as u32);
             }
+            // JMP rel16 / rel32 — under 0x66 the displacement widens
+            // from 16 to 32 bits. Kernel-side `jmp label` to anywhere
+            // more than ±32 KiB away compiles to this form.
             0xE9 => {
-                let rel = self.fetch_u16(mem) as i16;
-                self.ip = self.ip.wrapping_add(rel as i32 as u32);
+                let rel: i32 = if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    (lo | (hi << 16)) as i32
+                } else {
+                    self.fetch_u16(mem) as i16 as i32
+                };
+                self.ip = self.ip.wrapping_add(rel as u32);
             }
 
             // Jcc rel8 family — 0x70..0x7F
@@ -2529,12 +2538,21 @@ impl Cpu {
                 self.push16(mem, imm);
             }
 
-            // CALL rel16 — push return IP, then jump.
+            // CALL rel16 / rel32 — under 0x66 the displacement is a
+            // signed 32-bit offset. We still push only the low 16 of
+            // the return IP (16-bit gate convention). A 32-bit stack
+            // form will push the full dword when we land it.
             0xE8 => {
-                let rel = self.fetch_u16(mem) as i16;
+                let rel: i32 = if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    (lo | (hi << 16)) as i32
+                } else {
+                    self.fetch_u16(mem) as i16 as i32
+                };
                 let ret_ip = self.ip as u16;
                 self.push16(mem, ret_ip);
-                self.ip = self.ip.wrapping_add(rel as i32 as u32);
+                self.ip = self.ip.wrapping_add(rel as u32);
             }
             // CALL ptr16:16 — direct far call. Pushes CS then IP, then
             // loads CS:IP from the 4-byte immediate.
