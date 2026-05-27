@@ -2426,6 +2426,38 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// With `stack_size_32 = true` (i.e. running on a 32-bit kernel
+/// stack), push/pop drive the full ESP register — not just SP —
+/// so a stack that lives above the 64 KiB boundary works.
+#[test]
+fn stack_size_32_lets_push_pop_use_full_esp() {
+    let mut mem = Memory::new(0x0080_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    // ESP = 0x0020_0000, above the 64 KiB boundary.
+    cpu.write_r32(r16::SP as u8, 0x0020_0000);
+    // 66 68 EF BE AD DE   PUSH imm32 (0xDEADBEEF)
+    // 66 58               POP EAX
+    // F4                   HLT
+    mem.write_slice(
+        0x7C00,
+        &[0x66, 0x68, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x58, 0xF4],
+    );
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // ESP must be back to 0x0020_0000 (push then pop).
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0020_0000);
+    // EAX should hold 0xDEADBEEF.
+    assert_eq!(cpu.read_r32(0), 0xDEAD_BEEF);
+}
+
 /// `0x67 0x66 0xF3 0xA5` — REP MOVSD with 32-bit address size.
 /// Drives the loop counter from ECX and updates ESI/EDI as full
 /// 32-bit registers. The kernel-side memcpy compiles to this shape.

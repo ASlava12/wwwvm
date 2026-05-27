@@ -114,6 +114,12 @@ pub struct Cpu {
     /// registers in ModR/M, optional SIB byte, disp32 instead of
     /// disp16.
     pub(crate) addr_size_32: bool,
+    /// Stack-size attribute. On real x86 this comes from the SS
+    /// descriptor's D/B bit; a 32-bit kernel stack sets it to true
+    /// so SP becomes the full 32-bit ESP. Default false (matches the
+    /// 16-bit stack used in real mode and early PM). Public so an
+    /// OS-bootstrap test can flip it after building an SS descriptor.
+    pub stack_size_32: bool,
     /// Control Register 0. On real x86 it's 32 bits; we store the
     /// full width but only bit 0 (PE — Protection Enable) and bit 31
     /// (PG — Paging) will gain semantic meaning once those modes
@@ -245,6 +251,7 @@ impl Cpu {
             seg_override: None,
             op_size_32: false,
             addr_size_32: false,
+            stack_size_32: false,
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
@@ -898,38 +905,59 @@ impl Cpu {
         self.ip = new_ip as u32;
     }
 
-    /// Push a 16-bit value onto the SS:SP stack. SP decrements *before*
-    /// the write — matching real x86 — so after a push SP points at the
-    /// new top word.
-    fn push16(&mut self, mem: &mut Memory, value: u16) {
-        let sp = self.regs[r16::SP].wrapping_sub(2);
-        self.regs[r16::SP] = sp;
-        self.mem_write_u16(mem, self.linear_seg(sreg::SS, sp as u32), value);
+    /// Read the stack pointer at its current width. Returns the
+    /// full ESP when `stack_size_32` is set, otherwise just SP
+    /// zero-extended to u32 (which is what the SS:SP linear lookup
+    /// expects on real-mode/16-bit stacks).
+    fn read_stack_ptr(&self) -> u32 {
+        if self.stack_size_32 {
+            self.read_r32(r16::SP as u8)
+        } else {
+            self.regs[r16::SP] as u32
+        }
     }
 
-    /// Pop a 16-bit value from SS:SP. SP increments *after* the read.
+    /// Write the stack pointer at its current width.
+    fn write_stack_ptr(&mut self, value: u32) {
+        if self.stack_size_32 {
+            self.write_r32(r16::SP as u8, value);
+        } else {
+            self.regs[r16::SP] = value as u16;
+        }
+    }
+
+    /// Push a 16-bit value onto SS:[ESP|SP]. The stack pointer
+    /// decrements by 2 before the write. In 32-bit-stack mode the
+    /// full ESP moves; in 16-bit-stack mode only the low SP moves.
+    fn push16(&mut self, mem: &mut Memory, value: u16) {
+        let sp = self.read_stack_ptr().wrapping_sub(2);
+        self.write_stack_ptr(sp);
+        self.mem_write_u16(mem, self.linear_seg(sreg::SS, sp), value);
+    }
+
+    /// Pop a 16-bit value from SS:[ESP|SP]. SP increments *after*
+    /// the read.
     fn pop16(&mut self, mem: &Memory) -> u16 {
-        let sp = self.regs[r16::SP];
-        let v = self.mem_read_u16(mem, self.linear_seg(sreg::SS, sp as u32));
-        self.regs[r16::SP] = sp.wrapping_add(2);
+        let sp = self.read_stack_ptr();
+        let v = self.mem_read_u16(mem, self.linear_seg(sreg::SS, sp));
+        self.write_stack_ptr(sp.wrapping_add(2));
         v
     }
 
-    /// Push a 32-bit value onto SS:SP. SP decrements by 4 before the
-    /// write. Used by 0x66-prefixed PUSH r32 (and eventually PUSH
-    /// imm32 / PUSHA-32 / etc.).
+    /// Push a 32-bit value onto SS:[ESP|SP]. SP decrements by 4
+    /// before the write.
     fn push32(&mut self, mem: &mut Memory, value: u32) {
-        let sp = self.regs[r16::SP].wrapping_sub(4);
-        self.regs[r16::SP] = sp;
-        self.mem_write_u32(mem, self.linear_seg(sreg::SS, sp as u32), value);
+        let sp = self.read_stack_ptr().wrapping_sub(4);
+        self.write_stack_ptr(sp);
+        self.mem_write_u32(mem, self.linear_seg(sreg::SS, sp), value);
     }
 
-    /// Pop a 32-bit value from SS:SP. SP increments by 4 after the
-    /// read.
+    /// Pop a 32-bit value from SS:[ESP|SP]. SP increments by 4
+    /// after the read.
     fn pop32(&mut self, mem: &Memory) -> u32 {
-        let sp = self.regs[r16::SP];
-        let v = self.mem_read_u32(mem, self.linear_seg(sreg::SS, sp as u32));
-        self.regs[r16::SP] = sp.wrapping_add(4);
+        let sp = self.read_stack_ptr();
+        let v = self.mem_read_u32(mem, self.linear_seg(sreg::SS, sp));
+        self.write_stack_ptr(sp.wrapping_add(4));
         v
     }
 
@@ -2676,15 +2704,27 @@ impl Cpu {
                 }
             }
 
-            // PUSH imm16
+            // PUSH imm16 / imm32 (under 0x66).
             0x68 => {
-                let imm = self.fetch_u16(mem);
-                self.push16(mem, imm);
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    self.push32(mem, lo | (hi << 16));
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    self.push16(mem, imm);
+                }
             }
-            // PUSH imm8 (sign-extended to 16 bits)
+            // PUSH imm8 (sign-extended). Under 0x66 the sign-extension
+            // grows to 32 bits and the push is dword-sized.
             0x6A => {
-                let imm = self.fetch_u8(mem) as i8 as i16 as u16;
-                self.push16(mem, imm);
+                if self.op_size_32 {
+                    let imm = self.fetch_u8(mem) as i8 as i32 as u32;
+                    self.push32(mem, imm);
+                } else {
+                    let imm = self.fetch_u8(mem) as i8 as i16 as u16;
+                    self.push16(mem, imm);
+                }
             }
 
             // CALL rel16 / rel32 — under 0x66 the displacement is a
