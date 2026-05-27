@@ -152,6 +152,11 @@ pub struct Cpu {
     /// the value is just stored so a kernel can read/write it via
     /// `MOV CR4, r32` / `MOV r32, CR4` without faulting.
     pub cr4: u32,
+    /// Time-stamp counter. Incremented once per `step()`. Read via
+    /// RDTSC (0x0F 0x31). Linux uses TSC for delay calibration —
+    /// returning a monotonically advancing counter is what matters,
+    /// not the cycle-accurate semantics.
+    pub tsc: u64,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -263,6 +268,7 @@ impl Cpu {
             cr3: 0,
             cr2: 0,
             cr4: 0,
+            tsc: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -300,6 +306,7 @@ impl Cpu {
         self.cr3 = 0;
         self.cr2 = 0;
         self.cr4 = 0;
+        self.tsc = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
@@ -1882,6 +1889,7 @@ impl Cpu {
         if self.halted {
             return Ok(());
         }
+        self.tsc = self.tsc.wrapping_add(1);
         // A page fault flagged by the previous instruction's memory
         // accesses takes priority over fresh work. Latch the linear
         // address into CR2 and vector through INT 14, pushing the
@@ -3497,21 +3505,29 @@ impl Cpu {
                                 });
                             }
                         };
-                        let base_linear = self.linear_seg(ea.seg, ea.off);
-                        // 6-byte pseudo-descriptor: limit u16 + base u32
-                        let limit = self.mem_read_u16(mem, base_linear);
-                        let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
-                        let base_hi = self.mem_read_u16(mem, base_linear.wrapping_add(4));
-                        let base = (base_lo as u32) | ((base_hi as u32) << 16);
-                        match sub {
-                            2 => self.gdtr = DescriptorTable { limit, base }, // LGDT
-                            3 => self.idtr = DescriptorTable { limit, base }, // LIDT
-                            _ => {
-                                return Err(CpuError::Unimplemented {
-                                    opcode: op2,
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                        if sub == 7 {
+                            // INVLPG m — invalidate the TLB entry for
+                            // the given linear address. No TLB modelled
+                            // yet, so this is a no-op; the EA itself
+                            // is the operand (no descriptor read).
+                            let _ = self.linear_seg(ea.seg, ea.off);
+                        } else {
+                            let base_linear = self.linear_seg(ea.seg, ea.off);
+                            // 6-byte pseudo-descriptor: limit u16 + base u32
+                            let limit = self.mem_read_u16(mem, base_linear);
+                            let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
+                            let base_hi = self.mem_read_u16(mem, base_linear.wrapping_add(4));
+                            let base = (base_lo as u32) | ((base_hi as u32) << 16);
+                            match sub {
+                                2 => self.gdtr = DescriptorTable { limit, base }, // LGDT
+                                3 => self.idtr = DescriptorTable { limit, base }, // LIDT
+                                _ => {
+                                    return Err(CpuError::Unimplemented {
+                                        opcode: op2,
+                                        cs: op_cs,
+                                        ip: op_ip,
+                                    });
+                                }
                             }
                         }
                     }
@@ -3558,6 +3574,23 @@ impl Cpu {
                                 });
                             }
                         }
+                    }
+                    // CLTS — 0x0F 0x06. Clear Task-Switched flag in
+                    // CR0 (bit 3). Used by FPU context-switch code.
+                    0x06 => self.cr0 &= !(1 << 3),
+                    // INVD — 0x0F 0x08. Invalidate internal caches
+                    // without write-back. We don't model caches at
+                    // all, so it's a no-op.
+                    0x08 => {}
+                    // WBINVD — 0x0F 0x09. Same with write-back.
+                    0x09 => {}
+                    // RDTSC — 0x0F 0x31. Returns the time-stamp
+                    // counter (low 32 bits in EAX, high 32 in EDX).
+                    // We use the step counter — monotonically
+                    // advancing, which is what calibration loops want.
+                    0x31 => {
+                        self.write_r32(0, self.tsc as u32);
+                        self.write_r32(2, (self.tsc >> 32) as u32);
                     }
                     // RDMSR — 0x0F 0x32. Reads MSR named by ECX into
                     // EDX:EAX. We return 0 for everything; Linux setup

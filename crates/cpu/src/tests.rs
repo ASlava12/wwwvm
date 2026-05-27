@@ -2466,6 +2466,48 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0x31 — RDTSC. Returns a monotonically advancing counter
+/// in EDX:EAX. After two RDTSCs separated by a NOP, the second
+/// reading must be strictly greater than the first.
+#[test]
+fn rdtsc_advances_between_reads() {
+    // RDTSC ; MOV ECX, EAX ; NOP ; RDTSC ; HLT
+    //   0F 31              ; first read
+    //   89 C1              ; mov cx, ax  (we only check low 16)
+    //   90                 ; nop
+    //   0F 31              ; second read
+    //   F4
+    let (cpu, _, _) = run_payload(&[0x0F, 0x31, 0x89, 0xC1, 0x90, 0x0F, 0x31, 0xF4], 16);
+    // First reading captured into ECX (low half via the 16-bit MOV
+    // CX, AX which we use as a proxy). Second reading lives in EAX.
+    // The second must be strictly larger.
+    assert!(
+        cpu.regs[r16::AX] > cpu.regs[r16::CX],
+        "RDTSC must advance between reads: AX={:#x}, CX={:#x}",
+        cpu.regs[r16::AX],
+        cpu.regs[r16::CX]
+    );
+}
+
+/// 0x0F 0x06 — CLTS clears CR0.TS (bit 3).
+#[test]
+fn clts_clears_cr0_ts_bit() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x0000_000C; // TS=1, EM=1
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x7C00, &[0x0F, 0x06, 0xF4]); // CLTS; HLT
+    let mut io = IoBus::new();
+    for _ in 0..4 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.cr0, 0x0000_0004, "CLTS clears only bit 3; EM stays");
+}
+
 /// 0x0F 0x22 /4 / 0x0F 0x20 /4 — MOV CR4, r32 / MOV r32, CR4.
 #[test]
 fn mov_cr4_round_trip_carries_feature_bits() {
