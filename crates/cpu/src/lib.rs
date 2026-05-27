@@ -2682,17 +2682,36 @@ impl Cpu {
                         ip: op_ip,
                     });
                 }
-                let bp = self.regs[r16::BP];
-                self.push16(mem, bp);
-                let frame = self.regs[r16::SP];
-                self.regs[r16::BP] = frame;
-                self.regs[r16::SP] = self.regs[r16::SP].wrapping_sub(frame_size);
+                if self.op_size_32 {
+                    // ENTER 32-bit: push 4 bytes of EBP, EBP = full
+                    // ESP after the push, ESP -= frame_size.
+                    let ebp = self.read_r32(5);
+                    self.push32(mem, ebp);
+                    let frame = self.read_stack_ptr();
+                    self.write_r32(5, frame);
+                    let new_sp = frame.wrapping_sub(frame_size as u32);
+                    self.write_stack_ptr(new_sp);
+                } else {
+                    let bp = self.regs[r16::BP];
+                    self.push16(mem, bp);
+                    let frame = self.regs[r16::SP];
+                    self.regs[r16::BP] = frame;
+                    self.regs[r16::SP] = self.regs[r16::SP].wrapping_sub(frame_size);
+                }
             }
             // LEAVE — function epilogue. Mirror of ENTER level 0.
             //   SP = BP ; BP = pop
+            // Under 0x66 the dword form is used (ESP = EBP; pop EBP).
             0xC9 => {
-                self.regs[r16::SP] = self.regs[r16::BP];
-                self.regs[r16::BP] = self.pop16(mem);
+                if self.op_size_32 {
+                    let ebp = self.read_r32(5);
+                    self.write_stack_ptr(ebp);
+                    let new_ebp = self.pop32(mem);
+                    self.write_r32(5, new_ebp);
+                } else {
+                    self.regs[r16::SP] = self.regs[r16::BP];
+                    self.regs[r16::BP] = self.pop16(mem);
+                }
             }
 
             // PUSH/POP segment registers. Encoding 0b000sss11{0,1} where

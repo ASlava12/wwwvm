@@ -2427,6 +2427,45 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
 }
 
 /// 32-bit IDT gate (type 0xE) — the architectural form Linux 32-bit
+/// 0x66 0xC8 / 0x66 0xC9 — ENTER imm16, 0 / LEAVE under 32-bit
+/// operand size. Standard C function prologue / epilogue with frame
+/// pointer.
+#[test]
+fn enter_leave_round_trip_32_bit_frame() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.write_r32(5, 0xDEAD_BEEF); // EBP sentinel
+                                   // 66 C8 10 00 00   ENTER 0x10, 0   ; reserve 16 bytes
+                                   // (function body would use [EBP - imm] addressing; we just LEAVE)
+                                   // 66 C9            LEAVE
+                                   // F4
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xC8, 0x10, 0x00, 0x00, // ENTER 16, 0
+            0x66, 0xC9, // LEAVE
+            0xF4,
+        ],
+    );
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(5), 0xDEAD_BEEF, "LEAVE must restore EBP");
+    assert_eq!(
+        cpu.read_r32(r16::SP as u8),
+        0x0008_0000,
+        "stack ended at its starting value"
+    );
+}
+
 /// 0x66 0x60 / 0x66 0x61 — PUSHAD / POPAD.
 #[test]
 fn pushad_popad_round_trip_preserves_all_32_bit_gprs() {
