@@ -2959,6 +2959,104 @@ impl Cpu {
                             }
                         }
                     }
+                    // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
+                    // Conditional move: writes the source operand
+                    // into the destination only if the condition
+                    // holds. The whole point is to avoid a branch
+                    // — speculative execution stays linear.
+                    0x40..=0x4F => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let cond = self.eval_cond(op2 & 0x0F);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            if cond {
+                                self.write_r32(reg, v);
+                            }
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            if cond {
+                                self.write_r16(reg, v);
+                            }
+                        }
+                    }
+
+                    // SHLD r/m16/32, r16/32, imm8 — 0x0F 0xA4.
+                    // Shifts the destination left by `count`, filling
+                    // the low end with bits shifted out of the source's
+                    // high end. Count is masked to 5 bits (32-bit
+                    // operand) or 4 bits (16-bit). CF gets the last
+                    // bit shifted out of dest.
+                    0xA4 | 0xA5 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let count = if op2 == 0xA4 {
+                            self.fetch_u8(mem) & 0x1F
+                        } else {
+                            self.read_r8(1) & 0x1F // CL
+                        };
+                        if self.op_size_32 {
+                            shld32(self, rm, reg, count, mem);
+                        } else {
+                            shld16(self, rm, reg, count & 0x0F, mem);
+                        }
+                    }
+                    // SHRD r/m16/32, r16/32, imm8 — 0x0F 0xAC, CL form 0xAD.
+                    0xAC | 0xAD => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let count = if op2 == 0xAC {
+                            self.fetch_u8(mem) & 0x1F
+                        } else {
+                            self.read_r8(1) & 0x1F
+                        };
+                        if self.op_size_32 {
+                            shrd32(self, rm, reg, count, mem);
+                        } else {
+                            shrd16(self, rm, reg, count & 0x0F, mem);
+                        }
+                    }
+
+                    // CPUID — 0x0F 0xA2. Inputs in EAX/ECX, results in
+                    // EAX/EBX/ECX/EDX. We respond to the two leaves
+                    // Linux setup looks at first:
+                    //   leaf 0: max-leaf in EAX, vendor string in EBX|EDX|ECX.
+                    //           We report leaf 1 supported and pose as
+                    //           "WWWVMxRust  " — close enough to satisfy
+                    //           any "is this Intel/AMD" sniffing without
+                    //           accidentally triggering vendor-specific
+                    //           workarounds. (12 ASCII bytes.)
+                    //   leaf 1: family/model/stepping in EAX, feature
+                    //           flags in EDX/ECX. We report a bare i386
+                    //           with FPU=0, PSE=0, PAE=0, no SSE — the
+                    //           kernel may refuse if features look too
+                    //           lean, but at least it'll know what it's
+                    //           dealing with.
+                    // Anything else returns zeros.
+                    0xA2 => {
+                        let leaf = self.read_r32(0); // EAX
+                        match leaf {
+                            0 => {
+                                self.write_r32(0, 1); // max basic leaf = 1
+                                                      // "WWWVMxRust  " = 12 bytes in EBX, EDX, ECX
+                                self.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX
+                                self.write_r32(2, u32::from_le_bytes(*b"st  ")); // ECX
+                                self.write_r32(1, u32::from_le_bytes(*b"MxRu"));
+                                // EDX
+                            }
+                            1 => {
+                                // Family 3 (i386), no model, stepping 0.
+                                self.write_r32(0, 0x0000_0300);
+                                self.write_r32(3, 0); // EBX
+                                self.write_r32(2, 0); // ECX (SSE3+)
+                                self.write_r32(1, 0); // EDX (FPU/PSE/etc all 0)
+                            }
+                            _ => {
+                                self.write_r32(0, 0);
+                                self.write_r32(3, 0);
+                                self.write_r32(2, 0);
+                                self.write_r32(1, 0);
+                            }
+                        }
+                    }
+
                     // MOVZX r16/32, r/m8 — 0x0F 0xB6. Zero-extend a
                     // byte into the dest. Under 0x66 dest is r32, else r16.
                     0xB6 => {
@@ -3199,6 +3297,72 @@ impl Cpu {
             _ => false,
         }
     }
+}
+
+// SHLD/SHRD helpers — free fns to keep the dispatcher above readable.
+// Each takes &mut Cpu so it can update flags + the destination, plus
+// &mut Memory for the possible memory operand. count is already masked.
+
+fn shld32(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
+    if count == 0 {
+        return;
+    }
+    let dest = cpu.read_rm32(rm, mem);
+    let src = cpu.read_r32(reg);
+    // Combine dest||src into 64-bit, shift left by count, take top 32.
+    let combined = ((dest as u64) << 32) | (src as u64);
+    let shifted = combined.wrapping_shl(count as u32);
+    let result = (shifted >> 32) as u32;
+    let cf = (dest >> (32 - count)) & 1 != 0;
+    cpu.set_flag(flag::CF, cf);
+    cpu.flags_logic32(result);
+    cpu.write_rm32(rm, mem, result);
+}
+
+fn shld16(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
+    if count == 0 {
+        return;
+    }
+    let dest = cpu.read_rm16(rm, mem);
+    let src = cpu.read_r16(reg);
+    let combined = ((dest as u32) << 16) | (src as u32);
+    let shifted = combined.wrapping_shl(count as u32);
+    let result = (shifted >> 16) as u16;
+    let cf = (dest >> (16 - count)) & 1 != 0;
+    cpu.set_flag(flag::CF, cf);
+    cpu.flags_logic16(result);
+    cpu.write_rm16(rm, mem, result);
+}
+
+fn shrd32(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
+    if count == 0 {
+        return;
+    }
+    let dest = cpu.read_rm32(rm, mem);
+    let src = cpu.read_r32(reg);
+    // src||dest, shift right by count, take low 32.
+    let combined = ((src as u64) << 32) | (dest as u64);
+    let shifted = combined.wrapping_shr(count as u32);
+    let result = shifted as u32;
+    let cf = (dest >> (count - 1)) & 1 != 0;
+    cpu.set_flag(flag::CF, cf);
+    cpu.flags_logic32(result);
+    cpu.write_rm32(rm, mem, result);
+}
+
+fn shrd16(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
+    if count == 0 {
+        return;
+    }
+    let dest = cpu.read_rm16(rm, mem);
+    let src = cpu.read_r16(reg);
+    let combined = ((src as u32) << 16) | (dest as u32);
+    let shifted = combined.wrapping_shr(count as u32);
+    let result = shifted as u16;
+    let cf = (dest >> (count - 1)) & 1 != 0;
+    cpu.set_flag(flag::CF, cf);
+    cpu.flags_logic16(result);
+    cpu.write_rm16(rm, mem, result);
 }
 
 #[cfg(test)]

@@ -2400,6 +2400,72 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x0F 0x44 — CMOVE r16, r/m16. Moves when ZF=1.
+#[test]
+fn cmove_moves_when_zf_set() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x01, 0x00, 0x3D, 0x01, 0x00, 0xBB, 0xAA, 0xAA, 0x0F, 0x44, 0xC3, 0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0xAAAA);
+}
+
+#[test]
+fn cmove_skips_when_zf_clear() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x01, 0x00, 0x3D, 0x02, 0x00, 0xBB, 0xAA, 0xAA, 0x0F, 0x44, 0xC3, 0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.regs[r16::AX], 1);
+}
+
+/// 0x0F 0xA4 — SHLD. Shift dest left; vacated low bits come from
+/// source's high bits. dest=0x1234, src=0x5678, count=4:
+///   combined = 0x1234_5678; << 4 = 0x1_2345_6780; low 32's top 16 = 0x2345.
+#[test]
+fn shld_r16_imm8_fills_low_from_source_high() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x34, 0x12, // MOV AX, 0x1234
+            0xBB, 0x78, 0x56, // MOV BX, 0x5678
+            0x0F, 0xA4, 0xD8, 0x04, // SHLD AX, BX, 4
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x2345);
+}
+
+/// 0x0F 0xAC — SHRD. dest=0x1234, src=0x5678, count=4:
+///   combined = 0x5678_1234; >> 4 = 0x0567_8123; low 16 = 0x8123.
+#[test]
+fn shrd_r16_imm8_fills_high_from_source_low() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x34, 0x12, // MOV AX, 0x1234
+            0xBB, 0x78, 0x56, // MOV BX, 0x5678
+            0x0F, 0xAC, 0xD8, 0x04, // SHRD AX, BX, 4
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x8123);
+}
+
+/// 0x0F 0xA2 — CPUID leaf 0.
+#[test]
+fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
+    assert_eq!(cpu.read_r32(0), 1);
+    assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"WWWV"));
+    assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"MxRu"));
+    assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"st  "));
+}
+
 /// 0x0F 0xB6 — MOVZX r16, r/m8. Zero-extends a byte to 16 bits.
 #[test]
 fn movzx_r16_rm8_zero_extends() {
