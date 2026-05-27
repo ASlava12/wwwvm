@@ -1961,6 +1961,132 @@ fn protected_mode_addressing_uses_descriptor_base_not_shift_by_four() {
     );
 }
 
+/// JMP ptr16:16 (0xEA) in protected mode must reload CS through the
+/// GDT — the next instruction fetch then lands at the descriptor base
+/// plus the new IP, not at (selector << 4) + new_ip. We pre-poison
+/// both candidate code addresses with distinct HLT-vs-NOP+HLT
+/// sequences so the post-jump state distinguishes the two paths.
+#[test]
+fn protected_mode_far_jump_reloads_cs_through_gdt() {
+    let mut mem = Memory::new(0x10_0000);
+    // Boot code at 0x7C00: JMP FAR 0x10:0x0200; HLT (filler if jump fails).
+    mem.write_slice(0x7C00, &[0xEA, 0x00, 0x02, 0x10, 0x00, 0xF4]);
+    // Real-mode shift candidate: CS=0x10 → 0x100 base + IP 0x200 = 0x300.
+    // Land here would mean addressing still ignores PE.
+    // Put 0x90 0xF4 0xF4 ... here so AL would stay 0 after fetch.
+    mem.write_slice(0x0300, &[0x90, 0xF4]); // NOP; HLT — leaves AX=0
+                                            // PE descriptor base = 0x8000 → expected fetch at 0x8200.
+                                            // Put MOV AL, 0xC3; HLT here as the signature.
+    mem.write_slice(0x8200, &[0xB0, 0xC3, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    // GDT[2] at 0x0510: base=0x8000, limit=0xFFFF, access=0x9A (code, R/X, present).
+    mem.write_slice(
+        0x0510,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x80, // base 15:0
+            0x00, // base 23:16
+            0x9A, // access (code segment, executable, readable, present)
+            0x00, // limit 19:16 | flags
+            0x00, // base 31:24
+        ],
+    );
+
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.seg_cache[sreg::CS].base, 0x8000);
+    assert_eq!(
+        cpu.read_r8(0),
+        0xC3,
+        "JMP FAR in PE must fetch the next opcode from descriptor.base + IP"
+    );
+}
+
+/// INT n in protected mode dispatches via the IDT, not the real-mode
+/// IVT at 0x0000. We arm both candidate vectors — a fake "IVT" entry
+/// at vector 0x21 (linear 0x84) and a real IDT gate at idtr.base+8*0x21
+/// — pointing at different handlers. After `INT 0x21` we expect to be
+/// in the IDT handler.
+#[test]
+fn protected_mode_int_dispatches_via_idt_gate() {
+    let mut mem = Memory::new(0x10_0000);
+    // Boot stub: INT 0x21; HLT.
+    mem.write_slice(0x7C00, &[0xCD, 0x21, 0xF4]);
+
+    // Fake real-mode IVT entry at vector 0x21 (linear 0x84): IP=0x100, CS=0x40.
+    // If we incorrectly dispatched via the IVT this would land us at
+    // 0x40<<4 + 0x100 = 0x500, where we'd run MOV AL,0xEE; HLT.
+    mem.write_u16(0x84, 0x0100);
+    mem.write_u16(0x86, 0x0040);
+    mem.write_slice(0x0500, &[0xB0, 0xEE, 0xF4]);
+
+    // GDT[1] for the IDT handler's code segment: base=0x9000, access=0x9A.
+    cpu_pe_setup(&mut mem);
+
+    // IDT base at 0x4000, gate 0x21 at 0x4000 + 0x21*8 = 0x4108.
+    //   offset_lo = 0x0200, selector = 0x0008 (GDT[1]), type = 0x86 (16-bit interrupt gate)
+    mem.write_slice(
+        0x4108,
+        &[
+            0x00, 0x02, // offset 15:0
+            0x08, 0x00, // selector
+            0x00, // reserved
+            0x86, // P=1 DPL=0 type=6 (16-bit interrupt gate)
+            0x00, 0x00, // offset 31:16
+        ],
+    );
+    // Real IDT handler at 0x9000 + 0x0200 = 0x9200: MOV AL, 0xC4; HLT.
+    mem.write_slice(0x9200, &[0xB0, 0xC4, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x4000;
+    cpu.idtr.limit = 0x07FF;
+
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        cpu.read_r8(0),
+        0xC4,
+        "INT in PE must dispatch via IDT gate (sets AL=0xC4), not real-mode IVT (would set AL=0xEE)"
+    );
+}
+
+/// Builds GDT[1] = code segment base=0x9000 access=0x9A at gdtr.base=0x0500.
+fn cpu_pe_setup(mem: &mut Memory) {
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x90, // base 15:0
+            0x00, // base 23:16
+            0x9A, // access (code, R/X, present)
+            0x00, // limit 19:16 | flags
+            0x00, // base 31:24
+        ],
+    );
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {

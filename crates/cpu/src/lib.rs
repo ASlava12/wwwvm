@@ -530,13 +530,38 @@ impl Cpu {
         }
     }
 
-    /// Take a real-mode software interrupt. Pushes FLAGS, CS, IP,
-    /// clears IF (mask further interrupts), and loads CS:IP from the
-    /// IVT entry — a 4-byte (offset, segment) record at linear `n*4`.
+    /// Take a software interrupt. In real mode reads the 4-byte IVT
+    /// entry at linear `n*4`. In protected mode (CR0.PE=1) reads an
+    /// 8-byte gate descriptor at `idtr.base + n*8`:
+    ///
+    /// ```text
+    ///   byte 0-1: offset 15:0
+    ///   byte 2-3: segment selector
+    ///   byte 4:   reserved (0)
+    ///   byte 5:   P|DPL|S|type — 0x86 = present, ring 0, 16-bit interrupt gate
+    ///   byte 6-7: offset 31:16 (0 for 16-bit gates)
+    /// ```
+    ///
+    /// IF is always cleared for the moment (we don't yet distinguish
+    /// trap gates from interrupt gates — both end here). No privilege
+    /// level change is modelled: a ring transition would require
+    /// pushing the caller's SS/SP, which we'll add when ring 3 user
+    /// code shows up.
     fn do_interrupt(&mut self, n: u8, mem: &mut Memory) {
-        let ivt_addr = (n as u32) * 4;
-        let new_ip = mem.read_u16(ivt_addr);
-        let new_cs = mem.read_u16(ivt_addr + 2);
+        let (new_cs, new_ip) = if self.cr0 & 1 == 0 {
+            let ivt_addr = (n as u32) * 4;
+            (mem.read_u16(ivt_addr + 2), mem.read_u16(ivt_addr))
+        } else {
+            let gate_addr = self.idtr.base.wrapping_add((n as u32) * 8);
+            let off_lo = mem.read_u16(gate_addr);
+            let selector = mem.read_u16(gate_addr.wrapping_add(2));
+            // High 16 bits of offset live in bytes 6-7 — zero for the
+            // 16-bit gates we currently emit. We still read them so
+            // that 32-bit gates (the upgrade path) just slot in by
+            // widening `self.ip`.
+            let _off_hi = mem.read_u16(gate_addr.wrapping_add(6));
+            (selector, off_lo)
+        };
         let flags = self.flags;
         self.push16(mem, flags);
         let cs = self.sregs[sreg::CS];
