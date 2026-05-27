@@ -1,5 +1,91 @@
 use super::*;
 
+/// INT 0x13 with AL > 1 reads multiple sectors contiguously. Verifies
+/// the per-byte mem_write_u8 loop in `bios_int13` doesn't truncate
+/// after the first sector. Disk has 4 marker sectors (0xAA / 0xBB /
+/// 0xCC / 0xDD); we load sectors 1 + 2 via a single INT 0x13 AL=2
+/// call and expect them to land back-to-back at ES:BX.
+#[test]
+fn bios_int13_reads_multiple_sectors_contiguously() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    let mut disk = Vec::new();
+    for marker in [0xAA, 0xBB, 0xCC, 0xDD] {
+        disk.extend(std::iter::repeat_n(marker, 512));
+    }
+    vm.load_disk_image(&disk);
+    // Boot stub: ES=0, BX=0x3000, AH=2, AL=2, CL=2 (sector 2 = LBA 1),
+    // INT 0x13, HLT.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x00, 0x00, 0x8E, 0xC0, 0xBB, 0x00, 0x30, 0xB4, 0x02, 0xB0, 0x02, 0xB5, 0x00,
+            0xB1, 0x02, 0xB6, 0x00, 0xB2, 0x80, 0xCD, 0x13, 0xF4,
+        ],
+    );
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted));
+    // Bytes 0..511 must be 0xBB (sector 1), 512..1023 must be 0xCC (sector 2).
+    for off in 0..512 {
+        assert_eq!(vm.read_mem_u8(0x3000 + off), 0xBB);
+    }
+    for off in 0..512 {
+        assert_eq!(vm.read_mem_u8(0x3000 + 512 + off), 0xCC);
+    }
+}
+
+/// Full cold-boot pipeline into protected mode. The boot sector loads
+/// sector 1 from disk and far-jumps to it; sector 1 itself flips
+/// CR0.PE=1 via the canonical `MOV EAX,CR0; OR AX,1; MOV CR0,EAX`
+/// idiom and then issues a 32-bit MOV that writes `0xCAFEBABE` to
+/// linear 0x2000. After HLT the host inspects the dword.
+///
+/// This is the first regression that exercises every architectural
+/// piece in series: cold boot from disk → BIOS INT 0x13 → segmented
+/// far jump → CR0 read/write opcodes → PE flag flip → 32-bit operand
+/// dispatch → paged-or-not memory write. A regression in any of
+/// those breaks this test even when narrower unit tests still pass.
+#[test]
+fn cold_boot_kernel_transitions_to_protected_mode_and_writes_32_bit_dword() {
+    // Sector 0 — real-mode boot sector (same shape as the earlier
+    // cold-boot test): load sector 1 into 0x0000:0x8000 and far-jump.
+    let mut sector0 = vec![0u8; 512];
+    sector0[..27].copy_from_slice(&[
+        0xB8, 0x00, 0x00, 0x8E, 0xC0, 0xBB, 0x00, 0x80, 0xB4, 0x02, 0xB0, 0x01, 0xB5, 0x00, 0xB1,
+        0x02, 0xB6, 0x00, 0xB2, 0x80, 0xCD, 0x13, 0xEA, 0x00, 0x80, 0x00, 0x00,
+    ]);
+
+    // Sector 1 — kernel stub, runs at CS:IP = 0x0000:0x8000.
+    //   0F 20 C0          MOV EAX, CR0
+    //   83 C8 01          OR AX, 1            (PE = 1)
+    //   0F 22 C0          MOV CR0, EAX
+    //   66 B8 BE BA FE CA MOV EAX, 0xCAFEBABE
+    //   66 89 06 00 20    MOV [0x2000], EAX   (DS:disp16, DS = 0)
+    //   F4                HLT
+    let mut sector1 = vec![0u8; 512];
+    sector1[..21].copy_from_slice(&[
+        0x0F, 0x20, 0xC0, 0x83, 0xC8, 0x01, 0x0F, 0x22, 0xC0, 0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA,
+        0x66, 0x89, 0x06, 0x00, 0x20, 0xF4,
+    ]);
+
+    let mut disk = sector0;
+    disk.extend_from_slice(&sector1);
+
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_disk_image(&disk);
+    vm.boot_from_disk();
+    let (_, stop) = vm.run_steps(512);
+    assert!(matches!(stop, Stop::Halted), "stop: {stop:?}");
+    assert_eq!(vm.cpu().cr0 & 1, 1, "kernel stub must have flipped CR0.PE");
+    // Little-endian: 0xCAFEBABE at linear 0x2000 = BE BA FE CA.
+    assert_eq!(vm.read_mem_u8(0x2000), 0xBE);
+    assert_eq!(vm.read_mem_u8(0x2001), 0xBA);
+    assert_eq!(vm.read_mem_u8(0x2002), 0xFE);
+    assert_eq!(vm.read_mem_u8(0x2003), 0xCA);
+}
+
 /// End-to-end bootstrap: boot sector lives on the in-memory disk; the
 /// VM cold-boots via [`Vm::boot_from_disk`] which copies sector 0 to
 /// 0x7C00 (mimicking real BIOS). That sector then itself calls INT
