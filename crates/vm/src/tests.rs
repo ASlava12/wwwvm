@@ -1,5 +1,56 @@
 use super::*;
 
+/// install_bios() wires INT 0x10 to the Rust shim. A guest that does
+/// `MOV AH, 0x0E; MOV AL, 'X'; INT 0x10; HLT` must end up with 'X'
+/// at VGA cell (0,0) and the BDA cursor advanced to column 1.
+#[test]
+fn bios_int10_tty_writes_to_vga_and_advances_cursor() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Boot stub at 0x7C00:
+    //   MOV AH, 0x0E  ; B4 0E
+    //   MOV AL, 'X'   ; B0 58
+    //   INT 0x10      ; CD 10
+    //   HLT           ; F4
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB4, 0x0E, 0xB0, b'X', 0xCD, 0x10, 0xF4]);
+    vm.boot();
+    let (_, stop) = vm.run_steps(32);
+    assert!(matches!(stop, Stop::Halted));
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE), b'X');
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE + 1), 0x07, "attribute byte");
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_COL), 1);
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_ROW), 0);
+}
+
+/// CR and LF advance the cursor without writing characters; an
+/// 'A' afterwards lands at the start of row 1.
+#[test]
+fn bios_int10_tty_handles_cr_lf() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // MOV AH, 0x0E
+    // MOV AL, 0x0A ; LF
+    // INT 0x10
+    // MOV AL, 0x0D ; CR
+    // INT 0x10
+    // MOV AL, 'A'
+    // INT 0x10
+    // HLT
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x0E, 0xB0, 0x0A, 0xCD, 0x10, 0xB0, 0x0D, 0xCD, 0x10, 0xB0, b'A', 0xCD, 0x10,
+            0xF4,
+        ],
+    );
+    vm.boot();
+    let (_, _) = vm.run_steps(64);
+    // 'A' must be at row 1, col 0. VGA offset = (1*80 + 0)*2 = 160.
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE + 160), b'A');
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_COL), 1);
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_ROW), 1);
+}
+
 #[test]
 fn boots_and_prints_banner() {
     let mut vm = Vm::new();

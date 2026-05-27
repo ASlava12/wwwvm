@@ -134,6 +134,17 @@ pub struct Cpu {
     /// sets CR2 to the faulting address, and clears the slot.
     /// `Cell` so translate can flag a fault through `&self`.
     pending_fault: Cell<Option<PageFault>>,
+    /// Optional intercept for software interrupts. When `INT imm8`
+    /// fires, the CPU calls this with (cpu, mem, vector). If the hook
+    /// returns `true`, the dispatch is skipped — the host already did
+    /// the BIOS work directly in Rust. Returning `false` lets the
+    /// normal IVT/IDT path run, so a guest that installs its own
+    /// handler for the same vector still wins (it overrides the IVT
+    /// entry, which we'd then consult).
+    ///
+    /// Stored as a bare `fn` pointer (not `Box<dyn>`) so the Cpu
+    /// stays `Copy`-friendly and snapshot-able without extra plumbing.
+    pub bios_hook: Option<fn(&mut Cpu, &mut Memory, u8) -> bool>,
     /// Shadow descriptor cache for each segment register. The CPU
     /// addresses memory through `seg_cache[idx].base`, *not*
     /// `sregs[idx] << 4`, so once PM is on, the visible selector
@@ -215,6 +226,7 @@ impl Cpu {
             cr3: 0,
             cr2: 0,
             pending_fault: Cell::new(None),
+            bios_hook: None,
             seg_cache: [SegmentCache::default(); 6],
         }
     }
@@ -2474,9 +2486,22 @@ impl Cpu {
                 self.do_interrupt(3, mem);
             }
             // INT imm8 — software interrupt to the vector named by imm8.
+            // The bios_hook gets first refusal: a Rust-side handler for
+            // BIOS vectors (0x10 video, 0x13 disk, 0x16 keyboard, etc.)
+            // returns true and the CPU treats the INT as "done" without
+            // pushing a frame. Anything not claimed by the hook falls
+            // through to the standard IVT/IDT dispatch.
             0xCD => {
                 let n = self.fetch_u8(mem);
-                self.do_interrupt(n, mem);
+                if let Some(hook) = self.bios_hook {
+                    if hook(self, mem, n) {
+                        // Host handled it — no frame, no IRET needed.
+                    } else {
+                        self.do_interrupt(n, mem);
+                    }
+                } else {
+                    self.do_interrupt(n, mem);
+                }
             }
             // INTO — if OF=1, raise INT 4. Otherwise a no-op.
             0xCE => {

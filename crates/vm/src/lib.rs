@@ -23,6 +23,70 @@ pub const VGA_TEXT_BASE: u32 = 0xB8000;
 pub const VGA_TEXT_COLS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
 
+/// BIOS Data Area cursor location for active page 0:
+/// linear `0x450` = column, `0x451` = row. Real BIOS keeps all 8
+/// pages in `0x450..0x460` (2 bytes each); we just touch page 0
+/// because the host-side BIOS shim never changes the active page.
+pub const BDA_CURSOR_COL: u32 = 0x0450;
+pub const BDA_CURSOR_ROW: u32 = 0x0451;
+
+/// Host-side BIOS shim. Installed via [`Vm::install_bios`]. When the
+/// guest issues `INT n`, the CPU calls this with the vector; we
+/// handle the small subset of BIOS calls the bundled guests use and
+/// return `true` to short-circuit the normal IVT dispatch. Anything
+/// we don't claim returns `false` and falls through to whatever the
+/// guest installed at the IVT entry.
+///
+/// Currently implemented:
+///   * INT 0x10 AH=0x0E — TTY teletype output. Writes AL to the VGA
+///     text buffer at the BDA cursor (page 0), advances the cursor,
+///     wraps at column 80 and clamps at row 24. CR/LF/BS are honored;
+///     BEL is silently dropped.
+pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, vector: u8) -> bool {
+    match vector {
+        0x10 => bios_int10(cpu, mem),
+        _ => false,
+    }
+}
+
+fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
+    let ah = cpu.read_r8(4); // AH lives in the high half of AX
+    match ah {
+        0x0E => {
+            let al = cpu.read_r8(0);
+            let mut col = mem.read_u8(BDA_CURSOR_COL) as usize;
+            let mut row = mem.read_u8(BDA_CURSOR_ROW) as usize;
+            match al {
+                0x07 => { /* BEL — silently drop */ }
+                0x08 => col = col.saturating_sub(1),
+                b'\r' => col = 0,
+                b'\n' => {
+                    if row + 1 < VGA_TEXT_ROWS {
+                        row += 1;
+                    }
+                }
+                _ => {
+                    let off = ((row * VGA_TEXT_COLS) + col) * 2;
+                    mem.write_u8(VGA_TEXT_BASE + off as u32, al);
+                    // Attribute byte: 0x07 = light-grey on black.
+                    mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, 0x07);
+                    col += 1;
+                    if col >= VGA_TEXT_COLS {
+                        col = 0;
+                        if row + 1 < VGA_TEXT_ROWS {
+                            row += 1;
+                        }
+                    }
+                }
+            }
+            mem.write_u8(BDA_CURSOR_COL, col as u8);
+            mem.write_u8(BDA_CURSOR_ROW, row as u8);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Snapshot format constants and the error type used by `restore`.
 pub mod snapshot {
     /// 6-byte format magic. Suitable for identifying the file from a
@@ -456,6 +520,16 @@ impl Vm {
         self.io.uart_mut().push_rx(&self.autorun);
         self.autorun.clear();
         self.booted = true;
+    }
+
+    /// Wire the host-side BIOS shim into the CPU. After this, `INT 0x10`
+    /// (and future BIOS vectors) gets dispatched to the Rust functions
+    /// in [`bios_hook`] instead of the IVT entry — so a freshly booted
+    /// guest can print via teletype without first installing its own
+    /// handler. A guest that *does* install its own IVT entry can
+    /// override us by overwriting the `bios_hook` field with `None`.
+    pub fn install_bios(&mut self) {
+        self.cpu.bios_hook = Some(bios_hook);
     }
 
     pub fn is_booted(&self) -> bool {
