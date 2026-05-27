@@ -2466,6 +2466,52 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x66 0xFF /0 — INC r/m32.
+#[test]
+fn inc_r32_increments_dword_preserving_cf() {
+    // STC (so we can verify CF is preserved)
+    // MOV EAX, 0xFFFF_FFFF  ; 66 B8 FF FF FF FF
+    // INC EAX               ; 66 FF C0 (modrm 11 000 000 → sub=0, rm=EAX)
+    // HLT
+    // 0xFFFFFFFF + 1 = 0 with ZF=1, CF preserved from STC = 1.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xF9, // STC
+            0x66, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // MOV EAX, -1
+            0x66, 0xFF, 0xC0, // INC EAX
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0);
+    assert!(cpu.has(flag::ZF));
+    assert!(cpu.has(flag::CF), "INC preserves CF");
+}
+
+/// 0x66 0xFF /6 — PUSH r/m32 from a register source.
+#[test]
+fn push_rm32_via_group5_pushes_dword() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.write_r32(0, 0x1234_5678); // EAX
+                                   // 66 FF F0   PUSH EAX (sub=6 rm=EAX → modrm 11 110 000 = 0xF0)
+                                   // F4
+    mem.write_slice(0x7C00, &[0x66, 0xFF, 0xF0, 0xF4]);
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0007_FFFC);
+    assert_eq!(mem.read_u32(0x0007_FFFC), 0x1234_5678);
+}
+
 /// 0x66 0xC1 /4 — SHL r/m32, imm8. 32-bit shift through Group 2.
 /// CF after SHL is the *last* bit shifted out — i.e. bit (32-count)
 /// of the original. For value=0x80000001 and count=1, the last (and

@@ -2676,25 +2676,48 @@ impl Cpu {
                 match sub {
                     0 => {
                         let cf_before = self.has(flag::CF);
-                        let v = self.read_rm16(rm, mem);
-                        let r = v.wrapping_add(1);
-                        self.flags_add16(v, 1, 0, r);
-                        self.set_flag(flag::CF, cf_before);
-                        self.write_rm16(rm, mem, r);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            let r = v.wrapping_add(1);
+                            self.flags_add32(v, 1, 0, r);
+                            self.set_flag(flag::CF, cf_before);
+                            self.write_rm32(rm, mem, r);
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            let r = v.wrapping_add(1);
+                            self.flags_add16(v, 1, 0, r);
+                            self.set_flag(flag::CF, cf_before);
+                            self.write_rm16(rm, mem, r);
+                        }
                     }
                     1 => {
                         let cf_before = self.has(flag::CF);
-                        let v = self.read_rm16(rm, mem);
-                        let r = v.wrapping_sub(1);
-                        self.flags_sub16(v, 1, 0, r);
-                        self.set_flag(flag::CF, cf_before);
-                        self.write_rm16(rm, mem, r);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            let r = v.wrapping_sub(1);
+                            self.flags_sub32(v, 1, 0, r);
+                            self.set_flag(flag::CF, cf_before);
+                            self.write_rm32(rm, mem, r);
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            let r = v.wrapping_sub(1);
+                            self.flags_sub16(v, 1, 0, r);
+                            self.set_flag(flag::CF, cf_before);
+                            self.write_rm16(rm, mem, r);
+                        }
                     }
                     2 => {
-                        let target = self.read_rm16(rm, mem);
-                        let ret_ip = self.ip as u16;
-                        self.push16(mem, ret_ip);
-                        self.ip = target as u32;
+                        if self.op_size_32 {
+                            let target = self.read_rm32(rm, mem);
+                            let ret_ip = self.ip;
+                            self.push32(mem, ret_ip);
+                            self.ip = target;
+                        } else {
+                            let target = self.read_rm16(rm, mem);
+                            let ret_ip = self.ip as u16;
+                            self.push16(mem, ret_ip);
+                            self.ip = target as u32;
+                        }
                     }
                     // CALL m16:16 — far indirect. The operand must be
                     // memory (a 4-byte pointer). We re-fetch the linear
@@ -2722,8 +2745,13 @@ impl Cpu {
                         self.ip = new_ip as u32;
                     }
                     4 => {
-                        let target = self.read_rm16(rm, mem);
-                        self.ip = target as u32;
+                        if self.op_size_32 {
+                            let target = self.read_rm32(rm, mem);
+                            self.ip = target;
+                        } else {
+                            let target = self.read_rm16(rm, mem);
+                            self.ip = target as u32;
+                        }
                     }
                     // JMP m16:16 — far indirect (no stack activity).
                     5 => {
@@ -2744,8 +2772,13 @@ impl Cpu {
                         self.ip = new_ip as u32;
                     }
                     6 => {
-                        let v = self.read_rm16(rm, mem);
-                        self.push16(mem, v);
+                        if self.op_size_32 {
+                            let v = self.read_rm32(rm, mem);
+                            self.push32(mem, v);
+                        } else {
+                            let v = self.read_rm16(rm, mem);
+                            self.push16(mem, v);
+                        }
                     }
                     _ => {
                         return Err(CpuError::Unimplemented {
