@@ -1812,8 +1812,9 @@ impl Cpu {
             }
             // Group 1: ALU r/m, imm.  reg field of ModR/M = op (0=ADD..7=CMP)
             //   0x80: r/m8, imm8
-            //   0x81: r/m16, imm16
-            //   0x83: r/m16, imm8 sign-extended to 16-bit
+            //   0x81: r/m16, imm16   (with 0x66: r/m32, imm32)
+            //   0x83: r/m16, imm8 sign-extended to 16-bit (with 0x66:
+            //         r/m32, imm8 sign-extended to 32-bit)
             0x80 => {
                 let (_, op, rm) = self.fetch_modrm(mem);
                 let imm = self.fetch_u8(mem);
@@ -1825,20 +1826,40 @@ impl Cpu {
             }
             0x81 => {
                 let (_, op, rm) = self.fetch_modrm(mem);
-                let imm = self.fetch_u16(mem);
-                let a = self.read_rm16(rm, mem);
-                let (r, wb) = self.alu_apply16(op, a, imm);
-                if wb {
-                    self.write_rm16(rm, mem, r);
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    let imm = lo | (hi << 16);
+                    let a = self.read_rm32(rm, mem);
+                    let (r, wb) = self.alu_apply32(op, a, imm);
+                    if wb {
+                        self.write_rm32(rm, mem, r);
+                    }
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    let a = self.read_rm16(rm, mem);
+                    let (r, wb) = self.alu_apply16(op, a, imm);
+                    if wb {
+                        self.write_rm16(rm, mem, r);
+                    }
                 }
             }
             0x83 => {
                 let (_, op, rm) = self.fetch_modrm(mem);
-                let imm = self.fetch_u8(mem) as i8 as i16 as u16;
-                let a = self.read_rm16(rm, mem);
-                let (r, wb) = self.alu_apply16(op, a, imm);
-                if wb {
-                    self.write_rm16(rm, mem, r);
+                if self.op_size_32 {
+                    let imm = self.fetch_u8(mem) as i8 as i32 as u32;
+                    let a = self.read_rm32(rm, mem);
+                    let (r, wb) = self.alu_apply32(op, a, imm);
+                    if wb {
+                        self.write_rm32(rm, mem, r);
+                    }
+                } else {
+                    let imm = self.fetch_u8(mem) as i8 as i16 as u16;
+                    let a = self.read_rm16(rm, mem);
+                    let (r, wb) = self.alu_apply16(op, a, imm);
+                    if wb {
+                        self.write_rm16(rm, mem, r);
+                    }
                 }
             }
 

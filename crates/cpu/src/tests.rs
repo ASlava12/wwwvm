@@ -2385,6 +2385,78 @@ fn mov_rm32_r32_register_to_memory_round_trip() {
     assert_eq!(cpu.regs_high[r16::BX], 0xCAFE);
 }
 
+/// 0x66 0x81 /5 → SUB r/m32, imm32. Verify that 32-bit subtraction
+/// flows through alu_apply32 and clears ZF when the result is non-
+/// zero, with the high half participating (subtracts a value that
+/// would underflow if treated as 16-bit only).
+#[test]
+fn group1_sub_rm32_imm32_carries_borrow_through_high_half() {
+    // MOV EAX, 0x00010000     ; 66 B8 00 00 01 00
+    // SUB EAX, 0x00000001     ; 66 83 E8 01  (0x83 /5 sign-ext imm8)
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x01, 0x00, // MOV EAX, 0x10000
+            0x66, 0x83, 0xE8, 0x01, // SUB EAX, 1 (imm8 sign-ext)
+            0xF4,
+        ],
+        16,
+    );
+    // 0x10000 - 1 = 0xFFFF — low half flips to 0xFFFF, high half
+    // borrows down from 1 to 0.
+    assert_eq!(cpu.regs[r16::AX], 0xFFFF);
+    assert_eq!(cpu.regs_high[r16::AX], 0x0000);
+    assert!(!cpu.has(flag::ZF));
+    assert!(!cpu.has(flag::CF));
+}
+
+/// 0x66 0x81 /7 → CMP r/m32, imm32. Compare two 32-bit values that
+/// differ only in the high half; the 32-bit compare must set the
+/// flags correctly (a 16-bit-only compare would say "equal" here).
+#[test]
+fn group1_cmp_rm32_imm32_sees_high_half_difference() {
+    // MOV EAX, 0xDEAD_0000    ; 66 B8 00 00 AD DE
+    // CMP EAX, 0x0000_0000    ; 66 81 F8 00 00 00 00
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0xAD, 0xDE, // MOV EAX, 0xDEAD0000
+            0x66, 0x81, 0xF8, 0x00, 0x00, 0x00, 0x00, // CMP EAX, 0
+            0xF4,
+        ],
+        16,
+    );
+    // 0xDEAD0000 != 0, so ZF clear. EAX unchanged.
+    assert!(!cpu.has(flag::ZF));
+    assert_eq!(cpu.regs[r16::AX], 0);
+    assert_eq!(cpu.regs_high[r16::AX], 0xDEAD);
+}
+
+/// 0x66 0x01 → ADD r/m32, r32. Confirms the path through alu_dispatch
+/// variant 1 actually does 32-bit math by adding a 32-bit value whose
+/// low half rolls over into the high half.
+#[test]
+fn add_rm32_r32_with_carry_into_high_half() {
+    // MOV EAX, 0x0000_FFFF    ; 66 B8 FF FF 00 00
+    // MOV EBX, 0x0000_0001    ; 66 BB 01 00 00 00
+    // ADD EAX, EBX            ; 66 01 D8  (modrm 11 011 000 → reg=EBX, rm=EAX)
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xFF, 0xFF, 0x00, 0x00, // MOV EAX, 0xFFFF
+            0x66, 0xBB, 0x01, 0x00, 0x00, 0x00, // MOV EBX, 1
+            0x66, 0x01, 0xD8, // ADD EAX, EBX
+            0xF4,
+        ],
+        16,
+    );
+    // 0xFFFF + 1 = 0x10000 — low half now 0, high half now 1.
+    assert_eq!(cpu.regs[r16::AX], 0x0000);
+    assert_eq!(cpu.regs_high[r16::AX], 0x0001);
+    assert!(!cpu.has(flag::ZF));
+    assert!(!cpu.has(flag::CF));
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {
