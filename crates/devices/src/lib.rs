@@ -23,12 +23,14 @@ pub trait IoDevice {
 }
 
 mod cmos;
+mod disk;
 mod keyboard;
 mod pic;
 mod pit;
 mod uart;
 
 pub use cmos::{reg as cmos_reg, Cmos};
+pub use disk::{Disk, SECTOR_SIZE as DISK_SECTOR_SIZE};
 pub use keyboard::Keyboard;
 pub use pic::Pic;
 pub use pit::Pit;
@@ -48,6 +50,10 @@ pub struct IoBus {
     pub pit: Pit,
     pub kbd: Keyboard,
     pub cmos: Cmos,
+    /// In-memory boot disk. Empty by default; populated via
+    /// `Vm::load_disk_image`. The host-side BIOS shim consults this
+    /// for INT 0x13 reads. Not snapshotted yet.
+    pub disk: Disk,
 }
 
 impl IoBus {
@@ -61,6 +67,7 @@ impl IoBus {
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
+            disk: Disk::new(),
         }
     }
 
@@ -74,6 +81,7 @@ impl IoBus {
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
+            disk: Disk::new(),
         }
     }
 

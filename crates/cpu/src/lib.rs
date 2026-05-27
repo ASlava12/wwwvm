@@ -77,6 +77,9 @@ pub mod sreg {
     pub const GS: usize = 5;
 }
 
+/// Signature of an installed BIOS shim — see [`Cpu::bios_hook`].
+pub type BiosHook = fn(&mut Cpu, &mut Memory, &mut IoBus, u8) -> bool;
+
 pub struct Cpu {
     /// General-purpose register file — AX..DI as the low 16 bits of
     /// E?X. Indexed by the standard r16 encoding.
@@ -144,7 +147,7 @@ pub struct Cpu {
     ///
     /// Stored as a bare `fn` pointer (not `Box<dyn>`) so the Cpu
     /// stays `Copy`-friendly and snapshot-able without extra plumbing.
-    pub bios_hook: Option<fn(&mut Cpu, &mut Memory, u8) -> bool>,
+    pub bios_hook: Option<BiosHook>,
     /// Shadow descriptor cache for each segment register. The CPU
     /// addresses memory through `seg_cache[idx].base`, *not*
     /// `sregs[idx] << 4`, so once PM is on, the visible selector
@@ -2494,7 +2497,7 @@ impl Cpu {
             0xCD => {
                 let n = self.fetch_u8(mem);
                 if let Some(hook) = self.bios_hook {
-                    if hook(self, mem, n) {
+                    if hook(self, mem, io, n) {
                         // Host handled it — no frame, no IRET needed.
                     } else {
                         self.do_interrupt(n, mem);

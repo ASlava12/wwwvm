@@ -42,9 +42,10 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///     text buffer at the BDA cursor (page 0), advances the cursor,
 ///     wraps at column 80 and clamps at row 24. CR/LF/BS are honored;
 ///     BEL is silently dropped.
-pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, vector: u8) -> bool {
+pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
     match vector {
         0x10 => bios_int10(cpu, mem),
+        0x13 => bios_int13(cpu, mem, io),
         _ => false,
     }
 }
@@ -81,6 +82,54 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
             }
             mem.write_u8(BDA_CURSOR_COL, col as u8);
             mem.write_u8(BDA_CURSOR_ROW, row as u8);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// INT 0x13 — disk services. We model:
+///
+///   * AH=0x02 — Read sectors. Inputs: AL = sector count, CH = cyl
+///     bits 0..7, CL bits 6..7 = cyl bits 8..9, CL bits 0..5 = sector
+///     (1-based!), DH = head, DL = drive (0x80 = boot drive). The
+///     destination buffer is ES:BX.
+///
+/// The geometry is the canonical 1.44 MB floppy: 80 cylinders, 2
+/// heads, 18 sectors/track. We use it for hard disks too, which is
+/// wrong in general but fine for boot stubs that read by LBA via
+/// `MOV CH,0; MOV CL,2` (cyl 0, sector 2) etc.
+///
+/// On return: CF=0 + AH=0 on success; CF=1 + AH=error on failure.
+/// The flags update goes through `set_flag(flag::CF, …)` so it
+/// survives any later state inspection.
+fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
+    let ah = cpu.read_r8(4);
+    match ah {
+        0x02 => {
+            let count = cpu.read_r8(0) as usize; // AL
+            let ch = cpu.read_r8(5) as u32; // CH
+            let cl = cpu.read_r8(1) as u32; // CL
+            let dh = cpu.read_r8(6) as u32; // DH
+            let _dl = cpu.read_r8(2); // DL (drive index — we have one disk)
+            let cyl = ((cl & 0xC0) << 2) | ch;
+            let sector = (cl & 0x3F).saturating_sub(1); // 1-based -> 0-based
+            let head = dh;
+            // CHS -> LBA: ((cyl * heads) + head) * sectors_per_track + sector.
+            // Standard 1.44 MB floppy geometry.
+            let lba = (cyl * 2 + head) * 18 + sector;
+            // Destination linear = ES.base + BX. read_r16(3) returns BX.
+            let bx = cpu.read_r16(3);
+            let dest_linear = cpu.linear_seg(wwwvm_cpu::sreg::ES, bx);
+
+            let mut buf = vec![0u8; count * wwwvm_devices::DISK_SECTOR_SIZE];
+            io.disk.read_sectors(lba, count as u8, &mut buf);
+            for (i, &b) in buf.iter().enumerate() {
+                cpu.mem_write_u8(mem, dest_linear.wrapping_add(i as u32), b);
+            }
+            // Success: CF=0, AH=0. AL keeps the requested sector count.
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            cpu.write_r8(4, 0);
             true
         }
         _ => false,
@@ -530,6 +579,13 @@ impl Vm {
     /// override us by overwriting the `bios_hook` field with `None`.
     pub fn install_bios(&mut self) {
         self.cpu.bios_hook = Some(bios_hook);
+    }
+
+    /// Replace the boot disk image. The host-side `INT 0x13 AH=0x02`
+    /// shim reads from here. `bytes.len()` need not be a sector
+    /// multiple; bytes past the end read as zero.
+    pub fn load_disk_image(&mut self, bytes: &[u8]) {
+        self.io.disk.load(bytes);
     }
 
     pub fn is_booted(&self) -> bool {

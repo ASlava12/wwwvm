@@ -1,5 +1,60 @@
 use super::*;
 
+/// INT 0x13 AH=0x02 reads sectors from the in-memory disk image into
+/// ES:BX. We load a 1024-byte disk where sector 0 is all 0xAA and
+/// sector 1 is all 0xBB, then have a boot stub read sector 1 into
+/// [ES:BX] = [0:0x2000].
+#[test]
+fn bios_int13_read_sectors_copies_to_es_bx() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    let mut disk = vec![0xAAu8; 512];
+    disk.extend_from_slice(&[0xBB; 512]);
+    vm.load_disk_image(&disk);
+    // Boot stub at 0x7C00:
+    //   MOV AX, 0x0000     ; B8 00 00
+    //   MOV ES, AX         ; 8E C0     (ES = 0)
+    //   MOV BX, 0x2000     ; BB 00 20
+    //   MOV AH, 0x02       ; B4 02     (read sectors)
+    //   MOV AL, 0x01       ; B0 01     (one sector)
+    //   MOV CH, 0x00       ; B5 00     (cyl low)
+    //   MOV CL, 0x02       ; B1 02     (sector 2 = LBA 1)
+    //   MOV DH, 0x00       ; B6 00     (head 0)
+    //   MOV DL, 0x80       ; B2 80     (first hard disk)
+    //   INT 0x13           ; CD 13
+    //   HLT                ; F4
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x00, 0x00, // MOV AX, 0
+            0x8E, 0xC0, // MOV ES, AX
+            0xBB, 0x00, 0x20, // MOV BX, 0x2000
+            0xB4, 0x02, // MOV AH, 2
+            0xB0, 0x01, // MOV AL, 1
+            0xB5, 0x00, // MOV CH, 0
+            0xB1, 0x02, // MOV CL, 2 (sector 2, 1-based)
+            0xB6, 0x00, // MOV DH, 0
+            0xB2, 0x80, // MOV DL, 0x80
+            0xCD, 0x13, // INT 0x13
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted));
+    // The sector at LBA 1 (all 0xBB) must land at linear 0x2000.
+    for off in 0..512 {
+        assert_eq!(
+            vm.read_mem_u8(0x2000 + off),
+            0xBB,
+            "byte {off} of loaded sector"
+        );
+    }
+    // Sector 0 should NOT have been touched at 0x2000; we already
+    // checked the whole 512 are 0xBB. AH must be 0 (success).
+    assert_eq!(vm.cpu().read_r8(4), 0);
+}
+
 /// install_bios() wires INT 0x10 to the Rust shim. A guest that does
 /// `MOV AH, 0x0E; MOV AL, 'X'; INT 0x10; HLT` must end up with 'X'
 /// at VGA cell (0,0) and the BDA cursor advanced to column 1.
