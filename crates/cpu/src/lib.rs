@@ -77,7 +77,15 @@ pub mod sreg {
 }
 
 pub struct Cpu {
+    /// General-purpose register file — AX..DI as the low 16 bits of
+    /// E?X. Indexed by the standard r16 encoding.
     pub regs: [u16; 8],
+    /// Upper 16 bits of E?X — populated only by 32-bit-operand
+    /// instructions. In real mode and for 8086/186-only guests this
+    /// stays zero. Kept as a separate array (rather than widening
+    /// `regs` to u32) so the existing thousand+ call sites that
+    /// operate on 16-bit values compile unchanged.
+    pub regs_high: [u16; 8],
     pub sregs: [u16; 6],
     pub ip: u16,
     pub flags: u16,
@@ -136,6 +144,7 @@ impl Cpu {
     pub fn new() -> Self {
         Self {
             regs: [0; 8],
+            regs_high: [0; 8],
             sregs: [0; 6],
             ip: 0,
             flags: 0,
@@ -164,6 +173,7 @@ impl Cpu {
     /// memory, all data segments = 0.
     pub fn reset_to_boot(&mut self) {
         self.regs = [0; 8];
+        self.regs_high = [0; 8];
         self.sregs = [0; 6];
         self.regs[r16::SP] = 0x7C00;
         self.ip = 0x7C00;
@@ -203,6 +213,23 @@ impl Cpu {
 
     pub fn write_r16(&mut self, i: u8, value: u16) {
         self.regs[(i & 7) as usize] = value;
+    }
+
+    /// Read the full 32-bit register. Splices the upper 16 bits from
+    /// `regs_high` onto the low 16 from `regs`.
+    pub fn read_r32(&self, i: u8) -> u32 {
+        let idx = (i & 7) as usize;
+        ((self.regs_high[idx] as u32) << 16) | self.regs[idx] as u32
+    }
+
+    /// Write the full 32-bit register, splitting into `regs` (low)
+    /// and `regs_high` (high). Mirrors x86-64 zero-extension: a
+    /// 32-bit write to a register zeros nothing visible because it
+    /// covers the whole logical EAX.
+    pub fn write_r32(&mut self, i: u8, value: u32) {
+        let idx = (i & 7) as usize;
+        self.regs[idx] = value as u16;
+        self.regs_high[idx] = (value >> 16) as u16;
     }
 
     fn linear(seg: u16, off: u16) -> u32 {

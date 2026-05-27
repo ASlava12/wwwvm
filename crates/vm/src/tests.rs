@@ -484,6 +484,36 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.cmos.read(0x71), 26);
 }
 
+/// v3 snapshot must round-trip i386 control state (CR0, GDTR, IDTR,
+/// upper 16 of GPRs).
+#[test]
+fn snapshot_v3_preserves_i386_state() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // The tests module has crate-private access to Vm.cpu.
+    vm.cpu.cr0 = 0x8000_0001;
+    vm.cpu.gdtr = wwwvm_cpu::DescriptorTable {
+        limit: 0x00FF,
+        base: 0x0001_0000,
+    };
+    vm.cpu.idtr = wwwvm_cpu::DescriptorTable {
+        limit: 0x07FF,
+        base: 0x0002_0000,
+    };
+    vm.cpu.regs_high[0] = 0xDEAD;
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v3 restore");
+    assert_eq!(vm2.cpu().cr0, 0x8000_0001);
+    assert_eq!(vm2.cpu().gdtr.limit, 0x00FF);
+    assert_eq!(vm2.cpu().gdtr.base, 0x0001_0000);
+    assert_eq!(vm2.cpu().idtr.limit, 0x07FF);
+    assert_eq!(vm2.cpu().idtr.base, 0x0002_0000);
+    assert_eq!(vm2.cpu().regs_high[0], 0xDEAD);
+    assert_eq!(vm2.cpu().read_r32(0) & 0xFFFF_0000, 0xDEAD_0000);
+}
+
 /// A v1 snapshot (synthesized by hand) must still restore the CPU
 /// + RAM portions; devices come back fresh.
 #[test]

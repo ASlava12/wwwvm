@@ -1721,6 +1721,34 @@ fn aam_with_zero_base_raises_divide_error() {
 }
 
 #[test]
+fn read_write_r32_round_trip() {
+    let mut cpu = Cpu::new();
+    cpu.write_r32(0, 0xCAFE_BABE);
+    assert_eq!(cpu.read_r32(0), 0xCAFE_BABE);
+    assert_eq!(cpu.read_r16(0), 0xBABE);
+    assert_eq!(cpu.read_r8(0), 0xBE); // AL
+    assert_eq!(cpu.read_r8(4), 0xBA); // AH
+}
+
+#[test]
+fn r16_write_preserves_upper_16_of_r32() {
+    let mut cpu = Cpu::new();
+    cpu.write_r32(3, 0xDEAD_0000);
+    cpu.write_r16(3, 0xBEEF);
+    assert_eq!(cpu.read_r32(3), 0xDEAD_BEEF);
+}
+
+#[test]
+fn r8_write_preserves_upper_24_of_r32() {
+    let mut cpu = Cpu::new();
+    cpu.write_r32(0, 0x1122_3344);
+    cpu.write_r8(0, 0xFF);
+    assert_eq!(cpu.read_r32(0), 0x1122_33FF);
+    cpu.write_r8(4, 0xAA);
+    assert_eq!(cpu.read_r32(0), 0x1122_AAFF);
+}
+
+#[test]
 fn mov_cr0_round_trip_through_ax() {
     // MOV AX, CR0 → CR0 (=0) flows into AX. Set PE bit via OR AL, 1.
     // MOV CR0, AX writes back. MOV BX, CR0 reads it again — both the

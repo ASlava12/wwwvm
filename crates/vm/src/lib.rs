@@ -28,15 +28,22 @@ pub mod snapshot {
     /// 6-byte format magic. Suitable for identifying the file from a
     /// hex dump.
     pub const MAGIC: &[u8] = b"WWWVM\x00";
-    /// Current snapshot format version. v1 covered CPU + RAM only;
-    /// v2 adds device state (UART buffers, PIC IMR/IRR/ISR, PIT
-    /// counter, keyboard queue, CMOS) after the RAM image.
-    pub const VERSION: u8 = 2;
+    /// Current snapshot format version.
+    /// * v1 — CPU (16-bit regs) + RAM only.
+    /// * v2 — adds device state (UART/PIC/PIT/KBD/CMOS) after RAM.
+    /// * v3 — adds i386 fields to the CPU image: upper 16 bits of
+    ///   each GPR (regs_high), CR0, GDTR, IDTR.
+    pub const VERSION: u8 = 3;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
-    /// Bytes consumed by the CPU image: 8 r16 + 6 sreg + ip + flags +
-    /// halted byte + seg_override byte (rounded up).
+    /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
+    /// flags + halted + seg_override + 2 reserved.
     pub const CPU_LEN: usize = 36;
+    /// Extra bytes the v3 CPU image carries past the v1/v2 layout:
+    /// 16 (regs_high u16 × 8) + 4 (cr0 u32) + 6 (gdtr) + 6 (idtr) = 32.
+    pub const CPU_V3_EXTRA: usize = 32;
+    /// Total bytes a v3 CPU image takes.
+    pub const CPU_V3_LEN: usize = CPU_LEN + CPU_V3_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -151,14 +158,16 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE;
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE;
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
         buf.push(snapshot::VERSION);
         buf.push(0); // flags (reserved)
         buf.extend_from_slice(&[0u8; 8]); // reserved padding
-                                          // CPU
+
+        // CPU image v1/v2 prefix — preserved verbatim so v3 snapshots
+        // remain readable by any tool that knows the v1 layout.
         for r in &self.cpu.regs {
             buf.extend_from_slice(&r.to_le_bytes());
         }
@@ -172,13 +181,23 @@ impl Vm {
             None => 0xFF,
             Some(i) => i as u8,
         });
-        // 2 reserved CPU-state bytes so the block stays a round 36;
-        // future fields (TF, A20 gate, etc.) can land here without
-        // bumping the snapshot version.
+        // 2 reserved bytes — the v1/v2 layout always ended with these.
         buf.extend_from_slice(&[0u8; 2]);
+
+        // v3 CPU extension — upper-16 of each GPR + CR0 + GDTR + IDTR.
+        for h in &self.cpu.regs_high {
+            buf.extend_from_slice(&h.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.cpu.cr0.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.gdtr.limit.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.gdtr.base.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.idtr.limit.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.idtr.base.to_le_bytes());
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
-        // Devices (v2): length-prefixed records — see IoBus::snapshot.
+
+        // Devices (v2-style length-prefixed records — see IoBus::snapshot).
         let dev = self.io.snapshot();
         let dev_len = dev.len() as u32;
         buf.extend_from_slice(&dev_len.to_le_bytes());
@@ -192,24 +211,37 @@ impl Vm {
     /// whatever state they had before the call.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), snapshot::SnapshotError> {
         use snapshot::SnapshotError;
-        let min = snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE;
-        if bytes.len() < min {
+        if bytes.len() < snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE {
             return Err(SnapshotError::TooSmall {
                 got: bytes.len(),
-                need: min,
+                need: snapshot::HEADER_LEN + snapshot::CPU_LEN + Self::RAM_SIZE,
             });
         }
         if &bytes[..snapshot::MAGIC.len()] != snapshot::MAGIC {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if version != 1 && version != snapshot::VERSION {
+        if !matches!(version, 1..=3) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
+        // v3 CPU image is 32 bytes larger; revalidate min size.
+        if version == 3
+            && bytes.len() < snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE
+        {
+            return Err(SnapshotError::TooSmall {
+                got: bytes.len(),
+                need: snapshot::HEADER_LEN + snapshot::CPU_V3_LEN + Self::RAM_SIZE,
+            });
+        }
         let cpu_start = snapshot::HEADER_LEN;
-        let mem_start = cpu_start + snapshot::CPU_LEN;
-        // Decode CPU image into temporaries first so a malformed body
-        // can't half-overwrite live CPU state.
+        let cpu_len = if version == 3 {
+            snapshot::CPU_V3_LEN
+        } else {
+            snapshot::CPU_LEN
+        };
+        let mem_start = cpu_start + cpu_len;
+
+        // Decode v1/v2 prefix (always present in any version).
         let mut regs = [0u16; 8];
         for (i, r) in regs.iter_mut().enumerate() {
             *r = u16::from_le_bytes([bytes[cpu_start + i * 2], bytes[cpu_start + i * 2 + 1]]);
@@ -227,6 +259,40 @@ impl Vm {
             i if (i as usize) < 6 => Some(i as usize),
             _ => None,
         };
+
+        // v3 extension (regs_high, cr0, gdtr, idtr). For v1/v2 these
+        // come back at their defaults (zero / empty).
+        let mut regs_high = [0u16; 8];
+        let mut cr0: u32 = 0;
+        let mut gdtr = wwwvm_cpu::DescriptorTable::default();
+        let mut idtr = wwwvm_cpu::DescriptorTable::default();
+        if version == 3 {
+            let ext = cpu_start + snapshot::CPU_LEN;
+            for (i, h) in regs_high.iter_mut().enumerate() {
+                *h = u16::from_le_bytes([bytes[ext + i * 2], bytes[ext + i * 2 + 1]]);
+            }
+            cr0 = u32::from_le_bytes([
+                bytes[ext + 16],
+                bytes[ext + 17],
+                bytes[ext + 18],
+                bytes[ext + 19],
+            ]);
+            gdtr.limit = u16::from_le_bytes([bytes[ext + 20], bytes[ext + 21]]);
+            gdtr.base = u32::from_le_bytes([
+                bytes[ext + 22],
+                bytes[ext + 23],
+                bytes[ext + 24],
+                bytes[ext + 25],
+            ]);
+            idtr.limit = u16::from_le_bytes([bytes[ext + 26], bytes[ext + 27]]);
+            idtr.base = u32::from_le_bytes([
+                bytes[ext + 28],
+                bytes[ext + 29],
+                bytes[ext + 30],
+                bytes[ext + 31],
+            ]);
+        }
+
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
         self.mem
@@ -235,9 +301,8 @@ impl Vm {
                 expected,
                 actual: bytes.len() - mem_start,
             })?;
-        // v2: parse the device section right after the memory image.
-        // v1 snapshots have nothing here — devices stay fresh.
-        if version == 2 {
+        // Device section (v2 and v3). v1 snapshots have nothing here.
+        if version >= 2 {
             let dev_off = mem_start + Self::RAM_SIZE;
             if bytes.len() < dev_off + 4 {
                 return Err(SnapshotError::TooSmall {
@@ -257,20 +322,22 @@ impl Vm {
                     need: dev_off + 4 + dev_len,
                 });
             }
-            // Device blob is validated lazily by the IoBus; on error
-            // we surface it through MemorySizeMismatch's display so
-            // we don't have to grow SnapshotError's variants.
             self.io
                 .restore(&bytes[dev_off + 4..dev_off + 4 + dev_len])
                 .map_err(SnapshotError::DeviceRestore)?;
         }
-        // Now that validation passed, commit CPU state.
+
+        // Commit CPU state.
         self.cpu.regs = regs;
+        self.cpu.regs_high = regs_high;
         self.cpu.sregs = sregs;
         self.cpu.ip = ip;
         self.cpu.flags = flags;
         self.cpu.halted = halted;
         self.cpu.set_seg_override(seg_override);
+        self.cpu.cr0 = cr0;
+        self.cpu.gdtr = gdtr;
+        self.cpu.idtr = idtr;
         self.booted = true;
         Ok(())
     }
