@@ -139,7 +139,7 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
             let lba = (cyl * 2 + head) * 18 + sector;
             // Destination linear = ES.base + BX. read_r16(3) returns BX.
             let bx = cpu.read_r16(3);
-            let dest_linear = cpu.linear_seg(wwwvm_cpu::sreg::ES, bx);
+            let dest_linear = cpu.linear_seg(wwwvm_cpu::sreg::ES, bx as u32);
 
             let mut buf = vec![0u8; count * wwwvm_devices::DISK_SECTOR_SIZE];
             io.disk.read_sectors(lba, count as u8, &mut buf);
@@ -211,7 +211,7 @@ fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
 
     // Linear destination = ES:DI.
     let di = cpu.regs[wwwvm_cpu::r16::DI];
-    let dest = cpu.linear_seg(wwwvm_cpu::sreg::ES, di);
+    let dest = cpu.linear_seg(wwwvm_cpu::sreg::ES, di as u32);
 
     let base: u64 = 0;
     let length = mem.size() as u64;
@@ -451,7 +451,10 @@ impl Vm {
         for s in &self.cpu.sregs {
             buf.extend_from_slice(&s.to_le_bytes());
         }
-        buf.extend_from_slice(&self.cpu.ip.to_le_bytes());
+        // Snapshot still emits 16-bit IP for v1-v5 compatibility.
+        // The Cpu field is now u32; high bits get truncated on save
+        // (a future v6 layout widens this).
+        buf.extend_from_slice(&(self.cpu.ip as u16).to_le_bytes());
         buf.extend_from_slice(&self.cpu.flags.to_le_bytes());
         buf.push(self.cpu.halted as u8);
         buf.push(match self.cpu.seg_override() {
@@ -624,7 +627,7 @@ impl Vm {
         self.cpu.regs = regs;
         self.cpu.regs_high = regs_high;
         self.cpu.sregs = sregs;
-        self.cpu.ip = ip;
+        self.cpu.ip = ip as u32;
         self.cpu.flags = flags;
         self.cpu.halted = halted;
         self.cpu.set_seg_override(seg_override);

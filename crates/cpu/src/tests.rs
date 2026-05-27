@@ -2400,6 +2400,30 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// Verifies that the CPU's IP register is now 32-bit and can hold
+/// values above 0xFFFF — the prerequisite for jumping into a high-
+/// memory kernel image. We seed IP and CS:base manually, place a
+/// MOV AL,0x99; HLT at linear 0x12_3450, and let the fetch loop run.
+#[test]
+fn ip_register_is_32_bit_and_can_hold_addresses_above_64kib() {
+    let mut mem = Memory::new(0x0080_0000); // 8 MiB
+    mem.write_slice(0x12_3450, &[0xB0, 0x99, 0xF4]); // MOV AL,0x99; HLT
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    // CS cache base stays at 0; IP carries the full address.
+    cpu.ip = 0x0012_3450;
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0x99);
+    assert_eq!(cpu.ip, 0x0012_3453, "IP advanced past MOV+HLT");
+}
+
 /// 0x0F 0x44 — CMOVE r16, r/m16. Moves when ZF=1.
 #[test]
 fn cmove_moves_when_zf_set() {
