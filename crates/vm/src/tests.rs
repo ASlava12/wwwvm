@@ -1,5 +1,74 @@
 use super::*;
 
+/// INT 0x16 AH=0x00 (blocking read). With a key already queued, the
+/// single INT call must consume it and return it in AL.
+#[test]
+fn bios_int16_read_keystroke_returns_queued_byte() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.push_scancode(b'X');
+    // MOV AH, 0; INT 0x16; HLT
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB4, 0x00, 0xCD, 0x16, 0xF4]);
+    vm.boot();
+    let (_, stop) = vm.run_steps(16);
+    assert!(matches!(stop, Stop::Halted));
+    assert_eq!(vm.cpu().read_r8(0), b'X');
+}
+
+/// INT 0x16 AH=0x01 (check keystroke). When the queue is empty, ZF
+/// is set and AL is not loaded with anything meaningful. When a key
+/// is queued, ZF is clear and AL reflects the byte — without
+/// consuming it.
+#[test]
+fn bios_int16_check_keystroke_sets_zf_correctly() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // First sequence: no key, ZF must be set after INT.
+    //   MOV AH, 1; INT 0x16; HLT
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB4, 0x01, 0xCD, 0x16, 0xF4]);
+    vm.boot();
+    vm.run_steps(8);
+    assert_ne!(vm.cpu().flags & 0x40, 0, "ZF must be set for empty queue");
+
+    // Second sequence: push a key, run check again, expect ZF=0 and
+    // queue unchanged.
+    let mut vm2 = Vm::new();
+    vm2.install_bios();
+    vm2.push_scancode(b'Y');
+    vm2.load_image(BOOT_LOAD_ADDR, &[0xB4, 0x01, 0xCD, 0x16, 0xF4]);
+    vm2.boot();
+    vm2.run_steps(8);
+    assert_eq!(vm2.cpu().flags & 0x40, 0, "ZF must be clear when key waits");
+    assert_eq!(vm2.cpu().read_r8(0), b'Y');
+    // Queue still has the byte — AH=0x01 only peeks.
+    assert_eq!(vm2.io.kbd.rx_pending(), 1);
+}
+
+/// INT 0x16 AH=0x00 with no key must block by rewinding IP so the same
+/// INT re-executes next step. We run several steps with the queue
+/// empty (the CPU should keep landing back on `CD 16` without making
+/// progress), then push a key and run one more step. AL must end up
+/// with the byte.
+#[test]
+fn bios_int16_read_blocks_until_key_arrives() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // MOV AH, 0; INT 0x16; HLT
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB4, 0x00, 0xCD, 0x16, 0xF4]);
+    vm.boot();
+    // Spin: BIOS keeps rewinding past `CD 16`. The HLT should NOT
+    // have run yet because the INT hasn't consumed a key.
+    for _ in 0..20 {
+        vm.run_steps(1);
+    }
+    assert!(!vm.cpu().halted, "CPU must still be spinning on INT 0x16");
+
+    vm.push_scancode(b'Z');
+    let (_, stop) = vm.run_steps(8);
+    assert!(matches!(stop, Stop::Halted));
+    assert_eq!(vm.cpu().read_r8(0), b'Z');
+}
+
 /// load_elf_image() parses an ELF32 image and copies its PT_LOAD
 /// segments into memory. We craft a tiny ELF whose single segment is
 /// `MOV AL,'A'; HLT` at vaddr 0x7C00 (so a plain `boot()` lands the

@@ -50,6 +50,20 @@ impl Keyboard {
         self.queue.push_back(code);
     }
 
+    /// Drain the next queued byte. Used by the BIOS INT 0x16 shim;
+    /// port 0x60 reads also consume one byte (in the IO dispatch
+    /// path). Returns `None` when the queue is empty.
+    pub fn pop_scancode(&mut self) -> Option<u8> {
+        self.queue.pop_front()
+    }
+
+    /// Peek the next byte without consuming it. INT 0x16 AH=0x01
+    /// (check keystroke) uses this so the next read still sees the
+    /// same byte.
+    pub fn peek_scancode(&self) -> Option<u8> {
+        self.queue.front().copied()
+    }
+
     pub fn rx_pending(&self) -> usize {
         self.queue.len()
     }

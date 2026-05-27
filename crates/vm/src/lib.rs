@@ -49,6 +49,7 @@ pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) ->
     match vector {
         0x10 => bios_int10(cpu, mem),
         0x13 => bios_int13(cpu, mem, io),
+        0x16 => bios_int16(cpu, io),
         _ => false,
     }
 }
@@ -133,6 +134,45 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
             // Success: CF=0, AH=0. AL keeps the requested sector count.
             cpu.flags &= !wwwvm_cpu::flag::CF;
             cpu.write_r8(4, 0);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// INT 0x16 — keyboard services. We model:
+///
+///   * AH=0x00 — Read keystroke. Blocking on real BIOS; here we
+///     simulate the block by rewinding IP by 2 (back over the
+///     `CD 16` we just decoded) when the keyboard queue is empty,
+///     so the same INT re-executes next step. Once a byte is
+///     available, we pop it and return AH=AL=byte (we don't yet
+///     translate scan codes to ASCII).
+///   * AH=0x01 — Check for keystroke. Non-blocking: ZF=1 if queue
+///     empty, ZF=0 + AH/AL set (without popping) if a key waits.
+fn bios_int16(cpu: &mut Cpu, io: &mut IoBus) -> bool {
+    let ah = cpu.read_r8(4);
+    match ah {
+        0x00 => {
+            if io.kbd.rx_pending() == 0 {
+                // No key yet — rewind past `CD 16` so the next step
+                // retries. The IP is currently after the imm8.
+                cpu.ip = cpu.ip.wrapping_sub(2);
+            } else {
+                let byte = io.kbd.pop_scancode().unwrap_or(0);
+                cpu.write_r8(0, byte); // AL
+                cpu.write_r8(4, byte); // AH (scan code; we don't differentiate)
+            }
+            true
+        }
+        0x01 => {
+            if let Some(byte) = io.kbd.peek_scancode() {
+                cpu.flags &= !wwwvm_cpu::flag::ZF;
+                cpu.write_r8(0, byte);
+                cpu.write_r8(4, byte);
+            } else {
+                cpu.flags |= wwwvm_cpu::flag::ZF;
+            }
             true
         }
         _ => false,
