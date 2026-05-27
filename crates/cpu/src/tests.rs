@@ -2466,6 +2466,65 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0x34 — SYSENTER. WRMSR seeds IA32_SYSENTER_CS/ESP/EIP, then
+/// SYSENTER reloads CS:EIP and SS:ESP from them. Linux 2.6+ uses this
+/// for the fast syscall entry path.
+#[test]
+fn sysenter_loads_cs_eip_ss_esp_from_msrs() {
+    let mut mem = Memory::new(0x0010_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE; CS cache stays base 0 (selector 0) for the stub
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    // GDT[1] sel 0x08: flat code base=0 limit=0xFFFFF G=1 access=0x9A.
+    mem.write_slice(0x0508, &[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00]);
+    // GDT[2] sel 0x10: flat data base=0 access=0x92.
+    mem.write_slice(0x0510, &[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]);
+
+    // Boot stub at 0x7C00:
+    //   MOV ECX, 0x174 ; WRMSR (CS=0x08)
+    //   MOV ECX, 0x176 ; MOV EAX, 0x9000 ; WRMSR (EIP)
+    //   MOV ECX, 0x175 ; MOV EAX, 0x7_0000 ; WRMSR (ESP)
+    //   SYSENTER
+    // Build it programmatically to keep the encoding readable.
+    let mut boot: Vec<u8> = Vec::new();
+    // EAX=0x08, ECX=0x174, WRMSR
+    boot.extend_from_slice(&[0x66, 0xB8, 0x08, 0x00, 0x00, 0x00]); // MOV EAX,0x08
+    boot.extend_from_slice(&[0x66, 0xB9, 0x74, 0x01, 0x00, 0x00]); // MOV ECX,0x174
+    boot.extend_from_slice(&[0x0F, 0x30]); // WRMSR
+                                           // EAX=0x9000, ECX=0x176, WRMSR
+    boot.extend_from_slice(&[0x66, 0xB8, 0x00, 0x90, 0x00, 0x00]); // MOV EAX,0x9000
+    boot.extend_from_slice(&[0x66, 0xB9, 0x76, 0x01, 0x00, 0x00]); // MOV ECX,0x176
+    boot.extend_from_slice(&[0x0F, 0x30]); // WRMSR
+                                           // EAX=0x70000, ECX=0x175, WRMSR
+    boot.extend_from_slice(&[0x66, 0xB8, 0x00, 0x00, 0x07, 0x00]); // MOV EAX,0x70000
+    boot.extend_from_slice(&[0x66, 0xB9, 0x75, 0x01, 0x00, 0x00]); // MOV ECX,0x175
+    boot.extend_from_slice(&[0x0F, 0x30]); // WRMSR
+    boot.extend_from_slice(&[0x0F, 0x34]); // SYSENTER
+    mem.write_slice(0x7C00, &boot);
+
+    // Handler at 0x9000: MOV AL,0x77; HLT.
+    mem.write_slice(0x9000, &[0xB0, 0x77, 0xF4]);
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        cpu.read_r8(0),
+        0x77,
+        "SYSENTER must transfer to the handler"
+    );
+    assert_eq!(cpu.sregs[sreg::CS], 0x08);
+    assert_eq!(cpu.sregs[sreg::SS], 0x10);
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0007_0000);
+}
+
 /// 0x0F 0x1F — multi-byte NOP. Verifies the dispatch consumes the
 /// ModR/M (and disp here) without touching architectural state.
 #[test]

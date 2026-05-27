@@ -169,6 +169,12 @@ pub struct Cpu {
     pub fpu_sw: u16,
     /// FPU control word. Default 0x037F after FNINIT.
     pub fpu_cw: u16,
+    /// SYSENTER MSRs (IA32_SYSENTER_CS/ESP/EIP = 0x174/0x175/0x176).
+    /// SYSENTER loads CS:EIP and SS:ESP from these; SYSEXIT derives
+    /// the return selectors from `sysenter_cs`. Written via WRMSR.
+    pub sysenter_cs: u32,
+    pub sysenter_esp: u32,
+    pub sysenter_eip: u32,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -285,6 +291,9 @@ impl Cpu {
             tr: 0,
             fpu_sw: 0,
             fpu_cw: 0x037F,
+            sysenter_cs: 0,
+            sysenter_esp: 0,
+            sysenter_eip: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -327,6 +336,9 @@ impl Cpu {
         self.tr = 0;
         self.fpu_sw = 0;
         self.fpu_cw = 0x037F;
+        self.sysenter_cs = 0;
+        self.sysenter_esp = 0;
+        self.sysenter_eip = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
@@ -3769,17 +3781,53 @@ impl Cpu {
                     0x32 => {
                         let msr = self.read_r32(1); // ECX
                         let value: u64 = match msr {
-                            0x10 => self.tsc,    // IA32_TSC
-                            0x1B => 0xFEE0_0000, // IA32_APIC_BASE (canonical)
+                            0x10 => self.tsc,                  // IA32_TSC
+                            0x1B => 0xFEE0_0000,               // IA32_APIC_BASE
+                            0x174 => self.sysenter_cs as u64,  // IA32_SYSENTER_CS
+                            0x175 => self.sysenter_esp as u64, // IA32_SYSENTER_ESP
+                            0x176 => self.sysenter_eip as u64, // IA32_SYSENTER_EIP
                             _ => 0,
                         };
                         self.write_r32(0, value as u32);
                         self.write_r32(2, (value >> 32) as u32);
                     }
-                    // WRMSR — 0x0F 0x30. Write MSR. Stubbed (drop).
+                    // WRMSR — 0x0F 0x30. Write MSR named by ECX from
+                    // EDX:EAX. We persist the SYSENTER MSRs (the only
+                    // ones with read-back semantics SYSENTER relies on);
+                    // all others are dropped.
                     0x30 => {
-                        // No-op — neither side has any persistent MSR
-                        // state we'd want to update.
+                        let msr = self.read_r32(1); // ECX
+                        let lo = self.read_r32(0); // EAX
+                        match msr {
+                            0x174 => self.sysenter_cs = lo,
+                            0x175 => self.sysenter_esp = lo,
+                            0x176 => self.sysenter_eip = lo,
+                            _ => {}
+                        }
+                    }
+                    // SYSENTER — 0x0F 0x34. Fast ring-0 entry. Loads
+                    // CS:EIP from IA32_SYSENTER_CS / _EIP and SS:ESP
+                    // from CS+8 / _ESP. We don't model privilege rings,
+                    // so this is a straight segment+pointer reload.
+                    0x34 => {
+                        let cs_sel = (self.sysenter_cs & 0xFFFC) as u16;
+                        let ss_sel = cs_sel.wrapping_add(8);
+                        self.write_sreg(sreg::CS, cs_sel, mem);
+                        self.write_sreg(sreg::SS, ss_sel, mem);
+                        self.ip = self.sysenter_eip;
+                        let esp = self.sysenter_esp;
+                        self.write_r32(r16::SP as u8, esp);
+                    }
+                    // SYSEXIT — 0x0F 0x35. Return to ring 3. CS from
+                    // SYSENTER_CS+16, SS from +24; EIP=EDX, ESP=ECX.
+                    0x35 => {
+                        let cs_sel = ((self.sysenter_cs & 0xFFFC).wrapping_add(16)) as u16;
+                        let ss_sel = cs_sel.wrapping_add(8);
+                        self.write_sreg(sreg::CS, cs_sel, mem);
+                        self.write_sreg(sreg::SS, ss_sel, mem);
+                        self.ip = self.read_r32(2); // EDX
+                        let esp = self.read_r32(1); // ECX
+                        self.write_r32(r16::SP as u8, esp);
                     }
                     // Jcc rel16/rel32 — 0x0F 0x80..0x8F. Long-form
                     // conditional jump. Real-mode + no 0x66 = rel16;
