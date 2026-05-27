@@ -295,7 +295,9 @@ pub mod snapshot {
     /// * v6 — extends the CPU image with the fields added by the
     ///   32-bit-PM work: high 16 of IP (so EIP fully survives), CR4,
     ///   TSC, LDTR, TR, A20, and stack_size_32.
-    pub const VERSION: u8 = 6;
+    /// * v7 — appends FPU control/status words and the three
+    ///   IA32_SYSENTER MSRs (CS/ESP/EIP).
+    pub const VERSION: u8 = 7;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -319,6 +321,11 @@ pub mod snapshot {
     pub const CPU_V6_EXTRA: usize = 20;
     /// Total bytes a v6 CPU image takes.
     pub const CPU_V6_LEN: usize = CPU_V5_LEN + CPU_V6_EXTRA;
+    /// Extra bytes v7 adds: fpu_sw (2) + fpu_cw (2) + sysenter_cs (4)
+    /// + sysenter_esp (4) + sysenter_eip (4) = 16 bytes.
+    pub const CPU_V7_EXTRA: usize = 16;
+    /// Total bytes a v7 CPU image takes.
+    pub const CPU_V7_LEN: usize = CPU_V6_LEN + CPU_V7_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -443,7 +450,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V6_LEN + self.mem.size();
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V7_LEN + self.mem.size();
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -499,6 +506,13 @@ impl Vm {
         buf.push(self.cpu.a20 as u8);
         buf.push(self.cpu.stack_size_32 as u8);
 
+        // v7 CPU extension — FPU control/status + SYSENTER MSRs.
+        buf.extend_from_slice(&self.cpu.fpu_sw.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.fpu_cw.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.sysenter_cs.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.sysenter_esp.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.sysenter_eip.to_le_bytes());
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
@@ -527,10 +541,11 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=6) {
+        if !matches!(version, 1..=7) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
+            7 => snapshot::CPU_V7_LEN,
             6 => snapshot::CPU_V6_LEN,
             5 => snapshot::CPU_V5_LEN,
             4 => snapshot::CPU_V4_LEN,
@@ -641,6 +656,34 @@ impl Vm {
             a20 = bytes[ext + 18] != 0;
             stack_size_32 = bytes[ext + 19] != 0;
         }
+        let mut fpu_sw: u16 = 0;
+        let mut fpu_cw: u16 = 0x037F;
+        let mut sysenter_cs: u32 = 0;
+        let mut sysenter_esp: u32 = 0;
+        let mut sysenter_eip: u32 = 0;
+        if version >= 7 {
+            let ext = cpu_start + snapshot::CPU_V6_LEN;
+            fpu_sw = u16::from_le_bytes([bytes[ext], bytes[ext + 1]]);
+            fpu_cw = u16::from_le_bytes([bytes[ext + 2], bytes[ext + 3]]);
+            sysenter_cs = u32::from_le_bytes([
+                bytes[ext + 4],
+                bytes[ext + 5],
+                bytes[ext + 6],
+                bytes[ext + 7],
+            ]);
+            sysenter_esp = u32::from_le_bytes([
+                bytes[ext + 8],
+                bytes[ext + 9],
+                bytes[ext + 10],
+                bytes[ext + 11],
+            ]);
+            sysenter_eip = u32::from_le_bytes([
+                bytes[ext + 12],
+                bytes[ext + 13],
+                bytes[ext + 14],
+                bytes[ext + 15],
+            ]);
+        }
 
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
@@ -695,6 +738,11 @@ impl Vm {
         self.cpu.tr = tr;
         self.cpu.a20 = a20;
         self.cpu.stack_size_32 = stack_size_32;
+        self.cpu.fpu_sw = fpu_sw;
+        self.cpu.fpu_cw = fpu_cw;
+        self.cpu.sysenter_cs = sysenter_cs;
+        self.cpu.sysenter_esp = sysenter_esp;
+        self.cpu.sysenter_eip = sysenter_eip;
         // Re-derive seg_cache from the visible selectors. For real-
         // mode snapshots this is exact (cache = sel << 4). For a
         // future PM snapshot the cache values would diverge from

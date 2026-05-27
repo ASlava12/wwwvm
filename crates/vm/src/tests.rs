@@ -1311,11 +1311,12 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.cmos.read(0x71), 26);
 }
 
-/// v6 snapshot must round-trip the full architectural i386 state:
+/// v7 snapshot must round-trip the full architectural i386 state:
 /// CR0/2/3/4, GDTR, IDTR, full 32-bit IP, TSC, LDTR, TR, A20,
-/// stack_size_32, upper 16 of GPRs.
+/// stack_size_32, FPU control/status, SYSENTER MSRs, upper 16 of
+/// GPRs.
 #[test]
-fn snapshot_v6_preserves_i386_state() {
+fn snapshot_v7_preserves_i386_state() {
     let mut vm = Vm::new();
     vm.load_default_guest();
     vm.boot();
@@ -1338,9 +1339,14 @@ fn snapshot_v6_preserves_i386_state() {
     vm.cpu.stack_size_32 = true;
     vm.cpu.ip = 0xC010_0000;
     vm.cpu.regs_high[0] = 0xDEAD;
+    vm.cpu.fpu_cw = 0x027F;
+    vm.cpu.fpu_sw = 0x4000;
+    vm.cpu.sysenter_cs = 0x0008;
+    vm.cpu.sysenter_esp = 0x0007_0000;
+    vm.cpu.sysenter_eip = 0xC011_2233;
     let snap = vm.snapshot();
     let mut vm2 = Vm::new();
-    vm2.restore(&snap).expect("v6 restore");
+    vm2.restore(&snap).expect("v7 restore");
     assert_eq!(vm2.cpu().cr0, 0x8000_0001);
     assert_eq!(vm2.cpu().gdtr.limit, 0x00FF);
     assert_eq!(vm2.cpu().gdtr.base, 0x0001_0000);
@@ -1357,6 +1363,11 @@ fn snapshot_v6_preserves_i386_state() {
     assert_eq!(vm2.cpu().ip, 0xC010_0000);
     assert_eq!(vm2.cpu().regs_high[0], 0xDEAD);
     assert_eq!(vm2.cpu().read_r32(0) & 0xFFFF_0000, 0xDEAD_0000);
+    assert_eq!(vm2.cpu().fpu_cw, 0x027F);
+    assert_eq!(vm2.cpu().fpu_sw, 0x4000);
+    assert_eq!(vm2.cpu().sysenter_cs, 0x0008);
+    assert_eq!(vm2.cpu().sysenter_esp, 0x0007_0000);
+    assert_eq!(vm2.cpu().sysenter_eip, 0xC011_2233);
 }
 
 /// A v1 snapshot (synthesized by hand) must still restore the CPU
