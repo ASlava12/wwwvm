@@ -69,6 +69,80 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// End-to-end synthetic-bzImage boot. Combines:
+///
+///   1. `Vm::load_bzimage` — places setup at 0x90000 and the
+///      protected-mode payload at `code32_start` = 0x10_0000.
+///   2. A bootstrap stub at 0x7C00 that installs a flat code
+///      segment (GDT[1].base = code32_start), flips CR0.PE, and
+///      far-jumps to selector 0x08 / offset 0. With the descriptor
+///      base equal to the kernel address, the next fetch lands on
+///      the bzImage payload's first byte.
+///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
+///      asserts AL = 0xCD after the run.
+///
+/// The point: this is the final handoff a real Linux bzImage
+/// expects, exercised end-to-end on a binary that goes through the
+/// actual `load_bzimage` parser instead of a hand-crafted ELF.
+#[test]
+fn end_to_end_synthetic_bzimage_boots_kernel_at_code32_start() {
+    // Build the bzImage: 1024-byte setup blob + 3-byte payload.
+    let mut bz_bytes = vec![0u8; 1024];
+    bz_bytes[0x1F1] = 1; // setup_sects = 1 → payload at offset 1024
+    bz_bytes[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz_bytes[0x202..0x206].copy_from_slice(b"HdrS");
+    bz_bytes[0x206..0x208].copy_from_slice(&0x020Du16.to_le_bytes());
+    bz_bytes[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    bz_bytes.extend_from_slice(&[0xB0, 0xCD, 0xF4]); // MOV AL,0xCD; HLT
+
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    let bz = vm.load_bzimage(&bz_bytes).expect("bzImage load");
+    assert_eq!(bz.code32_start, 0x0010_0000);
+
+    // GDT + LGDT pseudo-descriptor (same layout as the earlier
+    // end_to_end_pm_kernel test). GDT[1] is flat code with base =
+    // code32_start, so a far-jump to selector 0x08 / IP=0 lands on
+    // the kernel.
+    vm.load_image(
+        0x0500,
+        &[
+            // LGDT pseudo-descriptor: limit (2) + base (4)
+            0x0F, 0x00, 0x08, 0x05, 0x00, 0x00, // pad to align GDT at 0x0508
+            0x00, 0x00, // GDT[0] = null
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // GDT[1] = code, base=0x0010_0000, limit=0xFFFF, access=0x9A
+            0xFF, 0xFF, 0x00, 0x00, 0x10, 0x9A, 0x00, 0x00,
+        ],
+    );
+
+    // Bootstrap at 0x7C00 — identical shape to the earlier PM test.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0x0F, 0x01, 0x16, 0x00, 0x05, // LGDT [0x0500]
+            0x0F, 0x20, 0xC0, // MOV EAX, CR0
+            0x83, 0xC8, 0x01, // OR  AX, 1
+            0x0F, 0x22, 0xC0, // MOV CR0, EAX
+            0xEA, 0x00, 0x00, 0x08, 0x00, // JMP FAR 0x08:0x0000
+            0xF4, // HLT (unreached)
+        ],
+    );
+
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted), "stop: {stop:?}");
+    assert_eq!(vm.cpu().cr0 & 1, 1);
+    assert_eq!(
+        vm.cpu().seg_cache[wwwvm_cpu::sreg::CS].base,
+        bz.code32_start
+    );
+    assert_eq!(
+        vm.cpu().read_r8(0),
+        0xCD,
+        "bzImage payload at code32_start must have executed"
+    );
+}
+
 /// `Vm::load_bzimage` parses a synthetic bzImage and places its setup
 /// blob at linear 0x90000 and its 32-bit payload at code32_start.
 /// We craft a minimal valid header with setup_sects=1 (so payload
