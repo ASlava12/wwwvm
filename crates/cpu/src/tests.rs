@@ -2466,6 +2466,51 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x85 — TEST r/m, r. `test ax, ax` sets ZF when AX is zero.
+#[test]
+fn test_rm16_r16_sets_zf_when_anding_to_zero() {
+    // MOV AX, 0 ; TEST AX, AX ; HLT  → ZF=1
+    let (cpu, _, _) = run_payload(&[0xB8, 0x00, 0x00, 0x85, 0xC0, 0xF4], 8);
+    assert!(cpu.has(flag::ZF));
+    // Non-zero case: MOV AX, 0x8000 ; TEST AX, AX → SF=1, ZF=0
+    let (cpu2, _, _) = run_payload(&[0xB8, 0x00, 0x80, 0x85, 0xC0, 0xF4], 8);
+    assert!(!cpu2.has(flag::ZF));
+    assert!(cpu2.has(flag::SF));
+}
+
+/// 0x66 0x85 — TEST r/m32, r32 with a value only visible in the
+/// high half proves the 32-bit width.
+#[test]
+fn test_rm32_r32_sees_high_half() {
+    // MOV EAX, 0x00010000 ; TEST EAX, EAX ; HLT → ZF=0 (high half set)
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x01, 0x00, // MOV EAX, 0x10000
+            0x66, 0x85, 0xC0, // TEST EAX, EAX
+            0xF4,
+        ],
+        12,
+    );
+    assert!(!cpu.has(flag::ZF), "high-half bit keeps ZF clear");
+}
+
+/// 0x66 0x87 — XCHG r/m32, r32 swaps full 32-bit registers.
+#[test]
+fn xchg_r32_r32_swaps_full_dwords() {
+    // MOV EAX, 0x11112222 ; MOV EBX, 0x33334444 ; XCHG EAX, EBX ; HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x22, 0x22, 0x11, 0x11, // MOV EAX, 0x11112222
+            0x66, 0xBB, 0x44, 0x44, 0x33, 0x33, // MOV EBX, 0x33334444
+            0x66, 0x87, 0xD8, // XCHG EAX, EBX (modrm 11 011 000 → reg=EBX rm=EAX)
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0x3333_4444);
+    assert_eq!(cpu.read_r32(3), 0x1111_2222);
+}
+
 /// 0x0F 0x34 — SYSENTER. WRMSR seeds IA32_SYSENTER_CS/ESP/EIP, then
 /// SYSENTER reloads CS:EIP and SS:ESP from them. Linux 2.6+ uses this
 /// for the fast syscall entry path.

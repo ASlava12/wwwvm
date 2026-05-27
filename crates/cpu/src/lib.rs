@@ -2171,6 +2171,27 @@ impl Cpu {
                 self.alu_dispatch(opcode, mem)?;
             }
 
+            // TEST r/m8, r8 — AND for flags only, no writeback.
+            0x84 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let result = self.read_rm8(rm, mem) & self.read_r8(reg);
+                self.flags_logic8(result);
+            }
+            // TEST r/m16, r16 — under 0x66 prefix becomes TEST r/m32,
+            // r32. `test eax, eax` (0x85 0xC0) is the canonical
+            // zero/sign check a compiler emits before a conditional
+            // branch, so this is one of the hottest opcodes in any
+            // kernel.
+            0x85 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if self.op_size_32 {
+                    let result = self.read_rm32(rm, mem) & self.read_r32(reg);
+                    self.flags_logic32(result);
+                } else {
+                    let result = self.read_rm16(rm, mem) & self.read_r16(reg);
+                    self.flags_logic16(result);
+                }
+            }
             // XCHG r/m8, r8 — swap byte operands.
             0x86 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
@@ -2179,13 +2200,20 @@ impl Cpu {
                 self.write_rm8(rm, mem, b);
                 self.write_r8(reg, a);
             }
-            // XCHG r/m16, r16 — swap word operands.
+            // XCHG r/m16, r16 — under 0x66 becomes XCHG r/m32, r32.
             0x87 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                let a = self.read_rm16(rm, mem);
-                let b = self.read_r16(reg);
-                self.write_rm16(rm, mem, b);
-                self.write_r16(reg, a);
+                if self.op_size_32 {
+                    let a = self.read_rm32(rm, mem);
+                    let b = self.read_r32(reg);
+                    self.write_rm32(rm, mem, b);
+                    self.write_r32(reg, a);
+                } else {
+                    let a = self.read_rm16(rm, mem);
+                    let b = self.read_r16(reg);
+                    self.write_rm16(rm, mem, b);
+                    self.write_r16(reg, a);
+                }
             }
 
             // MOV r/m8, r8 — direction = r/m
@@ -3311,11 +3339,19 @@ impl Cpu {
                 let result = self.read_r8(0) & imm;
                 self.flags_logic8(result);
             }
-            // TEST AX, imm16
+            // TEST AX, imm16 — under 0x66 becomes TEST EAX, imm32.
             0xA9 => {
-                let imm = self.fetch_u16(mem);
-                let result = self.read_r16(0) & imm;
-                self.flags_logic16(result);
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    let imm = lo | (hi << 16);
+                    let result = self.read_r32(0) & imm;
+                    self.flags_logic32(result);
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    let result = self.read_r16(0) & imm;
+                    self.flags_logic16(result);
+                }
             }
 
             0xEC => {
