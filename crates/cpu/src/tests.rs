@@ -1908,6 +1908,59 @@ fn pm_transition_idiom_sets_cr0_pe() {
     assert_eq!(cpu.cr0 & 1, 1);
 }
 
+/// PE=1 + a non-trivial GDT descriptor base must re-route every memory
+/// access that goes through the segment cache. We arrange the cache so
+/// the same DS selector (0x08) would read very different addresses in
+/// real mode (base = sel << 4 = 0x80) vs. PE (base = 0x4000), preload
+/// both candidates with distinct bytes, and verify MOV AL, [0x100]
+/// landed on the PE one.
+#[test]
+fn protected_mode_addressing_uses_descriptor_base_not_shift_by_four() {
+    let mut mem = Memory::new(0x10_0000);
+    // Code at boot CS:IP = 0000:7C00.
+    // MOV AL,[0x100]; HLT. Uses 0x8A /0 modrm=00 000 110 → [disp16].
+    mem.write_slice(0x7C00, &[0x8A, 0x06, 0x00, 0x01, 0xF4]);
+    // Real-mode-equivalent of DS=0x08 → 0x80 base. If addressing still
+    // went through (sel << 4) we'd read 0x42 from here.
+    mem.write_u8(0x0180, 0x42);
+    // PE descriptor base = 0x4000 → expected source is here.
+    mem.write_u8(0x4100, 0xAB);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    // GDT[1] at 0x0508: base=0x0000_4000, limit=0xFFFF, access=0x92.
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x40, // base 15:0
+            0x00, // base 23:16
+            0x92, // access
+            0x00, // limit 19:16 | flags
+            0x00, // base 31:24
+        ],
+    );
+    cpu.write_sreg(sreg::DS, 0x08, &mem);
+    assert_eq!(cpu.seg_cache[sreg::DS].base, 0x0000_4000);
+
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        cpu.read_r8(0),
+        0xAB,
+        "MOV AL,[0x100] must read from descriptor base 0x4000, not (sel << 4) = 0x80"
+    );
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {
