@@ -127,10 +127,14 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**158 тестов** зелёные (mem 6 + devices 29 + cpu 98 + vm 19 + wasm 1
-+ proxy 5). CI gates: `cargo fmt --check`, `cargo clippy --all-targets
--- -D warnings`, `cargo test --workspace --locked`. Throughput
-≈ 110 MIPS release (см. `cargo run --example throughput -p wwwvm-vm --release`).
+**160 тестов** зелёные (mem 6 + devices 29 + cpu 98 + vm 19 +
+tutorial-anchor 2 + wasm 1 + proxy 5). CI gates: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
+--locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
+throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
+`crates/vm/tests/tutorial_examples.rs` пин-fиксируют hex-байты из
+`docs/HAND_ASSEMBLY.md` — любое смещение между документацией и
+поведением VM ловит CI.
 
 ## Что НЕ работает (дорожная карта)
 
@@ -159,7 +163,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 cargo test --workspace
 ```
 
-Должно вывести 158 пройденных тестов на текущий момент. CI
+Должно вывести 160 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
