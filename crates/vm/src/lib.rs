@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bzimage;
 pub mod elf;
 
+pub use bzimage::{parse as parse_bzimage, BzImage, BzImageError};
 pub use elf::{load_elf, ElfError};
 use wwwvm_cpu::{Cpu, CpuError};
 use wwwvm_devices::IoBus;
