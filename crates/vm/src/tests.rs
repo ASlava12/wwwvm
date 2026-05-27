@@ -1311,14 +1311,14 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.cmos.read(0x71), 26);
 }
 
-/// v5 snapshot must round-trip i386 control state (CR0, GDTR, IDTR,
-/// CR3, CR2, upper 16 of GPRs).
+/// v6 snapshot must round-trip the full architectural i386 state:
+/// CR0/2/3/4, GDTR, IDTR, full 32-bit IP, TSC, LDTR, TR, A20,
+/// stack_size_32, upper 16 of GPRs.
 #[test]
-fn snapshot_v5_preserves_i386_state() {
+fn snapshot_v6_preserves_i386_state() {
     let mut vm = Vm::new();
     vm.load_default_guest();
     vm.boot();
-    // The tests module has crate-private access to Vm.cpu.
     vm.cpu.cr0 = 0x8000_0001;
     vm.cpu.gdtr = wwwvm_cpu::DescriptorTable {
         limit: 0x00FF,
@@ -1330,10 +1330,17 @@ fn snapshot_v5_preserves_i386_state() {
     };
     vm.cpu.cr3 = 0xCAFE_B000;
     vm.cpu.cr2 = 0xDEAD_FACE;
+    vm.cpu.cr4 = 0x0000_0020;
+    vm.cpu.tsc = 0x1234_5678_9ABC_DEF0;
+    vm.cpu.ldtr = 0x0048;
+    vm.cpu.tr = 0x0028;
+    vm.cpu.a20 = false;
+    vm.cpu.stack_size_32 = true;
+    vm.cpu.ip = 0xC010_0000;
     vm.cpu.regs_high[0] = 0xDEAD;
     let snap = vm.snapshot();
     let mut vm2 = Vm::new();
-    vm2.restore(&snap).expect("v5 restore");
+    vm2.restore(&snap).expect("v6 restore");
     assert_eq!(vm2.cpu().cr0, 0x8000_0001);
     assert_eq!(vm2.cpu().gdtr.limit, 0x00FF);
     assert_eq!(vm2.cpu().gdtr.base, 0x0001_0000);
@@ -1341,6 +1348,13 @@ fn snapshot_v5_preserves_i386_state() {
     assert_eq!(vm2.cpu().idtr.base, 0x0002_0000);
     assert_eq!(vm2.cpu().cr3, 0xCAFE_B000);
     assert_eq!(vm2.cpu().cr2, 0xDEAD_FACE);
+    assert_eq!(vm2.cpu().cr4, 0x0000_0020);
+    assert_eq!(vm2.cpu().tsc, 0x1234_5678_9ABC_DEF0);
+    assert_eq!(vm2.cpu().ldtr, 0x0048);
+    assert_eq!(vm2.cpu().tr, 0x0028);
+    assert!(!vm2.cpu().a20);
+    assert!(vm2.cpu().stack_size_32);
+    assert_eq!(vm2.cpu().ip, 0xC010_0000);
     assert_eq!(vm2.cpu().regs_high[0], 0xDEAD);
     assert_eq!(vm2.cpu().read_r32(0) & 0xFFFF_0000, 0xDEAD_0000);
 }

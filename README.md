@@ -128,7 +128,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 ### Качество
 
 **289 тестов** зелёные (mem 6 + devices 31 + cpu 188 + vm 56 +
-tutorial-anchor 2 + wasm 1 + proxy 5). CI gates: `cargo fmt --check`,
+tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v6.
+CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
 throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
