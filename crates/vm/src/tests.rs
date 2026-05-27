@@ -69,6 +69,92 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
+/// INT 0x15 AX=0xE820 — Linux setup uses this to discover usable
+/// RAM ranges. Our shim returns a single entry covering the whole
+/// VM RAM (base=0, length=mem.size(), type=1) and signals "no more
+/// entries" via EBX=0 on the first call.
+///
+/// Boot stub:
+///   MOV AX, 0xE820   ; B8 20 E8
+///   MOV EBX, 0       ; 66 BB 00 00 00 00
+///   MOV ECX, 20      ; 66 B9 14 00 00 00
+///   MOV EDX, "SMAP"  ; 66 BA 50 41 4D 53
+///   MOV DI, 0x3000   ; BF 00 30
+///   (ES already 0 from boot)
+///   INT 0x15         ; CD 15
+///   HLT              ; F4
+///
+/// Verifies the 20-byte buffer at 0x3000, EBX=0, ECX=20, AX="SMAP".
+#[test]
+fn bios_int15_e820_returns_single_ram_entry() {
+    let mut vm = Vm::with_ram_size(0x0200_0000); // 32 MiB
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x20, 0xE8, // MOV AX, 0xE820
+            0x66, 0xBB, 0x00, 0x00, 0x00, 0x00, // MOV EBX, 0
+            0x66, 0xB9, 0x14, 0x00, 0x00, 0x00, // MOV ECX, 20
+            0x66, 0xBA, 0x50, 0x41, 0x4D, 0x53, // MOV EDX, "SMAP"
+            0xBF, 0x00, 0x30, // MOV DI, 0x3000
+            0xCD, 0x15, // INT 0x15
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    let (_, stop) = vm.run_steps(64);
+    assert!(matches!(stop, Stop::Halted));
+
+    // base (u64) at 0x3000 = 0
+    for off in 0..8 {
+        assert_eq!(vm.read_mem_u8(0x3000 + off), 0, "base byte {off}");
+    }
+    // length (u64) at 0x3008 = 32 MiB = 0x0200_0000
+    let length_bytes = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+    for (off, &expected) in length_bytes.iter().enumerate() {
+        assert_eq!(
+            vm.read_mem_u8(0x3008 + off as u32),
+            expected,
+            "length byte {off}"
+        );
+    }
+    // type (u32) at 0x3010 = 1
+    assert_eq!(vm.read_mem_u8(0x3010), 1);
+    assert_eq!(vm.read_mem_u8(0x3011), 0);
+    assert_eq!(vm.read_mem_u8(0x3012), 0);
+    assert_eq!(vm.read_mem_u8(0x3013), 0);
+
+    // Returned register state.
+    assert_eq!(vm.cpu().read_r32(0), 0x534D_4150, "EAX = SMAP");
+    assert_eq!(vm.cpu().read_r32(1), 20, "ECX = 20");
+    assert_eq!(vm.cpu().read_r32(3), 0, "EBX = 0 (no more entries)");
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0, "CF clear");
+}
+
+/// A second E820 call with EBX != 0 must set CF=1 to signal "done".
+/// (Some loaders re-enter the loop and rely on CF as the terminator
+/// instead of EBX.)
+#[test]
+fn bios_int15_e820_with_nonzero_continuation_signals_done() {
+    let mut vm = Vm::with_ram_size(0x0010_0000);
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x20, 0xE8, // MOV AX, 0xE820
+            0x66, 0xBB, 0x01, 0x00, 0x00, 0x00, // MOV EBX, 1 (continuation)
+            0x66, 0xB9, 0x14, 0x00, 0x00, 0x00, // MOV ECX, 20
+            0xBF, 0x00, 0x30, // MOV DI, 0x3000
+            0xCD, 0x15, // INT 0x15
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    assert_ne!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0, "CF set");
+    assert_eq!(vm.cpu().read_r32(3), 0, "EBX cleared");
+}
+
 /// End-to-end synthetic-bzImage boot. Combines:
 ///
 ///   1. `Vm::load_bzimage` — places setup at 0x90000 and the

@@ -51,6 +51,7 @@ pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) ->
     match vector {
         0x10 => bios_int10(cpu, mem),
         0x13 => bios_int13(cpu, mem, io),
+        0x15 => bios_int15(cpu, mem),
         0x16 => bios_int16(cpu, io),
         _ => false,
     }
@@ -140,6 +141,72 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
         }
         _ => false,
     }
+}
+
+/// INT 0x15 — system services. We currently implement only one
+/// sub-function:
+///
+///   * AX=0xE820 — System Memory Map. Loops over E820 entries; on
+///     each call the kernel passes a 20-byte buffer at ES:DI, a
+///     continuation index in EBX (0 to start), the buffer size in
+///     ECX, and the signature "SMAP" in EDX. The BIOS writes one
+///     entry and updates EBX. EBX=0 on return means "this was the
+///     last entry".
+///
+/// Our model returns a single usable entry covering the VM's RAM
+/// — sufficient for kernels that just want to know how much memory
+/// they have, and consistent with how a flat physical address
+/// space looks.
+fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
+    let ax = cpu.regs[wwwvm_cpu::r16::AX];
+    if ax != 0xE820 {
+        return false;
+    }
+    // Validate "SMAP" signature in EDX. If the guest didn't set it
+    // we still service the call (some loaders skip it), but it's
+    // the canonical check Linux setup does.
+    let ebx = cpu.read_r32(3); // EBX
+    let ecx = cpu.read_r32(1); // ECX (buffer size)
+    if ecx < 20 {
+        // Buffer too small for a 20-byte entry. Set CF=1.
+        cpu.flags |= wwwvm_cpu::flag::CF;
+        return true;
+    }
+    if ebx != 0 {
+        // We only model one entry. Any nonzero continuation index
+        // means "we already returned the last one" — surface that
+        // by setting CF=1 and EBX=0.
+        cpu.flags |= wwwvm_cpu::flag::CF;
+        cpu.write_r32(3, 0);
+        return true;
+    }
+
+    // Linear destination = ES:DI.
+    let di = cpu.regs[wwwvm_cpu::r16::DI];
+    let dest = cpu.linear_seg(wwwvm_cpu::sreg::ES, di);
+
+    let base: u64 = 0;
+    let length = mem.size() as u64;
+    let entry_type: u32 = 1; // usable
+
+    // base (u64), length (u64), type (u32) — little-endian.
+    for i in 0..8 {
+        cpu.mem_write_u8(mem, dest + i, (base >> (i * 8)) as u8);
+    }
+    for i in 0..8 {
+        cpu.mem_write_u8(mem, dest + 8 + i, (length >> (i * 8)) as u8);
+    }
+    for i in 0..4 {
+        cpu.mem_write_u8(mem, dest + 16 + i, (entry_type >> (i * 8)) as u8);
+    }
+
+    // Returns: EAX = "SMAP", ECX = 20, EBX = 0 (no more entries),
+    // CF = 0.
+    cpu.write_r32(0, 0x534D_4150); // "SMAP"
+    cpu.write_r32(1, 20); // bytes returned
+    cpu.write_r32(3, 0); // continuation = 0 → no more
+    cpu.flags &= !wwwvm_cpu::flag::CF;
+    true
 }
 
 /// INT 0x16 — keyboard services. We model:
