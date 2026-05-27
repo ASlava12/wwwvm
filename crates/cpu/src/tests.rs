@@ -2400,6 +2400,68 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x0F 0x84 — JE rel16. Tests the long-form conditional jump.
+/// Uses a 16-bit relative offset that's bigger than the rel8 range
+/// (±127), so the short-form Jcc couldn't reach.
+#[test]
+fn je_rel16_conditional_long_jump() {
+    // Boot stub:
+    //   MOV AX, 1                  ; B8 01 00
+    //   CMP AX, 1                  ; 3D 01 00          (sets ZF)
+    //   JE rel16=+0x0200           ; 0F 84 00 02       (jump to IP + 0x200)
+    //   MOV AL, 0xEE; HLT          ; B0 EE F4          (fall-through; should NOT run)
+    // After fetching the full JE opcode+disp16 (4 bytes after the
+    // 6-byte prelude), IP sits at 0x7C0A. Target = 0x7C0A + 0x200.
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xB8, 0x01, 0x00, // MOV AX, 1
+            0x3D, 0x01, 0x00, // CMP AX, 1
+            0x0F, 0x84, 0x00, 0x02, // JE +0x200
+            0xB0, 0xEE, 0xF4, // fallthrough sentinel
+        ],
+    );
+    mem.write_slice(0x7E0A, &[0xB0, 0xCC, 0xF4]); // target
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0xCC, "JE must have taken the long branch");
+}
+
+/// 0x0F 0x85 — JNE rel16 when condition is false: must NOT jump.
+#[test]
+fn jne_rel16_not_taken_falls_through() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xB8, 0x01, 0x00, // MOV AX, 1
+            0x3D, 0x01, 0x00, // CMP AX, 1 (ZF=1, so JNE not taken)
+            0x0F, 0x85, 0x00, 0x02, // JNE +0x200
+            0xB0, 0xAB, 0xF4, // fallthrough (should run)
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0xAB);
+}
+
 /// Verifies that the CPU's IP register is now 32-bit and can hold
 /// values above 0xFFFF — the prerequisite for jumping into a high-
 /// memory kernel image. We seed IP and CS:base manually, place a

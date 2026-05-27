@@ -2995,6 +2995,25 @@ impl Cpu {
                             }
                         }
                     }
+                    // Jcc rel16/rel32 — 0x0F 0x80..0x8F. Long-form
+                    // conditional jump. Real-mode + no 0x66 = rel16;
+                    // 0x66 prefix = rel32. Linux uses the 32-bit form
+                    // pervasively because kernel functions span more
+                    // than the rel8 ±128-byte reach of the 0x70..7F
+                    // family.
+                    0x80..=0x8F => {
+                        let rel: i32 = if self.op_size_32 {
+                            let lo = self.fetch_u16(mem) as u32;
+                            let hi = self.fetch_u16(mem) as u32;
+                            (lo | (hi << 16)) as i32
+                        } else {
+                            self.fetch_u16(mem) as i16 as i32
+                        };
+                        if self.eval_cond(op2 & 0x0F) {
+                            self.ip = self.ip.wrapping_add(rel as u32);
+                        }
+                    }
+
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
                     // into the destination only if the condition
