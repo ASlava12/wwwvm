@@ -2278,6 +2278,65 @@ fn page_fault_dispatches_int14_and_latches_cr2() {
     );
 }
 
+/// 0x0F 0x22 /2 (MOV CR2, r32) and 0x0F 0x20 /2 (MOV r32, CR2) — used
+/// by a #PF handler to (re)write or read the faulting linear address.
+#[test]
+fn mov_cr2_round_trip_carries_full_32_bit_linear_address() {
+    // MOV EAX, 0xDEADC0DE  → 66 B8 imm32
+    // MOV CR2, EAX         → 0F 22 D0 (reg=2=CR2, rm=0=EAX)
+    // MOV EBX, CR2         → 0F 20 D3 (reg=2=CR2, rm=3=EBX)
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xDE, 0xC0, 0xAD, 0xDE, // MOV EAX, 0xDEADC0DE
+            0x0F, 0x22, 0xD0, // MOV CR2, EAX
+            0x0F, 0x20, 0xD3, // MOV EBX, CR2
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.cr2, 0xDEAD_C0DE);
+    assert_eq!(cpu.regs[r16::BX], 0xC0DE);
+    assert_eq!(cpu.regs_high[r16::BX], 0xDEAD);
+}
+
+/// A write that hits an unmapped page must flag the W bit in the #PF
+/// error code. Mirror of `translate_with_non_present_pde_raises_page_fault`
+/// but exercising `translate_write`.
+#[test]
+fn write_fault_sets_w_bit_in_error_code() {
+    let mut mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000;
+    cpu.cr3 = 0x0000_1000;
+    // PD empty -> any write faults.
+    cpu.mem_write_u8(&mut mem, 0x0040_1234, 0xFF);
+    let pf = cpu.pending_fault().expect("write must fault");
+    assert_eq!(pf.addr, 0x0040_1234);
+    assert_eq!(
+        pf.error_code & 0b10,
+        0b10,
+        "W bit set because the access was a write"
+    );
+    assert_eq!(pf.error_code & 1, 0, "P bit still clear (not present)");
+}
+
+/// Same setup as `write_fault_sets_w_bit_in_error_code` but a read —
+/// proves the W bit is zero for reads, so the two paths are not
+/// accidentally yoked together.
+#[test]
+fn read_fault_leaves_w_bit_clear() {
+    let mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000;
+    cpu.cr3 = 0x0000_1000;
+    let _ = cpu.mem_read_u8(&mem, 0x0040_1234);
+    let pf = cpu.pending_fault().expect("read must fault");
+    assert_eq!(pf.error_code & 0b10, 0, "W bit clear for read access");
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {

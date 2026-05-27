@@ -371,11 +371,25 @@ impl Cpu {
     ///   linear[11: 0] -> page offset
     /// ```
     ///
-    /// Not yet modelled (these become work for the page-fault tick):
-    /// the Present bit (P), Read/Write (R/W), User/Supervisor (U/S),
-    /// or a TLB. We assume every entry is present and writable.
-    /// 4 MiB pages (PSE) are also out of scope for the moment.
+    /// Not yet modelled: the R/W bit on the descriptor itself
+    /// (protection violations vs. plain not-present), User/Supervisor
+    /// (since we always run ring 0), and a TLB cache. 4 MiB pages
+    /// (PSE) are also out of scope.
+    ///
+    /// Defaults to a read access; writes go through `translate_write`
+    /// so the W bit in the #PF error code reflects the access type.
     pub fn translate(&self, mem: &Memory, linear: u32) -> u32 {
+        self.translate_inner(mem, linear, false)
+    }
+
+    /// Same as `translate` but tags the resulting #PF (if any) with
+    /// W=1 in the error code so the handler knows a write was the
+    /// trigger. Used by `mem_write_u8/16/32`.
+    pub fn translate_write(&self, mem: &Memory, linear: u32) -> u32 {
+        self.translate_inner(mem, linear, true)
+    }
+
+    fn translate_inner(&self, mem: &Memory, linear: u32, write: bool) -> u32 {
         if self.cr0 & 0x8000_0000 == 0 {
             return linear;
         }
@@ -384,17 +398,17 @@ impl Cpu {
         let page_offset = linear & 0xFFF;
         let pd_base = self.cr3 & 0xFFFF_F000;
         let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
-        // Present bit (bit 0) clear -> #PF with error code P=0. We
-        // don't yet distinguish read vs. write or supervisor vs. user
-        // — both stay zero. CR2 gets the faulting linear address.
+        let w_bit: u32 = if write { 0b10 } else { 0 };
+        // Present bit (bit 0) clear -> #PF with P=0. W bit reflects
+        // the access type. U/S stays zero (always supervisor for now).
         if pde & 1 == 0 {
-            self.raise_fault(linear, 0);
+            self.raise_fault(linear, w_bit);
             return 0;
         }
         let pt_base = pde & 0xFFFF_F000;
         let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
         if pte & 1 == 0 {
-            self.raise_fault(linear, 0);
+            self.raise_fault(linear, w_bit);
             return 0;
         }
         let frame = pte & 0xFFFF_F000;
@@ -438,7 +452,7 @@ impl Cpu {
     }
 
     pub fn mem_write_u8(&self, m: &mut Memory, linear: u32, value: u8) {
-        let phys = self.translate(m, linear);
+        let phys = self.translate_write(m, linear);
         m.write_u8(phys, value);
     }
 
@@ -2690,15 +2704,18 @@ impl Cpu {
                             }
                         }
                     }
-                    // MOV r32, CRn — 0x0F 0x20 /reg. CR0 and CR3 are
-                    // routed to the full 32-bit GPR (via write_r32) so
-                    // page-directory bases survive the round-trip.
+                    // MOV r32, CRn — 0x0F 0x20 /reg. CR0/CR2/CR3 routed
+                    // through the full 32-bit GPR (write_r32) so the
+                    // upper half of each control register survives.
+                    // The #PF handler reads CR2 here to learn which
+                    // linear address it must page in.
                     0x20 => {
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
                         let value = match reg {
                             0 => self.cr0,
+                            2 => self.cr2,
                             3 => self.cr3,
                             _ => {
                                 return Err(CpuError::Unimplemented {
@@ -2718,6 +2735,7 @@ impl Cpu {
                         let value = self.read_r32(rm);
                         match reg {
                             0 => self.cr0 = value,
+                            2 => self.cr2 = value,
                             3 => self.cr3 = value,
                             _ => {
                                 return Err(CpuError::Unimplemented {
