@@ -2426,6 +2426,101 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x67 prefix switches ModR/M to 32-bit addressing mode: rm
+/// fields name r32 registers, an optional SIB byte follows, and
+/// displacements are 8- or 32-bit. With a 32-bit operand size on
+/// top we can do `MOV EAX, [EBX]` — kernel-style.
+#[test]
+fn addressing_32_bit_mov_eax_from_ebx_deref() {
+    let mut mem = Memory::new(0x0010_0000);
+    // Place sentinel dword at 0x40000.
+    mem.write_u32(0x0004_0000, 0xCAFE_BABE);
+    // Boot stub at 0x7C00:
+    //   MOV EBX, 0x40000     (66 BB 00 00 04 00)
+    //   MOV EAX, [EBX]        (67 66 8B 03)
+    //     67: addr-size 32; 66: op-size 32; 8B: MOV r32, r/m32;
+    //     ModR/M 00 000 011 = mode=00 reg=AX rm=EBX (rm=3 → EBX).
+    //   HLT (F4)
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBB, 0x00, 0x00, 0x04, 0x00, 0x67, 0x66, 0x8B, 0x03, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0xBABE);
+    assert_eq!(cpu.regs_high[r16::AX], 0xCAFE);
+}
+
+/// 0x67 with mode=00 rm=5 → pure disp32. `MOV EAX, [0x12345]`.
+#[test]
+fn addressing_32_bit_disp32_only() {
+    let mut mem = Memory::new(0x0080_0000);
+    mem.write_u32(0x0001_2345, 0xDEAD_BEEF);
+    // 67 66 8B 05 45 23 01 00 ; MOV EAX, [0x12345]
+    // F4
+    mem.write_slice(
+        0x7C00,
+        &[0x67, 0x66, 0x8B, 0x05, 0x45, 0x23, 0x01, 0x00, 0xF4],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0xBEEF);
+    assert_eq!(cpu.regs_high[r16::AX], 0xDEAD);
+}
+
+/// SIB byte: `MOV EAX, [EBX + ECX*4]`. SIB scale=2 (×4), index=ECX,
+/// base=EBX. ModR/M with rm=4 introduces the SIB byte.
+#[test]
+fn addressing_32_bit_sib_base_index_scale() {
+    let mut mem = Memory::new(0x0010_0000);
+    mem.write_u32(0x0001_0010, 0x1234_5678);
+    // 66 BB 00 00 01 00       MOV EBX, 0x10000
+    // 66 B9 04 00 00 00       MOV ECX, 4         (so ECX*4 = 0x10)
+    // 67 66 8B 04 8B          MOV EAX, [EBX+ECX*4]
+    //   ModR/M = 00 000 100 = 0x04  (rm=4 → SIB follows)
+    //   SIB    = 10 001 011 = 0x8B  (scale=2 → ×4, index=ECX, base=EBX)
+    // F4
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBB, 0x00, 0x00, 0x01, 0x00, // MOV EBX, 0x10000
+            0x66, 0xB9, 0x04, 0x00, 0x00, 0x00, // MOV ECX, 4
+            0x67, 0x66, 0x8B, 0x04, 0x8B, // MOV EAX, [EBX+ECX*4]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0x5678);
+    assert_eq!(cpu.regs_high[r16::AX], 0x1234);
+}
+
 /// 0x66 0xE9 — JMP rel32. Under operand-size 0x66 the relative
 /// offset is 32-bit, so the jump can reach anywhere in the address
 /// space, not just ±32 KiB. We put the target at linear 0x00C0_0000

@@ -108,6 +108,12 @@ pub struct Cpu {
     /// so this means "32-bit operand" while set. Reset at the top
     /// of each `step()` just like `seg_override`.
     pub(crate) op_size_32: bool,
+    /// Address-size override for the current instruction. 0x67
+    /// prefix flips the default address size. With default 16-bit
+    /// addressing this means "32-bit address mode" — full r32
+    /// registers in ModR/M, optional SIB byte, disp32 instead of
+    /// disp16.
+    pub(crate) addr_size_32: bool,
     /// Control Register 0. On real x86 it's 32 bits; we store the
     /// full width but only bit 0 (PE — Protection Enable) and bit 31
     /// (PG — Paging) will gain semantic meaning once those modes
@@ -203,11 +209,15 @@ pub struct SegmentCache {
     pub access: u8,
 }
 
-/// Decoded 16-bit effective address: linear = (sregs[seg] << 4) + off.
+/// Decoded effective address: linear = seg_cache[seg].base + off.
+/// `off` is 32-bit so the same struct represents both 16-bit and
+/// 32-bit addressing modes. In 16-bit mode the upper half is zero;
+/// in 32-bit mode (0x67 prefix or in a 32-bit code segment) it
+/// carries the full computed displacement.
 #[derive(Copy, Clone, Debug)]
 pub struct EffAddr {
     pub seg: usize,
-    pub off: u16,
+    pub off: u32,
 }
 
 /// Either side of a ModR/M operand: register index or memory address.
@@ -234,6 +244,7 @@ impl Cpu {
             halted: false,
             seg_override: None,
             op_size_32: false,
+            addr_size_32: false,
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
@@ -653,7 +664,7 @@ impl Cpu {
     /// otherwise pick (SS for `[BP*]`, DS for everything else).
     fn compute_ea(&mut self, mode: u8, rm: u8, mem: &Memory) -> EffAddr {
         if mode == 0b00 && rm == 0b110 {
-            let off = self.fetch_u16(mem);
+            let off = self.fetch_u16(mem) as u32;
             let seg = self.seg_override.unwrap_or(sreg::DS);
             return EffAddr { seg, off };
         }
@@ -677,7 +688,77 @@ impl Cpu {
         let default_seg = if default_ss { sreg::SS } else { sreg::DS };
         EffAddr {
             seg: self.seg_override.unwrap_or(default_seg),
-            off: base.wrapping_add(disp),
+            off: base.wrapping_add(disp) as u32,
+        }
+    }
+
+    /// 32-bit ModR/M effective address. Decodes per the Intel SDM
+    /// "Addressing with 32-Bit Addresses" table. Notable differences
+    /// from 16-bit:
+    ///
+    ///   * `rm == 4` means a SIB byte follows (Scale-Index-Base).
+    ///   * `mode == 00 && rm == 5` means disp32 only (no base reg).
+    ///   * `mode == 01 && rm == 5` means [EBP + disp8], not [DI].
+    ///   * Displacements are 8- or 32-bit (not 16-bit).
+    ///
+    /// Default segment is DS unless the base reg is EBP/ESP (then SS).
+    fn compute_ea_32(&mut self, mode: u8, rm: u8, mem: &Memory) -> EffAddr {
+        if mode == 0b00 && rm == 0b101 {
+            // disp32 only.
+            let lo = self.fetch_u16(mem) as u32;
+            let hi = self.fetch_u16(mem) as u32;
+            let off = lo | (hi << 16);
+            let seg = self.seg_override.unwrap_or(sreg::DS);
+            return EffAddr { seg, off };
+        }
+        let (mut base, mut default_ss) = if rm == 0b100 {
+            // SIB byte.
+            let sib = self.fetch_u8(mem);
+            let scale = sib >> 6;
+            let index = (sib >> 3) & 0x07;
+            let base_reg = sib & 0x07;
+            // index == 4 means "no index". Other index values read
+            // the indicated r32 and scale it by 1/2/4/8.
+            let index_val = if index == 0b100 {
+                0u32
+            } else {
+                self.read_r32(index) << scale
+            };
+            let (base_val, ss) = if mode == 0b00 && base_reg == 0b101 {
+                // disp32 base, no register base.
+                let lo = self.fetch_u16(mem) as u32;
+                let hi = self.fetch_u16(mem) as u32;
+                (lo | (hi << 16), false)
+            } else {
+                let ss = base_reg == 0b100 || base_reg == 0b101;
+                (self.read_r32(base_reg), ss)
+            };
+            (base_val.wrapping_add(index_val), ss)
+        } else {
+            // Plain register base. mode==00 && rm==5 already
+            // returned above; here EBP forces SS.
+            let ss = rm == 0b101;
+            (self.read_r32(rm), ss)
+        };
+        let disp: u32 = match mode {
+            0b00 => 0,
+            0b01 => self.fetch_u8(mem) as i8 as i32 as u32,
+            0b10 => {
+                let lo = self.fetch_u16(mem) as u32;
+                let hi = self.fetch_u16(mem) as u32;
+                lo | (hi << 16)
+            }
+            _ => unreachable!("mode is 2 bits, caller filters 0b11"),
+        };
+        base = base.wrapping_add(disp);
+        // EBP with disp8/disp32 (mode != 00) still defaults to SS.
+        if mode != 0b00 && rm == 0b101 {
+            default_ss = true;
+        }
+        let default_seg = if default_ss { sreg::SS } else { sreg::DS };
+        EffAddr {
+            seg: self.seg_override.unwrap_or(default_seg),
+            off: base,
         }
     }
 
@@ -692,6 +773,8 @@ impl Cpu {
         let rm_field = byte & 0x07;
         let rm = if mode == 0b11 {
             Rm::Reg(rm_field)
+        } else if self.addr_size_32 {
+            Rm::Mem(self.compute_ea_32(mode, rm_field, mem))
         } else {
             Rm::Mem(self.compute_ea(mode, rm_field, mem))
         };
@@ -701,25 +784,25 @@ impl Cpu {
     fn read_rm8(&self, rm: Rm, mem: &Memory) -> u8 {
         match rm {
             Rm::Reg(i) => self.read_r8(i),
-            Rm::Mem(ea) => self.mem_read_u8(mem, self.linear_seg(ea.seg, ea.off as u32)),
+            Rm::Mem(ea) => self.mem_read_u8(mem, self.linear_seg(ea.seg, ea.off)),
         }
     }
     fn write_rm8(&mut self, rm: Rm, mem: &mut Memory, value: u8) {
         match rm {
             Rm::Reg(i) => self.write_r8(i, value),
-            Rm::Mem(ea) => self.mem_write_u8(mem, self.linear_seg(ea.seg, ea.off as u32), value),
+            Rm::Mem(ea) => self.mem_write_u8(mem, self.linear_seg(ea.seg, ea.off), value),
         }
     }
     fn read_rm16(&self, rm: Rm, mem: &Memory) -> u16 {
         match rm {
             Rm::Reg(i) => self.read_r16(i),
-            Rm::Mem(ea) => self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off as u32)),
+            Rm::Mem(ea) => self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off)),
         }
     }
     fn write_rm16(&mut self, rm: Rm, mem: &mut Memory, value: u16) {
         match rm {
             Rm::Reg(i) => self.write_r16(i, value),
-            Rm::Mem(ea) => self.mem_write_u16(mem, self.linear_seg(ea.seg, ea.off as u32), value),
+            Rm::Mem(ea) => self.mem_write_u16(mem, self.linear_seg(ea.seg, ea.off), value),
         }
     }
 
@@ -729,7 +812,7 @@ impl Cpu {
         match rm {
             Rm::Reg(i) => self.read_r32(i),
             Rm::Mem(ea) => {
-                let base = self.linear_seg(ea.seg, ea.off as u32);
+                let base = self.linear_seg(ea.seg, ea.off);
                 let lo = self.mem_read_u16(mem, base) as u32;
                 let hi = self.mem_read_u16(mem, base.wrapping_add(2)) as u32;
                 lo | (hi << 16)
@@ -743,7 +826,7 @@ impl Cpu {
         match rm {
             Rm::Reg(i) => self.write_r32(i, value),
             Rm::Mem(ea) => {
-                let base = self.linear_seg(ea.seg, ea.off as u32);
+                let base = self.linear_seg(ea.seg, ea.off);
                 self.mem_write_u16(mem, base, value as u16);
                 self.mem_write_u16(mem, base.wrapping_add(2), (value >> 16) as u16);
             }
@@ -1614,6 +1697,7 @@ impl Cpu {
         }
         self.seg_override = None;
         self.op_size_32 = false;
+        self.addr_size_32 = false;
         let op_cs = self.sregs[sreg::CS];
         let op_ip = self.ip;
         let opcode = loop {
@@ -1626,6 +1710,9 @@ impl Cpu {
                 // 0x66 — operand-size override. Flips default
                 // operand width from 16 to 32 for this instruction.
                 0x66 => self.op_size_32 = true,
+                // 0x67 — address-size override. Flips the ModR/M
+                // address decode from 16-bit to 32-bit (and SIB).
+                0x67 => self.addr_size_32 = true,
                 _ => break b,
             }
         };
@@ -1894,9 +1981,9 @@ impl Cpu {
                 match rm {
                     Rm::Mem(ea) => {
                         if self.op_size_32 {
-                            self.write_r32(reg, ea.off as u32);
+                            self.write_r32(reg, ea.off);
                         } else {
-                            self.write_r16(reg, ea.off);
+                            self.write_r16(reg, ea.off as u16);
                         }
                     }
                     Rm::Reg(_) => {
@@ -1949,10 +2036,10 @@ impl Cpu {
                         });
                     }
                 };
-                let base = self.linear_seg(ea.seg, ea.off as u32);
+                let base = self.linear_seg(ea.seg, ea.off);
                 let off_val = self.mem_read_u16(mem, base);
                 let seg_val =
-                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2) as u32));
+                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::ES, seg_val, mem);
                 let _ = base;
@@ -1971,9 +2058,9 @@ impl Cpu {
                         });
                     }
                 };
-                let off_val = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off as u32));
+                let off_val = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
                 let seg_val =
-                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2) as u32));
+                    self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::DS, seg_val, mem);
             }
@@ -2302,10 +2389,10 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off as u32));
+                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
                         let new_cs = self.mem_read_u16(
                             mem,
-                            self.linear_seg(ea.seg, ea.off.wrapping_add(2) as u32),
+                            self.linear_seg(ea.seg, ea.off.wrapping_add(2)),
                         );
                         let cs = self.sregs[sreg::CS];
                         self.push16(mem, cs);
@@ -2330,10 +2417,10 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off as u32));
+                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
                         let new_cs = self.mem_read_u16(
                             mem,
-                            self.linear_seg(ea.seg, ea.off.wrapping_add(2) as u32),
+                            self.linear_seg(ea.seg, ea.off.wrapping_add(2)),
                         );
                         self.write_sreg(sreg::CS, new_cs, mem);
                         self.ip = new_ip as u32;
@@ -2964,7 +3051,7 @@ impl Cpu {
                                 });
                             }
                         };
-                        let base_linear = self.linear_seg(ea.seg, ea.off as u32);
+                        let base_linear = self.linear_seg(ea.seg, ea.off);
                         // 6-byte pseudo-descriptor: limit u16 + base u32
                         let limit = self.mem_read_u16(mem, base_linear);
                         let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
