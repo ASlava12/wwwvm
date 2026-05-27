@@ -2959,6 +2959,85 @@ impl Cpu {
                             }
                         }
                     }
+                    // MOVZX r16/32, r/m8 — 0x0F 0xB6. Zero-extend a
+                    // byte into the dest. Under 0x66 dest is r32, else r16.
+                    0xB6 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_rm8(rm, mem);
+                        if self.op_size_32 {
+                            self.write_r32(reg, v as u32);
+                        } else {
+                            self.write_r16(reg, v as u16);
+                        }
+                    }
+                    // MOVZX r32, r/m16 — 0x0F 0xB7. Zero-extends a
+                    // word into a dword. (16-bit dest with 0x66 would
+                    // be a no-op MOV; we treat reg as r32 always.)
+                    0xB7 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_rm16(rm, mem);
+                        self.write_r32(reg, v as u32);
+                    }
+                    // MOVSX r16/32, r/m8 — 0x0F 0xBE. Sign-extend.
+                    0xBE => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_rm8(rm, mem) as i8;
+                        if self.op_size_32 {
+                            self.write_r32(reg, v as i32 as u32);
+                        } else {
+                            self.write_r16(reg, v as i16 as u16);
+                        }
+                    }
+                    // MOVSX r32, r/m16 — 0x0F 0xBF.
+                    0xBF => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_rm16(rm, mem) as i16;
+                        self.write_r32(reg, v as i32 as u32);
+                    }
+
+                    // SETcc r/m8 — 0x0F 0x90..0x9F. Writes 1 to the
+                    // 8-bit destination if the condition holds, 0
+                    // otherwise. Linux uses these for branchless
+                    // boolean conversions (`bool x = (a == b)`).
+                    0x90..=0x9F => {
+                        let (_, _, rm) = self.fetch_modrm(mem);
+                        let cond = self.eval_cond(op2 & 0x0F);
+                        self.write_rm8(rm, mem, if cond { 1 } else { 0 });
+                    }
+
+                    // XADD r/m8, r8 — 0x0F 0xC0. Atomic exchange-and-
+                    // add: dest, src = dest + src, dest (in that order
+                    // — the src register receives the old dest value).
+                    // Used by Linux atomic_add_return and refcount_inc.
+                    0xC0 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let dest = self.read_rm8(rm, mem);
+                        let src = self.read_r8(reg);
+                        let sum = dest.wrapping_add(src);
+                        self.flags_add8(dest, src, 0, sum);
+                        self.write_rm8(rm, mem, sum);
+                        self.write_r8(reg, dest);
+                    }
+                    // XADD r/m16/32, r16/32 — 0x0F 0xC1.
+                    0xC1 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if self.op_size_32 {
+                            let dest = self.read_rm32(rm, mem);
+                            let src = self.read_r32(reg);
+                            let sum = dest.wrapping_add(src);
+                            self.flags_add32(dest, src, 0, sum);
+                            self.write_rm32(rm, mem, sum);
+                            self.write_r32(reg, dest);
+                        } else {
+                            let dest = self.read_rm16(rm, mem);
+                            let src = self.read_r16(reg);
+                            let sum = dest.wrapping_add(src);
+                            self.flags_add16(dest, src, 0, sum);
+                            self.write_rm16(rm, mem, sum);
+                            self.write_r16(reg, dest);
+                        }
+                    }
+
                     // BSWAP r32 — 0x0F 0xC8..0xCF. Reverses byte
                     // order in a 32-bit register. Linux uses this
                     // for network byte-order conversions.

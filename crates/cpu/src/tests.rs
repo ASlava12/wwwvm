@@ -2400,6 +2400,60 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// 0x0F 0xB6 — MOVZX r16, r/m8. Zero-extends a byte to 16 bits.
+#[test]
+fn movzx_r16_rm8_zero_extends() {
+    // MOV BL, 0xFF; MOVZX AX, BL; HLT
+    let (cpu, _, _) = run_payload(&[0xB3, 0xFF, 0x0F, 0xB6, 0xC3, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 0x00FF);
+}
+
+/// 0x0F 0xBE — MOVSX r16, r/m8. Sign-extends a byte to 16 bits.
+#[test]
+fn movsx_r16_rm8_sign_extends_negative_byte() {
+    let (cpu, _, _) = run_payload(&[0xB3, 0xFF, 0x0F, 0xBE, 0xC3, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 0xFFFF);
+}
+
+/// 0x0F 0xB7 — MOVZX r32, r/m16.
+#[test]
+fn movzx_r32_rm16_zero_extends_high_half() {
+    let (cpu, _, _) = run_payload(&[0xBB, 0xFE, 0xCA, 0x0F, 0xB7, 0xC3, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 0xCAFE);
+    assert_eq!(cpu.regs_high[r16::AX], 0);
+}
+
+/// 0x0F 0x94 — SETE. Writes 1 when ZF=1, 0 when ZF=0.
+#[test]
+fn sete_writes_1_when_zf_set() {
+    let (cpu, _, _) = run_payload(
+        &[0xB8, 0x05, 0x00, 0x3D, 0x05, 0x00, 0x0F, 0x94, 0xC3, 0xF4],
+        12,
+    );
+    assert_eq!(cpu.read_r8(3), 1);
+}
+
+#[test]
+fn sete_writes_0_when_zf_clear() {
+    let (cpu, _, _) = run_payload(
+        &[0xB8, 0x05, 0x00, 0x3D, 0x06, 0x00, 0x0F, 0x94, 0xC3, 0xF4],
+        12,
+    );
+    assert_eq!(cpu.read_r8(3), 0);
+}
+
+/// 0x0F 0xC1 — XADD r/m16, r16. Atomic exchange-and-add.
+#[test]
+fn xadd_r16_swaps_and_adds() {
+    // MOV AX, 10 ; MOV BX, 3 ; XADD AX, BX ; HLT
+    let (cpu, _, _) = run_payload(
+        &[0xB8, 0x0A, 0x00, 0xBB, 0x03, 0x00, 0x0F, 0xC1, 0xD8, 0xF4],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 13);
+    assert_eq!(cpu.regs[r16::BX], 10);
+}
+
 /// 0x0F 0xC8 — BSWAP EAX. Reverses byte order in EAX. Linux uses
 /// this for converting between host and network byte order on
 /// 32-bit fields.
