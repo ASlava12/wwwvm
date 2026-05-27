@@ -87,6 +87,29 @@ pub struct Cpu {
     /// `0x26`/`0x2E`/`0x36`/`0x3E` prefix byte. Reads through
     /// `compute_ea` and string-op source addresses honor it.
     pub(crate) seg_override: Option<usize>,
+    /// Control Register 0. On real x86 it's 32 bits; we store the
+    /// full width but only bit 0 (PE — Protection Enable) and bit 31
+    /// (PG — Paging) will gain semantic meaning once those modes
+    /// are implemented. Real-mode code can already read/write it via
+    /// `MOV CR0, r` / `MOV r, CR0` (0x0F 0x22 / 0x0F 0x20).
+    pub cr0: u32,
+    /// GDT pseudo-descriptor: 16-bit limit + 32-bit base. Loaded by
+    /// `LGDT` (0x0F 0x01 /2). The CPU doesn't consult it yet — that
+    /// arrives with protected-mode segmentation.
+    pub gdtr: DescriptorTable,
+    /// IDT pseudo-descriptor — loaded by `LIDT` (0x0F 0x01 /3). In
+    /// real mode the IDT is fixed at linear 0 with 4-byte entries;
+    /// once we honor `gdtr` we'll also start using `idtr` for
+    /// protected-mode 8-byte IDT gates.
+    pub idtr: DescriptorTable,
+}
+
+/// 6-byte pseudo-descriptor loaded by LGDT/LIDT: 16-bit limit
+/// followed by 32-bit base.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DescriptorTable {
+    pub limit: u16,
+    pub base: u32,
 }
 
 /// Decoded 16-bit effective address: linear = (sregs[seg] << 4) + off.
@@ -118,6 +141,9 @@ impl Cpu {
             flags: 0,
             halted: false,
             seg_override: None,
+            cr0: 0,
+            gdtr: DescriptorTable::default(),
+            idtr: DescriptorTable::default(),
         }
     }
 
@@ -144,6 +170,9 @@ impl Cpu {
         self.flags = 0;
         self.halted = false;
         self.seg_override = None;
+        self.cr0 = 0;
+        self.gdtr = DescriptorTable::default();
+        self.idtr = DescriptorTable::default();
     }
 
     pub fn read_r8(&self, i: u8) -> u8 {
@@ -2143,6 +2172,97 @@ impl Cpu {
                 // fresh instruction here, but to keep one instruction
                 // per step() call we surface it as a no-op for now.
                 // The next step() will see whatever comes after.
+            }
+
+            // 0x0F — two-byte opcode escape. On the 8086 this byte is
+            // POP CS (undocumented and rarely useful); on the 80286+
+            // it became the prefix for the expanding "extended" opcode
+            // space that protected-mode and i386+ instructions live in.
+            // We dispatch on the second byte. Unknown second bytes are
+            // surfaced through CpuError::Unimplemented with that byte
+            // as the `opcode` field so error messages stay meaningful.
+            0x0F => {
+                let op2 = self.fetch_u8(mem);
+                match op2 {
+                    // Group 7 — LGDT, LIDT, SGDT, SIDT, SMSW, LMSW,
+                    // INVLPG depending on the ModR/M reg field.
+                    0x01 => {
+                        let (mode, sub, rm) = self.fetch_modrm(mem);
+                        let ea = match rm {
+                            Rm::Mem(ea) => ea,
+                            Rm::Reg(_) => {
+                                return Err(CpuError::UnimplementedModRm {
+                                    opcode: op2,
+                                    mode,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        let base_linear = Self::linear(self.sregs[ea.seg], ea.off);
+                        // 6-byte pseudo-descriptor: limit u16 + base u32
+                        let limit = mem.read_u16(base_linear);
+                        let base_lo = mem.read_u16(base_linear.wrapping_add(2));
+                        let base_hi = mem.read_u16(base_linear.wrapping_add(4));
+                        let base = (base_lo as u32) | ((base_hi as u32) << 16);
+                        match sub {
+                            2 => self.gdtr = DescriptorTable { limit, base }, // LGDT
+                            3 => self.idtr = DescriptorTable { limit, base }, // LIDT
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        }
+                    }
+                    // MOV r32, CRn — 0x0F 0x20 /reg. We don't have
+                    // 32-bit GPRs yet, so the low 16 bits of CRn land
+                    // in the r16 indicated by rm. The high 16 of CRn
+                    // are dropped for now (they're zero in any state
+                    // we currently reach anyway).
+                    0x20 => {
+                        let modrm = self.fetch_u8(mem);
+                        let reg = (modrm >> 3) & 0x07;
+                        let rm = modrm & 0x07;
+                        let value = match reg {
+                            0 => self.cr0,
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        self.write_r16(rm, value as u16);
+                    }
+                    // MOV CRn, r32 — 0x0F 0x22 /reg.
+                    0x22 => {
+                        let modrm = self.fetch_u8(mem);
+                        let reg = (modrm >> 3) & 0x07;
+                        let rm = modrm & 0x07;
+                        let value = self.read_r16(rm) as u32;
+                        match reg {
+                            0 => self.cr0 = value,
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode: op2,
+                            cs: op_cs,
+                            ip: op_ip,
+                        });
+                    }
+                }
             }
 
             _ => {

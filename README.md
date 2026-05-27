@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**160 тестов** зелёные (mem 6 + devices 29 + cpu 98 + vm 19 +
+**163 теста** зелёные (mem 6 + devices 29 + cpu 101 + vm 19 +
 tutorial-anchor 2 + wasm 1 + proxy 5). CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
@@ -143,7 +143,7 @@ throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
 
 | Шаг | Объём | Зачем |
 |-----|-------|-------|
-| Protected mode (CR0.PE, GDT, дескрипторы, IDT-gates) | большой | Любое современное ядро |
+| Protected mode (CR0.PE, GDT, дескрипторы, IDT-gates) | большой | Любое современное ядро. **В процессе**: CR0/GDTR/IDTR-регистры, опкоды `MOV CR0, r` / `MOV r, CR0`, `LGDT`/`LIDT` уже есть как stubs (значения сохраняются, ещё не используются) |
 | 32-бит (i386): operand/address-size префиксы 0x66/0x67, новые регистры EAX..EDI | большой | 32-битный код |
 | Long mode (x86_64), CR4/EFER, страничная трансляция 4 уровня | большой | 64-битные ядра |
 | Страничная трансляция (CR0.PG, CR3, PDE/PTE) | большой | Любое ядро использующее MMU |
@@ -163,7 +163,7 @@ throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
 cargo test --workspace
 ```
 
-Должно вывести 160 пройденных тестов на текущий момент. CI
+Должно вывести 163 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

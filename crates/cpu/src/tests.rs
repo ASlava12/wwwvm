@@ -1721,15 +1721,66 @@ fn aam_with_zero_base_raises_divide_error() {
 }
 
 #[test]
+fn mov_cr0_round_trip_through_ax() {
+    // MOV AX, CR0 → CR0 (=0) flows into AX. Set PE bit via OR AL, 1.
+    // MOV CR0, AX writes back. MOV BX, CR0 reads it again — both the
+    // BX register and cpu.cr0 should reflect bit 0 = 1.
+    //   0F 20 C0 — MOV AX, CR0   (ModR/M 11 000 000)
+    //   0F 22 C0 — MOV CR0, AX
+    //   0F 20 C3 — MOV BX, CR0   (rm = BX)
+    let (cpu, _, _) = run_payload(
+        &[
+            0x0F, 0x20, 0xC0, 0x0C, 0x01, 0x0F, 0x22, 0xC0, 0x0F, 0x20, 0xC3, 0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.cr0 & 0x0000_FFFF, 1);
+    assert_eq!(cpu.regs[r16::BX], 1);
+}
+
+#[test]
+fn lgdt_loads_gdt_descriptor_table_pseudo_register() {
+    // 6-byte pseudo-descriptor at 0x800: limit=0x00FF, base=0x0010_2030
+    // LGDT [SI] — 0x0F 0x01 /2, ModR/M = 00 010 100 = 0x14
+    let descriptor: &[u8] = &[0xFF, 0x00, 0x30, 0x20, 0x10, 0x00];
+    let (cpu, _, _) = run_with_data(
+        &[0xBE, 0x00, 0x08, 0x0F, 0x01, 0x14, 0xF4],
+        0x800,
+        descriptor,
+        8,
+    );
+    assert_eq!(cpu.gdtr.limit, 0x00FF);
+    assert_eq!(cpu.gdtr.base, 0x0010_2030);
+    assert_eq!(cpu.idtr, DescriptorTable::default());
+}
+
+#[test]
+fn lidt_loads_idt_descriptor_independently() {
+    let descriptor: &[u8] = &[0x7F, 0x03, 0xAB, 0xCD, 0xEF, 0x00];
+    // LIDT [SI] — 0x0F 0x01 /3, ModR/M = 00 011 100 = 0x1C
+    let (cpu, _, _) = run_with_data(
+        &[0xBE, 0x00, 0x08, 0x0F, 0x01, 0x1C, 0xF4],
+        0x800,
+        descriptor,
+        8,
+    );
+    assert_eq!(cpu.idtr.limit, 0x037F);
+    assert_eq!(cpu.idtr.base, 0x00EF_CDAB);
+    assert_eq!(cpu.gdtr, DescriptorTable::default());
+}
+
+#[test]
 fn unknown_opcode_reports_error() {
     let mut mem = Memory::new(0x10_0000);
-    mem.write_slice(0x7C00, &[0x0F]); // 0x0F = 2-byte opcode prefix, not supported
+    // 0x0F is now a real prefix. Use 0x0F + an unrecognised second
+    // byte to test the catch-all in the two-byte opcode space.
+    mem.write_slice(0x7C00, &[0x0F, 0x77]);
     let mut cpu = Cpu::new();
     cpu.reset_to_boot();
     let mut io = IoBus::new();
     let err = cpu.step(&mut mem, &mut io).unwrap_err();
     match err {
-        CpuError::Unimplemented { opcode: 0x0F, .. } => {}
+        CpuError::Unimplemented { opcode: 0x77, .. } => {}
         other => panic!("unexpected: {other:?}"),
     }
 }
