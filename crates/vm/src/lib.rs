@@ -35,7 +35,11 @@ pub mod snapshot {
     ///   each GPR (regs_high), CR0, GDTR, IDTR.
     /// * v4 — appends CR3 (4 bytes) past the v3 layout — needed once
     ///   paging is in use, since CR3 names the page directory.
-    pub const VERSION: u8 = 4;
+    /// * v5 — appends CR2 (4 bytes) past v4. CR2 holds the linear
+    ///   address of the last page fault; preserving it across save/
+    ///   restore lets a #PF handler see the address it was about to
+    ///   service.
+    pub const VERSION: u8 = 5;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -50,6 +54,10 @@ pub mod snapshot {
     pub const CPU_V4_EXTRA: usize = 4;
     /// Total bytes a v4 CPU image takes.
     pub const CPU_V4_LEN: usize = CPU_V3_LEN + CPU_V4_EXTRA;
+    /// Extra bytes v5 adds past v4: 4 (cr2 u32).
+    pub const CPU_V5_EXTRA: usize = 4;
+    /// Total bytes a v5 CPU image takes.
+    pub const CPU_V5_LEN: usize = CPU_V4_LEN + CPU_V5_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -164,7 +172,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V4_LEN + Self::RAM_SIZE;
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V5_LEN + Self::RAM_SIZE;
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -203,6 +211,9 @@ impl Vm {
         // v4 CPU extension — CR3 (page directory physical base).
         buf.extend_from_slice(&self.cpu.cr3.to_le_bytes());
 
+        // v5 CPU extension — CR2 (last page-fault linear address).
+        buf.extend_from_slice(&self.cpu.cr2.to_le_bytes());
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
@@ -230,10 +241,11 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=4) {
+        if !matches!(version, 1..=5) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
+            5 => snapshot::CPU_V5_LEN,
             4 => snapshot::CPU_V4_LEN,
             3 => snapshot::CPU_V3_LEN,
             _ => snapshot::CPU_LEN,
@@ -304,6 +316,11 @@ impl Vm {
             let ext = cpu_start + snapshot::CPU_V3_LEN;
             cr3 = u32::from_le_bytes([bytes[ext], bytes[ext + 1], bytes[ext + 2], bytes[ext + 3]]);
         }
+        let mut cr2: u32 = 0;
+        if version >= 5 {
+            let ext = cpu_start + snapshot::CPU_V4_LEN;
+            cr2 = u32::from_le_bytes([bytes[ext], bytes[ext + 1], bytes[ext + 2], bytes[ext + 3]]);
+        }
 
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
@@ -351,6 +368,7 @@ impl Vm {
         self.cpu.gdtr = gdtr;
         self.cpu.idtr = idtr;
         self.cpu.cr3 = cr3;
+        self.cpu.cr2 = cr2;
         // Re-derive seg_cache from the visible selectors. For real-
         // mode snapshots this is exact (cache = sel << 4). For a
         // future PM snapshot the cache values would diverge from

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use thiserror::Error;
 use wwwvm_devices::IoBus;
 use wwwvm_mem::Memory;
@@ -121,11 +122,38 @@ pub struct Cpu {
     /// `cr0 & 0x8000_0000` (PG). Loaded via `MOV CR3, r32` (0x0F 0x22
     /// /3) and read via `MOV r32, CR3` (0x0F 0x20 /3).
     pub cr3: u32,
+    /// Control Register 2 — written by the CPU on a page fault to
+    /// the linear address that triggered it. Software (the #PF
+    /// handler) reads it via `MOV r32, CR2` to figure out which
+    /// address to fix up. We don't model the MOV opcode yet — it
+    /// will be added when a guest needs it.
+    pub cr2: u32,
+    /// Set by `translate()` when a page walk hits a non-present
+    /// entry. Read at the end of each `step()`; if set, the CPU
+    /// dispatches INT 14 with the error code pushed on the stack,
+    /// sets CR2 to the faulting address, and clears the slot.
+    /// `Cell` so translate can flag a fault through `&self`.
+    pending_fault: Cell<Option<PageFault>>,
     /// Shadow descriptor cache for each segment register. The CPU
     /// addresses memory through `seg_cache[idx].base`, *not*
     /// `sregs[idx] << 4`, so once PM is on, the visible selector
     /// and the active translation base diverge — same as real x86.
     pub seg_cache: [SegmentCache; 6],
+}
+
+/// Page-fault payload built by `translate()`. The `error_code` follows
+/// the i386 #PF format documented in the Intel SDM:
+///   * bit 0 — P    (0 = not present, 1 = protection violation)
+///   * bit 1 — W/R  (1 = write attempt, 0 = read)
+///   * bit 2 — U/S  (1 = user mode, 0 = supervisor)
+///
+/// Bits 3+ stay zero until we model reserved-bit / instruction-fetch
+/// distinctions. `addr` is the linear address that triggered the
+/// fault — it'll be latched into CR2 when the exception is taken.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PageFault {
+    pub addr: u32,
+    pub error_code: u32,
 }
 
 /// 6-byte pseudo-descriptor loaded by LGDT/LIDT: 16-bit limit
@@ -185,6 +213,8 @@ impl Cpu {
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
             cr3: 0,
+            cr2: 0,
+            pending_fault: Cell::new(None),
             seg_cache: [SegmentCache::default(); 6],
         }
     }
@@ -217,6 +247,8 @@ impl Cpu {
         self.gdtr = DescriptorTable::default();
         self.idtr = DescriptorTable::default();
         self.cr3 = 0;
+        self.cr2 = 0;
+        self.pending_fault.set(None);
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
         // Since sregs reset to 0, base is 0 for everything.
         self.seg_cache = [SegmentCache {
@@ -352,10 +384,47 @@ impl Cpu {
         let page_offset = linear & 0xFFF;
         let pd_base = self.cr3 & 0xFFFF_F000;
         let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
+        // Present bit (bit 0) clear -> #PF with error code P=0. We
+        // don't yet distinguish read vs. write or supervisor vs. user
+        // — both stay zero. CR2 gets the faulting linear address.
+        if pde & 1 == 0 {
+            self.raise_fault(linear, 0);
+            return 0;
+        }
         let pt_base = pde & 0xFFFF_F000;
         let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
+        if pte & 1 == 0 {
+            self.raise_fault(linear, 0);
+            return 0;
+        }
         let frame = pte & 0xFFFF_F000;
         frame | page_offset
+    }
+
+    /// Record a pending #PF. `step()` consumes this at the top of the
+    /// next iteration; until then, the in-progress instruction's
+    /// memory accesses become benign reads from physical 0 (and
+    /// writes to physical 0). That's accepted skew vs. real x86,
+    /// which would abort the instruction outright — fine for now
+    /// because the only guests we currently run are tests that bring
+    /// down the CPU immediately after triggering a fault.
+    fn raise_fault(&self, addr: u32, error_code: u32) {
+        if self.pending_fault.get().is_none() {
+            self.pending_fault.set(Some(PageFault { addr, error_code }));
+        }
+    }
+
+    /// Inspect the pending page-fault slot without consuming it. The
+    /// test suite uses this to assert that translate() actually
+    /// flagged the fault; `step()` uses `take_pending_fault`.
+    pub fn pending_fault(&self) -> Option<PageFault> {
+        self.pending_fault.get()
+    }
+
+    /// Consume the pending page-fault, if any. Used by `step()` to
+    /// dispatch INT 14 after the faulting instruction returns.
+    fn take_pending_fault(&self) -> Option<PageFault> {
+        self.pending_fault.replace(None)
     }
 
     /// Paging-aware memory read. Returns the byte that lives at the
@@ -626,6 +695,17 @@ impl Cpu {
     /// pushing the caller's SS/SP, which we'll add when ring 3 user
     /// code shows up.
     fn do_interrupt(&mut self, n: u8, mem: &mut Memory) {
+        self.do_interrupt_with_error(n, None, mem);
+    }
+
+    /// Variant that also pushes an architectural error code below
+    /// the IP/CS/FLAGS frame. Used for INT 14 (#PF), INT 8 (#DF),
+    /// INT 10 (#TS), INT 11 (#NP), INT 12 (#SS), INT 13 (#GP). For
+    /// now we only emit #PF — the other vectors will reuse this
+    /// path as they come online. The error code is pushed as a 16-bit
+    /// word, which is the 16-bit-handler convention; a future 32-bit
+    /// handler path will widen to a 32-bit push.
+    fn do_interrupt_with_error(&mut self, n: u8, error_code: Option<u32>, mem: &mut Memory) {
         let (new_cs, new_ip) = if self.cr0 & 1 == 0 {
             let ivt_addr = (n as u32) * 4;
             (
@@ -649,6 +729,9 @@ impl Cpu {
         self.push16(mem, cs);
         let ip = self.ip;
         self.push16(mem, ip);
+        if let Some(ec) = error_code {
+            self.push16(mem, ec as u16);
+        }
         self.set_flag(flag::IF, false);
         // TF is not modeled yet — when it is, this is also where it
         // gets cleared.
@@ -1326,6 +1409,15 @@ impl Cpu {
     /// the override first.
     pub fn step(&mut self, mem: &mut Memory, io: &mut IoBus) -> Result<(), CpuError> {
         if self.halted {
+            return Ok(());
+        }
+        // A page fault flagged by the previous instruction's memory
+        // accesses takes priority over fresh work. Latch the linear
+        // address into CR2 and vector through INT 14, pushing the
+        // architectural error code below the IP/CS/FLAGS frame.
+        if let Some(pf) = self.take_pending_fault() {
+            self.cr2 = pf.addr;
+            self.do_interrupt_with_error(14, Some(pf.error_code), mem);
             return Ok(());
         }
         // External interrupt delivery — must come *before* fetch so an

@@ -2182,6 +2182,102 @@ fn paged_code_fetch_routes_through_page_tables() {
     );
 }
 
+/// A linear address whose PDE has Present=0 must raise #PF. We arm
+/// CR3, leave PDE[0] zeroed (P=0), then translate() and confirm the
+/// pending-fault slot got latched with the right linear address.
+#[test]
+fn translate_with_non_present_pde_raises_page_fault() {
+    let mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000;
+    cpu.cr3 = 0x0000_1000;
+    // PD at 0x1000 left entirely zero — PDE[0..1023] all have P=0.
+    let _ = cpu.translate(&mem, 0x0040_1234);
+    let pf = cpu.pending_fault().expect("translate must flag #PF");
+    assert_eq!(pf.addr, 0x0040_1234);
+    assert_eq!(
+        pf.error_code & 1,
+        0,
+        "P bit clear (not present) in error code"
+    );
+}
+
+/// PDE present, PTE not present. Same expectation, different stop in
+/// the walk.
+#[test]
+fn translate_with_non_present_pte_raises_page_fault() {
+    let mut mem = Memory::new(0x10_0000);
+    // PDE[0] -> PT at 0x2000, present.
+    mem.write_u32(0x1000, 0x0000_2000 | 0x01);
+    // PT entirely zero — every PTE has P=0.
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000;
+    cpu.cr3 = 0x0000_1000;
+    let _ = cpu.translate(&mem, 0x0000_0123);
+    let pf = cpu.pending_fault().expect("PTE fault must be latched");
+    assert_eq!(pf.addr, 0x0000_0123);
+}
+
+/// End-to-end: a load that touches an unmapped page must vector
+/// through INT 14 with CR2 set. We identity-map the first 4 MiB so
+/// the boot code, the IVT, and the #PF handler are all reachable,
+/// then poke a hole at PTE[0x10] (linear 0x10000-0x10FFF). The boot
+/// stub loads DS=0x1000 and does MOV AL,[0x100], so the operand
+/// linear becomes 0x10100 — the address inside the unmapped page.
+/// The handler at linear 0x9000 sets AH=0xFE and HLTs.
+#[test]
+fn page_fault_dispatches_int14_and_latches_cr2() {
+    let mut mem = Memory::new(0x10_0000);
+    // Boot stub at linear 0x7C00:
+    //   MOV AX, 0x1000   ; B8 00 10
+    //   MOV DS, AX       ; 8E D8
+    //   MOV AL, [0x100]  ; 8A 06 00 01  (DS:0x100 → linear 0x10100)
+    //   HLT              ; F4
+    mem.write_slice(
+        0x7C00,
+        &[0xB8, 0x00, 0x10, 0x8E, 0xD8, 0x8A, 0x06, 0x00, 0x01, 0xF4],
+    );
+    // PF handler at linear 0x9000: MOV AH, 0xFE; HLT.
+    mem.write_slice(0x9000, &[0xB4, 0xFE, 0xF4]);
+    // IVT entry for INT 14 (linear 14*4 = 0x38): IP=0x9000, CS=0x0000.
+    mem.write_u16(0x38, 0x9000);
+    mem.write_u16(0x3A, 0x0000);
+
+    // Page directory at 0x1000, page table at 0x2000. Identity-map
+    // the first 4 MiB, then knock PTE[0x10] (linear 0x10000-0x10FFF)
+    // unconditionally not-present.
+    mem.write_u32(0x1000, 0x0000_2000 | 0x03);
+    for i in 0..1024u32 {
+        mem.write_u32(0x2000 + i * 4, (i << 12) | 0x03);
+    }
+    mem.write_u32(0x2000 + 0x10 * 4, 0); // hole at PTE[0x10]
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // PG only
+    cpu.cr3 = 0x0000_1000;
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(4), 0xFE, "AH set by the #PF handler");
+    assert_eq!(
+        cpu.cr2, 0x0001_0100,
+        "CR2 latched the linear address inside the unmapped page"
+    );
+    assert!(
+        cpu.pending_fault().is_none(),
+        "fault must be consumed by dispatch"
+    );
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {
