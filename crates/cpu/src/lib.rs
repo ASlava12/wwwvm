@@ -2317,97 +2317,196 @@ impl Cpu {
             }
             0xF7 => {
                 let (_, sub, rm) = self.fetch_modrm(mem);
-                match sub {
-                    0 | 1 => {
-                        let imm = self.fetch_u16(mem);
-                        let v = self.read_rm16(rm, mem);
-                        let r = v & imm;
-                        self.flags_logic16(r);
-                    }
-                    2 => {
-                        let v = self.read_rm16(rm, mem);
-                        self.write_rm16(rm, mem, !v);
-                    }
-                    3 => {
-                        let v = self.read_rm16(rm, mem);
-                        let r = 0u16.wrapping_sub(v);
-                        self.flags_sub16(0, v, 0, r);
-                        self.write_rm16(rm, mem, r);
-                    }
-                    4 => {
-                        // MUL r/m16 — DX:AX = AX * r/m16 (unsigned)
-                        let v = self.read_rm16(rm, mem) as u32;
-                        let ax = self.regs[r16::AX] as u32;
-                        let result = ax.wrapping_mul(v);
-                        self.regs[r16::AX] = result as u16;
-                        self.regs[r16::DX] = (result >> 16) as u16;
-                        let upper_nonzero = self.regs[r16::DX] != 0;
-                        self.set_flag(flag::CF, upper_nonzero);
-                        self.set_flag(flag::OF, upper_nonzero);
-                    }
-                    5 => {
-                        // IMUL r/m16 — DX:AX = AX * r/m16 (signed)
-                        let v = self.read_rm16(rm, mem) as i16 as i32;
-                        let ax = self.regs[r16::AX] as i16 as i32;
-                        let result = ax.wrapping_mul(v);
-                        self.regs[r16::AX] = result as u16;
-                        self.regs[r16::DX] = (result >> 16) as u16;
-                        let sign_extended = (result as i16) as i32;
-                        let overflow = sign_extended != result;
-                        self.set_flag(flag::CF, overflow);
-                        self.set_flag(flag::OF, overflow);
-                    }
-                    6 => {
-                        // DIV r/m16 — AX = DX:AX / v (unsigned), DX = rem
-                        let v = self.read_rm16(rm, mem) as u32;
-                        if v == 0 {
-                            return Err(CpuError::DivideError {
+                if self.op_size_32 {
+                    // 32-bit forms: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV r/m32.
+                    match sub {
+                        0 | 1 => {
+                            let lo = self.fetch_u16(mem) as u32;
+                            let hi = self.fetch_u16(mem) as u32;
+                            let imm = lo | (hi << 16);
+                            let v = self.read_rm32(rm, mem);
+                            let r = v & imm;
+                            self.flags_logic32(r);
+                        }
+                        2 => {
+                            let v = self.read_rm32(rm, mem);
+                            self.write_rm32(rm, mem, !v);
+                        }
+                        3 => {
+                            let v = self.read_rm32(rm, mem);
+                            let r = 0u32.wrapping_sub(v);
+                            self.flags_sub32(0, v, 0, r);
+                            self.write_rm32(rm, mem, r);
+                        }
+                        4 => {
+                            // MUL r/m32 — EDX:EAX = EAX * r/m32 (unsigned)
+                            let v = self.read_rm32(rm, mem) as u64;
+                            let eax = self.read_r32(0) as u64;
+                            let result = eax.wrapping_mul(v);
+                            self.write_r32(0, result as u32);
+                            self.write_r32(2, (result >> 32) as u32);
+                            let upper_nonzero = (result >> 32) != 0;
+                            self.set_flag(flag::CF, upper_nonzero);
+                            self.set_flag(flag::OF, upper_nonzero);
+                        }
+                        5 => {
+                            // IMUL r/m32 — EDX:EAX = EAX * r/m32 (signed)
+                            let v = self.read_rm32(rm, mem) as i32 as i64;
+                            let eax = self.read_r32(0) as i32 as i64;
+                            let result = eax.wrapping_mul(v);
+                            self.write_r32(0, result as u32);
+                            self.write_r32(2, (result >> 32) as u32);
+                            let sign_extended = (result as i32) as i64;
+                            let overflow = sign_extended != result;
+                            self.set_flag(flag::CF, overflow);
+                            self.set_flag(flag::OF, overflow);
+                        }
+                        6 => {
+                            // DIV r/m32 — EAX = EDX:EAX / v, EDX = rem (unsigned)
+                            let v = self.read_rm32(rm, mem) as u64;
+                            if v == 0 {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            let dividend =
+                                ((self.read_r32(2) as u64) << 32) | self.read_r32(0) as u64;
+                            let q = dividend / v;
+                            let r = dividend % v;
+                            if q > 0xFFFF_FFFF {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            self.write_r32(0, q as u32);
+                            self.write_r32(2, r as u32);
+                        }
+                        7 => {
+                            // IDIV r/m32 — signed division of EDX:EAX by r/m32
+                            let v = self.read_rm32(rm, mem) as i32 as i64;
+                            if v == 0 {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            let dividend = (((self.read_r32(2) as u64) << 32)
+                                | self.read_r32(0) as u64)
+                                as i64;
+                            let q = dividend / v;
+                            let r = dividend % v;
+                            if !(i32::MIN as i64..=i32::MAX as i64).contains(&q) {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            self.write_r32(0, q as u32);
+                            self.write_r32(2, r as u32);
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
                                 cs: op_cs,
                                 ip: op_ip,
-                            });
+                            })
                         }
-                        let dividend =
-                            ((self.regs[r16::DX] as u32) << 16) | self.regs[r16::AX] as u32;
-                        let q = dividend / v;
-                        let r = dividend % v;
-                        if q > 0xFFFF {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
-                        }
-                        self.regs[r16::AX] = q as u16;
-                        self.regs[r16::DX] = r as u16;
                     }
-                    7 => {
-                        // IDIV r/m16 — signed division of DX:AX by r/m16
-                        let v = self.read_rm16(rm, mem) as i16 as i32;
-                        if v == 0 {
-                            return Err(CpuError::DivideError {
+                } else {
+                    match sub {
+                        0 | 1 => {
+                            let imm = self.fetch_u16(mem);
+                            let v = self.read_rm16(rm, mem);
+                            let r = v & imm;
+                            self.flags_logic16(r);
+                        }
+                        2 => {
+                            let v = self.read_rm16(rm, mem);
+                            self.write_rm16(rm, mem, !v);
+                        }
+                        3 => {
+                            let v = self.read_rm16(rm, mem);
+                            let r = 0u16.wrapping_sub(v);
+                            self.flags_sub16(0, v, 0, r);
+                            self.write_rm16(rm, mem, r);
+                        }
+                        4 => {
+                            // MUL r/m16 — DX:AX = AX * r/m16 (unsigned)
+                            let v = self.read_rm16(rm, mem) as u32;
+                            let ax = self.regs[r16::AX] as u32;
+                            let result = ax.wrapping_mul(v);
+                            self.regs[r16::AX] = result as u16;
+                            self.regs[r16::DX] = (result >> 16) as u16;
+                            let upper_nonzero = self.regs[r16::DX] != 0;
+                            self.set_flag(flag::CF, upper_nonzero);
+                            self.set_flag(flag::OF, upper_nonzero);
+                        }
+                        5 => {
+                            // IMUL r/m16 — DX:AX = AX * r/m16 (signed)
+                            let v = self.read_rm16(rm, mem) as i16 as i32;
+                            let ax = self.regs[r16::AX] as i16 as i32;
+                            let result = ax.wrapping_mul(v);
+                            self.regs[r16::AX] = result as u16;
+                            self.regs[r16::DX] = (result >> 16) as u16;
+                            let sign_extended = (result as i16) as i32;
+                            let overflow = sign_extended != result;
+                            self.set_flag(flag::CF, overflow);
+                            self.set_flag(flag::OF, overflow);
+                        }
+                        6 => {
+                            // DIV r/m16 — AX = DX:AX / v (unsigned), DX = rem
+                            let v = self.read_rm16(rm, mem) as u32;
+                            if v == 0 {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            let dividend =
+                                ((self.regs[r16::DX] as u32) << 16) | self.regs[r16::AX] as u32;
+                            let q = dividend / v;
+                            let r = dividend % v;
+                            if q > 0xFFFF {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            self.regs[r16::AX] = q as u16;
+                            self.regs[r16::DX] = r as u16;
+                        }
+                        7 => {
+                            // IDIV r/m16 — signed division of DX:AX by r/m16
+                            let v = self.read_rm16(rm, mem) as i16 as i32;
+                            if v == 0 {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            let dividend = (((self.regs[r16::DX] as u32) << 16)
+                                | self.regs[r16::AX] as u32)
+                                as i32;
+                            let q = dividend / v;
+                            let r = dividend % v;
+                            if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
+                                return Err(CpuError::DivideError {
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                            self.regs[r16::AX] = q as u16;
+                            self.regs[r16::DX] = r as u16;
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
                                 cs: op_cs,
                                 ip: op_ip,
-                            });
+                            })
                         }
-                        let dividend = (((self.regs[r16::DX] as u32) << 16)
-                            | self.regs[r16::AX] as u32)
-                            as i32;
-                        let q = dividend / v;
-                        let r = dividend % v;
-                        if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
-                        }
-                        self.regs[r16::AX] = q as u16;
-                        self.regs[r16::DX] = r as u16;
-                    }
-                    _ => {
-                        return Err(CpuError::Unimplemented {
-                            opcode,
-                            cs: op_cs,
-                            ip: op_ip,
-                        })
                     }
                 }
             }

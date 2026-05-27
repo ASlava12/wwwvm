@@ -2466,6 +2466,55 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x66 0xF7 /4 — MUL r/m32. EDX:EAX = EAX * r/m32 unsigned.
+#[test]
+fn mul_r32_unsigned_produces_64_bit_product_in_edx_eax() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x01, 0x00, // MOV EAX, 0x10000
+            0x66, 0xBB, 0x00, 0x00, 0x01, 0x00, // MOV EBX, 0x10000
+            0x66, 0xF7, 0xE3, // MUL EBX
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0);
+    assert_eq!(cpu.read_r32(2), 1);
+    assert!(cpu.has(flag::CF));
+}
+
+/// 0x66 0xF7 /6 — DIV r/m32. EAX = EDX:EAX / r/m32, EDX = rem.
+#[test]
+fn div_r32_unsigned_divides_64_bit_dividend() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // MOV EAX, 0
+            0x66, 0xBA, 0x01, 0x00, 0x00, 0x00, // MOV EDX, 1
+            0x66, 0xBB, 0x00, 0x00, 0x01, 0x00, // MOV EBX, 0x10000
+            0x66, 0xF7, 0xF3, // DIV EBX
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0x10000);
+    assert_eq!(cpu.read_r32(2), 0);
+}
+
+/// 0x66 0xF7 /3 — NEG r/m32.
+#[test]
+fn neg_r32_two_complements_dword() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x05, 0x00, 0x00, 0x00, // MOV EAX, 5
+            0x66, 0xF7, 0xD8, // NEG EAX
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0xFFFF_FFFB);
+    assert!(cpu.has(flag::CF));
+}
+
 /// 0x0F 0xBA /5 — BTS r/m16, imm8. Sets a bit, returns old in CF.
 #[test]
 fn bts_imm8_sets_bit_and_writes_cf_with_old_value() {
