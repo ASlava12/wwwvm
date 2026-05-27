@@ -3653,6 +3653,84 @@ impl Cpu {
                             }
                         }
                     }
+                    // 0x0F 0xAE — group with FXSAVE/FXRSTOR (when
+                    // mod != 11) and the fences/CLFLUSH (when
+                    // mod == 11 or for CLFLUSH /7). Decoded by both
+                    // the reg field and the mod bits.
+                    0xAE => {
+                        let modrm = self.fetch_u8(mem);
+                        let mode = modrm >> 6;
+                        let sub = (modrm >> 3) & 0x07;
+                        let rm_field = modrm & 0x07;
+                        // Fences and CLFLUSH-with-mod=11 use no memory.
+                        if mode == 0b11 {
+                            match sub {
+                                5..=7 => {
+                                    // LFENCE / MFENCE / SFENCE — all
+                                    // no-ops in our single-threaded model.
+                                }
+                                _ => {
+                                    return Err(CpuError::Unimplemented {
+                                        opcode: op2,
+                                        cs: op_cs,
+                                        ip: op_ip,
+                                    });
+                                }
+                            }
+                        } else {
+                            let ea = if self.addr_size_32 {
+                                self.compute_ea_32(mode, rm_field, mem)
+                            } else {
+                                self.compute_ea(mode, rm_field, mem)
+                            };
+                            let addr = self.linear_seg(ea.seg, ea.off);
+                            match sub {
+                                0 => {
+                                    // FXSAVE m512 — write 512 bytes
+                                    // of zeros. We don't model an FPU
+                                    // or SSE register file, so an all-
+                                    // zero save image is the truth.
+                                    for off in 0..512u32 {
+                                        self.mem_write_u8(mem, addr.wrapping_add(off), 0);
+                                    }
+                                }
+                                1 => {
+                                    // FXRSTOR m512 — read but discard
+                                    // 512 bytes. Touch the memory so
+                                    // an unmapped page faults the way
+                                    // a real FXRSTOR would.
+                                    for off in 0..512u32 {
+                                        let _ = self.mem_read_u8(mem, addr.wrapping_add(off));
+                                    }
+                                }
+                                2 | 3 => {
+                                    // LDMXCSR / STMXCSR — load/store
+                                    // the SSE control register. We
+                                    // don't track it yet; load is a
+                                    // no-op, store writes 0x1F80
+                                    // (the architectural default).
+                                    if sub == 3 {
+                                        self.mem_write_u8(mem, addr, 0x80);
+                                        self.mem_write_u8(mem, addr.wrapping_add(1), 0x1F);
+                                        self.mem_write_u8(mem, addr.wrapping_add(2), 0);
+                                        self.mem_write_u8(mem, addr.wrapping_add(3), 0);
+                                    }
+                                }
+                                7 => {
+                                    // CLFLUSH — flush cache line at
+                                    // EA. No cache modelled, so just
+                                    // consume the operand.
+                                }
+                                _ => {
+                                    return Err(CpuError::Unimplemented {
+                                        opcode: op2,
+                                        cs: op_cs,
+                                        ip: op_ip,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     // CLTS — 0x0F 0x06. Clear Task-Switched flag in
                     // CR0 (bit 3). Used by FPU context-switch code.
                     0x06 => self.cr0 &= !(1 << 3),

@@ -2466,6 +2466,43 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0xAE /0 — FXSAVE m512. Stub writes 512 zeros at EA.
+#[test]
+fn fxsave_writes_512_zero_bytes() {
+    let mut mem = Memory::new(0x10_0000);
+    // Pre-poison the region so we can see FXSAVE clear it.
+    for off in 0..512 {
+        mem.write_u8(0x2000 + off, 0xFF);
+    }
+    // FXSAVE [0x2000] — 0F AE 06 00 20 (mod=00 reg=0 rm=110 = 0x06 disp16)
+    mem.write_slice(0x7C00, &[0x0F, 0xAE, 0x06, 0x00, 0x20, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    for off in 0..512 {
+        assert_eq!(
+            mem.read_u8(0x2000 + off),
+            0,
+            "FXSAVE must zero offset {off}"
+        );
+    }
+}
+
+/// 0x0F 0xAE /6 with mod=11 — MFENCE no-op.
+#[test]
+fn mfence_runs_as_noop() {
+    // MFENCE — 0F AE F0 (modrm 11 110 000)
+    let (cpu, _, _) = run_payload(&[0x0F, 0xAE, 0xF0, 0xF4], 8);
+    assert!(cpu.halted);
+}
+
 /// FNINIT + FNSTSW AX — Linux probes the FPU's existence with this
 /// pair. After FNINIT the status word is 0 and FNSTSW must copy it
 /// into AX. The "FPU present" check is `(AX & 0xB8FF) == 0`.
