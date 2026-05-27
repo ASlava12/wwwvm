@@ -1779,6 +1779,56 @@ fn operand_size_prefix_resets_after_one_instruction() {
     assert_eq!(cpu.read_r32(3), 0xDEAD_1234);
 }
 
+/// 0x66 0x0D imm32 → OR EAX, imm32 (variant 5 under 0x66). The
+/// canonical "set CR0.PE bit" pre-step uses this.
+#[test]
+fn or_eax_imm32_sets_target_bit() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // MOV EAX, 0
+            0x66, 0x0D, 0x01, 0x00, 0x00, 0x00, // OR EAX, 1
+            0xF4,
+        ],
+        4,
+    );
+    assert_eq!(cpu.read_r32(0), 1);
+    assert!(!cpu.has(flag::ZF));
+}
+
+/// ADD r32, r32 — variant 1 (0x01 /r) under 0x66. Carry crossing
+/// the 16-bit boundary should not set CF.
+#[test]
+fn add_r32_r32_with_operand_size_prefix() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xFF, 0xFF, 0x00, 0x00, // MOV EAX, 0x0000_FFFF
+            0x66, 0xBB, 0x01, 0x00, 0x00, 0x00, // MOV EBX, 0x0000_0001
+            0x66, 0x01, 0xD8, // ADD EAX, EBX (modrm 11 011 000)
+            0xF4,
+        ],
+        8,
+    );
+    assert_eq!(cpu.read_r32(0), 0x0001_0000);
+    assert!(!cpu.has(flag::CF));
+    assert!(!cpu.has(flag::ZF));
+}
+
+/// PM-transition idiom: `MOV EAX, CR0 ; OR EAX, 1 ; MOV CR0, EAX`.
+/// Sets CR0.PE — the actual real-mode → protected-mode transition.
+#[test]
+fn pm_transition_idiom_sets_cr0_pe() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x0F, 0x20, 0xC0, // MOV EAX, CR0
+            0x66, 0x0D, 0x01, 0x00, 0x00, 0x00, // OR EAX, 1
+            0x0F, 0x22, 0xC0, // MOV CR0, EAX
+            0xF4,
+        ],
+        8,
+    );
+    assert_eq!(cpu.cr0 & 1, 1);
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {

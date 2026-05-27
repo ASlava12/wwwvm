@@ -284,6 +284,14 @@ impl Cpu {
         self.set_flag(flag::OF, false);
     }
 
+    fn flags_logic32(&mut self, result: u32) {
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x8000_0000 != 0);
+        self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
+        self.set_flag(flag::CF, false);
+        self.set_flag(flag::OF, false);
+    }
+
     fn flags_add8(&mut self, a: u8, b: u8, cin: u8, result: u8) {
         let sum = a as u16 + b as u16 + cin as u16;
         self.set_flag(flag::CF, sum > 0xFF);
@@ -302,6 +310,15 @@ impl Cpu {
         self.set_flag(flag::OF, ((a ^ result) & (b ^ result) & 0x8000) != 0);
     }
 
+    fn flags_add32(&mut self, a: u32, b: u32, cin: u32, result: u32) {
+        let sum = a as u64 + b as u64 + cin as u64;
+        self.set_flag(flag::CF, sum > 0xFFFF_FFFF);
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x8000_0000 != 0);
+        self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
+        self.set_flag(flag::OF, ((a ^ result) & (b ^ result) & 0x8000_0000) != 0);
+    }
+
     fn flags_sub8(&mut self, a: u8, b: u8, bin: u8, result: u8) {
         let borrow = (a as i16) - (b as i16) - (bin as i16);
         self.set_flag(flag::CF, borrow < 0);
@@ -318,6 +335,15 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x8000 != 0);
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x8000) != 0);
+    }
+
+    fn flags_sub32(&mut self, a: u32, b: u32, bin: u32, result: u32) {
+        let borrow = (a as i64) - (b as i64) - (bin as i64);
+        self.set_flag(flag::CF, borrow < 0);
+        self.set_flag(flag::ZF, result == 0);
+        self.set_flag(flag::SF, result & 0x8000_0000 != 0);
+        self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
+        self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x8000_0000) != 0);
     }
 
     /// Decode a 16-bit ModR/M effective address. `mode` must be 0b00,
@@ -399,9 +425,22 @@ impl Cpu {
         }
     }
 
+    /// Read 32-bit value through an `Rm`. Memory dword = two 16-bit
+    /// reads at `off` and `off+2`.
+    fn read_rm32(&self, rm: Rm, mem: &Memory) -> u32 {
+        match rm {
+            Rm::Reg(i) => self.read_r32(i),
+            Rm::Mem(ea) => {
+                let base = Self::linear(self.sregs[ea.seg], ea.off);
+                let lo = mem.read_u16(base) as u32;
+                let hi = mem.read_u16(base.wrapping_add(2)) as u32;
+                lo | (hi << 16)
+            }
+        }
+    }
+
     /// Write 32-bit value through an `Rm`. Memory dword = two 16-bit
-    /// writes at `off` and `off+2`. Symmetric `read_rm32` will land
-    /// in the next iteration when r/m32-source MOVs need it.
+    /// writes at `off` and `off+2`.
     fn write_rm32(&mut self, rm: Rm, mem: &mut Memory, value: u32) {
         match rm {
             Rm::Reg(i) => self.write_r32(i, value),
@@ -922,6 +961,60 @@ impl Cpu {
         }
     }
 
+    /// 32-bit version of `alu_apply16`. Identical structure with
+    /// u32 operands and 32-bit flag helpers — the boilerplate is
+    /// unavoidable until the helpers move behind a generic.
+    fn alu_apply32(&mut self, op: u8, a: u32, b: u32) -> (u32, bool) {
+        let cin: u32 = if (op == 2 || op == 3) && self.has(flag::CF) {
+            1
+        } else {
+            0
+        };
+        match op {
+            0 => {
+                let r = a.wrapping_add(b);
+                self.flags_add32(a, b, 0, r);
+                (r, true)
+            }
+            1 => {
+                let r = a | b;
+                self.flags_logic32(r);
+                (r, true)
+            }
+            2 => {
+                let r = a.wrapping_add(b).wrapping_add(cin);
+                self.flags_add32(a, b, cin, r);
+                (r, true)
+            }
+            3 => {
+                let r = a.wrapping_sub(b).wrapping_sub(cin);
+                self.flags_sub32(a, b, cin, r);
+                (r, true)
+            }
+            4 => {
+                let r = a & b;
+                self.flags_logic32(r);
+                (r, true)
+            }
+            5 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub32(a, b, 0, r);
+                (r, true)
+            }
+            6 => {
+                let r = a ^ b;
+                self.flags_logic32(r);
+                (r, true)
+            }
+            7 => {
+                let r = a.wrapping_sub(b);
+                self.flags_sub32(a, b, 0, r);
+                (r, false)
+            }
+            _ => unreachable!("op is 3 bits"),
+        }
+    }
+
     /// Execute one of the 8 standard ALU operations encoded in opcode
     /// 0x00..0x3F. `op` is the operation (0=ADD … 7=CMP) and `variant`
     /// (opcode & 7) selects operand form. Supports all 16-bit ModR/M
@@ -931,17 +1024,21 @@ impl Cpu {
         let op = (opcode >> 3) & 7;
         let variant = opcode & 7;
 
-        // Resolve operands per variant. After this block we have:
-        //   a, b        the two values (a is the destination side)
-        //   dest        where to write the result (None = imm form)
-        //   is_word     8-bit vs 16-bit
+        // OperandSize picks the width for this ALU dispatch. Byte
+        // for variants 0/2/4; Word/Dword for 1/3/5 depending on the
+        // 0x66 operand-size prefix.
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum Sz {
+            B,
+            W,
+            D,
+        }
         #[derive(Copy, Clone)]
         enum Dest {
             Rm(Rm),
-            Reg8(u8),
-            Reg16(u8),
+            Reg(u8),
         }
-        let is_word: bool;
+        let sz: Sz;
         let a: u32;
         let b: u32;
         let dest: Dest;
@@ -951,60 +1048,86 @@ impl Cpu {
                 a = self.read_rm8(rm, mem) as u32;
                 b = self.read_r8(reg) as u32;
                 dest = Dest::Rm(rm);
-                is_word = false;
+                sz = Sz::B;
             }
             1 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                a = self.read_rm16(rm, mem) as u32;
-                b = self.read_r16(reg) as u32;
+                if self.op_size_32 {
+                    a = self.read_rm32(rm, mem);
+                    b = self.read_r32(reg);
+                    sz = Sz::D;
+                } else {
+                    a = self.read_rm16(rm, mem) as u32;
+                    b = self.read_r16(reg) as u32;
+                    sz = Sz::W;
+                }
                 dest = Dest::Rm(rm);
-                is_word = true;
             }
             2 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
                 a = self.read_r8(reg) as u32;
                 b = self.read_rm8(rm, mem) as u32;
-                dest = Dest::Reg8(reg);
-                is_word = false;
+                dest = Dest::Reg(reg);
+                sz = Sz::B;
             }
             3 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                a = self.read_r16(reg) as u32;
-                b = self.read_rm16(rm, mem) as u32;
-                dest = Dest::Reg16(reg);
-                is_word = true;
+                if self.op_size_32 {
+                    a = self.read_r32(reg);
+                    b = self.read_rm32(rm, mem);
+                    sz = Sz::D;
+                } else {
+                    a = self.read_r16(reg) as u32;
+                    b = self.read_rm16(rm, mem) as u32;
+                    sz = Sz::W;
+                }
+                dest = Dest::Reg(reg);
             }
             4 => {
                 let imm = self.fetch_u8(mem);
                 a = self.read_r8(0) as u32;
                 b = imm as u32;
-                dest = Dest::Reg8(0);
-                is_word = false;
+                dest = Dest::Reg(0);
+                sz = Sz::B;
             }
             5 => {
-                let imm = self.fetch_u16(mem);
-                a = self.read_r16(0) as u32;
-                b = imm as u32;
-                dest = Dest::Reg16(0);
-                is_word = true;
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    b = lo | (hi << 16);
+                    a = self.read_r32(0);
+                    sz = Sz::D;
+                } else {
+                    let imm = self.fetch_u16(mem);
+                    b = imm as u32;
+                    a = self.read_r16(0) as u32;
+                    sz = Sz::W;
+                }
+                dest = Dest::Reg(0);
             }
             _ => unreachable!("ALU dispatch only covers variants 0..5"),
         }
 
-        let (result, writeback) = if !is_word {
-            let (r, wb) = self.alu_apply8(op, a as u8, b as u8);
-            (r as u32, wb)
-        } else {
-            let (r, wb) = self.alu_apply16(op, a as u16, b as u16);
-            (r as u32, wb)
+        let (result, writeback) = match sz {
+            Sz::B => {
+                let (r, wb) = self.alu_apply8(op, a as u8, b as u8);
+                (r as u32, wb)
+            }
+            Sz::W => {
+                let (r, wb) = self.alu_apply16(op, a as u16, b as u16);
+                (r as u32, wb)
+            }
+            Sz::D => self.alu_apply32(op, a, b),
         };
 
         if writeback {
-            match dest {
-                Dest::Rm(rm) if is_word => self.write_rm16(rm, mem, result as u16),
-                Dest::Rm(rm) => self.write_rm8(rm, mem, result as u8),
-                Dest::Reg8(i) => self.write_r8(i, result as u8),
-                Dest::Reg16(i) => self.write_r16(i, result as u16),
+            match (dest, sz) {
+                (Dest::Rm(rm), Sz::B) => self.write_rm8(rm, mem, result as u8),
+                (Dest::Rm(rm), Sz::W) => self.write_rm16(rm, mem, result as u16),
+                (Dest::Rm(rm), Sz::D) => self.write_rm32(rm, mem, result),
+                (Dest::Reg(i), Sz::B) => self.write_r8(i, result as u8),
+                (Dest::Reg(i), Sz::W) => self.write_r16(i, result as u16),
+                (Dest::Reg(i), Sz::D) => self.write_r32(i, result),
             }
         }
         Ok(())
