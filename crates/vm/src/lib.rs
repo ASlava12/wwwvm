@@ -588,6 +588,22 @@ impl Vm {
         self.io.disk.load(bytes);
     }
 
+    /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
+    /// disk image to linear `0x7C00` (the standard boot-sector load
+    /// address), then continue with the same autorun/UART setup as
+    /// [`boot`]. Real BIOS does this before the IVT is even guest-
+    /// visible — we model it directly on `Vm` rather than inside the
+    /// CPU because nothing in CPU state needs to know.
+    pub fn boot_from_disk(&mut self) {
+        self.cpu.reset_to_boot();
+        let mut buf = [0u8; wwwvm_devices::DISK_SECTOR_SIZE];
+        self.io.disk.read_sectors(0, 1, &mut buf);
+        self.mem.write_slice(BOOT_LOAD_ADDR, &buf);
+        self.io.uart_mut().push_rx(&self.autorun);
+        self.autorun.clear();
+        self.booted = true;
+    }
+
     pub fn is_booted(&self) -> bool {
         self.booted
     }

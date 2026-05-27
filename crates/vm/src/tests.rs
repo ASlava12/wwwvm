@@ -1,5 +1,53 @@
 use super::*;
 
+/// End-to-end bootstrap: boot sector lives on the in-memory disk; the
+/// VM cold-boots via [`Vm::boot_from_disk`] which copies sector 0 to
+/// 0x7C00 (mimicking real BIOS). That sector then itself calls INT
+/// 0x13 AH=0x02 to load sector 1 into 0x0000:0x8000 and far-jumps to
+/// it. Sector 1 prints "OK" via INT 0x10 AH=0x0E and HLTs. The whole
+/// pipeline — host-side BIOS shim, IoBus disk, segment cache, INT
+/// dispatch, far jump, VGA write — has to work cooperatively.
+#[test]
+fn cold_boot_loads_kernel_from_disk_and_runs_it() {
+    let mut sector0 = vec![0u8; 512];
+    sector0[..27].copy_from_slice(&[
+        // MOV AX, 0; MOV ES, AX            ; B8 00 00 8E C0
+        0xB8, 0x00, 0x00, 0x8E, 0xC0, // MOV BX, 0x8000                   ; BB 00 80
+        0xBB, 0x00, 0x80, // MOV AH, 0x02                     ; B4 02
+        0xB4, 0x02, // MOV AL, 0x01                     ; B0 01
+        0xB0, 0x01, // MOV CH, 0x00                     ; B5 00
+        0xB5, 0x00, // MOV CL, 0x02 (sector 2)          ; B1 02
+        0xB1, 0x02, // MOV DH, 0x00                     ; B6 00
+        0xB6, 0x00, // MOV DL, 0x80                     ; B2 80
+        0xB2, 0x80, // INT 0x13                         ; CD 13
+        0xCD, 0x13, // JMP FAR 0x0000:0x8000            ; EA 00 80 00 00
+        0xEA, 0x00, 0x80, 0x00, 0x00,
+    ]);
+
+    let mut sector1 = vec![0u8; 512];
+    sector1[..9].copy_from_slice(&[
+        // MOV AH, 0x0E; MOV AL, 'O'; INT 0x10
+        // MOV AL, 'K';  INT 0x10
+        // HLT
+        0xB4, 0x0E, 0xB0, b'O', 0xCD, 0x10, 0xB0, b'K', 0xCD,
+    ]);
+    sector1[9] = 0x10;
+    sector1[10] = 0xF4;
+
+    let mut disk = sector0;
+    disk.extend_from_slice(&sector1);
+
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_disk_image(&disk);
+    vm.boot_from_disk();
+    let (_, stop) = vm.run_steps(256);
+    assert!(matches!(stop, Stop::Halted), "got: {stop:?}");
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE), b'O');
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE + 2), b'K');
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_COL), 2);
+}
+
 /// INT 0x13 AH=0x02 reads sectors from the in-memory disk image into
 /// ES:BX. We load a 1024-byte disk where sector 0 is all 0xAA and
 /// sector 1 is all 0xBB, then have a boot stub read sector 1 into
