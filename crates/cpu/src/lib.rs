@@ -157,6 +157,12 @@ pub struct Cpu {
     /// returning a monotonically advancing counter is what matters,
     /// not the cycle-accurate semantics.
     pub tsc: u64,
+    /// LDT selector — stored value, used only by SLDT (and a future
+    /// LDT-based descriptor lookup). LLDT writes this; SLDT reads it.
+    pub ldtr: u16,
+    /// Task Register selector. Same shape: LTR sets, STR reads.
+    /// We don't yet walk the TSS for ring transitions.
+    pub tr: u16,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -269,6 +275,8 @@ impl Cpu {
             cr2: 0,
             cr4: 0,
             tsc: 0,
+            ldtr: 0,
+            tr: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -307,6 +315,8 @@ impl Cpu {
         self.cr2 = 0;
         self.cr4 = 0;
         self.tsc = 0;
+        self.ldtr = 0;
+        self.tr = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
@@ -3490,10 +3500,50 @@ impl Cpu {
             0x0F => {
                 let op2 = self.fetch_u8(mem);
                 match op2 {
+                    // Group 6 — SLDT (/0) STR (/1) LLDT (/2) LTR (/3).
+                    // Each operates on a 16-bit selector in r/m16.
+                    // VERR/VERW (/4/5) are not implemented yet.
+                    0x00 => {
+                        let (_, sub, rm) = self.fetch_modrm(mem);
+                        match sub {
+                            0 => {
+                                let v = self.ldtr;
+                                self.write_rm16(rm, mem, v);
+                            }
+                            1 => {
+                                let v = self.tr;
+                                self.write_rm16(rm, mem, v);
+                            }
+                            2 => self.ldtr = self.read_rm16(rm, mem),
+                            3 => self.tr = self.read_rm16(rm, mem),
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        }
+                    }
                     // Group 7 — LGDT, LIDT, SGDT, SIDT, SMSW, LMSW,
                     // INVLPG depending on the ModR/M reg field.
                     0x01 => {
                         let (mode, sub, rm) = self.fetch_modrm(mem);
+                        // SMSW (/4) and LMSW (/6) accept r/m16 with
+                        // mod=11. The other sub-ops require memory.
+                        match sub {
+                            4 => {
+                                let v = self.cr0 as u16;
+                                self.write_rm16(rm, mem, v);
+                                return Ok(());
+                            }
+                            6 => {
+                                let v = self.read_rm16(rm, mem);
+                                self.cr0 = (self.cr0 & !0xF) | (v as u32 & 0xF);
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
                             Rm::Reg(_) => {
@@ -3505,29 +3555,47 @@ impl Cpu {
                                 });
                             }
                         };
-                        if sub == 7 {
-                            // INVLPG m — invalidate the TLB entry for
-                            // the given linear address. No TLB modelled
-                            // yet, so this is a no-op; the EA itself
-                            // is the operand (no descriptor read).
-                            let _ = self.linear_seg(ea.seg, ea.off);
-                        } else {
-                            let base_linear = self.linear_seg(ea.seg, ea.off);
-                            // 6-byte pseudo-descriptor: limit u16 + base u32
-                            let limit = self.mem_read_u16(mem, base_linear);
-                            let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
-                            let base_hi = self.mem_read_u16(mem, base_linear.wrapping_add(4));
-                            let base = (base_lo as u32) | ((base_hi as u32) << 16);
-                            match sub {
-                                2 => self.gdtr = DescriptorTable { limit, base }, // LGDT
-                                3 => self.idtr = DescriptorTable { limit, base }, // LIDT
-                                _ => {
-                                    return Err(CpuError::Unimplemented {
-                                        opcode: op2,
-                                        cs: op_cs,
-                                        ip: op_ip,
-                                    });
+                        match sub {
+                            // SGDT / SIDT — store pseudo-descriptor.
+                            0 | 1 => {
+                                let base_linear = self.linear_seg(ea.seg, ea.off);
+                                let desc = if sub == 0 { self.gdtr } else { self.idtr };
+                                self.mem_write_u16(mem, base_linear, desc.limit);
+                                self.mem_write_u16(
+                                    mem,
+                                    base_linear.wrapping_add(2),
+                                    desc.base as u16,
+                                );
+                                self.mem_write_u16(
+                                    mem,
+                                    base_linear.wrapping_add(4),
+                                    (desc.base >> 16) as u16,
+                                );
+                            }
+                            // LGDT / LIDT — load pseudo-descriptor.
+                            2 | 3 => {
+                                let base_linear = self.linear_seg(ea.seg, ea.off);
+                                let limit = self.mem_read_u16(mem, base_linear);
+                                let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
+                                let base_hi = self.mem_read_u16(mem, base_linear.wrapping_add(4));
+                                let base = (base_lo as u32) | ((base_hi as u32) << 16);
+                                let desc = DescriptorTable { limit, base };
+                                if sub == 2 {
+                                    self.gdtr = desc;
+                                } else {
+                                    self.idtr = desc;
                                 }
+                            }
+                            // INVLPG m — invalidate TLB entry.
+                            7 => {
+                                let _ = self.linear_seg(ea.seg, ea.off);
+                            }
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
                             }
                         }
                     }

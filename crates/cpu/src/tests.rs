@@ -2466,6 +2466,73 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0x00 /2 / /0 — LLDT / SLDT round-trip via AX.
+#[test]
+fn lldt_sldt_round_trip_via_register() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x28, 0x00, // MOV AX, 0x28
+            0x0F, 0x00, 0xD0, // LLDT AX
+            0x0F, 0x00, 0xC3, // SLDT BX
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.ldtr, 0x28);
+    assert_eq!(cpu.regs[r16::BX], 0x28);
+}
+
+/// 0x0F 0x01 /0 — SGDT stores the 6-byte GDTR pseudo-descriptor.
+#[test]
+fn sgdt_stores_pseudo_descriptor_to_memory() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x500, &[0xFF, 0x00, 0x30, 0x20, 0x10, 0x00]);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xBE, 0x00, 0x05, // MOV SI, 0x500
+            0x0F, 0x01, 0x14, // LGDT [SI]
+            0xBE, 0x00, 0x06, // MOV SI, 0x600
+            0x0F, 0x01, 0x04, // SGDT [SI]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.gdtr.limit, 0x00FF);
+    assert_eq!(cpu.gdtr.base, 0x0010_2030);
+    assert_eq!(mem.read_u16(0x600), 0x00FF);
+    assert_eq!(mem.read_u16(0x602), 0x2030);
+    assert_eq!(mem.read_u16(0x604), 0x0010);
+}
+
+/// 0x0F 0x01 /4 — SMSW stores low 16 of CR0 into r/m16.
+#[test]
+fn smsw_stores_cr0_low_16() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x1234_5678;
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x7C00, &[0x0F, 0x01, 0xE0, 0xF4]); // SMSW AX; HLT
+    let mut io = IoBus::new();
+    for _ in 0..4 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0x5678);
+}
+
 /// 0x0F 0x31 — RDTSC. Returns a monotonically advancing counter
 /// in EDX:EAX. After two RDTSCs separated by a NOP, the second
 /// reading must be strictly greater than the first.
