@@ -1230,19 +1230,57 @@ impl Cpu {
         }
     }
 
-    /// Common SI/DI delta for string ops, picked by DF (10 → backward).
-    /// `width` is the operand size in bytes (1, 2, or 4).
-    fn string_delta_n(&self, width: u16) -> u16 {
+    /// Per-iteration SI/DI delta for string ops, picked by DF
+    /// (1 → backward). `width` is the operand size in bytes (1/2/4).
+    /// Returns u32 with sign-extension so 32-bit-address-mode index
+    /// updates compute correctly.
+    fn string_delta_n_u32(&self, width: u32) -> u32 {
         if self.has(flag::DF) {
-            0u16.wrapping_sub(width)
+            0u32.wrapping_sub(width)
         } else {
             width
         }
     }
 
-    /// Back-compat shim: byte ops pass false, word ops pass true.
-    fn string_delta(&self, word: bool) -> u16 {
-        self.string_delta_n(if word { 2 } else { 1 })
+    /// Read SI (16-bit) or ESI (32-bit) depending on the address-size
+    /// attribute. String ops use this to source from the right width.
+    fn read_si_for_string(&self) -> u32 {
+        if self.addr_size_32 {
+            self.read_r32(r16::SI as u8)
+        } else {
+            self.regs[r16::SI] as u32
+        }
+    }
+
+    /// Read DI (16-bit) or EDI (32-bit) depending on the address-size
+    /// attribute.
+    fn read_di_for_string(&self) -> u32 {
+        if self.addr_size_32 {
+            self.read_r32(r16::DI as u8)
+        } else {
+            self.regs[r16::DI] as u32
+        }
+    }
+
+    /// Advance SI/ESI by `delta`. `delta` is u32; in 16-bit mode the
+    /// low 16 bits get added to the 16-bit register; in 32-bit mode
+    /// the full 32-bit ESI is updated.
+    fn advance_si_for_string(&mut self, delta: u32) {
+        if self.addr_size_32 {
+            let new = self.read_r32(r16::SI as u8).wrapping_add(delta);
+            self.write_r32(r16::SI as u8, new);
+        } else {
+            self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta as u16);
+        }
+    }
+
+    fn advance_di_for_string(&mut self, delta: u32) {
+        if self.addr_size_32 {
+            let new = self.read_r32(r16::DI as u8).wrapping_add(delta);
+            self.write_r32(r16::DI as u8, new);
+        } else {
+            self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta as u16);
+        }
     }
 
     /// Segment used for the SI side of string ops — DS by default, but
@@ -1253,90 +1291,90 @@ impl Cpu {
     }
 
     fn step_movsb(&mut self, mem: &mut Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let v = self.mem_read_u8(mem, src);
         self.mem_write_u8(mem, dst, v);
-        let d = self.string_delta(false);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(1);
+        self.advance_si_for_string(d);
+        self.advance_di_for_string(d);
     }
     fn step_movsw(&mut self, mem: &mut Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let v = self.mem_read_u16(mem, src);
         self.mem_write_u16(mem, dst, v);
-        let d = self.string_delta(true);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(2);
+        self.advance_si_for_string(d);
+        self.advance_di_for_string(d);
     }
     fn step_stosb(&mut self, mem: &mut Memory) {
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let al = self.read_r8(0);
         self.mem_write_u8(mem, dst, al);
-        let d = self.string_delta(false);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(1);
+        self.advance_di_for_string(d);
     }
     fn step_stosw(&mut self, mem: &mut Memory) {
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let ax = self.regs[r16::AX];
         self.mem_write_u16(mem, dst, ax);
-        let d = self.string_delta(true);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(2);
+        self.advance_di_for_string(d);
     }
     fn step_lodsb(&mut self, mem: &Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
         let v = self.mem_read_u8(mem, src);
         self.write_r8(0, v);
-        let d = self.string_delta(false);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        let d = self.string_delta_n_u32(1);
+        self.advance_si_for_string(d);
     }
     fn step_lodsw(&mut self, mem: &Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
         let v = self.mem_read_u16(mem, src);
         self.regs[r16::AX] = v;
-        let d = self.string_delta(true);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        let d = self.string_delta_n_u32(2);
+        self.advance_si_for_string(d);
     }
     fn step_scasb(&mut self, mem: &Memory) {
-        let addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let v = self.mem_read_u8(mem, addr);
         let al = self.read_r8(0);
         let r = al.wrapping_sub(v);
         self.flags_sub8(al, v, 0, r);
-        let d = self.string_delta(false);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(1);
+        self.advance_di_for_string(d);
     }
     fn step_scasw(&mut self, mem: &Memory) {
-        let addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let v = self.mem_read_u16(mem, addr);
         let ax = self.regs[r16::AX];
         let r = ax.wrapping_sub(v);
         self.flags_sub16(ax, v, 0, r);
-        let d = self.string_delta(true);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(2);
+        self.advance_di_for_string(d);
     }
     fn step_cmpsb(&mut self, mem: &Memory) {
-        let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let s = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let d_addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let a = self.mem_read_u8(mem, s);
         let b = self.mem_read_u8(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub8(a, b, 0, r);
-        let delta = self.string_delta(false);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+        let delta = self.string_delta_n_u32(1);
+        self.advance_si_for_string(delta);
+        self.advance_di_for_string(delta);
     }
     fn step_cmpsw(&mut self, mem: &Memory) {
-        let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let s = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let d_addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let a = self.mem_read_u16(mem, s);
         let b = self.mem_read_u16(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub16(a, b, 0, r);
-        let delta = self.string_delta(true);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+        let delta = self.string_delta_n_u32(2);
+        self.advance_si_for_string(delta);
+        self.advance_di_for_string(delta);
     }
 
     // 32-bit string ops — selected by the 0x66 prefix on top of the
@@ -1344,47 +1382,47 @@ impl Cpu {
     // `REP MOVSL` (= REP MOVSD) for bulk dword copies; memset uses
     // `REP STOSL` similarly.
     fn step_movsd(&mut self, mem: &mut Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let v = self.mem_read_u32(mem, src);
         self.mem_write_u32(mem, dst, v);
-        let d = self.string_delta_n(4);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(4);
+        self.advance_si_for_string(d);
+        self.advance_di_for_string(d);
     }
     fn step_stosd(&mut self, mem: &mut Memory) {
-        let dst = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let dst = self.linear_seg(sreg::ES, self.read_di_for_string());
         let eax = self.read_r32(0);
         self.mem_write_u32(mem, dst, eax);
-        let d = self.string_delta_n(4);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(4);
+        self.advance_di_for_string(d);
     }
     fn step_lodsd(&mut self, mem: &Memory) {
-        let src = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
+        let src = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
         let v = self.mem_read_u32(mem, src);
         self.write_r32(0, v);
-        let d = self.string_delta_n(4);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(d);
+        let d = self.string_delta_n_u32(4);
+        self.advance_si_for_string(d);
     }
     fn step_scasd(&mut self, mem: &Memory) {
-        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let d_addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let a = self.read_r32(0);
         let b = self.mem_read_u32(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub32(a, b, 0, r);
-        let d = self.string_delta_n(4);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(d);
+        let d = self.string_delta_n_u32(4);
+        self.advance_di_for_string(d);
     }
     fn step_cmpsd(&mut self, mem: &Memory) {
-        let s = self.linear_seg(self.string_src_seg(), self.regs[r16::SI] as u32);
-        let d_addr = self.linear_seg(sreg::ES, self.regs[r16::DI] as u32);
+        let s = self.linear_seg(self.string_src_seg(), self.read_si_for_string());
+        let d_addr = self.linear_seg(sreg::ES, self.read_di_for_string());
         let a = self.mem_read_u32(mem, s);
         let b = self.mem_read_u32(mem, d_addr);
         let r = a.wrapping_sub(b);
         self.flags_sub32(a, b, 0, r);
-        let delta = self.string_delta_n(4);
-        self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta);
-        self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta);
+        let delta = self.string_delta_n_u32(4);
+        self.advance_si_for_string(delta);
+        self.advance_di_for_string(delta);
     }
 
     /// Dispatch a single string op by primary opcode. Returns true if
@@ -1847,12 +1885,14 @@ impl Cpu {
             // REP / REPE / REPZ (0xF3) and REPNE / REPNZ (0xF2) prefix.
             // For MOVS/STOS/LODS the prefix repeats CX times with no
             // ZF condition. For CMPS/SCAS the prefix repeats while
-            // (REPE: ZF=1, REPNE: ZF=0). CX is decremented after each
-            // string-op step.
+            // (REPE: ZF=1, REPNE: ZF=0). The counter register is CX
+            // or ECX depending on the address-size attribute — Linux
+            // memcpy compiles to `REP MOVSD` with ECX-driven length.
             //
             // A seg-override prefix may appear before *or* after REP
             // (`26 F3 A4` and `F3 26 A4` both mean ES: REP MOVSB), so
-            // we additionally absorb seg-overrides here.
+            // we additionally absorb seg-overrides + address-size and
+            // operand-size prefixes here.
             0xF2 | 0xF3 => {
                 let rep_zero = opcode == 0xF3;
                 let inner = loop {
@@ -1862,11 +1902,21 @@ impl Cpu {
                         0x2E => self.seg_override = Some(sreg::CS),
                         0x36 => self.seg_override = Some(sreg::SS),
                         0x3E => self.seg_override = Some(sreg::DS),
+                        0x66 => self.op_size_32 = true,
+                        0x67 => self.addr_size_32 = true,
                         _ => break b,
                     }
                 };
                 let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
-                while self.regs[r16::CX] != 0 {
+                loop {
+                    let counter_done = if self.addr_size_32 {
+                        self.read_r32(r16::CX as u8) == 0
+                    } else {
+                        self.regs[r16::CX] == 0
+                    };
+                    if counter_done {
+                        break;
+                    }
                     if !self.step_string(inner, mem) {
                         return Err(CpuError::Unimplemented {
                             opcode: inner,
@@ -1874,7 +1924,12 @@ impl Cpu {
                             ip: op_ip,
                         });
                     }
-                    self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
+                    if self.addr_size_32 {
+                        let c = self.read_r32(r16::CX as u8).wrapping_sub(1);
+                        self.write_r32(r16::CX as u8, c);
+                    } else {
+                        self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
+                    }
                     if conditional {
                         let zf = self.has(flag::ZF);
                         if rep_zero && !zf {
@@ -2390,10 +2445,8 @@ impl Cpu {
                             }
                         };
                         let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
-                        let new_cs = self.mem_read_u16(
-                            mem,
-                            self.linear_seg(ea.seg, ea.off.wrapping_add(2)),
-                        );
+                        let new_cs =
+                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                         let cs = self.sregs[sreg::CS];
                         self.push16(mem, cs);
                         let ip = self.ip as u16;
@@ -2418,10 +2471,8 @@ impl Cpu {
                             }
                         };
                         let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
-                        let new_cs = self.mem_read_u16(
-                            mem,
-                            self.linear_seg(ea.seg, ea.off.wrapping_add(2)),
-                        );
+                        let new_cs =
+                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
                         self.write_sreg(sreg::CS, new_cs, mem);
                         self.ip = new_ip as u32;
                     }

@@ -2426,6 +2426,45 @@ fn out_to_port_0x92_with_bit1_clear_disables_a20() {
     assert!(!cpu.a20, "A20 must be gated off after OUT 0x92");
 }
 
+/// `0x67 0x66 0xF3 0xA5` — REP MOVSD with 32-bit address size.
+/// Drives the loop counter from ECX and updates ESI/EDI as full
+/// 32-bit registers. The kernel-side memcpy compiles to this shape.
+#[test]
+fn rep_movsd_under_0x67_uses_ecx_esi_edi() {
+    let mut mem = Memory::new(0x0010_0000);
+    mem.write_u32(0x0001_0000, 0xAABBCCDD);
+    mem.write_u32(0x0001_0004, 0x11223344);
+    mem.write_u32(0x0001_0008, 0xDEADBEEF);
+    mem.write_u32(0x0001_000C, 0xCAFEBABE);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBE, 0x00, 0x00, 0x01, 0x00, // MOV ESI, 0x10000
+            0x66, 0xBF, 0x00, 0x00, 0x02, 0x00, // MOV EDI, 0x20000
+            0x66, 0xB9, 0x04, 0x00, 0x00, 0x00, // MOV ECX, 4
+            0x67, 0x66, 0xF3, 0xA5, // 32-bit REP MOVSD
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x0002_0000), 0xAABBCCDD);
+    assert_eq!(mem.read_u32(0x0002_0004), 0x11223344);
+    assert_eq!(mem.read_u32(0x0002_0008), 0xDEADBEEF);
+    assert_eq!(mem.read_u32(0x0002_000C), 0xCAFEBABE);
+    assert_eq!(cpu.read_r32(1), 0);
+    assert_eq!(cpu.read_r32(6), 0x0001_0010);
+    assert_eq!(cpu.read_r32(7), 0x0002_0010);
+}
+
 /// 0x67 prefix switches ModR/M to 32-bit addressing mode: rm
 /// fields name r32 registers, an optional SIB byte follows, and
 /// displacements are 8- or 32-bit. With a 32-bit operand size on
