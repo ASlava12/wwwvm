@@ -770,6 +770,24 @@ impl Cpu {
         v
     }
 
+    /// Push a 32-bit value onto SS:SP. SP decrements by 4 before the
+    /// write. Used by 0x66-prefixed PUSH r32 (and eventually PUSH
+    /// imm32 / PUSHA-32 / etc.).
+    fn push32(&mut self, mem: &mut Memory, value: u32) {
+        let sp = self.regs[r16::SP].wrapping_sub(4);
+        self.regs[r16::SP] = sp;
+        self.mem_write_u32(mem, self.linear_seg(sreg::SS, sp), value);
+    }
+
+    /// Pop a 32-bit value from SS:SP. SP increments by 4 after the
+    /// read.
+    fn pop32(&mut self, mem: &Memory) -> u32 {
+        let sp = self.regs[r16::SP];
+        let v = self.mem_read_u32(mem, self.linear_seg(sreg::SS, sp));
+        self.regs[r16::SP] = sp.wrapping_add(4);
+        v
+    }
+
     /// Compute one of the 8 standard ALU ops on 8-bit operands and
     /// update flags. Returns (result, true) for ADD/OR/ADC/SBB/AND/SUB/
     /// XOR (writeback) or (result, false) for CMP. `op` is the same
@@ -1663,11 +1681,16 @@ impl Cpu {
                 let v = self.read_r8(reg);
                 self.write_rm8(rm, mem, v);
             }
-            // MOV r/m16, r16
+            // MOV r/m16, r16 — under 0x66 prefix becomes MOV r/m32, r32.
             0x89 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                let v = self.read_r16(reg);
-                self.write_rm16(rm, mem, v);
+                if self.op_size_32 {
+                    let v = self.read_r32(reg);
+                    self.write_rm32(rm, mem, v);
+                } else {
+                    let v = self.read_r16(reg);
+                    self.write_rm16(rm, mem, v);
+                }
             }
             // MOV r8, r/m8 — direction = reg
             0x8A => {
@@ -1675,11 +1698,16 @@ impl Cpu {
                 let v = self.read_rm8(rm, mem);
                 self.write_r8(reg, v);
             }
-            // MOV r16, r/m16
+            // MOV r16, r/m16 — under 0x66 prefix becomes MOV r32, r/m32.
             0x8B => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                let v = self.read_rm16(rm, mem);
-                self.write_r16(reg, v);
+                if self.op_size_32 {
+                    let v = self.read_rm32(rm, mem);
+                    self.write_r32(reg, v);
+                } else {
+                    let v = self.read_rm16(rm, mem);
+                    self.write_r16(reg, v);
+                }
             }
 
             // MOV r/m16, sreg — store segment register to r/m.
@@ -2291,20 +2319,31 @@ impl Cpu {
             }
 
             // PUSH r16 (0x50..0x57) — push GPR in standard r16 order.
-            // PUSH SP on the 8086 pushes the value *after* the decrement
-            // (an 80186 quirk fixed by Intel later). We push the original
-            // SP — the 80286+ behaviour — because it is what every modern
-            // toolchain assumes.
+            // Under 0x66 prefix becomes PUSH r32: pushes the full 32
+            // bits and decrements SP by 4. PUSH SP on the 8086 pushes
+            // the value *after* the decrement (an 80186 quirk fixed
+            // later). We push the original SP — the 80286+ behaviour —
+            // because it is what every modern toolchain assumes.
             0x50..=0x57 => {
                 let i = opcode - 0x50;
-                let v = self.read_r16(i);
-                self.push16(mem, v);
+                if self.op_size_32 {
+                    let v = self.read_r32(i);
+                    self.push32(mem, v);
+                } else {
+                    let v = self.read_r16(i);
+                    self.push16(mem, v);
+                }
             }
-            // POP r16 (0x58..0x5F)
+            // POP r16 (0x58..0x5F) — under 0x66 prefix becomes POP r32.
             0x58..=0x5F => {
                 let i = opcode - 0x58;
-                let v = self.pop16(mem);
-                self.write_r16(i, v);
+                if self.op_size_32 {
+                    let v = self.pop32(mem);
+                    self.write_r32(i, v);
+                } else {
+                    let v = self.pop16(mem);
+                    self.write_r16(i, v);
+                }
             }
 
             // PUSH imm16

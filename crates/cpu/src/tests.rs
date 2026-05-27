@@ -2337,6 +2337,54 @@ fn read_fault_leaves_w_bit_clear() {
     assert_eq!(pf.error_code & 0b10, 0, "W bit clear for read access");
 }
 
+/// 0x66 + 0x50..0x57 / 0x58..0x5F → PUSH r32 / POP r32. Decrements SP
+/// by 4, writes the full 32-bit register, then pops it back into a
+/// different register so both halves survive.
+#[test]
+fn push_r32_pop_r32_round_trip_preserves_upper_half() {
+    // MOV EAX, 0x11223344  → 66 B8 imm32
+    // PUSH EAX             → 66 50
+    // POP  EBX             → 66 5B
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x44, 0x33, 0x22, 0x11, // MOV EAX, 0x11223344
+            0x66, 0x50, // PUSH EAX
+            0x66, 0x5B, // POP EBX
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.regs[r16::BX], 0x3344);
+    assert_eq!(cpu.regs_high[r16::BX], 0x1122);
+    // SP must return to its boot value — push4 then pop4 is a no-op.
+    assert_eq!(cpu.regs[r16::SP], 0x7C00);
+}
+
+/// 0x66 + 0x89 / 0x8B → MOV r/m32, r32 / MOV r32, r/m32. Store a
+/// 32-bit GPR to memory through a memory operand, then load it back
+/// into a different GPR. Confirms both directions handle full 32-bit
+/// width and that the dword landed contiguously in memory.
+#[test]
+fn mov_rm32_r32_register_to_memory_round_trip() {
+    // MOV EAX, 0xCAFEBABE  → 66 B8 imm32
+    // MOV [0x500], EAX     → 66 89 06 00 05  (modrm 00 000 110 = [disp16])
+    // MOV EBX, [0x500]     → 66 8B 1E 00 05  (modrm 00 011 110)
+    // HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // MOV EAX, 0xCAFEBABE
+            0x66, 0x89, 0x06, 0x00, 0x05, // MOV [0x500], EAX
+            0x66, 0x8B, 0x1E, 0x00, 0x05, // MOV EBX, [0x500]
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(mem.read_u32(0x0500), 0xCAFE_BABE);
+    assert_eq!(cpu.regs[r16::BX], 0xBABE);
+    assert_eq!(cpu.regs_high[r16::BX], 0xCAFE);
+}
+
 /// 0x66 0xC7 /0 imm32 → MOV r/m32, imm32. Round-trip through memory.
 #[test]
 fn mov_rm32_imm32_writes_dword_to_memory() {
