@@ -155,6 +155,31 @@ impl WwwVm {
         self.inner.read_mem_u32(addr)
     }
 
+    /// Read a 32-bit GPR by its standard x86 encoding index:
+    ///   0 EAX, 1 ECX, 2 EDX, 3 EBX, 4 ESP, 5 EBP, 6 ESI, 7 EDI.
+    /// Indices outside that range return 0. The kernel just halted?
+    /// `vm.read_register_u32(0)` is the natural way for JS to read
+    /// the "exit code" the guest stashed in EAX.
+    pub fn read_register_u32(&self, idx: u8) -> u32 {
+        if idx > 7 {
+            return 0;
+        }
+        self.inner.cpu().read_r32(idx)
+    }
+
+    /// Instruction pointer (EIP) after the last step. Useful for
+    /// JS debuggers showing "stopped at PC".
+    pub fn get_eip(&self) -> u32 {
+        self.inner.cpu().ip
+    }
+
+    /// EFLAGS bits 0..15. Bit 0 = CF, 6 = ZF, 7 = SF, 9 = IF, 10 = DF,
+    /// 11 = OF, etc. JS debuggers display the flag bits next to the
+    /// register dump.
+    pub fn get_eflags(&self) -> u16 {
+        self.inner.cpu().flags
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -429,6 +454,45 @@ mod tests {
         // Single 32-bit read — would need four read_mem_u8 calls
         // and bit-shifting on the JS side without this wrapper.
         assert_eq!(vm.read_mem_u32(0x900), 0xCAFE_BABE);
+    }
+
+    /// Register accessors expose the kernel's post-execution state
+    /// directly — no snapshot-blob parsing. JS can call
+    /// `read_register_u32(0)` to read EAX as an exit code,
+    /// `get_eip()` for the PC, `get_eflags()` for the status word.
+    #[test]
+    fn js_facing_register_accessors_expose_kernel_state() {
+        let mut bz = vec![0u8; 1024];
+        bz[0x1F1] = 1;
+        bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        bz[0x202..0x206].copy_from_slice(b"HdrS");
+        bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+        bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        // 32-bit kernel:
+        //   B8 EF BE AD DE   MOV EAX, 0xDEADBEEF
+        //   BB 55 AA 55 AA   MOV EBX, 0xAA55AA55
+        //   F4               HLT
+        bz.extend_from_slice(&[
+            0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0xBB, 0x55, 0xAA, 0x55, 0xAA, 0xF4,
+        ]);
+
+        let mut vm = WwwVm::new_with_ram_size(0x0020_0000);
+        let entry = vm.load_bzimage(&bz).expect("load");
+        vm.start_protected_mode_at(entry);
+        vm.run(16);
+
+        assert!(vm.is_halted());
+        // GPR-by-index — full 32-bit values.
+        assert_eq!(vm.read_register_u32(0), 0xDEAD_BEEF, "EAX (idx 0)");
+        assert_eq!(vm.read_register_u32(3), 0xAA55_AA55, "EBX (idx 3)");
+        // ESI was set to 0x90000 by start_protected_mode_at.
+        assert_eq!(vm.read_register_u32(6), 0x0009_0000, "ESI (idx 6)");
+        // EIP points at the byte *after* HLT.
+        assert_eq!(vm.get_eip(), entry + 11);
+        // IF must be clear (start_protected_mode_at honors §4.1).
+        assert_eq!(vm.get_eflags() & 0x0200, 0, "IF clear");
+        // Out-of-range index returns 0 (no panic).
+        assert_eq!(vm.read_register_u32(42), 0);
     }
 
     #[test]
