@@ -74,6 +74,55 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
 #[test]
+fn bios_int10_set_cursor_shape_is_silent_accept() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // The shape passed (CH=2, CL=6) is a typical "underscore"
+    // cursor. We accept silently — the test confirms the dispatch
+    // doesn't fall through to the host (which would have left the
+    // VM in a non-halted state).
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x01, // MOV AH, 0x01
+            0xB5, 0x02, // MOV CH, 2
+            0xB1, 0x06, // MOV CL, 6
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    assert!(vm.is_halted());
+}
+
+#[test]
+fn bios_int10_read_char_and_attr_at_cursor_returns_cell_contents() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Plant 'Q' / 0x4F at row=3 col=7 and place the cursor there.
+    let off = ((3 * 80) + 7) * 2;
+    vm.mem.write_u8(VGA_TEXT_BASE + off, b'Q');
+    vm.mem.write_u8(VGA_TEXT_BASE + off + 1, 0x4F);
+    vm.mem.write_u8(BDA_CURSOR_ROW, 3);
+    vm.mem.write_u8(BDA_CURSOR_COL, 7);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x08, // MOV AH, 0x08
+            0xB7, 0x00, // MOV BH, 0
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(0), b'Q', "AL = char at cursor");
+    assert_eq!(cpu.read_r8(4), 0x4F, "AH = attribute at cursor");
+}
+
+#[test]
 fn bios_int10_scroll_up_with_zero_lines_clears_window() {
     let mut vm = Vm::new();
     vm.install_bios();

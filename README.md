@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**381 тест** зелёный (mem 6 + devices 38 + cpu 266 + vm 63 +
+**383 теста** зелёные (mem 6 + devices 38 + cpu 266 + vm 65 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -181,11 +181,11 @@ spinlock через LOCK CMPXCHG + PAUSE):
   PSHUFHW/PSHUFLW, PMULUDQ/PMULHUW/PSADBW, PMINUB/PMAXUB/PMINSW/PMAXSW,
   PAVGB/PAVGW, MOVQ (load и store), PMOVMSKB, non-temporal stores
   MOVNTDQ/MOVNTPS/MOVNTI, MASKMOVDQU, фенсы LFENCE/SFENCE/MFENCE.
-- **BIOS-shim**: INT 0x10 (AH=0x00 set mode / 0x02 set cursor /
-  0x03 get cursor / 0x06 scroll up / 0x07 scroll down / 0x09
-  char+attr / 0x0E TTY / 0x0F get mode), 0x12, 0x13 (disk read),
-  0x15 (E820 + AH=88), 0x16 (AH=0x00 read / 0x01 peek / 0x02
-  shift flags).
+- **BIOS-shim**: INT 0x10 (AH=0x00 set mode / 0x01 set cursor
+  shape / 0x02 set cursor / 0x03 get cursor / 0x06 scroll up /
+  0x07 scroll down / 0x08 read char+attr / 0x09 char+attr / 0x0E
+  TTY / 0x0F get mode), 0x12, 0x13 (disk read), 0x15 (E820 +
+  AH=88), 0x16 (AH=0x00 read / 0x01 peek / 0x02 shift flags).
 - **IDE/ATA два канала** (primary 0x1F0..0x1F7, secondary
   0x170..0x177): IDENTIFY DEVICE, READ SECTORS и WRITE SECTORS
   (LBA28). 16-битная передача данных приходит как пара байтовых
@@ -224,7 +224,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 381 пройденный тест на текущий момент. CI
+Должно вывести 383 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

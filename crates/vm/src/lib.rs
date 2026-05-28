@@ -46,12 +46,16 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///   * INT 0x10 AH=0x00 — set video mode. Clears the 80×25 text
 ///     buffer and resets the cursor to (0, 0). The mode number is
 ///     accepted but ignored (we only model mode 3).
+///   * INT 0x10 AH=0x01 — set cursor shape (CH/CL scan lines). We
+///     don't model cursor shape, so this is a silent-accept.
 ///   * INT 0x10 AH=0x02 — set cursor position (BH page, DH row, DL col)
 ///   * INT 0x10 AH=0x03 — read cursor position (returns row/col in
 ///     DH/DL plus a canned cursor shape in CH/CL)
 ///   * INT 0x10 AH=0x06 — scroll window up. CH/CL = upper-left,
 ///     DH/DL = lower-right, AL = lines (0 = clear), BH = fill attr.
 ///   * INT 0x10 AH=0x07 — scroll window down (mirror of 0x06).
+///   * INT 0x10 AH=0x08 — read char + attribute at the current
+///     cursor (BH = page; AL = char, AH = attribute on return).
 ///   * INT 0x10 AH=0x09 — write char + attribute at the current
 ///     cursor, CX times. Does NOT advance the cursor (matches BIOS).
 ///   * INT 0x10 AH=0x0E — TTY teletype output. Writes AL to the VGA
@@ -137,6 +141,10 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
         }
         // Set cursor position. BH = page (ignored — page 0 only),
         // DH = row, DL = column. Clamps each to the 80×25 grid.
+        // Set cursor shape (CH = start scan line, CL = end). We
+        // don't model the cursor shape, so accept silently — every
+        // CGA/EGA/VGA-aware caller writes through this on startup.
+        0x01 => true,
         0x02 => {
             let row = cpu.read_r8(6).min(VGA_TEXT_ROWS as u8 - 1);
             let col = cpu.read_r8(2).min(VGA_TEXT_COLS as u8 - 1);
@@ -206,6 +214,18 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
         // Write char + attribute at current cursor, CX times. AL =
         // char, BL = attribute, CX = repeat count. The cursor is
         // NOT advanced — that's the real BIOS contract, distinct
+        // Read char + attribute at the current cursor (BH = page,
+        // ignored — page 0 only). Returns AL = char, AH = attr.
+        0x08 => {
+            let col = mem.read_u8(BDA_CURSOR_COL) as usize;
+            let row = mem.read_u8(BDA_CURSOR_ROW) as usize;
+            let off = ((row * VGA_TEXT_COLS) + col) * 2;
+            let ch = mem.read_u8(VGA_TEXT_BASE + off as u32);
+            let attr = mem.read_u8(VGA_TEXT_BASE + off as u32 + 1);
+            cpu.write_r8(0, ch); // AL
+            cpu.write_r8(4, attr); // AH
+            true
+        }
         // from AH=0x0E's teletype behavior.
         0x09 => {
             let ch = cpu.read_r8(0); // AL
