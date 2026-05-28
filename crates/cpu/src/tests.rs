@@ -2546,6 +2546,49 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// FPU compare → branch: `if (a > b)` on floats. FCOMP sets the
+/// C0/C2/C3 condition bits, FNSTSW AX copies the status word to AX,
+/// SAHF moves C0→CF / C3→ZF, and JA branches when above. This is
+/// the full path glibc/compilers use to compare doubles before a
+/// conditional.
+#[test]
+fn fpu_compare_then_branch_above() {
+    // helper: run the compare program with given a,b; return AL.
+    fn run_cmp(a: f32, b: f32) -> u8 {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u32(0x600, a.to_bits());
+        mem.write_u32(0x604, b.to_bits());
+        mem.write_slice(
+            0x7C00,
+            &[
+                0xD9, 0x06, 0x00, 0x06, // FLD m32 [0x600] = a
+                0xD8, 0x1E, 0x04, 0x06, // FCOMP m32 [0x604] = b
+                0xDF, 0xE0, // FNSTSW AX
+                0x9E, // SAHF
+                0x77, 0x04, // JA greater (+4)
+                0xB0, 0x00, // MOV AL, 0
+                0xEB, 0x02, // JMP done
+                0xB0, 0x01, // greater: MOV AL, 1
+                0xF4, // done: HLT
+            ],
+        );
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..24 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert!(cpu.halted);
+        cpu.read_r8(0)
+    }
+    assert_eq!(run_cmp(5.0, 3.0), 1, "5 > 3 → JA taken");
+    assert_eq!(run_cmp(2.0, 9.0), 0, "2 > 9 → not taken");
+    assert_eq!(run_cmp(4.0, 4.0), 0, "4 > 4 → not taken (equal)");
+}
+
 /// x87 m64 (double) load + memory-operand FADD + store. `d + 0.25`
 /// where d is a double in memory.
 #[test]
