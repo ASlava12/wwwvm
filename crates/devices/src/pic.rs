@@ -5,8 +5,11 @@
 //!   * vector base (set by ICW2 or directly on construction)
 //!   * Initialization Command Words 1/2 (ICW1 sets init mode + expected
 //!     ICWs, ICW2 sets vector base). ICW3/ICW4 are accepted and dropped.
-//!   * OCW2 = EOI (any value with the bottom bits looking like 0x20)
-//!   * OCW3 / read-back / poll mode — *not* yet implemented
+//!   * OCW2 EOI variants:
+//!       * 0x20 (non-specific) — clear highest in-service ISR bit
+//!       * 0x60 | irq (specific EOI) — clear ISR bit for that IRQ
+//!   * OCW3 read-register select (IRR / ISR)
+//!   * OCW3 / poll mode — *not* yet implemented
 //!
 //! What we do *not* model:
 //!   * cascading to a slave PIC (no IRQ 8..15)
@@ -142,6 +145,15 @@ impl Pic {
         let bit = self.isr & self.isr.wrapping_neg();
         self.isr &= !bit;
     }
+
+    /// Specific EOI — clears the named IRQ's bit in ISR regardless of
+    /// priority order. Used when the handler is for a lower-priority
+    /// IRQ that fired after a higher-priority one already EOIed.
+    fn specific_eoi(&mut self, irq: u8) {
+        if irq < 8 {
+            self.isr &= !(1 << irq);
+        }
+    }
 }
 
 impl IoDevice for Pic {
@@ -181,9 +193,19 @@ impl IoDevice for Pic {
                         _ => {}
                     }
                 } else if value & 0x18 == 0x00 {
-                    // OCW2 — bottom bits: 0x20 = non-specific EOI
-                    if value & 0xE0 == 0x20 {
-                        self.non_specific_eoi();
+                    // OCW2. Bits 7:5 select the operation:
+                    //   001 (0x20) — non-specific EOI
+                    //   011 (0x60) — specific EOI; bits 2:0 = IRQ
+                    // Rotate variants (100/101/110/111) parse but
+                    // don't take effect — we ignore the rotation
+                    // hint since `pending_vector` always picks the
+                    // lowest-numbered IRR bit anyway.
+                    match value & 0xE0 {
+                        0x20 => self.non_specific_eoi(),
+                        0x60 => self.specific_eoi(value & 0x07),
+                        0xA0 => self.non_specific_eoi(),
+                        0xE0 => self.specific_eoi(value & 0x07),
+                        _ => {}
                     }
                 }
             }
@@ -266,6 +288,42 @@ mod tests {
         pic.ack();
         assert!(pic.isr != 0);
         pic.write(0x20, 0x20);
+        assert_eq!(pic.isr, 0);
+    }
+
+    /// Specific EOI (OCW2 = 0x60 | irq) clears the named bit even
+    /// when it's not the highest-priority pending one. Non-specific
+    /// EOI by contrast would clear bit 3 (the higher-priority IRQ)
+    /// — leaving the IRQ-5 handler with no way to acknowledge.
+    #[test]
+    fn specific_eoi_clears_named_irq_bit_only() {
+        let mut pic = Pic::master();
+        pic.imr = 0;
+        pic.raise_irq(3);
+        pic.ack();
+        pic.raise_irq(5);
+        pic.ack();
+        // Both IRQ-3 and IRQ-5 are in-service. Non-specific would
+        // clear IRQ-3 (lowest bit). Specific-EOI for IRQ-5 clears
+        // exactly bit 5.
+        assert_eq!(pic.isr, (1 << 3) | (1 << 5));
+        pic.write(0x20, 0x60 | 5);
+        assert_eq!(pic.isr, 1 << 3, "only IRQ-5 cleared");
+        pic.write(0x20, 0x60 | 3);
+        assert_eq!(pic.isr, 0);
+    }
+
+    /// Rotate-on-specific-EOI (OCW2 = 0xE0 | irq) still EOIs the
+    /// named bit — we don't model the rotation hint, but the EOI
+    /// half of the operation must take effect.
+    #[test]
+    fn rotate_specific_eoi_still_clears_named_bit() {
+        let mut pic = Pic::master();
+        pic.imr = 0;
+        pic.raise_irq(2);
+        pic.ack();
+        assert_eq!(pic.isr, 1 << 2);
+        pic.write(0x20, 0xE0 | 2);
         assert_eq!(pic.isr, 0);
     }
 
