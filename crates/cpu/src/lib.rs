@@ -4468,6 +4468,22 @@ impl Cpu {
                             }
                             _ => {}
                         }
+                        // RDTSCP — 0x0F 0x01 0xF9 (mode=11 sub=7 rm=1).
+                        // Reads TSC into EDX:EAX and TSC_AUX into ECX.
+                        // We don't model TSC_AUX as state — Linux uses
+                        // it for vget_cpu() to tag the current CPU, and
+                        // returning 0 means "CPU 0", which is fine for
+                        // our single-threaded VM. The vDSO clock_gettime
+                        // path falls through to this on every userspace
+                        // gettimeofday().
+                        if mode == 0b11 && sub == 7 {
+                            if let Rm::Reg(1) = rm {
+                                self.write_r32(0, self.tsc as u32);
+                                self.write_r32(2, (self.tsc >> 32) as u32);
+                                self.write_r32(1, 0); // ECX = TSC_AUX = 0
+                                return Ok(());
+                            }
+                        }
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
                             Rm::Reg(_) => {
@@ -4709,6 +4725,18 @@ impl Cpu {
                     0x31 => {
                         self.write_r32(0, self.tsc as u32);
                         self.write_r32(2, (self.tsc >> 32) as u32);
+                    }
+                    // RDPMC — 0x0F 0x33. Reads performance counter
+                    // ECX into EDX:EAX. Real CPUs raise #GP for
+                    // out-of-range counters or when CR4.PCE=0 in
+                    // CPL>0. We don't model PMCs at all, so every
+                    // read returns zero — the kernel uses RDPMC
+                    // during perf-event sampling, and zero just
+                    // means "no events" which is correct for a
+                    // single-threaded VM with no real counters.
+                    0x33 => {
+                        self.write_r32(0, 0);
+                        self.write_r32(2, 0);
                     }
                     // RDMSR — 0x0F 0x32. Reads MSR named by ECX into
                     // EDX:EAX. Unknown MSRs raise #GP(0), which is

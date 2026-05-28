@@ -5946,6 +5946,43 @@ fn rdtsc_advances_between_reads() {
     );
 }
 
+/// RDTSCP — 0x0F 0x01 0xF9. Returns TSC in EDX:EAX *and* the
+/// per-CPU TSC_AUX in ECX. We don't model multiple CPUs, so
+/// TSC_AUX is always 0 (= "CPU 0"). Linux's vDSO
+/// `clock_gettime(CLOCK_MONOTONIC)` falls through to this on
+/// every userspace gettimeofday — a #UD here would make those
+/// calls trap into the kernel slow-path on every invocation.
+#[test]
+fn rdtscp_returns_tsc_and_zero_aux() {
+    // 0F 01 F9   RDTSCP
+    // F4         HLT
+    let (cpu, _, _) = run_payload(&[0x0F, 0x01, 0xF9, 0xF4], 8);
+    // TSC was incremented per step; after 1 step it's at 1.
+    assert!(cpu.read_r32(0) >= 1);
+    assert_eq!(cpu.read_r32(2), 0); // EDX = high half, zero for small TSC
+    assert_eq!(cpu.read_r32(1), 0); // ECX = TSC_AUX = 0 (CPU 0)
+}
+
+/// RDPMC — 0x0F 0x33. Reads PMC[ECX] into EDX:EAX. We have no
+/// PMCs, so every read returns zero. Linux's perf-event sampling
+/// path uses this; a #UD would oops `perf_event_open`.
+#[test]
+fn rdpmc_returns_zero_for_any_counter() {
+    // MOV ECX, 0       ; 66 B9 00 00 00 00
+    // RDPMC            ; 0F 33
+    // HLT              ; F4
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x00, 0x00, 0x00, 0x00, // MOV ECX, 0
+            0x0F, 0x33, // RDPMC
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0);
+    assert_eq!(cpu.read_r32(2), 0);
+}
+
 /// 0x0F 0x06 — CLTS clears CR0.TS (bit 3).
 #[test]
 fn clts_clears_cr0_ts_bit() {
