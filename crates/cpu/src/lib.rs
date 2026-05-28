@@ -2827,6 +2827,34 @@ impl Cpu {
             return Ok(());
         }
         self.tsc = self.tsc.wrapping_add(1);
+        // Diagnostic: WWWVM_TRACE_CALL=0xADDR prints whenever EIP
+        // enters that address (typically a function start), with
+        // the args (EAX/EDX/ECX), saved return addr at [ESP], and
+        // the TSC. Cached in a OnceLock so the env-var lookup runs
+        // exactly once per process — checking env::var per step
+        // adds 50+ syscalls/instr and the kernel boot crawls.
+        {
+            use std::sync::OnceLock;
+            static TARGET: OnceLock<Option<u32>> = OnceLock::new();
+            let t = *TARGET.get_or_init(|| {
+                std::env::var("WWWVM_TRACE_CALL")
+                    .ok()
+                    .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            });
+            if let Some(target) = t {
+                if self.ip == target {
+                    let esp = self.read_r32(r16::SP as u8);
+                    let ret = mem.read_u32(self.translate(mem, esp));
+                    eprintln!(
+                        "[CALL {target:08X}] EAX={:08X} EDX={:08X} ECX={:08X} ret={ret:08X} TSC={}",
+                        self.read_r32(0),
+                        self.read_r32(2),
+                        self.read_r32(1),
+                        self.tsc
+                    );
+                }
+            }
+        }
         // A page fault flagged by the previous instruction's memory
         // accesses takes priority over fresh work. Latch the linear
         // address into CR2 and vector through INT 14, pushing the
