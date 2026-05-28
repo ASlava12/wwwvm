@@ -847,6 +847,53 @@ impl Cpu {
                 };
                 self.write_r32(reg, result as u32);
             }
+            // Scalar precision converts (F3/F2 0F 5A):
+            //   F3 → CVTSS2SD  (low f32 → low f64; upper 64 preserved)
+            //   F2 → CVTSD2SS  (low f64 → low f32; upper 96 preserved)
+            0x5A => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let f = f32::from_bits(self.read_xmm_rm32(rm, mem)) as f64;
+                    let v = f.to_bits() as u128;
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO64) | v;
+                } else {
+                    let f = f64::from_bits(self.read_xmm_rm64(rm, mem)) as f32;
+                    let v = f.to_bits() as u128;
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO32) | v;
+                }
+            }
+            // CVTTPS2DQ (F3 0F 5B) — 4×f32 → 4×i32 with truncation.
+            // The 0F 5B no-prefix / 66 forms (CVTDQ2PS / CVTPS2DQ)
+            // go through the main 0F dispatch; F2 is undefined.
+            0x5B if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let src = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = packed_lanes(src, 0, 32, |x, _, _| {
+                    let f = f32::from_bits(x as u32);
+                    (f.trunc() as i32) as u32 as u128
+                });
+            }
+            // Packed double↔int converts (0F E6):
+            //   F3 → CVTDQ2PD  (2×i32 from low 64 → 2×f64, all 128)
+            //   F2 → CVTPD2DQ  (2×f64 → 2×i32 in low 64, upper = 0,
+            //                    rounded per default MXCSR)
+            // The 66 form (CVTTPD2DQ, truncate) is in the main 0F arm.
+            0xE6 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let src = self.read_xmm_rm64(rm, mem);
+                    let lo = (src as u32 as i32) as f64;
+                    let hi = ((src >> 32) as u32 as i32) as f64;
+                    self.xmm[reg as usize] =
+                        (lo.to_bits() as u128) | ((hi.to_bits() as u128) << 64);
+                } else {
+                    let src = self.read_xmm_rm(rm, mem);
+                    let lo = f64::from_bits(src as u64).round_ties_even() as i32 as u32 as u128;
+                    let hi =
+                        f64::from_bits((src >> 64) as u64).round_ties_even() as i32 as u32 as u128;
+                    self.xmm[reg as usize] = lo | (hi << 32);
+                }
+            }
             _ => {
                 return Err(CpuError::Unimplemented {
                     opcode: op2,
@@ -4666,6 +4713,55 @@ impl Cpu {
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
                         self.xmm[reg as usize] = pmaddwd(a, b);
+                    }
+                    // Packed precision converts (0F 5A):
+                    //   no prefix → CVTPS2PD (2×f32 → 2×f64)
+                    //   0x66      → CVTPD2PS (2×f64 → 2×f32, low half;
+                    //                          upper 64 of dest is zero)
+                    // Scalar (F3/F2) variants go through sse_scalar.
+                    0x5A => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            let src = self.read_xmm_rm(rm, mem);
+                            let lo = f64::from_bits(src as u64) as f32;
+                            let hi = f64::from_bits((src >> 64) as u64) as f32;
+                            (lo.to_bits() as u128) | ((hi.to_bits() as u128) << 32)
+                        } else {
+                            let src = self.read_xmm_rm64(rm, mem);
+                            let lo = f32::from_bits(src as u32) as f64;
+                            let hi = f32::from_bits((src >> 32) as u32) as f64;
+                            (lo.to_bits() as u128) | ((hi.to_bits() as u128) << 64)
+                        };
+                    }
+                    // Packed int↔single converts (0F 5B):
+                    //   no prefix → CVTDQ2PS  (4×i32 → 4×f32)
+                    //   0x66      → CVTPS2DQ  (4×f32 → 4×i32, round)
+                    //   F3 → CVTTPS2DQ (truncate) — via sse_scalar
+                    0x5B => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            packed_lanes(src, 0, 32, |x, _, _| {
+                                let f = f32::from_bits(x as u32);
+                                (f.round_ties_even() as i32) as u32 as u128
+                            })
+                        } else {
+                            packed_lanes(src, 0, 32, |x, _, _| {
+                                let f = (x as u32 as i32) as f32;
+                                f.to_bits() as u128
+                            })
+                        };
+                    }
+                    // CVTTPD2DQ (66 0F E6) — 2×f64 → 2×i32 (truncate)
+                    // in the low 64 bits; upper 64 of dest is zero.
+                    // The F2/F3 variants (CVTPD2DQ round / CVTDQ2PD)
+                    // route through sse_scalar.
+                    0xE6 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        let lo = f64::from_bits(src as u64).trunc() as i32 as u32 as u128;
+                        let hi = f64::from_bits((src >> 64) as u64).trunc() as i32 as u32 as u128;
+                        self.xmm[reg as usize] = lo | (hi << 32);
                     }
                     // Packed float arithmetic. The 0x66 prefix
                     // (op_size_32) selects double-precision (PD, 2×f64)

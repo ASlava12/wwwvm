@@ -3388,6 +3388,123 @@ fn sse_packed_int_multiplies_pmullw_pmulhw_pmaddwd() {
     assert_eq!(mem.read_u32(0x64C), 0);
 }
 
+/// CVTPS2PD widens 2×f32 (low half) to 2×f64; CVTPD2PS narrows it
+/// back into the low 64 bits with the upper 64 zeroed. A clean
+/// round-trip on values that fit both representations.
+#[test]
+fn sse_cvtps2pd_then_cvtpd2ps_roundtrip() {
+    let mut mem = Memory::new(0x10_0000);
+    // Low half = [1.5f32, 2.5f32]; upper half is irrelevant for
+    // CVTPS2PD but we zero it for tidiness.
+    mem.write_u32(0x600, 1.5f32.to_bits());
+    mem.write_u32(0x604, 2.5f32.to_bits());
+    mem.write_u32(0x608, 0);
+    mem.write_u32(0x60C, 0);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x0F, 0x5A, 0xC8, // CVTPS2PD XMM1, XMM0
+            0x66, 0x0F, 0x5A, 0xD1, // CVTPD2PS XMM2, XMM1
+            0x66, 0x0F, 0x7F, 0x16, 0x20, 0x06, // MOVDQA [0x620], XMM2
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x620)), 1.5);
+    assert_eq!(f32::from_bits(mem.read_u32(0x624)), 2.5);
+    assert_eq!(mem.read_u32(0x628), 0); // CVTPD2PS zeroes upper 64.
+    assert_eq!(mem.read_u32(0x62C), 0);
+}
+
+/// CVTPS2DQ rounds (round-to-nearest-even, default MXCSR) while
+/// CVTTPS2DQ truncates toward zero. Inputs picked so the two
+/// instructions disagree on lane 0 (1.7 → 2 vs 1).
+#[test]
+fn sse_cvtps2dq_vs_cvttps2dq_rounding_modes() {
+    let mut mem = Memory::new(0x10_0000);
+    let xs = [1.7f32, -2.4, 0.5, -0.5];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, xs[i as usize].to_bits());
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0xC8, // MOVDQA XMM1, XMM0
+            0x66, 0x0F, 0x5B, 0xC0, // CVTPS2DQ  XMM0, XMM0 (round)
+            0xF3, 0x0F, 0x5B, 0xC9, // CVTTPS2DQ XMM1, XMM1 (trunc)
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0x66, 0x0F, 0x7F, 0x0E, 0x30, 0x06, // MOVDQA [0x630], XMM1
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..24 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Round-to-even: 1.7→2, -2.4→-2, 0.5→0, -0.5→0 (ties go to even).
+    assert_eq!(mem.read_u32(0x620) as i32, 2);
+    assert_eq!(mem.read_u32(0x624) as i32, -2);
+    assert_eq!(mem.read_u32(0x628) as i32, 0);
+    assert_eq!(mem.read_u32(0x62C) as i32, 0);
+    // Truncate: 1.7→1, -2.4→-2, 0.5→0, -0.5→0.
+    assert_eq!(mem.read_u32(0x630) as i32, 1);
+    assert_eq!(mem.read_u32(0x634) as i32, -2);
+    assert_eq!(mem.read_u32(0x638) as i32, 0);
+    assert_eq!(mem.read_u32(0x63C) as i32, 0);
+}
+
+/// CVTDQ2PD (F3 0F E6) widens 2×i32 from the low qword into 2×f64
+/// across the full 128 bits — the scalar-prefix route into
+/// sse_scalar's E6 arm. Negative input verifies signed widening.
+#[test]
+fn sse_cvtdq2pd_widens_two_ints_to_doubles() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 42_u32);
+    mem.write_u32(0x604, (-7_i32) as u32);
+    mem.write_u32(0x608, 0);
+    mem.write_u32(0x60C, 0);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0xF3, 0x0F, 0xE6, 0xC8, // CVTDQ2PD XMM1, XMM0
+            0x66, 0x0F, 0x7F, 0x0E, 0x20, 0x06, // MOVDQA [0x620], XMM1
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    let lo = (mem.read_u32(0x620) as u64) | ((mem.read_u32(0x624) as u64) << 32);
+    let hi = (mem.read_u32(0x628) as u64) | ((mem.read_u32(0x62C) as u64) << 32);
+    assert_eq!(f64::from_bits(lo), 42.0);
+    assert_eq!(f64::from_bits(hi), -7.0);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
