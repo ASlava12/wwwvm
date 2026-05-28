@@ -3800,6 +3800,106 @@ fn sse_movq_load_and_store_low_qword() {
     assert_eq!(mem.read_u32(0x62C), 0);
 }
 
+/// MOVNTDQ + MOVNTPS + MOVNTI in one program. Since we have no
+/// cache to bypass, every non-temporal store is just a plain store
+/// — but we still want to confirm the dispatch wires each one up
+/// to the right memory width (128, 128, 32) and the correct source
+/// (XMM, XMM, GP).
+#[test]
+fn sse_non_temporal_stores_match_their_temporal_kin() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM source = four distinct dwords.
+    mem.write_u32(0x600, 0x1111_1111);
+    mem.write_u32(0x604, 0x2222_2222);
+    mem.write_u32(0x608, 0x3333_3333);
+    mem.write_u32(0x60C, 0x4444_4444);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0xE7, 0x06, 0x20, 0x06, // MOVNTDQ [0x620], XMM0
+            0x0F, 0x2B, 0x06, 0x30, 0x06, // MOVNTPS [0x630], XMM0
+            0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, // MOV EAX, 0xDEADBEEF
+            0x0F, 0xC3, 0x06, 0x40, 0x06, // MOVNTI  [0x640], EAX
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // MOVNTDQ + MOVNTPS each stored a full 128 bits.
+    for (off, base) in [0x620u32, 0x630].iter().copied().enumerate() {
+        let want = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        for i in 0..4u32 {
+            assert_eq!(
+                mem.read_u32(base + i * 4),
+                want[i as usize],
+                "store {off} lane {i}"
+            );
+        }
+    }
+    // MOVNTI stored EAX = 0xDEADBEEF as one dword.
+    assert_eq!(mem.read_u32(0x640), 0xDEAD_BEEF);
+}
+
+/// MASKMOVDQU writes only the bytes whose mask byte has its high
+/// bit set, to DS:[(E)DI]. Sentinel-fill the destination first so
+/// the unselected bytes can be checked as unchanged.
+#[test]
+fn sse_maskmovdqu_writes_only_selected_bytes() {
+    let mut mem = Memory::new(0x10_0000);
+    // Destination region: pre-fill with 0xCC.
+    for i in 0..16u32 {
+        mem.write_u8(0x600 + i, 0xCC);
+    }
+    // Data bytes 1..16; mask high-bits at positions {0, 1, 5, 15}.
+    for i in 0..16u32 {
+        mem.write_u8(0x610 + i, (i + 1) as u8);
+        let m = if matches!(i, 0 | 1 | 5 | 15) {
+            0x80u8
+        } else {
+            0x00
+        };
+        mem.write_u8(0x620 + i, m);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xBF, 0x00, 0x06, // MOV DI, 0x600 (destination address)
+            0x66, 0x0F, 0x6F, 0x06, 0x10, 0x06, // MOVDQA XMM0, [0x610]  (data)
+            0x66, 0x0F, 0x6F, 0x0E, 0x20, 0x06, // MOVDQA XMM1, [0x620]  (mask)
+            0x66, 0x0F, 0xF7, 0xC1, // MASKMOVDQU XMM0, XMM1
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Selected positions hold the corresponding data byte; the rest
+    // still read 0xCC from the pre-fill.
+    let want: [u8; 16] = [
+        0x01, 0x02, 0xCC, 0xCC, 0xCC, 0x06, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+        0x10,
+    ];
+    for i in 0..16u32 {
+        assert_eq!(mem.read_u8(0x600 + i), want[i as usize], "byte {i}");
+    }
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

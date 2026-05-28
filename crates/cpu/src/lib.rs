@@ -4912,6 +4912,85 @@ impl Cpu {
                         }
                         self.write_r32(reg, mask);
                     }
+                    // Non-temporal stores. These are cache-bypass
+                    // hints — semantically identical to regular stores
+                    // for us since we don't model a cache. All forms
+                    // require a memory destination (reg form is UD).
+                    //   0F 2B  MOVNTPS m128, xmm   (66 → MOVNTPD; same bits)
+                    //   66 0F E7  MOVNTDQ m128, xmm
+                    //   0F C3  MOVNTI m32, r32     (note: source is GP)
+                    0x2B => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if let Rm::Mem(ea) = rm {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            self.mem_write_u128(mem, a, self.xmm[reg as usize]);
+                        } else {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                    0xE7 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if let Rm::Mem(ea) = rm {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            self.mem_write_u128(mem, a, self.xmm[reg as usize]);
+                        } else {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                    0xC3 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if let Rm::Mem(ea) = rm {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            self.mem_write_u32(mem, a, self.read_r32(reg));
+                        } else {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                    // MASKMOVDQU xmm1, xmm2 (66 0F F7) — for each of 16
+                    // bytes in xmm1, if the matching byte in xmm2 has
+                    // its high bit set, store the byte to DS:[(E)DI+i].
+                    // Reg form only; the destination address is
+                    // implicit (no ModR/M.rm encoded for the dest).
+                    0xF7 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let mask_idx = match rm {
+                            Rm::Reg(i) => i as usize,
+                            Rm::Mem(_) => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        let data = self.xmm[reg as usize];
+                        let mask = self.xmm[mask_idx];
+                        let di = if self.addr_size_32 {
+                            self.read_r32(r16::DI as u8)
+                        } else {
+                            self.regs[r16::DI] as u32
+                        };
+                        let base = self.linear_seg(sreg::DS, di);
+                        for i in 0..16u32 {
+                            let mb = (mask >> (i * 8 + 7)) & 1;
+                            if mb != 0 {
+                                let byte = ((data >> (i * 8)) & 0xFF) as u8;
+                                self.mem_write_u8(mem, base.wrapping_add(i), byte);
+                            }
+                        }
+                    }
                     // Packed precision converts (0F 5A):
                     //   no prefix → CVTPS2PD (2×f32 → 2×f64)
                     //   0x66      → CVTPD2PS (2×f64 → 2×f32, low half;
