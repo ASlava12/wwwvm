@@ -548,6 +548,46 @@ fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
         cpu.flags |= wwwvm_cpu::flag::CF;
         return true;
     }
+    // AH=0x24 — A20 gate control. Linux's arch/x86/boot/a20.c
+    // tries this first before falling back to KBC and port 0x92.
+    //   AL=0x00 disable A20
+    //   AL=0x01 enable A20
+    //   AL=0x02 query current A20 state (returns AL = state)
+    //   AL=0x03 query supported A20 methods
+    //             (returns BX = bit0:KBC | bit1:fast-A20)
+    // Real BIOSes return CF=1 / AH=0x86 if A20 isn't BIOS-controllable;
+    // we always model it, so CF=0 on every sub-function.
+    if ax >> 8 == 0x24 {
+        let al = cpu.read_r8(0);
+        match al {
+            0x00 => {
+                cpu.a20 = false;
+                cpu.flags &= !wwwvm_cpu::flag::CF;
+                cpu.write_r8(4, 0);
+            }
+            0x01 => {
+                cpu.a20 = true;
+                cpu.flags &= !wwwvm_cpu::flag::CF;
+                cpu.write_r8(4, 0);
+            }
+            0x02 => {
+                cpu.write_r8(0, cpu.a20 as u8);
+                cpu.write_r8(4, 0);
+                cpu.flags &= !wwwvm_cpu::flag::CF;
+            }
+            0x03 => {
+                // We support both: KBC bit (1<<0) + fast A20 (1<<1).
+                cpu.regs[wwwvm_cpu::r16::BX] = 0b11;
+                cpu.write_r8(4, 0);
+                cpu.flags &= !wwwvm_cpu::flag::CF;
+            }
+            _ => {
+                cpu.write_r8(4, 0x86);
+                cpu.flags |= wwwvm_cpu::flag::CF;
+            }
+        }
+        return true;
+    }
     // AX=0xE801 — Get Memory Size (older alternative to E820 some
     // loaders prefer). Returns memory 1MB..16MB in KiB (AX = CX,
     // capped at 0x3C00 = 15 MiB) and memory above 16MB in 64KB

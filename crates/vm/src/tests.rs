@@ -720,6 +720,62 @@ fn bios_int12_returns_640_kib_conventional_memory() {
     assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
 }
 
+/// INT 0x15 / AH=0x24 — A20 gate control. Linux's a20.c tries
+/// BIOS first; if the BIOS doesn't support it, fall back to KBC
+/// and port 0x92. We model all four sub-functions.
+#[test]
+fn bios_int15_a20_query_returns_current_state() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // MOV AX, 0x2402; INT 0x15; MOV BL, AL; HLT — query current state.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x02, 0x24, // MOV AX, 0x2402
+            0xCD, 0x15, // INT 0x15
+            0x88, 0xC3, // MOV BL, AL
+            0xF4,
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    // A20 defaults enabled → AL = 1 → BL = 1.
+    assert_eq!(vm.cpu().read_r8(3), 1, "A20 query reports enabled");
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// AL=0x00 actually flips the A20 bit the translator honors.
+#[test]
+fn bios_int15_a20_disable_clears_a20_line() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB8, 0x00, 0x24, 0xCD, 0x15, 0xF4]);
+    vm.boot();
+    vm.run_steps(8);
+    assert!(!vm.cpu().a20, "A20 disabled after BIOS call");
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// AL=0x03 — query supported A20 methods. We model both KBC
+/// (bit 0) and fast A20 (bit 1), so BX = 0b11.
+#[test]
+fn bios_int15_a20_get_support_reports_kbc_and_fast() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x03, 0x24, // MOV AX, 0x2403
+            0xCD, 0x15, // INT 0x15
+            0xF4,
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    assert_eq!(vm.cpu().regs[wwwvm_cpu::r16::BX], 0b11);
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
 /// INT 0x15 AH=0x88 — legacy fallback for "how much extended memory
 /// is there". Returns AX = KiB above 1 MiB, capped at 0xFFFF. With
 /// a 16 MiB VM, expected value is (16 - 1) * 1024 = 15360.
