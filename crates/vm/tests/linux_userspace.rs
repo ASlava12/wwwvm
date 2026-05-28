@@ -7,10 +7,10 @@
 //!
 //! The test is `#[ignore]` because it depends on a vmlinuz file
 //! we don't ship (Tinycore Core ISO `boot/vmlinuz`, 5.85 MB). One
-//! run is ~70 seconds wall-clock — the test bails the moment
+//! run is ~55 seconds wall-clock — the test bails the moment
 //! HELLO shows up, vs. the linux_boot example which intentionally
 //! runs the full 16 B-step budget for diagnostics and clocks
-//! ~10 min. Even at 70 seconds, this isn't something to put in
+//! ~10 min. Even at 55 seconds, this isn't something to put in
 //! the default sweep.
 //!
 //! What it locks in: the kernel runs all the way through
@@ -149,7 +149,7 @@ fn run_until_hello(vm: &mut Vm) -> Result<u64, String> {
 /// isn't present (so contributors without the binary can still
 /// run `cargo test -- --ignored`).
 #[test]
-#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~70s wall-clock"]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~55s wall-clock"]
 fn linux_userspace_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());

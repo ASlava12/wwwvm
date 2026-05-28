@@ -242,7 +242,21 @@ pub struct Cpu {
     /// since sequential fetches mostly stay on the same page.
     /// Cleared on CR3 reload, INVLPG, CR0.PG toggle, write_sreg(CS)
     /// (CPL transition may change U/S semantics), and CPU reset.
-    fetch_tlb: Cell<Option<(u32, u32)>>,
+    /// The tuple is `(linear_page, phys_frame_after_a20, a20_state)`
+    /// — a20 state is carried so a direct `cpu.a20 = …` poke (as
+    /// the unit tests do) is self-invalidating: the lookup just
+    /// misses on the next translate when a20 changed under us.
+    fetch_tlb: Cell<Option<(u32, u32, bool)>>,
+    /// Sibling 1-entry data-read translation cache. Covers
+    /// `translate` (read access). Sequential stack pushes, struct
+    /// field loads, REP MOVSD source/dest — these all hit the
+    /// same page for many bytes in a row, so caching the most
+    /// recent (page, frame, a20) tuple lets us skip the PDE+PTE
+    /// walk on each follow-up byte. We don't cache *writes* —
+    /// write permission depends on CR0.WP + effective R/W + CPL
+    /// and the bookkeeping would dwarf the saved walk.
+    /// Invalidations match `fetch_tlb`.
+    read_tlb: Cell<Option<(u32, u32, bool)>>,
     /// IP of the instruction currently being decoded — captured at
     /// the top of every `step()` so that a #PF raised mid-decode
     /// can rewind `self.ip` to the faulting instruction before
@@ -386,8 +400,9 @@ impl Cpu {
             efer: 0,
             pending_fault: Cell::new(None),
             fetch_tlb: Cell::new(None),
-            // (the slot is also explicitly cleared by reset_to_boot
-            // — see `Cpu::reset_to_boot`).
+            read_tlb: Cell::new(None),
+            // (the TLB slots are also explicitly cleared by
+            // reset_to_boot — see `Cpu::reset_to_boot`).
             last_op_ip: 0,
             a20: true,
             bios_hook: None,
@@ -442,6 +457,7 @@ impl Cpu {
         self.efer = 0;
         self.pending_fault.set(None);
         self.fetch_tlb.set(None);
+        self.read_tlb.set(None);
         self.last_op_ip = 0;
         self.a20 = true;
         self.code_size_32 = false;
@@ -760,7 +776,29 @@ impl Cpu {
     /// bit (bit 4) is set — Linux's `do_page_fault` reads this bit
     /// to know whether the kernel tried to execute the page.
     pub fn translate(&self, mem: &Memory, linear: u32) -> u32 {
-        self.translate_inner(mem, linear, Access::Read)
+        // Read fast path: same shape as `translate_fetch`'s
+        // mini-ITLB, just on `read_tlb`. Walks for write accesses
+        // and instruction fetches bypass this slot — see
+        // `translate_write` and `translate_fetch`.
+        if self.cr0 & 0x8000_0000 == 0 {
+            return if self.a20 {
+                linear
+            } else {
+                linear & 0xFFEF_FFFF
+            };
+        }
+        let page = linear & 0xFFFF_F000;
+        if let Some((cached_page, cached_frame, cached_a20)) = self.read_tlb.get() {
+            if cached_page == page && cached_a20 == self.a20 {
+                return cached_frame | (linear & 0xFFF);
+            }
+        }
+        let phys = self.translate_inner(mem, linear, Access::Read);
+        if self.pending_fault.get().is_none() {
+            self.read_tlb
+                .set(Some((page, phys & 0xFFFF_F000, self.a20)));
+        }
+        phys
     }
 
     /// Same as `translate` but tags the resulting #PF (if any) with
@@ -786,11 +824,15 @@ impl Cpu {
         // ITLB. Invalidations: CR3 reload, INVLPG, CR0.PG toggle,
         // write_sreg(CS), and CPU reset all clear this slot.
         if self.cr0 & 0x8000_0000 == 0 {
-            return linear;
+            return if self.a20 {
+                linear
+            } else {
+                linear & 0xFFEF_FFFF
+            };
         }
         let page = linear & 0xFFFF_F000;
-        if let Some((cached_page, cached_frame)) = self.fetch_tlb.get() {
-            if cached_page == page {
+        if let Some((cached_page, cached_frame, cached_a20)) = self.fetch_tlb.get() {
+            if cached_page == page && cached_a20 == self.a20 {
                 return cached_frame | (linear & 0xFFF);
             }
         }
@@ -799,7 +841,8 @@ impl Cpu {
         // faulting walk returns the sentinel 0 and shouldn't seed
         // future fetches.
         if self.pending_fault.get().is_none() {
-            self.fetch_tlb.set(Some((page, phys & 0xFFFF_F000)));
+            self.fetch_tlb
+                .set(Some((page, phys & 0xFFFF_F000, self.a20)));
         }
         phys
     }
@@ -812,6 +855,10 @@ impl Cpu {
     /// silicon and Linux never does that on the fetch path.
     fn invalidate_fetch_tlb(&self) {
         self.fetch_tlb.set(None);
+        // Read-side cache shares all the same invalidation
+        // triggers; clear both together so the call sites only
+        // have one helper to remember.
+        self.read_tlb.set(None);
     }
 
     fn translate_inner(&self, mem: &Memory, linear: u32, access: Access) -> u32 {
@@ -917,6 +964,10 @@ impl Cpu {
     fn port_write(&mut self, io: &mut IoBus, port: u16, value: u8) {
         if port == 0x92 {
             self.a20 = value & 0b10 != 0;
+            // The fetch/read TLB tuples carry the a20 state they
+            // were captured under, so a direct toggle here would
+            // already be picked up as a cache miss on the next
+            // translate — we don't need an explicit invalidation.
             return;
         }
         io.write(port, value);
