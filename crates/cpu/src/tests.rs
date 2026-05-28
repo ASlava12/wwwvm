@@ -2500,6 +2500,52 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// Spinlock acquire — the kernel's `lock cmpxchg` + `jz` + `pause`
+/// loop. With the lock free (0), the first LOCK CMPXCHG swaps in 1,
+/// sets ZF, and JZ falls through to the critical section; the
+/// PAUSE/retry arm is present but not taken. Exercises the LOCK
+/// prefix, 32-bit CMPXCHG to memory, and the branch — the exact
+/// shape of `arch_spin_lock`.
+#[test]
+fn spinlock_acquire_via_lock_cmpxchg() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 0); // lock free
+                             // acquire: (ofs 0)
+                             //   66 31 C0              xor eax, eax        ; expected = 0
+                             //   66 BB 01 00 00 00     mov ebx, 1          ; desired = 1
+                             //   F0                    lock                (ofs 9)
+                             //   66 0F B1 1E 00 06     cmpxchg [0x600], ebx (ofs 10)
+                             //   74 04                 jz acquired (IP 18 → 22)
+                             //   F3 90                 pause
+                             //   EB EA                 jmp acquire (-22)
+                             // acquired: (ofs 22)
+                             //   F4                    hlt
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x31, 0xC0, // xor eax, eax
+            0x66, 0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
+            0xF0, // lock
+            0x66, 0x0F, 0xB1, 0x1E, 0x00, 0x06, // cmpxchg [0x600], ebx
+            0x74, 0x04, // jz acquired
+            0xF3, 0x90, // pause
+            0xEB, 0xEA, // jmp acquire
+            0xF4, // hlt (acquired)
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "should acquire and reach the critical section");
+    assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
+}
+
 /// F3 90 — PAUSE. The spin-loop hint a `while (locked) cpu_relax()`
 /// emits. Must decode as a no-op, not as REP NOP (which would
 /// reject 0x90).
