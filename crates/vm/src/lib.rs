@@ -742,7 +742,13 @@ pub mod snapshot {
     ///   guest's kernel writes to SIV/TPR/etc. survive snapshot.
     /// * v11 — appends the HPET MMIO scratch buffer (1 KiB) right
     ///   after the LAPIC section.
-    pub const VERSION: u8 = 11;
+    /// * v12 — extends the CPU image with `code_size_32` (1 byte),
+    ///   `misc_enable` (u64), `tsc_aux` (u32), and the eight DR
+    ///   registers (`dr[8]`, 32 bytes). Total 45 new bytes. With
+    ///   this every Cpu field that survives reset is covered by
+    ///   the snapshot; pre-v12 snapshots leave the new fields at
+    ///   `Cpu::new()` defaults.
+    pub const VERSION: u8 = 12;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
@@ -785,6 +791,13 @@ pub mod snapshot {
     pub const CPU_V9_EXTRA: usize = 128;
     /// Total bytes a v9 CPU image takes.
     pub const CPU_V9_LEN: usize = CPU_V8_LEN + CPU_V9_EXTRA;
+    /// Extra bytes v12 adds: code_size_32 (1) + misc_enable (8) +
+    /// tsc_aux (4) + dr[8] (32) = 45 bytes. v10 and v11 left the
+    /// CPU image alone — they appended MMIO scratch buffers past
+    /// RAM — so v12's CPU extension comes right after v9's XMM.
+    pub const CPU_V12_EXTRA: usize = 45;
+    /// Total bytes a v12 CPU image takes.
+    pub const CPU_V12_LEN: usize = CPU_V9_LEN + CPU_V12_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -918,7 +931,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V9_LEN + self.mem.size();
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V12_LEN + self.mem.size();
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -992,6 +1005,17 @@ impl Vm {
             buf.extend_from_slice(&x.to_le_bytes());
         }
 
+        // v12 CPU extension — fields added since v9 that survive
+        // reset: code_size_32 (latched from CS.D), misc_enable
+        // (MSR 0x1A0), tsc_aux (MSR 0xC0000103, the RDTSCP ECX
+        // source), and the eight debug registers (DR0..7).
+        buf.push(self.cpu.code_size_32 as u8);
+        buf.extend_from_slice(&self.cpu.misc_enable.to_le_bytes());
+        buf.extend_from_slice(&self.cpu.tsc_aux.to_le_bytes());
+        for d in &self.cpu.dr {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
@@ -1028,10 +1052,11 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=11) {
+        if !matches!(version, 1..=12) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
+            12 => snapshot::CPU_V12_LEN,
             // v10/v11 don't extend the CPU image — they append MMIO
             // sections (LAPIC, then HPET) between RAM and the device
             // blob.
@@ -1206,6 +1231,37 @@ impl Vm {
                 *slot = u128::from_le_bytes(b);
             }
         }
+        // v12 extras: code_size_32 + misc_enable + tsc_aux + DR0..7.
+        // Pre-v12 snapshots leave these at `Cpu::new()` defaults
+        // (false / 0 / 0 / [0; 8]).
+        let mut code_size_32 = false;
+        let mut misc_enable: u64 = 0;
+        let mut tsc_aux: u32 = 0;
+        let mut dr = [0u32; 8];
+        if version >= 12 {
+            let ext = cpu_start + snapshot::CPU_V9_LEN;
+            code_size_32 = bytes[ext] != 0;
+            misc_enable = u64::from_le_bytes([
+                bytes[ext + 1],
+                bytes[ext + 2],
+                bytes[ext + 3],
+                bytes[ext + 4],
+                bytes[ext + 5],
+                bytes[ext + 6],
+                bytes[ext + 7],
+                bytes[ext + 8],
+            ]);
+            tsc_aux = u32::from_le_bytes([
+                bytes[ext + 9],
+                bytes[ext + 10],
+                bytes[ext + 11],
+                bytes[ext + 12],
+            ]);
+            for (i, slot) in dr.iter_mut().enumerate() {
+                let o = ext + 13 + i * 4;
+                *slot = u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+            }
+        }
 
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
@@ -1310,6 +1366,14 @@ impl Vm {
         self.cpu.fpu_st = fpu_st;
         self.cpu.fpu_top = fpu_top;
         self.cpu.xmm = xmm;
+        // v12 — fields added after v9. Pre-v12 restores leave these
+        // at Cpu::new()'s defaults; the kernel re-derives most of
+        // them on the next instruction anyway (code_size_32 from
+        // CS.D on the next far-jump, MSRs on the next WRMSR).
+        self.cpu.code_size_32 = code_size_32;
+        self.cpu.misc_enable = misc_enable;
+        self.cpu.tsc_aux = tsc_aux;
+        self.cpu.dr = dr;
         // Re-derive seg_cache from the visible selectors. For real-
         // mode snapshots this is exact (cache = sel << 4). For a
         // future PM snapshot the cache values would diverge from

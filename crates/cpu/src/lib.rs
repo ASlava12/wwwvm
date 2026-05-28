@@ -121,7 +121,7 @@ pub struct Cpu {
     /// flip them back to 16-bit (rather than the other way round in
     /// real mode). This is how a 32-bit kernel runs without
     /// 0x66-stuffing every immediate.
-    pub(crate) code_size_32: bool,
+    pub code_size_32: bool,
     /// Control Register 0. On real x86 it's 32 bits; we store the
     /// full width but only bit 0 (PE — Protection Enable) and bit 31
     /// (PG — Paging) will gain semantic meaning once those modes

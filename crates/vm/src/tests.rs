@@ -2762,6 +2762,34 @@ fn snapshot_v10_preserves_lapic_writes_to_siv() {
     assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFEE0_0030), 0x0006_0014);
 }
 
+/// v12 round-trips the four CPU fields added after v9 — code_size_32,
+/// misc_enable, tsc_aux, dr[8]. Pre-v12 snapshots leave these at
+/// Cpu::new() defaults; v12 round-trips them exactly.
+#[test]
+fn snapshot_v12_preserves_code_size_misc_enable_tsc_aux_dr() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // Poison every new field with distinct sentinels.
+    vm.cpu.code_size_32 = true;
+    vm.cpu.misc_enable = 0xCAFE_BABE_DEAD_BEEF;
+    vm.cpu.tsc_aux = 0xFEED_FACE;
+    for (i, slot) in vm.cpu.dr.iter_mut().enumerate() {
+        *slot = 0xDEC0_DE00 | (i as u32);
+    }
+
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v12 restore");
+
+    assert!(vm2.cpu().code_size_32);
+    assert_eq!(vm2.cpu().misc_enable, 0xCAFE_BABE_DEAD_BEEF);
+    assert_eq!(vm2.cpu().tsc_aux, 0xFEED_FACE);
+    for (i, slot) in vm2.cpu().dr.iter().enumerate() {
+        assert_eq!(*slot, 0xDEC0_DE00 | (i as u32), "DR{i}");
+    }
+}
+
 /// v9 snapshot must round-trip the full architectural i386 state:
 /// CR0/2/3/4, GDTR, IDTR, full 32-bit IP, TSC, LDTR, TR, A20,
 /// stack_size_32, FPU control/status, SYSENTER MSRs, x87 stack,
