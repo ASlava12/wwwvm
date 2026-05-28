@@ -6893,8 +6893,8 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
         }
         // Extended leaves.
         0x8000_0000 => {
-            // Max extended leaf supported = 0x80000004 (brand string).
-            cpu.write_r32(0, 0x8000_0004);
+            // Max extended leaf supported = 0x80000008 (address widths).
+            cpu.write_r32(0, 0x8000_0008);
             cpu.write_r32(3, 0);
             cpu.write_r32(2, 0);
             cpu.write_r32(1, 0);
@@ -6914,6 +6914,28 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             cpu.write_r32(3, brand_dword(base + 4));
             cpu.write_r32(2, brand_dword(base + 8));
             cpu.write_r32(1, brand_dword(base + 12));
+        }
+        // Leaves 0x80000005 (AMD L1 cache info) and 0x80000006 (L2
+        // cache info) are zeros on Intel and AMD-on-no-cache-info.
+        // Linux's parse_amd_topology gracefully handles all-zero.
+        0x8000_0005..=0x8000_0007 => {
+            cpu.write_r32(0, 0);
+            cpu.write_r32(3, 0);
+            cpu.write_r32(2, 0);
+            cpu.write_r32(1, 0);
+        }
+        // 0x80000008 — virtual / physical address widths.
+        //   EAX bits  7:0  = physical address bits   = 32
+        //   EAX bits 15:8  = linear (virtual) bits   = 32
+        //   EAX bits 23:16 = guest physical bits     = 0 (no nested)
+        // Linux uses this to compute MAXPHYSADDR — the mask for
+        // CR3 / PTE / MTRR base addresses. On 32-bit non-PAE,
+        // 32-bit physical is exactly right.
+        0x8000_0008 => {
+            cpu.write_r32(0, 0x0000_2020);
+            cpu.write_r32(3, 0);
+            cpu.write_r32(2, 0);
+            cpu.write_r32(1, 0);
         }
         _ => {
             cpu.write_r32(0, 0);

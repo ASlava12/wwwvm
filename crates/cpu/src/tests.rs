@@ -7875,6 +7875,19 @@ fn cpuid_extended_leaves_return_brand_string() {
     assert!(text.contains("x86 CPU"));
 }
 
+/// CPUID leaf 0x80000008 — virtual / physical address widths.
+/// Linux uses bits 7:0 to compute MAXPHYSADDR (the mask for the
+/// upper bits of CR3 / PTE / MTRR base). On 32-bit non-PAE, the
+/// physical address bus is 32 bits — we report exactly that
+/// (EAX = 0x2020 → phys = 32, virt = 32).
+#[test]
+fn cpuid_ext_leaf_8_reports_32_bit_address_widths() {
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x08, 0x00, 0x00, 0x80, 0x0F, 0xA2, 0xF4], 12);
+    let eax = cpu.read_r32(0);
+    assert_eq!(eax & 0xFF, 32, "physical address bits");
+    assert_eq!((eax >> 8) & 0xFF, 32, "virtual address bits");
+}
+
 /// 0x0F 0xB6 — MOVZX r16, r/m8. Zero-extends a byte to 16 bits.
 #[test]
 fn movzx_r16_rm8_zero_extends() {
