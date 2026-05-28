@@ -169,6 +169,13 @@ pub struct Cpu {
     pub fpu_sw: u16,
     /// FPU control word. Default 0x037F after FNINIT.
     pub fpu_cw: u16,
+    /// x87 register file, modelled as f64 (not bit-exact for the
+    /// hardware's 80-bit extended format, but enough for the
+    /// load/store/arith the kernel and glibc actually do). The stack
+    /// top is `fpu_top`; ST(i) is `fpu_st[(fpu_top + i) & 7]`.
+    pub fpu_st: [f64; 8],
+    /// x87 stack-top index (the architectural TOP field, 0..7).
+    pub fpu_top: u8,
     /// SYSENTER MSRs (IA32_SYSENTER_CS/ESP/EIP = 0x174/0x175/0x176).
     /// SYSENTER loads CS:EIP and SS:ESP from these; SYSEXIT derives
     /// the return selectors from `sysenter_cs`. Written via WRMSR.
@@ -291,6 +298,8 @@ impl Cpu {
             tr: 0,
             fpu_sw: 0,
             fpu_cw: 0x037F,
+            fpu_st: [0.0; 8],
+            fpu_top: 0,
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
@@ -336,6 +345,8 @@ impl Cpu {
         self.tr = 0;
         self.fpu_sw = 0;
         self.fpu_cw = 0x037F;
+        self.fpu_st = [0.0; 8];
+        self.fpu_top = 0;
         self.sysenter_cs = 0;
         self.sysenter_esp = 0;
         self.sysenter_eip = 0;
@@ -614,6 +625,30 @@ impl Cpu {
         let lo = self.fetch_u8(mem) as u16;
         let hi = self.fetch_u8(mem) as u16;
         lo | (hi << 8)
+    }
+
+    /// Push a value onto the x87 stack: decrement TOP, write ST(0).
+    fn fpu_push(&mut self, value: f64) {
+        self.fpu_top = (self.fpu_top.wrapping_sub(1)) & 7;
+        self.fpu_st[self.fpu_top as usize] = value;
+    }
+
+    /// Pop ST(0): read it, then increment TOP.
+    fn fpu_pop(&mut self) -> f64 {
+        let v = self.fpu_st[self.fpu_top as usize];
+        self.fpu_top = (self.fpu_top.wrapping_add(1)) & 7;
+        v
+    }
+
+    /// Read ST(i) without popping.
+    fn fpu_st(&self, i: u8) -> f64 {
+        self.fpu_st[((self.fpu_top + i) & 7) as usize]
+    }
+
+    /// Write ST(i).
+    fn fpu_set_st(&mut self, i: u8, value: f64) {
+        let idx = ((self.fpu_top + i) & 7) as usize;
+        self.fpu_st[idx] = value;
     }
 
     /// Fetch the direct memory offset that follows a `moffs`-form MOV
@@ -4499,31 +4534,96 @@ impl Cpu {
                 }
             }
             0xD9 => {
-                // Peek modrm. We accept /5 (FLDCW m16) and /7 (FNSTCW m16);
-                // anything else returns Unimplemented.
                 let modrm = self.fetch_u8(mem);
                 let mode = modrm >> 6;
                 let sub = (modrm >> 3) & 0x07;
                 let rm_field = modrm & 0x07;
-                if mode == 0b11 || !matches!(sub, 5 | 7) {
+                // Register-form constant loads: FLD1 (E8) / FLDZ (EE).
+                if mode == 0b11 {
+                    match modrm {
+                        0xE8 => self.fpu_push(1.0), // FLD1
+                        0xEE => self.fpu_push(0.0), // FLDZ
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                } else {
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, rm_field, mem)
+                    } else {
+                        self.compute_ea(mode, rm_field, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    match sub {
+                        // FLD m32 — load a 32-bit float and push.
+                        0 => {
+                            let bits = self.mem_read_u32(mem, addr);
+                            self.fpu_push(f32::from_bits(bits) as f64);
+                        }
+                        // FST m32 — store ST(0) as f32 (no pop).
+                        2 => {
+                            let v = self.fpu_st(0) as f32;
+                            self.mem_write_u32(mem, addr, v.to_bits());
+                        }
+                        // FSTP m32 — store ST(0) as f32 and pop.
+                        3 => {
+                            let v = self.fpu_pop() as f32;
+                            self.mem_write_u32(mem, addr, v.to_bits());
+                        }
+                        // FLDCW m16 — load control word.
+                        5 => self.fpu_cw = self.mem_read_u16(mem, addr),
+                        // FNSTCW m16 — store control word.
+                        7 => {
+                            let cw = self.fpu_cw;
+                            self.mem_write_u16(mem, addr, cw);
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                }
+            }
+            // DE — arithmetic with a pop. The register forms used by
+            // compilers: FADDP/FMULP/FSUBRP/FSUBP/FDIVRP/FDIVP ST(i),
+            // ST(0). DE C1 = FADDP ST(1),ST(0): ST(1) op= ST(0), pop.
+            0xDE => {
+                let modrm = self.fetch_u8(mem);
+                if modrm >> 6 != 0b11 {
                     return Err(CpuError::Unimplemented {
                         opcode,
                         cs: op_cs,
                         ip: op_ip,
                     });
                 }
-                let ea = if self.addr_size_32 {
-                    self.compute_ea_32(mode, rm_field, mem)
-                } else {
-                    self.compute_ea(mode, rm_field, mem)
+                let i = modrm & 0x07; // DE C0+i → ST(i) destination
+                let op = (modrm >> 3) & 0x07;
+                let dst = self.fpu_st(i);
+                let src = self.fpu_st(0);
+                let r = match op {
+                    0 => dst + src, // FADDP
+                    1 => dst * src, // FMULP
+                    4 => src - dst, // FSUBRP
+                    5 => dst - src, // FSUBP
+                    6 => src / dst, // FDIVRP
+                    7 => dst / src, // FDIVP
+                    _ => {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        });
+                    }
                 };
-                let addr = self.linear_seg(ea.seg, ea.off);
-                if sub == 5 {
-                    self.fpu_cw = self.mem_read_u16(mem, addr);
-                } else {
-                    let cw = self.fpu_cw;
-                    self.mem_write_u16(mem, addr, cw);
-                }
+                self.fpu_set_st(i, r);
+                let _ = self.fpu_pop();
             }
 
             _ => {

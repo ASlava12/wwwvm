@@ -2546,6 +2546,69 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// x87 FPU: FLD / FADDP / FSTP round-trip. Loads two f32s onto the
+/// stack, adds them, stores the result. 1.5 + 2.25 = 3.75. First
+/// real floating-point arithmetic — the start of the FPU blocker.
+#[test]
+fn fpu_fadd_load_add_store() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 1.5f32.to_bits());
+    mem.write_u32(0x604, 2.25f32.to_bits());
+    // FLD [0x600] ; FLD [0x604] ; FADDP ; FSTP [0x608] ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x06, 0x00, 0x06, // FLD m32 [0x600]
+            0xD9, 0x06, 0x04, 0x06, // FLD m32 [0x604]
+            0xDE, 0xC1, // FADDP ST(1), ST(0)
+            0xD9, 0x1E, 0x08, 0x06, // FSTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x608)), 3.75);
+    assert_eq!(cpu.fpu_top, 0, "stack balanced after load/load/addp/store");
+}
+
+/// FLD1 / FLDZ constant loads and FMULP.
+#[test]
+fn fpu_constants_and_fmulp() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 6.0f32.to_bits());
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x06, 0x00, 0x06, // FLD m32 [0x600]   → ST0=6
+            0xD9, 0xE8, // FLD1              → ST0=1, ST1=6
+            0xD9, 0xE8, // FLD1              → ST0=1, ST1=1, ST2=6
+            0xDE, 0xC1, // FADDP            → ST0=2, ST1=6
+            0xDE, 0xC9, // FMULP            → ST0=12
+            0xD9, 0x1E, 0x04, 0x06, // FSTP m32 [0x604]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..20 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x604)), 12.0);
+}
+
 /// F3 90 — PAUSE. The spin-loop hint a `while (locked) cpu_relax()`
 /// emits. Must decode as a no-op, not as REP NOP (which would
 /// reject 0x90).
