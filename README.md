@@ -279,6 +279,22 @@ boots to userspace`.
 укажите путь через `WWWVM_KERNEL=...`. Tinycore Core ISO извлекает
 vmlinuz прямо из `boot/vmlinuz`.
 
+**Двусторонний I/O через tty.** Та же команда с `WWWVM_INIT_INPUT=Q`
+переключает встроенный /init в echo-режим:
+
+```
+WWWVM_INITRD_BUILTIN=1 WWWVM_INIT_INPUT=Q \
+  cargo run --release --example linux_boot
+```
+
+/init делает `write(1, "echo ", 5); read(0, &buf, 1); write(1, &buf, 1);
+write(1, "\n", 1); exit(42)`. Пример откладывает push байта в UART
+rx queue до момента, когда `/init`'s "echo " префикс появляется в
+выводе — это обходит 8250 autoconfig probe, который иначе съедает
+наши rx-байты. В выводе появляется `echo Q\n` — RDA IRQ доставка,
+serial8250 ISR, tty line discipline buffer, scheduler wake блокированного
+/init, обратная запись через THRE IRQ — все звенья цепи работают.
+
 ## Что НЕ работает (дорожная карта к Alpine)
 
 Между «грузит userspace из minimal initramfs» и «грузит Alpine» —
