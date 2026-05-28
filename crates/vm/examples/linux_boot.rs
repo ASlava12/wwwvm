@@ -24,7 +24,7 @@ use std::time::Instant;
 use wwwvm_vm::{Stop, Vm};
 
 const RAM_SIZE: usize = 256 * 1024 * 1024;
-const STEP_BUDGET: u64 = 8_000_000_000;
+const STEP_BUDGET: u64 = 16_000_000_000;
 
 fn main() {
     let path = env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());

@@ -1853,6 +1853,15 @@ impl Vm {
             .write_u32(0x9_0000 + bzimage::OFF_RAMDISK_IMAGE as u32, start);
         self.mem
             .write_u32(0x9_0000 + bzimage::OFF_RAMDISK_SIZE as u32, len as u32);
+        // type_of_loader at 0x90210 — Linux checks this to enable
+        // the "loader knows the boot protocol" code path. With
+        // type_of_loader=0 Linux treats the boot block as legacy
+        // and ignores ramdisk_image / cmd_line_ptr. We claim
+        // 0xFF = "Unknown bootloader, with reserved value 0xF" —
+        // the conventional sentinel a non-syslinux/non-grub loader
+        // uses to opt into modern protocol fields without lying
+        // about its identity.
+        self.mem.write_u8(0x9_0000 + 0x210, 0xFF);
         Ok(())
     }
 
