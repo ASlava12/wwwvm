@@ -4148,6 +4148,64 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
     assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
 }
 
+/// Software INT n against a kernel-only IDT gate (DPL=0) from
+/// CPL=3 must fault with #GP and the Intel error-code shape
+/// ((vector << 3) | 2 — IDT bit set). Without this guard,
+/// user-space could trigger any IDT entry including the page-fault
+/// or double-fault handler.
+#[test]
+fn int_n_from_ring_3_against_dpl0_gate_faults_with_idt_error_code() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, // null
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF,
+        0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xF2,
+        0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+
+    // IDT[0x14] = kernel-only gate (DPL=0). Userspace mustn't reach it.
+    // IDT[13] = #GP gate, DPL=3 (so the fault below can land in it).
+    mem.write_slice(
+        0x6000 + 0x14 * 8,
+        &[0x00, 0xA0, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    // User-mode INT 0x14.
+    mem.write_slice(0x8000, &[0xCD, 0x14]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step INT 0x14");
+
+    // Landed on the #GP handler (vector 13), not the requested gate
+    // (which would have jumped to offset 0xA000).
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.ip, 0x9000, "#GP handler at 0x9000, not gate's 0xA000");
+    // Error code: vector 0x14 = index → (0x14 << 3) | 2 = 0xA2.
+    assert_eq!(mem.read_u32(0x3000 - 24), 0xA2);
+    // Saved IP names the start of the INT 0x14 instruction.
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+}
+
 /// `IN AL, 0x60` from CPL=3 with IOPL=0 raises #GP via the same
 /// `raise_gp_if_below_iopl` path as CLI/STI. We only check the
 /// fault branch here; the positive branch (CPL ≤ IOPL) is exercised

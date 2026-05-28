@@ -460,6 +460,42 @@ impl Cpu {
         }
     }
 
+    /// Software-INT gate-DPL check. When a guest executes INT3 /
+    /// INT N / INTO from CPL > gate.DPL, real silicon raises
+    /// #GP((vector*8)|2) instead of dispatching — that's how the
+    /// kernel keeps internal IDT entries (e.g. page-fault, double
+    /// fault) inaccessible to userspace while leaving the syscall
+    /// gate (DPL=3) open. Returns true after firing; the caller
+    /// should `return Ok(())`.
+    ///
+    /// The error-code shape is the Intel format:
+    ///   bit 0 EXT (0 for software interrupt — not external)
+    ///   bit 1 IDT (1 — the selector lives in the IDT)
+    ///   bit 2 TI  (ignored when IDT=1)
+    ///   bits 3..15 index = vector
+    fn raise_gp_if_gate_too_privileged(
+        &mut self,
+        vector: u8,
+        op_ip: u32,
+        mem: &mut Memory,
+    ) -> bool {
+        if self.cr0 & 1 == 0 {
+            return false;
+        }
+        let gate_addr = self.idtr.base.wrapping_add((vector as u32) * 8);
+        let access = self.mem_read_u8(mem, gate_addr.wrapping_add(5));
+        let gate_dpl = (access >> 5) & 3;
+        let cpl = (self.sregs[sreg::CS] & 3) as u8;
+        if cpl > gate_dpl {
+            self.ip = op_ip;
+            let ec = ((vector as u32) << 3) | 2;
+            self.do_interrupt_with_error(13, Some(ec), mem);
+            true
+        } else {
+            false
+        }
+    }
+
     /// If we're in PE mode and the current CPL exceeds the IOPL
     /// field in EFLAGS, raise #GP(0) from `op_ip` and return true —
     /// the caller should immediately `return Ok(())`. IOPL gates
@@ -3864,7 +3900,13 @@ impl Cpu {
             }
 
             // INT3 — single-byte software interrupt to vector 3.
+            // Subject to the software-INT gate-DPL check (CPL must
+            // be ≤ gate.DPL), so user-space INT3 traps unless the
+            // kernel left the breakpoint gate open at DPL=3.
             0xCC => {
+                if self.raise_gp_if_gate_too_privileged(3, op_ip, mem) {
+                    return Ok(());
+                }
                 self.do_interrupt(3, mem);
             }
             // INT imm8 — software interrupt to the vector named by imm8.
@@ -3872,22 +3914,29 @@ impl Cpu {
             // BIOS vectors (0x10 video, 0x13 disk, 0x16 keyboard, etc.)
             // returns true and the CPU treats the INT as "done" without
             // pushing a frame. Anything not claimed by the hook falls
-            // through to the standard IVT/IDT dispatch.
+            // through to the standard IVT/IDT dispatch — but first
+            // the gate-DPL guard runs so user-space INT $entry can't
+            // reach kernel-only vectors.
             0xCD => {
                 let n = self.fetch_u8(mem);
                 if let Some(hook) = self.bios_hook {
                     if hook(self, mem, io, n) {
                         // Host handled it — no frame, no IRET needed.
-                    } else {
-                        self.do_interrupt(n, mem);
+                        return Ok(());
                     }
-                } else {
-                    self.do_interrupt(n, mem);
                 }
+                if self.raise_gp_if_gate_too_privileged(n, op_ip, mem) {
+                    return Ok(());
+                }
+                self.do_interrupt(n, mem);
             }
             // INTO — if OF=1, raise INT 4. Otherwise a no-op.
+            // INT 4 (#OF) shares the software-INT gate-DPL check.
             0xCE => {
                 if self.has(flag::OF) {
+                    if self.raise_gp_if_gate_too_privileged(4, op_ip, mem) {
+                        return Ok(());
+                    }
                     self.do_interrupt(4, mem);
                 }
             }
