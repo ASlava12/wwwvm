@@ -1622,6 +1622,50 @@ impl Cpu {
     /// word, which is the 16-bit-handler convention; a future 32-bit
     /// handler path will widen to a 32-bit push.
     fn do_interrupt_with_error(&mut self, n: u8, error_code: Option<u32>, mem: &mut Memory) {
+        // Probe trace: WWWVM_TRACE_EXC=1 prints every exception
+        // (vec 0..=31) dispatch so we can see what the kernel hits
+        // before it ends up in rewind_stack_and_make_dead. Also
+        // reads [ESP] through paging — if EIP=0 that's a CALL to
+        // NULL and [ESP] is the return address into the caller,
+        // which names the bug site.
+        if n < 32 && std::env::var_os("WWWVM_TRACE_EXC").is_some() {
+            let esp = self.read_r32(r16::SP as u8);
+            // Walk paging to read [ESP] — the return address pushed
+            // by a CALL just before the fault, if there was one.
+            let walk = |va: u32, mem: &Memory| -> Option<u32> {
+                if self.cr0 & 0x8000_0000 == 0 {
+                    return Some(va);
+                }
+                let cr3 = self.cr3 & 0xFFFF_F000;
+                let pde = mem.read_u32(cr3.wrapping_add((va >> 22) * 4));
+                if pde & 1 == 0 {
+                    return None;
+                }
+                if pde & 0x80 != 0 {
+                    return Some((pde & 0xFFC0_0000) | (va & 0x003F_FFFF));
+                }
+                let pte = mem.read_u32((pde & !0xFFF).wrapping_add(((va >> 12) & 0x3FF) * 4));
+                if pte & 1 == 0 {
+                    return None;
+                }
+                Some((pte & !0xFFF) | (va & 0xFFF))
+            };
+            let top = walk(esp, mem).map(|p| mem.read_u32(p)).unwrap_or(0);
+            let top4 = walk(esp.wrapping_add(4), mem)
+                .map(|p| mem.read_u32(p))
+                .unwrap_or(0);
+            eprintln!(
+                "[EXC vec={n:#x}] CS:EIP={:04X}:{:08X} errcode={:?} CR2={:08X} ESP={:08X} [ESP]={:08X} [ESP+4]={:08X} TSC={}",
+                self.sregs[sreg::CS],
+                self.ip,
+                error_code,
+                self.cr2,
+                esp,
+                top,
+                top4,
+                self.tsc
+            );
+        }
         // In PE, the gate's type bits (low nibble of the access byte
         // at descriptor offset 5) pick the frame width and whether
         // IF gets cleared:
@@ -2817,6 +2861,20 @@ impl Cpu {
                     return Ok(());
                 }
                 self.set_flag(flag::IF, true);
+                // One-shot probe trace (WWWVM_TRACE_STI=1) used by
+                // the linux_boot diagnostic to spot the first time
+                // the kernel enables interrupts in early boot. The
+                // env-var read happens every STI but STI is rare
+                // (a few times per kernel boot), so the overhead
+                // is negligible.
+                if std::env::var_os("WWWVM_TRACE_STI").is_some() {
+                    eprintln!(
+                        "[STI] @ CS:EIP={:04X}:{:08X}  TSC={}",
+                        self.sregs[sreg::CS],
+                        op_ip,
+                        self.tsc
+                    );
+                }
             }
             0xFC => {
                 self.set_flag(flag::DF, false);

@@ -66,7 +66,10 @@ fn main() {
     // which our kernel hasn't reached yet — so without lpj we hit
     // a soft hang in calibrate_delay_converge. Setting lpj declares
     // a pre-computed value and skips calibration entirely.
-    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         noefi efi=disable noapic nolapic nosmp acpi=off",
+    );
 
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);
@@ -104,9 +107,15 @@ fn main() {
     let mut transitions = 0u32;
     let mut last_if = false;
     let mut if_transitions = 0u32;
+    // WWWVM_STOP_AT_FIRST_EXC=1: halt at the moment a handler runs.
+    // Detect by EIP entering the IDT[14] (#PF) handler region —
+    // which our trace already proved to be at 0xC0889E00..+0x100.
+    // The trace bookends gave us TSC=435422282 for the NULL-call
+    // first exception; we want the stack contents at that moment.
+    let stop_at_first_exc = env::var("WWWVM_STOP_AT_FIRST_EXC").is_ok();
     while steps < STEP_BUDGET {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
-        let chunk = if stop_at_first_pf && pg_on {
+        let chunk = if pg_on && (stop_at_first_pf || stop_at_first_exc) {
             100
         } else if trace_esp_align && pg_on {
             1
@@ -159,6 +168,18 @@ fn main() {
             last_esp = esp;
             last_esp_align = aligned;
             last_eip = vm.cpu().ip;
+        }
+        // EIP in IDT[14] handler region = a fault was just dispatched
+        // (this catches the NULL-call case where CR2 stays at 0).
+        if stop_at_first_exc && pg_on && (0xC0889E00..0xC088A000).contains(&vm.cpu().ip) {
+            println!(
+                "[{:>10}] FIRST EXC dispatched: EIP={:08X} (handler entry) ESP={:08X}",
+                steps,
+                vm.cpu().ip,
+                vm.cpu().read_r32(4)
+            );
+            stop = st;
+            break;
         }
         if stop_at_first_pf && vm.cpu().cr2 != 0 {
             println!(
@@ -370,14 +391,57 @@ fn main() {
     }
     println!();
 
-    // Stack contents — top 32 bytes (likely contain saved return
-    // addresses / register spills from the path that got us here).
-    print!("  stack @ ESP: ");
-    for i in 0..8 {
-        let w = mem.read_u32(esp.wrapping_add(i * 4));
-        print!("{w:08X} ");
+    // Stack contents through paging — read the kernel stack as the
+    // kernel sees it. mem.read_u32 reads physical, which is wrong
+    // for any VA above our RAM size; here we walk CR3 first. This
+    // surfaces the return-address chain so we can name the caller
+    // that led to the stuck __delay/loop.
+    let walk_va = |va: u32| -> Option<u32> {
+        let cr3 = cpu.cr3 & !0xFFF;
+        let pde = mem.read_u32(cr3 + ((va >> 22) & 0x3FF) * 4);
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            return Some((pde & 0xFFC0_0000) | (va & 0x003F_FFFF));
+        }
+        let pt = pde & !0xFFF;
+        let pte = mem.read_u32(pt + ((va >> 12) & 0x3FF) * 4);
+        if pte & 1 == 0 {
+            return None;
+        }
+        Some((pte & !0xFFF) | (va & 0xFFF))
+    };
+    print!("  stack @ ESP (paged):");
+    for i in 0..16 {
+        let va = esp.wrapping_add(i * 4);
+        if let Some(phys) = walk_va(va) {
+            let w = mem.read_u32(phys);
+            print!(" {w:08X}");
+        } else {
+            print!(" --------");
+        }
     }
     println!();
+    // EBP-based frame chain — kernel functions push EBP early, so
+    // [EBP+4] is the return address into the caller and [EBP] is
+    // the previous frame. Walk up to 8 frames.
+    println!("  EBP-chain (call stack):");
+    let mut frame_ebp = ebp;
+    for depth in 0..8 {
+        let ret_addr_va = frame_ebp.wrapping_add(4);
+        let prev_ebp_va = frame_ebp;
+        let ret = walk_va(ret_addr_va).map(|p| mem.read_u32(p)).unwrap_or(0);
+        let prev = walk_va(prev_ebp_va).map(|p| mem.read_u32(p)).unwrap_or(0);
+        if ret == 0 && prev == 0 {
+            break;
+        }
+        println!("    [{depth}] EBP={frame_ebp:08X}  ret={ret:08X}");
+        if prev == frame_ebp || prev < 0x1000 {
+            break;
+        }
+        frame_ebp = prev;
+    }
 
     // IDT[14] = #PF gate. IDTR base is a *virtual* address — we
     // must walk through CR3 to read the gate. If our CPU's #PF
