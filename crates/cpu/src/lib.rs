@@ -3168,20 +3168,26 @@ impl Cpu {
             }
 
             // CALL rel16 / rel32 — under 0x66 the displacement is a
-            // signed 32-bit offset. We still push only the low 16 of
-            // the return IP (16-bit gate convention). A 32-bit stack
-            // form will push the full dword when we land it.
+            // signed 32-bit offset *and* the return address pushed is
+            // a full 32-bit dword (matching a 32-bit code segment's
+            // near-CALL semantics). Without 0x66 it's the classic
+            // 16-bit rel + 16-bit return push. Keeping the push width
+            // tied to the operand size is what lets 32-bit cdecl
+            // `add esp, 4`-style cleanup stay balanced.
             0xE8 => {
-                let rel: i32 = if self.op_size_32 {
+                if self.op_size_32 {
                     let lo = self.fetch_u16(mem) as u32;
                     let hi = self.fetch_u16(mem) as u32;
-                    (lo | (hi << 16)) as i32
+                    let rel = (lo | (hi << 16)) as i32;
+                    let ret_ip = self.ip;
+                    self.push32(mem, ret_ip);
+                    self.ip = self.ip.wrapping_add(rel as u32);
                 } else {
-                    self.fetch_u16(mem) as i16 as i32
-                };
-                let ret_ip = self.ip as u16;
-                self.push16(mem, ret_ip);
-                self.ip = self.ip.wrapping_add(rel as u32);
+                    let rel = self.fetch_u16(mem) as i16 as i32;
+                    let ret_ip = self.ip as u16;
+                    self.push16(mem, ret_ip);
+                    self.ip = self.ip.wrapping_add(rel as u32);
+                }
             }
             // CALL ptr16:16 — direct far call. Pushes CS then IP, then
             // loads CS:IP from the 4-byte immediate.
@@ -3227,15 +3233,24 @@ impl Cpu {
                 self.write_sreg(sreg::CS, new_cs, mem);
                 self.ip = new_ip;
             }
-            // RET (near) — pop IP.
+            // RET (near) — pop IP. Under 0x66 pops a 32-bit return
+            // address, matching the CALL push width.
             0xC3 => {
-                self.ip = self.pop16(mem) as u32;
+                self.ip = if self.op_size_32 {
+                    self.pop32(mem)
+                } else {
+                    self.pop16(mem) as u32
+                };
             }
             // RET imm16 (near) — pop IP, then SP += imm16. Used by
             // callee-cleanup conventions.
             0xC2 => {
                 let extra = self.fetch_u16(mem);
-                self.ip = self.pop16(mem) as u32;
+                self.ip = if self.op_size_32 {
+                    self.pop32(mem)
+                } else {
+                    self.pop16(mem) as u32
+                };
                 self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
             }
             // RETF — pop IP then CS (far return).

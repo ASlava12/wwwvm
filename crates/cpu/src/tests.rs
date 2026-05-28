@@ -2500,6 +2500,97 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// Recursive factorial — the deepest end-to-end control-flow test
+/// so far. fact(5)=120 via cdecl recursion: argument on the stack,
+/// EBP-relative frame access, 32-bit CALL/RET (each pushing a dword
+/// return address), and balanced `add esp, 4` cleanup. If 32-bit
+/// CALL/RET push/pop widths or EBP-relative addressing were wrong,
+/// the recursion's stack would drift and the result would be junk.
+///
+///   ; entry: push 5; call fact; hlt
+///   fact:
+///     push ebp ; mov ebp, esp
+///     mov eax, [ebp+8]      ; n
+///     cmp eax, 1
+///     jg recurse
+///     mov eax, 1            ; base
+///     jmp done
+///   recurse:
+///     dec eax ; push eax ; call fact ; add esp, 4
+///     imul eax, [ebp+8]    ; fact(n-1) * n
+///   done:
+///     mov esp, ebp ; pop ebp ; ret
+#[test]
+fn recursive_factorial_via_32bit_cdecl() {
+    let mut mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+
+    // Entry at 0x7C00:
+    //   66 6A 05         push dword 5         (PUSH imm8 sign-ext, op32)
+    //   66 E8 rel32      call fact
+    //   F4               hlt
+    // fact at 0x7C0A (computed below).
+    // We assemble fact first to know its size, then fix the rel32.
+    // EBP-relative memory operands need the 0x67 address-size prefix
+    // *and* the 0x66 operand-size prefix — 0x66 alone leaves the
+    // ModR/M in the 16-bit table where rm=101 means [DI], not [EBP].
+    let fact: &[u8] = &[
+        0x66, 0x55, // push ebp                  (idx 0-1)
+        0x66, 0x89, 0xE5, // mov ebp, esp              (idx 2-4)
+        0x67, 0x66, 0x8B, 0x45, 0x08, // mov eax, [ebp+8]          (idx 5-9)
+        0x66, 0x83, 0xF8, 0x01, // cmp eax, 1                (idx 10-13)
+        0x7F, 0x08, // jg recurse (IP 16 → 24)   (idx 14-15)
+        0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1            (idx 16-21)
+        0xEB, 0x14, // jmp done (IP 24 → 44)     (idx 22-23)
+        // recurse: (idx 24)
+        0x66, 0x48, // dec eax                   (idx 24-25)
+        0x66, 0x50, // push eax                  (idx 26-27)
+        0x66, 0xE8, 0x00, 0x00, 0x00, 0x00, // call fact (rel32)         (idx 28-33)
+        0x66, 0x83, 0xC4, 0x04, // add esp, 4                (idx 34-37)
+        0x67, 0x66, 0x0F, 0xAF, 0x45, 0x08, // imul eax, [ebp+8]         (idx 38-43)
+        // done: (idx 44)
+        0x66, 0x89, 0xEC, // mov esp, ebp              (idx 44-46)
+        0x66, 0x5D, // pop ebp                   (idx 47-48)
+        0x66, 0xC3, // ret                       (idx 49-50)
+    ];
+    // Layout: entry is 3 (push) + 6 (call) + 1 (hlt) = 10 bytes, so
+    // fact starts at 0x7C0A.
+    let fact_start: u32 = 0x7C0A;
+    // Entry CALL is at 0x7C03 (after the 3-byte push); after its 6
+    // bytes IP = 0x7C09. rel32 = fact_start - 0x7C09.
+    let entry_call_rel: u32 = fact_start.wrapping_sub(0x7C09);
+    // The recursive `call fact` (66 E8 + rel32) starts at idx 28
+    // inside fact; after its 6 bytes IP = fact_start + 34. rel32
+    // back to fact_start.
+    let rec_call_site = fact_start + 28;
+    let rec_call_rel: u32 = fact_start.wrapping_sub(rec_call_site + 6);
+
+    let mut entry = vec![0x66, 0x6A, 0x05, 0x66, 0xE8];
+    entry.extend_from_slice(&entry_call_rel.to_le_bytes());
+    entry.push(0xF4);
+    let mut fact_patched = fact.to_vec();
+    fact_patched[30..34].copy_from_slice(&rec_call_rel.to_le_bytes());
+
+    mem.write_slice(0x7C00, &entry);
+    mem.write_slice(fact_start, &fact_patched);
+
+    let mut io = IoBus::new();
+    for _ in 0..2000 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "factorial recursion should terminate");
+    assert_eq!(cpu.read_r32(0), 120, "fact(5) = 120");
+    // Stack balanced back to the entry value minus the one arg the
+    // top-level `push 5` left (we never clean it up): 0x80000 - 4.
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0007_FFFC);
+}
+
 /// Richer decode medley: sum a 4-element dword array via SIB-indexed
 /// loads in a loop, then CALL a helper that doubles the accumulator.
 /// Exercises 32-bit SIB addressing (addr32), MOV r32 from memory,
@@ -3367,7 +3458,7 @@ fn kernel_shaped_routine_combines_enter_repmovsd_cmpxchg_leave() {
         0x67, 0x66, 0xF3, 0xA5, // REP MOVSD
         0x67, 0x0F, 0xB1, 0x1D, 0x00, 0x40, 0x01, 0x00, // CMPXCHG [0x14000], EBX
         0x66, 0xC9, // LEAVE
-        0xC3, // RET near
+        0x66, 0xC3, // RET near (32-bit: matches the 66 E8 CALL's dword push)
     ];
     mem.write_slice(0x9000, &sub);
     let mut io = IoBus::new();
