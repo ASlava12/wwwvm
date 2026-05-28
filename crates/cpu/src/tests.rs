@@ -2466,6 +2466,41 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x64 — FS segment-override prefix. `mov al, fs:[0x10]` reads
+/// from FS.base + 0x10, the way Linux fetches per-CPU data.
+#[test]
+fn fs_segment_override_reads_through_fs_base() {
+    let mut mem = Memory::new(0x10_0000);
+    // FS = 0x2000 → real-mode base 0x20000. Put sentinel at
+    // linear 0x20000 + 0x10 = 0x20010.
+    mem.write_u8(0x2_0010, 0x9D);
+    // Boot stub:
+    //   MOV AX, 0x2000 ; MOV FS, AX
+    //   64 8A 06 10 00   MOV AL, fs:[0x10]   (0x64 prefix, MOV r8 r/m8
+    //                    with modrm 00 000 110 = [disp16], disp=0x10)
+    //   HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xB8, 0x00, 0x20, // MOV AX, 0x2000
+            0x8E, 0xE0, // MOV FS, AX
+            0x64, 0x8A, 0x06, 0x10, 0x00, // MOV AL, fs:[0x10]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..12 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0x9D, "AL must come from FS:0x10");
+}
+
 /// 0x0F 0xA0/0xA1 — PUSH FS / POP FS round-trip. (FS holds the
 /// per-CPU / TLS base in Linux.)
 #[test]

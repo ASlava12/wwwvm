@@ -1969,6 +1969,10 @@ impl Cpu {
                 0x2E => self.seg_override = Some(sreg::CS),
                 0x36 => self.seg_override = Some(sreg::SS),
                 0x3E => self.seg_override = Some(sreg::DS),
+                // 0x64/0x65 — FS/GS segment override. Linux addresses
+                // per-CPU and TLS data as `fs:[off]` / `gs:[off]`.
+                0x64 => self.seg_override = Some(sreg::FS),
+                0x65 => self.seg_override = Some(sreg::GS),
                 // 0x66 — operand-size override. Flips default
                 // operand width from 16 to 32 for this instruction.
                 0x66 => self.op_size_32 = true,
@@ -2130,6 +2134,8 @@ impl Cpu {
                         0x2E => self.seg_override = Some(sreg::CS),
                         0x36 => self.seg_override = Some(sreg::SS),
                         0x3E => self.seg_override = Some(sreg::DS),
+                        0x64 => self.seg_override = Some(sreg::FS),
+                        0x65 => self.seg_override = Some(sreg::GS),
                         0x66 => self.op_size_32 = true,
                         0x67 => self.addr_size_32 = true,
                         _ => break b,
