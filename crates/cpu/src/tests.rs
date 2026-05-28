@@ -2466,6 +2466,52 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0xA0/0xA2 — MOV AL, moffs8 / MOV moffs8, AL. Absolute-address
+/// accumulator load/store (global-variable access).
+#[test]
+fn mov_moffs8_store_then_load_round_trip() {
+    // MOV AL, 0x5A          ; B0 5A
+    // MOV [0x0400], AL      ; A2 00 04   (store AL to DS:0x400)
+    // MOV AL, 0x00          ; B0 00      (clobber)
+    // MOV AL, [0x0400]      ; A0 00 04   (load it back)
+    // HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0xB0, 0x5A, // MOV AL, 0x5A
+            0xA2, 0x00, 0x04, // MOV [0x400], AL
+            0xB0, 0x00, // MOV AL, 0
+            0xA0, 0x00, 0x04, // MOV AL, [0x400]
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(mem.read_u8(0x400), 0x5A);
+    assert_eq!(cpu.read_r8(0), 0x5A);
+}
+
+/// 0x66 0xA1 / 0x66 0xA3 — MOV EAX, moffs32 / MOV moffs32, EAX.
+#[test]
+fn mov_moffs_eax_round_trip() {
+    // MOV EAX, 0xCAFEBABE   ; 66 B8 BE BA FE CA
+    // MOV [0x0500], EAX     ; 66 A3 00 05
+    // MOV EAX, 0            ; 66 B8 00 00 00 00
+    // MOV EAX, [0x0500]     ; 66 A1 00 05
+    // HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // MOV EAX, 0xCAFEBABE
+            0x66, 0xA3, 0x00, 0x05, // MOV [0x500], EAX
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // MOV EAX, 0
+            0x66, 0xA1, 0x00, 0x05, // MOV EAX, [0x500]
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(mem.read_u16(0x500), 0xBABE);
+    assert_eq!(mem.read_u16(0x502), 0xCAFE);
+    assert_eq!(cpu.read_r32(0), 0xCAFE_BABE);
+}
+
 /// 0x0F 0xAF — two-operand IMUL r, r/m. The `a * b` a C compiler
 /// emits.
 #[test]

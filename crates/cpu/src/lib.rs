@@ -616,6 +616,19 @@ impl Cpu {
         lo | (hi << 8)
     }
 
+    /// Fetch the direct memory offset that follows a `moffs`-form MOV
+    /// (0xA0..0xA3). 16-bit under the default address size, 32-bit
+    /// when the 0x67 prefix set `addr_size_32`.
+    fn fetch_moffs(&mut self, mem: &Memory) -> u32 {
+        if self.addr_size_32 {
+            let lo = self.fetch_u16(mem) as u32;
+            let hi = self.fetch_u16(mem) as u32;
+            lo | (hi << 16)
+        } else {
+            self.fetch_u16(mem) as u32
+        }
+    }
+
     fn set_flag(&mut self, mask: u16, value: bool) {
         if value {
             self.flags |= mask;
@@ -3343,6 +3356,47 @@ impl Cpu {
                 self.flags_sub16(a, 1, 0, r);
                 self.set_flag(flag::CF, cf_before);
                 self.write_r16(i, r);
+            }
+
+            // MOV AL, moffs8 / MOV moffs8, AL (0xA0/0xA2) and the
+            // word/dword accumulator forms (0xA1/0xA3). `moffs` is a
+            // direct memory offset that follows the opcode — 16-bit
+            // under the default address size, 32-bit under 0x67. The
+            // segment is DS (honoring an override). Compilers emit
+            // these for absolute global-variable access.
+            0xA0 => {
+                let off = self.fetch_moffs(mem);
+                let lin = self.linear_seg(self.string_src_seg(), off);
+                let v = self.mem_read_u8(mem, lin);
+                self.write_r8(0, v);
+            }
+            0xA1 => {
+                let off = self.fetch_moffs(mem);
+                let lin = self.linear_seg(self.string_src_seg(), off);
+                if self.op_size_32 {
+                    let v = self.mem_read_u32(mem, lin);
+                    self.write_r32(0, v);
+                } else {
+                    let v = self.mem_read_u16(mem, lin);
+                    self.write_r16(0, v);
+                }
+            }
+            0xA2 => {
+                let off = self.fetch_moffs(mem);
+                let lin = self.linear_seg(self.string_src_seg(), off);
+                let al = self.read_r8(0);
+                self.mem_write_u8(mem, lin, al);
+            }
+            0xA3 => {
+                let off = self.fetch_moffs(mem);
+                let lin = self.linear_seg(self.string_src_seg(), off);
+                if self.op_size_32 {
+                    let v = self.read_r32(0);
+                    self.mem_write_u32(mem, lin, v);
+                } else {
+                    let v = self.read_r16(0);
+                    self.mem_write_u16(mem, lin, v);
+                }
             }
 
             // TEST AL, imm8
