@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**398 тестов** зелёные (mem 6 + devices 41 + cpu 267 + vm 76 +
+**399 тестов** зелёные (mem 6 + devices 42 + cpu 267 + vm 76 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -190,10 +190,11 @@ spinlock через LOCK CMPXCHG + PAUSE):
   AX=0xE801 mem split / AX=0xE820), 0x16 (AH=0x00 read / 0x01
   peek / 0x02 shift flags), 0x1A (AH=0x00 get tick / 0x01 set tick /
   0x02 RTC time / 0x04 RTC date — BCD из CMOS).
-- **IDE/ATA два канала** (primary 0x1F0..0x1F7, secondary
-  0x170..0x177): IDENTIFY DEVICE, READ SECTORS и WRITE SECTORS
-  (LBA28). 16-битная передача данных приходит как пара байтовых
-  обращений подряд — оба продвигают буфер, в обе стороны
+- **IDE/ATA два канала** (primary 0x1F0..0x1F7 + control 0x3F6,
+  secondary 0x170..0x177 + control 0x376): IDENTIFY DEVICE,
+  READ SECTORS и WRITE SECTORS (LBA28). Alt-status и device-control
+  через base+0x206. 16-битная передача данных приходит как пара
+  байтовых обращений подряд — оба продвигают буфер, в обе стороны
   (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
   header parser + loader. Снапшот v9 round-trip'ит всё состояние.
@@ -232,7 +233,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 398 пройденных тестов на текущий момент. CI
+Должно вывести 399 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

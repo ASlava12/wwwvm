@@ -231,6 +231,15 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.ata2.read(port);
         }
+        // ATA control-block ports — base + 0x206. These live outside
+        // each channel's contiguous command-block range, so they need
+        // their own dispatch line.
+        if port == self.ata.control_port() {
+            return self.ata.read_alt_status();
+        }
+        if port == self.ata2.control_port() {
+            return self.ata2.read_alt_status();
+        }
         let (lo, hi) = self.pci.port_range();
         if port >= lo && port <= hi {
             return self.pci.read(port);
@@ -277,6 +286,14 @@ impl IoBus {
         let (lo, hi) = self.ata2.port_range();
         if port >= lo && port <= hi {
             self.ata2.write(port, value);
+            return;
+        }
+        if port == self.ata.control_port() {
+            self.ata.write_device_control(value);
+            return;
+        }
+        if port == self.ata2.control_port() {
+            self.ata2.write_device_control(value);
             return;
         }
         let (lo, hi) = self.pci.port_range();
@@ -377,6 +394,30 @@ impl IoBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ata_control_ports_mirror_status_for_both_channels() {
+        let mut bus = IoBus::new();
+        bus.ata.disk.load(&[0xAA; 512]);
+        bus.ata2.disk.load(&[0x55; 512]);
+        // Issue IDENTIFY on each side. The status registers should
+        // come up with DRDY | DRQ. Read it both from the command
+        // block (base+7) and the control port (base+0x206); the
+        // values must match.
+        for base in [0x1F0u16, 0x170u16] {
+            bus.write(base + 7, 0xEC); // IDENTIFY
+            let cmd = bus.read(base + 7);
+            let alt = bus.read(base + 0x206);
+            assert_eq!(cmd, alt, "channel @ {base:#X}");
+            // DRDY (0x40) | DRQ (0x08) both set.
+            assert_eq!(cmd & 0x48, 0x48);
+            // A device-control write must be silently accepted.
+            bus.write(base + 0x206, 0x02);
+            // Alt-status reads don't disturb anything; same value
+            // still comes back.
+            assert_eq!(bus.read(base + 0x206), cmd);
+        }
+    }
 
     #[test]
     fn primary_and_secondary_ata_channels_route_independently() {

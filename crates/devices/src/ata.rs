@@ -2,7 +2,9 @@
 //! it bypasses BIOS and talks to the disk directly. We own a
 //! single `Disk` and present the legacy port interface at a
 //! configurable base (0x1F0 for the primary channel, 0x170 for
-//! the secondary).
+//! the secondary), plus a single control-block port at base+0x206
+//! (0x3F6 / 0x376) for the alt-status register and device-control
+//! writes the kernel uses to poll BSY without acking interrupts.
 //!
 //! The two commands we actually service:
 //!   * 0xEC — IDENTIFY DEVICE (drive metadata block)
@@ -74,11 +76,38 @@ pub struct Ata {
 }
 
 impl Ata {
+    /// Offset from the command-block base to the control-block port
+    /// (alt-status read, device-control write). 0x3F6 - 0x1F0 = 0x206.
+    pub const CONTROL_OFFSET: u16 = 0x206;
+
     /// Build a controller listening on the primary command block
     /// (0x1F0..0x1F7). This is what the existing IoBus uses.
     pub fn new() -> Self {
         Self::with_port_base(PRIMARY_PORT_BASE)
     }
+
+    /// Port hosting the alt-status / device-control register —
+    /// 0x3F6 on the primary channel, 0x376 on the secondary.
+    pub fn control_port(&self) -> u16 {
+        self.port_base + Self::CONTROL_OFFSET
+    }
+
+    /// Read alt-status. Same value as the command-block status
+    /// register (`base + 7`) but, on real silicon, reading this
+    /// port doesn't ack a pending interrupt. We don't generate
+    /// interrupts on the controller, so the distinction is
+    /// observational only.
+    pub fn read_alt_status(&self) -> u8 {
+        self.status
+    }
+
+    /// Write the device-control register. Bit 1 = nIEN (interrupt
+    /// disable), bit 2 = SRST (software reset), bit 7 = HOB (LBA48
+    /// high-order byte select). We don't expose interrupts here and
+    /// don't model LBA48 yet; SRST would clear the controller, but
+    /// since our state machine completes commands synchronously
+    /// there's nothing to clear mid-operation. Silently accept.
+    pub fn write_device_control(&mut self, _value: u8) {}
 
     /// Build a controller listening on a specific command-block
     /// base. Use [`SECONDARY_PORT_BASE`] for the second channel.
