@@ -26,6 +26,19 @@ pub struct Pic {
     pub irr: u8,
     pub isr: u8,
     init_state: InitState,
+    /// OCW3 read-register select. After the kernel writes OCW3
+    /// with bits 1:0 = 10, reads from the command port return
+    /// IRR (the default); with bits 1:0 = 11 they return ISR.
+    /// Linux uses this to detect spurious IRQ 7 / IRQ 15 by
+    /// checking whether the highest in-service bit is actually
+    /// set when the handler fires.
+    read_select: ReadSelect,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReadSelect {
+    Irr,
+    Isr,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -51,6 +64,7 @@ impl Pic {
             irr: 0,
             isr: 0,
             init_state: InitState::Idle,
+            read_select: ReadSelect::Irr,
         }
     }
 
@@ -137,7 +151,10 @@ impl IoDevice for Pic {
 
     fn read(&mut self, port: u16) -> u8 {
         match port - self.base_port {
-            0 => self.irr,
+            0 => match self.read_select {
+                ReadSelect::Irr => self.irr,
+                ReadSelect::Isr => self.isr,
+            },
             1 => self.imr,
             _ => 0,
         }
@@ -152,13 +169,23 @@ impl IoDevice for Pic {
                     self.imr = 0;
                     self.isr = 0;
                     self.irr = 0;
+                } else if value & 0x18 == 0x08 {
+                    // OCW3 (bit 3 set, bit 4 clear). Bits 1:0 select
+                    // the read register on subsequent command-port
+                    // reads: 10 = IRR (default), 11 = ISR. Linux
+                    // writes OCW3 with bits 1:0 = 11 before reading
+                    // ISR to detect spurious IRQ 7 / IRQ 15.
+                    match value & 0b11 {
+                        0b10 => self.read_select = ReadSelect::Irr,
+                        0b11 => self.read_select = ReadSelect::Isr,
+                        _ => {}
+                    }
                 } else if value & 0x18 == 0x00 {
                     // OCW2 — bottom bits: 0x20 = non-specific EOI
                     if value & 0xE0 == 0x20 {
                         self.non_specific_eoi();
                     }
                 }
-                // OCW3 (0b0xx01xxx) not implemented yet.
             }
             1 => match self.init_state {
                 InitState::Idle => self.imr = value,
@@ -181,6 +208,34 @@ impl IoDevice for Pic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OCW3 with bits 1:0 = 11 switches the command-port read to
+    /// return ISR. Linux uses this to detect spurious IRQ 7 / 15
+    /// — if the handler fires but the matching ISR bit is clear,
+    /// the IRQ was spurious and the handler should bail without
+    /// sending EOI.
+    #[test]
+    fn ocw3_isr_select_switches_command_port_read() {
+        let mut pic = Pic::master();
+        pic.imr = 0;
+        pic.raise_irq(5);
+        pic.ack();
+        // ISR bit 5 set; IRR is now clear.
+        assert_eq!(pic.isr, 1 << 5);
+        assert_eq!(pic.irr, 0);
+
+        // Default read returns IRR (= 0).
+        assert_eq!(pic.read(0x20), 0);
+
+        // Write OCW3 with bits 1:0 = 11 → switch to ISR.
+        // OCW3 layout: 0b0_xx_01_xx_b → bit 3 set, bit 4 clear.
+        pic.write(0x20, 0b0000_1011);
+        assert_eq!(pic.read(0x20), 1 << 5, "ISR readable via OCW3");
+
+        // Switch back to IRR with bits 1:0 = 10.
+        pic.write(0x20, 0b0000_1010);
+        assert_eq!(pic.read(0x20), 0, "IRR readable after switch back");
+    }
 
     #[test]
     fn masked_irq_does_not_become_pending() {
