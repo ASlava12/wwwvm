@@ -5169,6 +5169,112 @@ fn int_from_ring_3_switches_to_kernel_stack_via_tss() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8002);
 }
 
+/// #PF from CPL=3 dispatches cross-ring via TSS *and* pushes the
+/// error code below the IRET frame. The user's load from an
+/// unmapped page must:
+///   1. raise #PF with U/S=1 (because CPL=3),
+///   2. swap to the kernel stack via TSS.SS0:ESP0,
+///   3. push user SS, user ESP, EFLAGS, user CS, user EIP, then
+///      the error code on the kernel stack,
+///   4. land at the handler at CPL=0.
+///
+/// This is the userspace demand-paging path Linux walks on every
+/// COW write, file-backed mmap read, etc. We previously tested
+/// each piece in isolation (cross-ring INT, in-CPL=0 #PF dispatch,
+/// CR3 reload); this one composes them.
+#[test]
+fn pf_from_ring_3_swaps_to_kernel_stack_via_tss_with_error_code() {
+    let mut mem = Memory::new(0x0080_0000);
+    // GDT — same 6-entry shape as the syscall test (null + kcode +
+    // kdata + ucode + udata + TSS).
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000); // TSS.ESP0
+    mem.write_u16(0x4008, 0x0010); // TSS.SS0
+
+    // IDT[14] = #PF gate at DPL=0, kernel selector 0x08, handler 0x9000.
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+
+    // PD at 0x100000: PDE[0] = PSE identity for [0, 4M) — covers
+    // GDT/IDT/TSS/user code/handler. PDE[1] = 0 → user's load
+    // from linear 0x400000 #PFs.
+    mem.write_u32(0x0010_0000, 0x0000_0083);
+
+    // Ring-3 user code at 0x8000:
+    //   A1 00 00 40 00   MOV EAX, [0x400000]  ; faults
+    //   F4               HLT (never reached)
+    mem.write_slice(0x8000, &[0xA1, 0x00, 0x00, 0x40, 0x00, 0xF4]);
+
+    // Ring-0 handler at 0x9000:
+    //   58           POP EAX               ; pop the error code into EAX
+    //   0F 20 D3     MOV EBX, CR2          ; capture faulting linear
+    //   F4           HLT
+    mem.write_slice(0x9000, &[0x58, 0x0F, 0x20, 0xD3, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0001; // PG | PE
+    cpu.cr3 = 0x0010_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_sreg(sreg::DS, 0x0023, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "handler must reach HLT");
+
+    // CR2 latched the faulting linear.
+    assert_eq!(cpu.cr2, 0x0040_0000);
+    // EBX captured CR2 via MOV EBX, CR2 inside the handler.
+    assert_eq!(cpu.read_r32(3), 0x0040_0000);
+    // EAX has the error code the handler popped. U/S (bit 2) set
+    // because the fault came from CPL=3; W (bit 1) clear (read);
+    // P (bit 0) clear (page not present); I/D (bit 4) clear.
+    let err = cpu.read_r32(0);
+    assert_eq!(err & 0b100, 0b100, "U/S bit set on CPL=3 fault");
+    assert_eq!(err & 0b1, 0, "P=0 (not present)");
+    assert_eq!(err & 0b10, 0, "W=0 (read)");
+    assert_eq!(err & 0b1_0000, 0, "I/D=0 (data access)");
+    // Stack switched via TSS and CS landed on the gate target.
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+
+    // Cross-ring frame layout on the kernel stack, walking down
+    // from TSS.ESP0 = 0x3000:
+    //   [0x3000 -  4] = SS_user    = 0x23
+    //   [0x3000 -  8] = ESP_user   = 0x2000
+    //   [0x3000 - 12] = EFLAGS (IF clear: interrupt gate)
+    //   [0x3000 - 16] = CS_user    = 0x1B
+    //   [0x3000 - 20] = EIP_user   = 0x8000 (faulting instr, not next)
+    //   [0x3000 - 24] = error code (popped into EAX)
+    assert_eq!(mem.read_u32(0x3000 - 4), 0x23);
+    assert_eq!(mem.read_u32(0x3000 - 8), 0x2000);
+    assert_eq!(mem.read_u32(0x3000 - 16), 0x1B);
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+}
+
 /// User code at CPL=3 actually executes data writes, then INTs back
 /// to the kernel — the Linux syscall shape end-to-end. The
 /// previous test only asserts the frame layout the moment after
