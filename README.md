@@ -160,7 +160,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
   RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe),
   MOV/POP sreg и LES/LDS на селекторе вне GDT.limit раздают
-  #GP(selector) через общий raise_gp_if_bad_selector.
+  #GP(selector) через общий raise_gp_if_bad_selector,
+  DIV/IDIV/AAM на нуле или overflow раздают #DE (vector 0) через IVT.
 - **x87 FPU**: 8×f64 register-stack с TOP, FLD/FST/FSTP (m32/m64),
   FILD/FISTP, FADD/FMUL/FSUB(R)/FDIV(R) + ...P-формы, FCHS/FABS/
   FSQRT/FRNDINT, константы (FLD1/FLDPI/...), FCOM/FTST + FNSTSW.
@@ -204,7 +205,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
-| Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #GP уже raised из RDMSR/WRMSR на неизвестных MSR (rdmsr_safe работает); остаётся раздавать из segment-load helper'ов и привилегий |
+| Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #DE, #UD, #PF и существенный кусок #GP уже доезжают; остался #GP из ring transitions и #DF/#NP/#SS |
 | IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
 | APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |

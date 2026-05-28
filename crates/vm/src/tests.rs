@@ -1575,25 +1575,24 @@ fn restore_rejects_truncated_blob() {
     }
 }
 
-/// Divide-by-zero in the guest must surface as `Stop::CpuError`
-/// rather than silently producing garbage. This is the VM-side
-/// view of `CpuError::DivideError`.
+/// Divide-by-zero now raises #DE through IVT[0] instead of
+/// surfacing as `Stop::CpuError`. Confirms the VM-side view: a
+/// handler set up via the IVT actually runs and the VM ends
+/// halted, not in an error state.
 #[test]
-fn div_by_zero_surfaces_through_vm_stop() {
-    // MOV AL, 5 ; MOV BL, 0 ; DIV BL ; HLT (unreached)
-    let program: &[u8] = &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3, 0xF4];
+fn div_by_zero_vectors_through_ivt_de_under_vm() {
     let mut vm = Vm::new();
-    vm.load_image(BOOT_LOAD_ADDR, program);
+    // IVT[0] = 0:0x7C20 (handler).
+    vm.mem.write_u8(0, 0x20);
+    vm.mem.write_u8(1, 0x7C);
+    vm.mem.write_u8(2, 0);
+    vm.mem.write_u8(3, 0);
+    // MOV AL, 5 ; MOV BL, 0 ; DIV BL ; HLT (unreached)
+    vm.load_image(BOOT_LOAD_ADDR, &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3, 0xF4]);
+    // Handler at 0:0x7C20: MOV AL, 0xDE ; HLT
+    vm.mem.write_slice(0x7C20, &[0xB0, 0xDE, 0xF4]);
     vm.boot();
-    let (_, stop) = vm.run_steps(1_000);
-    match stop {
-        Stop::CpuError(e) => {
-            let msg = e.to_string();
-            assert!(msg.contains("divide error"), "got: {msg}");
-        }
-        other => panic!("expected CpuError(DivideError), got {other:?}"),
-    }
-    // VM did not transition to halted state — divide error is a
-    // separate failure mode.
-    assert!(!vm.is_halted());
+    vm.run_steps(64);
+    assert!(vm.is_halted(), "VM halts via the handler, not on Err");
+    assert_eq!(vm.cpu().read_r8(0), 0xDE, "handler ran");
 }

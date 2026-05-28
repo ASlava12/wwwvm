@@ -754,22 +754,35 @@ fn div_r16_dx_ax_dividend() {
     assert_eq!(cpu.regs[r16::DX], 0);
 }
 
+/// Divide-by-zero raises #DE through IVT[0]. The handler ran iff
+/// AL holds the sentinel we set inside it; the pushed IP names the
+/// start of the DIV instruction (the fault-frame convention).
 #[test]
-fn div_by_zero_returns_cpu_error() {
+fn div_by_zero_vectors_through_ivt_de() {
     let mut mem = Memory::new(0x10_0000);
-    // MOV AL, 5 ; MOV BL, 0 ; DIV BL  (no HLT — we expect error first)
-    mem.write_slice(0x7C00, &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3]);
+    // IVT[0] = 0:0x7C20 — handler that sets AL = sentinel and HLTs.
+    mem.write_u8(0, 0x20);
+    mem.write_u8(1, 0x7C);
+    mem.write_u8(2, 0);
+    mem.write_u8(3, 0);
+    //   MOV AL, 5 ; MOV BL, 0 ; DIV BL  (DIV is at offset 4 → 0x7C04)
+    mem.write_slice(0x7C00, &[0xB0, 0x05, 0xB3, 0x00, 0xF6, 0xF3, 0xF4]);
+    //   Handler: MOV AL, 0xDE ; HLT
+    mem.write_slice(0x7C20, &[0xB0, 0xDE, 0xF4]);
     let mut cpu = Cpu::new();
     cpu.reset_to_boot();
     let mut io = IoBus::new();
-    // 3 steps until DIV
-    cpu.step(&mut mem, &mut io).unwrap();
-    cpu.step(&mut mem, &mut io).unwrap();
-    let err = cpu.step(&mut mem, &mut io).unwrap_err();
-    match err {
-        CpuError::DivideError { .. } => {}
-        other => panic!("expected DivideError, got {other:?}"),
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
     }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0xDE, "handler ran");
+    // Frame: SP=0x7C00 → 0x7BFA after three 16-bit pushes (FLAGS, CS, IP).
+    // mem[0x7BFA] = saved IP = 0x7C04 (start of DIV BL).
+    assert_eq!(mem.read_u16(0x7BFA), 0x7C04);
 }
 
 #[test]
@@ -1790,19 +1803,31 @@ fn aad_combines_ah_al_into_al() {
     assert_eq!(cpu.read_r8(4), 0);
 }
 
+/// AAM with base = 0 raises #DE through IVT[0] (same path as DIV
+/// by zero). The handler-ran-and-IP-was-right shape of the test
+/// is identical to div_by_zero_vectors_through_ivt_de.
 #[test]
-fn aam_with_zero_base_raises_divide_error() {
+fn aam_with_zero_base_vectors_through_ivt_de() {
     let mut mem = Memory::new(0x10_0000);
+    mem.write_u8(0, 0x20);
+    mem.write_u8(1, 0x7C);
+    mem.write_u8(2, 0);
+    mem.write_u8(3, 0);
+    // MOV AL, 5 ; AAM 0  (AAM at offset 2 → 0x7C02)
     mem.write_slice(0x7C00, &[0xB0, 0x05, 0xD4, 0x00, 0xF4]);
+    mem.write_slice(0x7C20, &[0xB0, 0xAA, 0xF4]);
     let mut cpu = Cpu::new();
     cpu.reset_to_boot();
     let mut io = IoBus::new();
-    cpu.step(&mut mem, &mut io).unwrap();
-    let err = cpu.step(&mut mem, &mut io).unwrap_err();
-    match err {
-        CpuError::DivideError { .. } => {}
-        other => panic!("expected DivideError, got {other:?}"),
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
     }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0xAA);
+    assert_eq!(mem.read_u16(0x7BFA), 0x7C02, "saved IP = start of AAM");
 }
 
 #[test]

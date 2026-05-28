@@ -36,12 +36,6 @@ pub enum CpuError {
         cs: u16,
         ip: u32,
     },
-    /// Real x86 raises interrupt #0 (Divide Error) for div-by-zero or
-    /// quotient overflow. We surface it as a CPU error so callers see
-    /// what happened — future iterations may wire it to an IDT-based
-    /// interrupt vector.
-    #[error("divide error at {cs:04X}:{ip:08X}")]
-    DivideError { cs: u16, ip: u32 },
 }
 
 /// Flags register bits we actually maintain.
@@ -437,6 +431,16 @@ impl Cpu {
         // The 8-byte descriptor at `index..index+7` must lie within
         // the table; GDTR.limit is the largest valid byte offset.
         index + 7 > self.gdtr.limit as u32
+    }
+
+    /// Raise #DE (vector 0) for a divide error — division by zero
+    /// or quotient overflow on DIV/IDIV, or AAM with base = 0. Real
+    /// silicon vectors through IDT[0]; previously we returned a
+    /// host-visible `CpuError`. Rewinding IP to `op_ip` makes the
+    /// pushed fault frame name the offending instruction.
+    fn raise_de(&mut self, op_ip: u32, mem: &mut Memory) {
+        self.ip = op_ip;
+        self.do_interrupt(0, mem);
     }
 
     /// If `selector` is out of GDT bounds in PE mode, raise #GP
@@ -2945,19 +2949,15 @@ impl Cpu {
                         // DIV r/m8 — AL = AX/v (unsigned), AH = AX%v
                         let v = self.read_rm8(rm, mem);
                         if v == 0 {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
+                            self.raise_de(op_ip, mem);
+                            return Ok(());
                         }
                         let ax = self.regs[r16::AX];
                         let q = ax / v as u16;
                         let r = ax % v as u16;
                         if q > 0xFF {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
+                            self.raise_de(op_ip, mem);
+                            return Ok(());
                         }
                         self.write_r8(0, q as u8);
                         self.write_r8(4, r as u8); // AH
@@ -2966,19 +2966,15 @@ impl Cpu {
                         // IDIV r/m8 — signed division of AX by r/m8
                         let v = self.read_rm8(rm, mem) as i8 as i16;
                         if v == 0 {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
+                            self.raise_de(op_ip, mem);
+                            return Ok(());
                         }
                         let ax = self.regs[r16::AX] as i16;
                         let q = ax / v;
                         let r = ax % v;
                         if !(-128..=127).contains(&q) {
-                            return Err(CpuError::DivideError {
-                                cs: op_cs,
-                                ip: op_ip,
-                            });
+                            self.raise_de(op_ip, mem);
+                            return Ok(());
                         }
                         self.write_r8(0, q as u8);
                         self.write_r8(4, r as u8); // AH
@@ -3042,20 +3038,16 @@ impl Cpu {
                             // DIV r/m32 — EAX = EDX:EAX / v, EDX = rem (unsigned)
                             let v = self.read_rm32(rm, mem) as u64;
                             if v == 0 {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             let dividend =
                                 ((self.read_r32(2) as u64) << 32) | self.read_r32(0) as u64;
                             let q = dividend / v;
                             let r = dividend % v;
                             if q > 0xFFFF_FFFF {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             self.write_r32(0, q as u32);
                             self.write_r32(2, r as u32);
@@ -3064,10 +3056,8 @@ impl Cpu {
                             // IDIV r/m32 — signed division of EDX:EAX by r/m32
                             let v = self.read_rm32(rm, mem) as i32 as i64;
                             if v == 0 {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             let dividend = (((self.read_r32(2) as u64) << 32)
                                 | self.read_r32(0) as u64)
@@ -3075,10 +3065,8 @@ impl Cpu {
                             let q = dividend / v;
                             let r = dividend % v;
                             if !(i32::MIN as i64..=i32::MAX as i64).contains(&q) {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             self.write_r32(0, q as u32);
                             self.write_r32(2, r as u32);
@@ -3136,20 +3124,16 @@ impl Cpu {
                             // DIV r/m16 — AX = DX:AX / v (unsigned), DX = rem
                             let v = self.read_rm16(rm, mem) as u32;
                             if v == 0 {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             let dividend =
                                 ((self.regs[r16::DX] as u32) << 16) | self.regs[r16::AX] as u32;
                             let q = dividend / v;
                             let r = dividend % v;
                             if q > 0xFFFF {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             self.regs[r16::AX] = q as u16;
                             self.regs[r16::DX] = r as u16;
@@ -3158,10 +3142,8 @@ impl Cpu {
                             // IDIV r/m16 — signed division of DX:AX by r/m16
                             let v = self.read_rm16(rm, mem) as i16 as i32;
                             if v == 0 {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             let dividend = (((self.regs[r16::DX] as u32) << 16)
                                 | self.regs[r16::AX] as u32)
@@ -3169,10 +3151,8 @@ impl Cpu {
                             let q = dividend / v;
                             let r = dividend % v;
                             if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
-                                return Err(CpuError::DivideError {
-                                    cs: op_cs,
-                                    ip: op_ip,
-                                });
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
                             }
                             self.regs[r16::AX] = q as u16;
                             self.regs[r16::DX] = r as u16;
@@ -4093,10 +4073,8 @@ impl Cpu {
             0xD4 => {
                 let base = self.fetch_u8(mem);
                 if base == 0 {
-                    return Err(CpuError::DivideError {
-                        cs: op_cs,
-                        ip: op_ip,
-                    });
+                    self.raise_de(op_ip, mem);
+                    return Ok(());
                 }
                 let al = self.read_r8(0);
                 let ah = al / base;
