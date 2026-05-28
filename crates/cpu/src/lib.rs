@@ -5845,6 +5845,46 @@ impl Cpu {
                         }
                     }
 
+                    // CMPXCHG8B m64 — 0x0F 0xC7 /1. Atomic 64-bit
+                    // compare-and-swap.  If EDX:EAX == [m64] then
+                    // [m64] := ECX:EBX and ZF=1; otherwise
+                    // EDX:EAX := [m64] and ZF=0.  Linux uses this
+                    // for `cmpxchg64` / `atomic64_t` on i486+, and
+                    // for per-CPU pointer updates during boot.
+                    // Only the memory form is defined — mod=11
+                    // would mean a register operand, which is
+                    // invalid on real silicon (and overlaps with
+                    // RDRAND/RDSEED on newer CPUs we don't model).
+                    0xC7 => {
+                        let (mode, reg, rm) = self.fetch_modrm(mem);
+                        if mode == 0b11 || reg != 1 {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                        let Rm::Mem(ea) = rm else { unreachable!() };
+                        let addr = self.linear_seg(ea.seg, ea.off);
+                        let mem_lo = self.mem_read_u32(mem, addr);
+                        let mem_hi = self.mem_read_u32(mem, addr.wrapping_add(4));
+                        let expected_lo = self.read_r32(0); // EAX
+                        let expected_hi = self.read_r32(2); // EDX
+                        if mem_lo == expected_lo && mem_hi == expected_hi {
+                            // Match → publish ECX:EBX, set ZF.
+                            let new_lo = self.read_r32(3); // EBX
+                            let new_hi = self.read_r32(1); // ECX
+                            self.mem_write_u32(mem, addr, new_lo);
+                            self.mem_write_u32(mem, addr.wrapping_add(4), new_hi);
+                            self.set_flag(flag::ZF, true);
+                        } else {
+                            // Miss → load actual [m64] into EDX:EAX,
+                            // clear ZF. The kernel retries the loop.
+                            self.write_r32(0, mem_lo);
+                            self.write_r32(2, mem_hi);
+                            self.set_flag(flag::ZF, false);
+                        }
+                    }
                     // BSWAP r32 — 0x0F 0xC8..0xCF. Reverses byte
                     // order in a 32-bit register. Linux uses this
                     // for network byte-order conversions.

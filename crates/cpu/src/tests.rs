@@ -7020,6 +7020,76 @@ fn cmpxchg_r8_mismatch_case_loads_memory_into_al() {
     assert!(!cpu.has(flag::ZF));
 }
 
+/// CMPXCHG8B match case — atomic 64-bit compare-and-swap. The
+/// kernel uses this for `cmpxchg64`/`atomic64_t` on i486+ and for
+/// per-CPU pointer updates. EDX:EAX hold the expected value; if
+/// it matches [m64], publish ECX:EBX and set ZF=1.
+#[test]
+fn cmpxchg8b_match_publishes_ecx_ebx_and_sets_zf() {
+    // Seed [0x500] = 0x1111_2222_3333_4444 (lo dword + hi dword)
+    // 66 C7 06 00 05 44 33 22 11   MOV DWORD [0x500], 0x11223344
+    // 66 C7 06 04 05 88 77 66 55   MOV DWORD [0x504], 0x55667788
+    // Wait — we need the expected to match, so set expected:
+    //   EAX = 0x11223344, EDX = 0x55667788
+    //   ECX:EBX = 0xCAFEBABE_DEADBEEF (high in ECX, low in EBX)
+    // Then CMPXCHG8B [0x500] (0F C7 0E 00 05; modrm=00 001 110 = 0x0E)
+    let (cpu, mem, _) = run_payload(
+        &[
+            // Seed memory.
+            0x66, 0xC7, 0x06, 0x00, 0x05, 0x44, 0x33, 0x22,
+            0x11, // MOV DWORD [0x500], 0x11223344
+            0x66, 0xC7, 0x06, 0x04, 0x05, 0x88, 0x77, 0x66,
+            0x55, // MOV DWORD [0x504], 0x55667788
+            // Set up the expected value.
+            0x66, 0xB8, 0x44, 0x33, 0x22, 0x11, // MOV EAX, 0x11223344
+            0x66, 0xBA, 0x88, 0x77, 0x66, 0x55, // MOV EDX, 0x55667788
+            // Set up the replacement.
+            0x66, 0xBB, 0xEF, 0xBE, 0xAD, 0xDE, // MOV EBX, 0xDEADBEEF
+            0x66, 0xB9, 0xBE, 0xBA, 0xFE, 0xCA, // MOV ECX, 0xCAFEBABE
+            0x0F, 0xC7, 0x0E, 0x00, 0x05, // CMPXCHG8B [0x500]
+            0xF4,
+        ],
+        32,
+    );
+    // Memory was published: low dword = EBX, high dword = ECX.
+    assert_eq!(mem.read_u16(0x500), 0xBEEF);
+    assert_eq!(mem.read_u16(0x502), 0xDEAD);
+    assert_eq!(mem.read_u16(0x504), 0xBABE);
+    assert_eq!(mem.read_u16(0x506), 0xCAFE);
+    assert!(cpu.has(flag::ZF), "ZF set on match");
+}
+
+/// CMPXCHG8B mismatch case: the memory value flows back into
+/// EDX:EAX, ZF cleared, [m64] untouched.
+#[test]
+fn cmpxchg8b_mismatch_loads_memory_into_edx_eax_and_clears_zf() {
+    let (cpu, mem, _) = run_payload(
+        &[
+            // Seed memory with 0x9999_8888_7777_6666 (lo,hi).
+            0x66, 0xC7, 0x06, 0x00, 0x05, 0x66, 0x77, 0x88, 0x99, // [0x500] = 0x99887766
+            0x66, 0xC7, 0x06, 0x04, 0x05, 0x22, 0x33, 0x44, 0x55, // [0x504] = 0x55443322
+            // Expected (intentionally wrong).
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // MOV EAX, 0
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x00, // MOV EDX, 0
+            // Replacement (would-be).
+            0x66, 0xBB, 0xEF, 0xBE, 0xAD, 0xDE, // MOV EBX, 0xDEADBEEF
+            0x66, 0xB9, 0xBE, 0xBA, 0xFE, 0xCA, // MOV ECX, 0xCAFEBABE
+            0x0F, 0xC7, 0x0E, 0x00, 0x05, // CMPXCHG8B [0x500]
+            0xF4,
+        ],
+        32,
+    );
+    // Memory untouched.
+    assert_eq!(mem.read_u16(0x500), 0x7766);
+    assert_eq!(mem.read_u16(0x502), 0x9988);
+    assert_eq!(mem.read_u16(0x504), 0x3322);
+    assert_eq!(mem.read_u16(0x506), 0x5544);
+    // EDX:EAX now hold the loaded memory value.
+    assert_eq!(cpu.read_r32(0), 0x9988_7766);
+    assert_eq!(cpu.read_r32(2), 0x5544_3322);
+    assert!(!cpu.has(flag::ZF), "ZF clear on mismatch");
+}
+
 /// 0x0F 0x22 /2 (MOV CR2, r32) and 0x0F 0x20 /2 (MOV r32, CR2) — used
 /// by a #PF handler to (re)write or read the faulting linear address.
 #[test]
