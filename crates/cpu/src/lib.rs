@@ -861,6 +861,20 @@ impl Cpu {
         self.read_tlb.set(None);
     }
 
+    // PDE/PTE A/D bits are deliberately NOT updated by translate_inner.
+    // Linux's only consumer is page-reclaim sweeps that compare A=1 vs
+    // A=0 to estimate page activity; on our boot path no reclaim
+    // ever runs (we hit the kernel-init → /init → exit panic chain
+    // long before kswapd activates), so the user-visible difference
+    // is zero. A previous attempt to support A/D via deferred
+    // writeback (a 1-slot Cell flushed at step start) regressed three
+    // page-table unit tests: a user-mode `MOV [pde]` would land 4
+    // bytes of user data, then the next step's flush would overwrite
+    // those bytes with the *pre-write* PDE OR'd with A/D bits,
+    // silently undoing the write. The fix would be a per-write
+    // same-word check that drops the pending update, which works
+    // but is fragile and doesn't actually buy anything on a real
+    // workload. Tracking the work item in commit messages instead.
     fn translate_inner(&self, mem: &Memory, linear: u32, access: Access) -> u32 {
         let phys = if self.cr0 & 0x8000_0000 == 0 {
             linear
