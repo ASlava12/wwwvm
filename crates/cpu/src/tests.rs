@@ -2587,6 +2587,92 @@ fn sse_paddd_packed_lane_add() {
     assert_eq!(mem.read_u32(0x62C), 0);
 }
 
+/// SSE ADDPS — packed single-precision add across all 4 lanes.
+/// Loads two f32×4 vectors from memory (MOVUPS, no 0x66 prefix),
+/// adds them lane-wise, stores the result, and checks each lane.
+#[test]
+fn sse_addps_packed_single_add() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [1.0f32, 2.0, 3.0, 4.0];
+    let b = [10.0f32, 20.0, 30.0, 40.0];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize].to_bits());
+        mem.write_u32(0x610 + i * 4, b[i as usize].to_bits());
+    }
+    // MOVUPS XMM0,[0x600] ; MOVUPS XMM1,[0x610] ; ADDPS XMM0,XMM1 ;
+    // MOVUPS [0x620],XMM0 ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x0F, 0x10, 0x06, 0x00, 0x06, // MOVUPS XMM0, [0x600]
+            0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVUPS XMM1, [0x610]
+            0x0F, 0x58, 0xC1, // ADDPS XMM0, XMM1
+            0x0F, 0x11, 0x06, 0x20, 0x06, // MOVUPS [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    for i in 0..4u32 {
+        let got = f32::from_bits(mem.read_u32(0x620 + i * 4));
+        assert_eq!(got, a[i as usize] + b[i as usize]);
+    }
+}
+
+/// SSE2 MULPD — packed double-precision multiply (the 0x66 prefix
+/// selects the 2×f64 form). Confirms lane width and op selection are
+/// both keyed correctly off the prefix + opcode.
+#[test]
+fn sse_mulpd_packed_double_multiply() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [1.5f64, 2.5];
+    let b = [10.0f64, 20.0];
+    for i in 0..2u32 {
+        let ab = a[i as usize].to_bits();
+        let bb = b[i as usize].to_bits();
+        mem.write_u32(0x600 + i * 8, ab as u32);
+        mem.write_u32(0x600 + i * 8 + 4, (ab >> 32) as u32);
+        mem.write_u32(0x610 + i * 8, bb as u32);
+        mem.write_u32(0x610 + i * 8 + 4, (bb >> 32) as u32);
+    }
+    // MOVUPD XMM0,[0x600] ; MOVUPD XMM1,[0x610] ; MULPD XMM0,XMM1 ;
+    // MOVUPD [0x620],XMM0 ; HLT  (all 0x66-prefixed)
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x10, 0x06, 0x00, 0x06, // MOVUPD XMM0, [0x600]
+            0x66, 0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVUPD XMM1, [0x610]
+            0x66, 0x0F, 0x59, 0xC1, // MULPD XMM0, XMM1
+            0x66, 0x0F, 0x11, 0x06, 0x20, 0x06, // MOVUPD [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    for i in 0..2u32 {
+        let lo = mem.read_u32(0x620 + i * 8) as u64;
+        let hi = mem.read_u32(0x620 + i * 8 + 4) as u64;
+        let got = f64::from_bits(lo | (hi << 32));
+        assert_eq!(got, a[i as usize] * b[i as usize]);
+    }
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

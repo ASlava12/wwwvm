@@ -4309,6 +4309,31 @@ impl Cpu {
                         };
                         self.xmm[reg as usize] = packed_sub(a, b, lane);
                     }
+                    // Packed float arithmetic. The 0x66 prefix
+                    // (op_size_32) selects double-precision (PD, 2×f64)
+                    // over single (PS, 4×f32); the opcode low bits pick
+                    // the operation:
+                    //   58 ADD   59 MUL   5C SUB   5E DIV
+                    0x58 | 0x59 | 0x5C | 0x5E => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            match op2 {
+                                0x58 => packed_f64(a, b, |x, y| x + y),
+                                0x59 => packed_f64(a, b, |x, y| x * y),
+                                0x5C => packed_f64(a, b, |x, y| x - y),
+                                _ => packed_f64(a, b, |x, y| x / y),
+                            }
+                        } else {
+                            match op2 {
+                                0x58 => packed_f32(a, b, |x, y| x + y),
+                                0x59 => packed_f32(a, b, |x, y| x * y),
+                                0x5C => packed_f32(a, b, |x, y| x - y),
+                                _ => packed_f32(a, b, |x, y| x / y),
+                            }
+                        };
+                    }
 
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
@@ -5051,6 +5076,33 @@ fn packed_lanes(a: u128, b: u128, lane_bits: u32, f: impl Fn(u128, u128, u128) -
         let lb = (b >> shift) & mask;
         out |= (f(la, lb, mask) & mask) << shift;
         shift += lane_bits;
+    }
+    out
+}
+
+/// Packed single-precision float op — split `a` and `b` into 4 ×
+/// f32 lanes, apply `f` lane-by-lane, recombine. The SSE
+/// ADDPS/SUBPS/MULPS/DIVPS family (no 0x66 prefix).
+fn packed_f32(a: u128, b: u128, f: impl Fn(f32, f32) -> f32) -> u128 {
+    let mut out: u128 = 0;
+    for lane in 0..4 {
+        let shift = lane * 32;
+        let la = f32::from_bits((a >> shift) as u32);
+        let lb = f32::from_bits((b >> shift) as u32);
+        out |= (f(la, lb).to_bits() as u128) << shift;
+    }
+    out
+}
+
+/// Packed double-precision float op — split `a` and `b` into 2 ×
+/// f64 lanes. The SSE2 ADDPD/SUBPD/MULPD/DIVPD family (0x66 prefix).
+fn packed_f64(a: u128, b: u128, f: impl Fn(f64, f64) -> f64) -> u128 {
+    let mut out: u128 = 0;
+    for lane in 0..2 {
+        let shift = lane * 64;
+        let la = f64::from_bits((a >> shift) as u64);
+        let lb = f64::from_bits((b >> shift) as u64);
+        out |= (f(la, lb).to_bits() as u128) << shift;
     }
     out
 }
