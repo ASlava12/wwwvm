@@ -2466,6 +2466,36 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x66 0x69 — three-operand IMUL r32, r/m32, imm32.
+#[test]
+fn imul_three_operand_imm32() {
+    // MOV EBX, 100 ; IMUL EAX, EBX, 1000 ; HLT → EAX=100000
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xBB, 0x64, 0x00, 0x00, 0x00, // MOV EBX, 100
+            0x66, 0x69, 0xC3, 0xE8, 0x03, 0x00, 0x00, // IMUL EAX, EBX, 1000
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 100_000);
+}
+
+/// 0x66 0x6B — three-operand IMUL r32, r/m32, imm8 (sign-extended).
+#[test]
+fn imul_three_operand_imm8_32bit() {
+    // MOV EBX, 0x1000 ; IMUL EAX, EBX, -2 ; HLT → EAX = -0x2000
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xBB, 0x00, 0x10, 0x00, 0x00, // MOV EBX, 0x1000
+            0x66, 0x6B, 0xC3, 0xFE, // IMUL EAX, EBX, -2
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0xFFFF_E000); // -0x2000
+}
+
 /// 0xA0/0xA2 — MOV AL, moffs8 / MOV moffs8, AL. Absolute-address
 /// accumulator load/store (global-variable access).
 #[test]

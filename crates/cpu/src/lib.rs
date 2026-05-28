@@ -2979,32 +2979,53 @@ impl Cpu {
                 }
             }
 
-            // IMUL r16, r/m16, imm (80186+ three-operand form).
-            //   0x69 — imm16
-            //   0x6B — imm8 sign-extended to 16
+            // IMUL r, r/m, imm (80186+ three-operand form).
+            //   0x69 — imm16 (0x66: imm32)
+            //   0x6B — imm8 sign-extended to operand width
             // The reg field of ModR/M is the destination; the source
-            // is the r/m operand multiplied by the immediate.
+            // is the r/m operand multiplied by the immediate. Under
+            // the 0x66 prefix all three operands are 32-bit.
             0x69 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                let imm = self.fetch_u16(mem) as i16 as i32;
-                let a = self.read_rm16(rm, mem) as i16 as i32;
-                let product = a.wrapping_mul(imm);
-                self.write_r16(reg, product as u16);
-                let sign_extended = (product as i16) as i32;
-                let overflow = sign_extended != product;
-                self.set_flag(flag::CF, overflow);
-                self.set_flag(flag::OF, overflow);
+                if self.op_size_32 {
+                    let lo = self.fetch_u16(mem) as u32;
+                    let hi = self.fetch_u16(mem) as u32;
+                    let imm = (lo | (hi << 16)) as i32 as i64;
+                    let a = self.read_rm32(rm, mem) as i32 as i64;
+                    let product = a.wrapping_mul(imm);
+                    self.write_r32(reg, product as u32);
+                    let overflow = i64::from(product as i32) != product;
+                    self.set_flag(flag::CF, overflow);
+                    self.set_flag(flag::OF, overflow);
+                } else {
+                    let imm = self.fetch_u16(mem) as i16 as i32;
+                    let a = self.read_rm16(rm, mem) as i16 as i32;
+                    let product = a.wrapping_mul(imm);
+                    self.write_r16(reg, product as u16);
+                    let overflow = (product as i16) as i32 != product;
+                    self.set_flag(flag::CF, overflow);
+                    self.set_flag(flag::OF, overflow);
+                }
             }
             0x6B => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
-                let imm = self.fetch_u8(mem) as i8 as i32;
-                let a = self.read_rm16(rm, mem) as i16 as i32;
-                let product = a.wrapping_mul(imm);
-                self.write_r16(reg, product as u16);
-                let sign_extended = (product as i16) as i32;
-                let overflow = sign_extended != product;
-                self.set_flag(flag::CF, overflow);
-                self.set_flag(flag::OF, overflow);
+                if self.op_size_32 {
+                    let imm = self.fetch_u8(mem) as i8 as i64;
+                    let a = self.read_rm32(rm, mem) as i32 as i64;
+                    let product = a.wrapping_mul(imm);
+                    self.write_r32(reg, product as u32);
+                    let overflow = i64::from(product as i32) != product;
+                    self.set_flag(flag::CF, overflow);
+                    self.set_flag(flag::OF, overflow);
+                } else {
+                    let imm = self.fetch_u8(mem) as i8 as i32;
+                    let a = self.read_rm16(rm, mem) as i16 as i32;
+                    let product = a.wrapping_mul(imm);
+                    self.write_r16(reg, product as u16);
+                    let overflow = (product as i16) as i32 != product;
+                    self.set_flag(flag::CF, overflow);
+                    self.set_flag(flag::OF, overflow);
+                }
             }
 
             // ENTER imm16, imm8 (80186+) — function prologue.
