@@ -219,6 +219,13 @@ pub struct Cpu {
     /// sets CR2 to the faulting address, and clears the slot.
     /// `Cell` so translate can flag a fault through `&self`.
     pending_fault: Cell<Option<PageFault>>,
+    /// IP of the instruction currently being decoded — captured at
+    /// the top of every `step()` so that a #PF raised mid-decode
+    /// can rewind `self.ip` to the faulting instruction before
+    /// dispatching. Without this, IRETD from the #PF handler lands
+    /// on the instruction *after* the one that faulted and demand
+    /// paging silently breaks: the kernel can't retry the load.
+    pub(crate) last_op_ip: u32,
     /// State of the A20 address line. On real hardware A20 starts
     /// gated *off* at reset — addresses with bit 20 set wrap into
     /// the low 1 MiB, the 8086 compatibility quirk. Modern BIOSes
@@ -340,6 +347,7 @@ impl Cpu {
             misc_enable: 0,
             tsc_aux: 0,
             pending_fault: Cell::new(None),
+            last_op_ip: 0,
             a20: true,
             bios_hook: None,
             seg_cache: [SegmentCache::default(); 6],
@@ -391,6 +399,7 @@ impl Cpu {
         self.misc_enable = 0;
         self.tsc_aux = 0;
         self.pending_fault.set(None);
+        self.last_op_ip = 0;
         self.a20 = true;
         self.code_size_32 = false;
         self.stack_size_32 = false;
@@ -2564,8 +2573,16 @@ impl Cpu {
         // accesses takes priority over fresh work. Latch the linear
         // address into CR2 and vector through INT 14, pushing the
         // architectural error code below the IP/CS/FLAGS frame.
+        //
+        // Rewind IP to the *start* of the faulting instruction before
+        // pushing the fault frame — #PF is a fault (not a trap), so
+        // IRETD must land back on the same MOV and let it retry once
+        // the handler maps the page in. Without the rewind, demand
+        // paging silently breaks: IRETD returns to the *next*
+        // instruction and the kernel never re-reads the operand.
         if let Some(pf) = self.take_pending_fault() {
             self.cr2 = pf.addr;
+            self.ip = self.last_op_ip;
             self.do_interrupt_with_error(14, Some(pf.error_code), mem);
             return Ok(());
         }
@@ -2592,6 +2609,10 @@ impl Cpu {
         self.addr_size_32 = self.code_size_32;
         let op_cs = self.sregs[sreg::CS];
         let op_ip = self.ip;
+        // Persist op_ip across the step boundary so a #PF raised by
+        // this instruction's memory accesses can rewind IP back here
+        // when the fault is dispatched at the start of the next step.
+        self.last_op_ip = op_ip;
         let opcode = loop {
             let b = self.fetch_u8(mem);
             match b {

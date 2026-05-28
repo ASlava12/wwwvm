@@ -2672,6 +2672,109 @@ fn cr3_reload_mid_execution_switches_address_space_immediately() {
     assert_eq!(cpu.cr3, 0x0002_0000);
 }
 
+/// Demand paging — the canonical Linux flow. A faulting load
+/// vectors through the #PF gate; the handler reads CR2, patches
+/// the missing PDE/PTE to make the page present, then IRETs
+/// back to the *same* MOV which now succeeds. This is what
+/// `do_page_fault` does for file-backed mmap, anonymous
+/// mappings, and zero-page COW.
+///
+/// The previous PM-#PF test only exercises the dispatch + HLT
+/// path. This one closes the loop: handler returns and the
+/// faulting instruction completes.
+#[test]
+fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
+    let mut mem = Memory::new(0x0080_0000); // 8 MiB
+
+    // GDT at 0x500 — flat D=1/G=1 code+data.
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+
+    // IDT at 0x1000 — 32-bit interrupt gate for #PF (vector 14):
+    //   offset=0x0800, selector=0x0008, type=0x8E
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+
+    // PD at 0x10000:
+    //   PDE[0] = PSE identity [0, 4M)   → 0x83
+    //   PDE[1] = 0 (linear [4M, 8M) not present)
+    mem.write_u32(0x0001_0000, 0x0000_0083);
+    // PDE[1] left at zero — the kernel's load will fault.
+
+    // Sentinel at phys 0x400000 — only visible once the handler
+    // installs PDE[1] = 0x00400083.
+    mem.write_u32(0x0040_0000, 0xDEAD_BEEF);
+
+    // #PF handler at phys 0x800 (also linear 0x800 via PDE[0]):
+    //   58                              POP EAX             (discard error code)
+    //   0F 20 D3                        MOV EBX, CR2
+    //   C7 05 04 00 01 00 83 00 40 00   MOV DWORD [0x10004], 0x00400083
+    //                                                       (PDE[1] = PSE @ 0x400000)
+    //   CF                              IRETD               (retry faulting load)
+    mem.write_slice(
+        0x0800,
+        &[
+            0x58, 0x0F, 0x20, 0xD3, 0xC7, 0x05, 0x04, 0x00, 0x01, 0x00, 0x83, 0x00, 0x40, 0x00,
+            0xCF,
+        ],
+    );
+
+    // Kernel at phys 0x100000 (identity in PDE[0]):
+    //   A1 00 00 40 00   MOV EAX, [0x400000]   ; #PF first time, succeeds second
+    //   F4               HLT
+    mem.write_slice(0x0010_0000, &[0xA1, 0x00, 0x00, 0x40, 0x00, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.write_sreg(sreg::ES, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.cr3 = 0x0001_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+
+    assert!(cpu.halted, "kernel must reach HLT after retry");
+    // EBX captured the faulting CR2 (read inside the handler).
+    let ebx = cpu.regs[r16::BX] as u32 | ((cpu.regs_high[r16::BX] as u32) << 16);
+    assert_eq!(ebx, 0x0040_0000, "handler saw the faulting linear");
+    // EAX picked up the sentinel on the retry — the IRETD landed
+    // back on the faulting MOV and PDE[1] now resolves the page.
+    assert_eq!(
+        cpu.read_r32(0),
+        0xDEAD_BEEF,
+        "retry load saw the now-present page"
+    );
+    // PDE[1] is populated.
+    assert_eq!(mem.read_u32(0x0001_0004), 0x0040_0083);
+    // Stack is back where it started — IRETD un-pushed the frame.
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000);
+    assert!(cpu.pending_fault().is_none());
+}
+
 /// Protected-mode #PF dispatch composes with paging *and* a real
 /// 32-bit IDT gate. The previous test exercises the real-mode IVT
 /// path; once the kernel is in PM with paging on, the dispatch goes
