@@ -1022,6 +1022,108 @@ fn start_protected_mode_at_seeds_esp_to_safe_address() {
     assert!((esp as usize) < vm.mem().size(), "ESP must point into RAM");
 }
 
+/// Demand-paging end-to-end through the bzImage/PM pipeline. The
+/// kernel
+///   1. installs its own IDT with a #PF gate via LIDT,
+///   2. builds a PSE page directory with PDE[0] identity and
+///      PDE[1] not-present,
+///   3. enables PG | PSE,
+///   4. loads from an unmapped linear address → #PF,
+///   5. the handler captures CR2, patches PDE[1] to point at the
+///      target frame, IRETs,
+///   6. the retry load succeeds with the sentinel,
+///   7. HLT.
+///
+/// Composes everything we built recently (boot protocol §4.1
+/// register/ESP init, CS.D=1 default operand size, LIDT,
+/// CR3/CR4/CR0, #PF dispatch with rewound IP, demand-paging
+/// IRETD retry) into the smallest "boot a kernel and have it
+/// serve a real-shape page fault" round trip.
+#[test]
+fn bzimage_kernel_handles_demand_paging_round_trip() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel payload at code32_start = 0x100000:
+    //   ; Install IDT[14] = 32-bit interrupt gate to handler at 0x800.
+    //   C7 05 70 10 00 00 00 08 08 00   MOV DWORD [0x1070], 0x00080800
+    //   C7 05 74 10 00 00 00 8E 00 00   MOV DWORD [0x1074], 0x00008E00
+    //   ; Pseudo-descriptor at 0x600 for LIDT.
+    //   C7 05 00 06 00 00 FF 07 00 10   MOV DWORD [0x600], 0x100007FF
+    //   C7 05 04 06 00 00 00 00 00 00   MOV DWORD [0x604], 0
+    //   0F 01 1D 00 06 00 00            LIDT [0x600]
+    //   ; PD at 0x200000: PDE[0] = PSE identity; PDE[1] left zero.
+    //   C7 05 00 00 20 00 83 00 00 00   MOV DWORD [0x200000], 0x83
+    //   ; Load CR3, PSE, PG.
+    //   B8 00 00 20 00                  MOV EAX, 0x200000
+    //   0F 22 D8                        MOV CR3, EAX
+    //   0F 20 E0                        MOV EAX, CR4
+    //   83 C8 10                        OR EAX, 0x10
+    //   0F 22 E0                        MOV CR4, EAX
+    //   0F 20 C0                        MOV EAX, CR0
+    //   0D 00 00 00 80                  OR EAX, 0x80000000
+    //   0F 22 C0                        MOV CR0, EAX
+    //   ; Touch unmapped linear → #PF → handler patches PDE[1] → retry.
+    //   A1 00 00 40 00                  MOV EAX, [0x400000]
+    //   F4                              HLT
+    let kernel: &[u8] = &[
+        0xC7, 0x05, 0x70, 0x10, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x74, 0x10, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        0xC7, 0x05, 0x00, 0x00, 0x20, 0x00, 0x83, 0x00, 0x00, 0x00, //
+        0xB8, 0x00, 0x00, 0x20, 0x00, //
+        0x0F, 0x22, 0xD8, //
+        0x0F, 0x20, 0xE0, //
+        0x83, 0xC8, 0x10, //
+        0x0F, 0x22, 0xE0, //
+        0x0F, 0x20, 0xC0, //
+        0x0D, 0x00, 0x00, 0x00, 0x80, //
+        0x0F, 0x22, 0xC0, //
+        0xA1, 0x00, 0x00, 0x40, 0x00, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000); // 8 MiB
+                                                 // Pre-stage handler bytes + sentinel.
+                                                 //
+                                                 // Handler at phys 0x800 (CS.D=1):
+                                                 //   58                              POP EAX (discard error code)
+                                                 //   0F 20 D3                        MOV EBX, CR2
+                                                 //   C7 05 04 00 20 00 83 00 40 00   MOV DWORD [0x200004], 0x00400083
+                                                 //   CF                              IRETD
+    vm.mem.write_slice(
+        0x0800,
+        &[
+            0x58, 0x0F, 0x20, 0xD3, 0xC7, 0x05, 0x04, 0x00, 0x20, 0x00, 0x83, 0x00, 0x40, 0x00,
+            0xCF,
+        ],
+    );
+    vm.mem.write_u32(0x0040_0000, 0xDEAD_BEEF);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(256);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert_eq!(vm.cpu().read_r32(0), 0xDEAD_BEEF, "retry saw sentinel");
+    assert_eq!(vm.cpu().read_r32(3), 0x0040_0000, "handler captured CR2");
+    assert_eq!(
+        vm.mem().read_u32(0x0020_0004),
+        0x0040_0083,
+        "PDE[1] populated"
+    );
+    assert_eq!(vm.cpu().cr3, 0x0020_0000);
+    assert_eq!(vm.cpu().cr4 & 0x10, 0x10);
+    assert_eq!(vm.cpu().cr0 & 0x8000_0001, 0x8000_0001);
+}
+
 /// `head_32`-shape integration: a synthetic bzImage kernel runs
 /// the full early-Linux startup chain through real instruction
 /// execution. The kernel
