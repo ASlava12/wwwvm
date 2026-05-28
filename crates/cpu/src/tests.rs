@@ -5142,6 +5142,38 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// WRMSR to IA32_TSC (0x10) sets the time-stamp counter from
+/// EDX:EAX. Linux's TSC-sync path uses this on SMP bring-up; on
+/// our single-CPU model it's mostly a calibration latch, but
+/// silently #GP'ing on a kernel WRMSR(TSC) would have crashed the
+/// resync attempt. Read-back via RDMSR(0x10) must see the same
+/// value (modulo the TSC tick from RDMSR's own step).
+#[test]
+fn wrmsr_to_ia32_tsc_latches_the_counter() {
+    // MOV ECX, 0x10        ; 66 B9 10 00 00 00
+    // MOV EAX, 0xDEAD_BEEF ; 66 B8 EF BE AD DE
+    // MOV EDX, 0x1234_5678 ; 66 BA 78 56 34 12
+    // WRMSR                ; 0F 30
+    // F4                    HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x10, 0x00, 0x00, 0x00, //
+            0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, //
+            0x66, 0xBA, 0x78, 0x56, 0x34, 0x12, //
+            0x0F, 0x30, //
+            0xF4,
+        ],
+        16,
+    );
+    // TSC ticks once per step, so it's slightly above the written
+    // value by the time we observe it. The exact delta is
+    // implementation defined; assert it's at least the written
+    // value and not wildly off.
+    let written = ((0x1234_5678u64) << 32) | 0xDEAD_BEEF;
+    assert!(cpu.tsc >= written, "TSC didn't update");
+    assert!(cpu.tsc <= written + 16, "TSC drifted too far");
+}
+
 /// POPF at CPL > IOPL must not change the IF bit — otherwise an
 /// untrusted process could disable interrupts. Setup: PM, CPL=3,
 /// IOPL=0, IF=1. User pushes EFLAGS with IF=0 then POPFs. After

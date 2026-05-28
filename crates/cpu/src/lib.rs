@@ -5023,15 +5023,24 @@ impl Cpu {
                         }
                         let msr = self.read_r32(1); // ECX
                         let lo = self.read_r32(0); // EAX
+                        let hi = self.read_r32(2); // EDX
                         match msr {
+                            // IA32_TSC: Linux writes it during early
+                            // bring-up to sync TSC across CPUs (we're
+                            // single-CPU so the write is mostly a
+                            // calibration latch).
+                            0x10 => self.tsc = (lo as u64) | ((hi as u64) << 32),
                             0x174 => self.sysenter_cs = lo,
                             0x175 => self.sysenter_esp = lo,
                             0x176 => self.sysenter_eip = lo,
                             // IA32_MISC_ENABLE — kernel toggles a few
                             // bits here (FAST_STRING, NHM_PEBS_DISABLE,
                             // BIOS_ENABLE etc.). Storing the value is
-                            // enough; we don't act on any bit.
-                            0x1A0 => self.misc_enable = lo as u64,
+                            // enough; we don't act on any bit. The high
+                            // dword carries XD-disable + reserved bits;
+                            // capture it too so the kernel's read-back
+                            // sees what it wrote.
+                            0x1A0 => self.misc_enable = (lo as u64) | ((hi as u64) << 32),
                             // IA32_BIOS_SIGN_ID write means "trigger a
                             // microcode update read-back". We don't
                             // model microcode at all — silently accept.
