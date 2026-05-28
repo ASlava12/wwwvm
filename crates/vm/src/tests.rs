@@ -3553,6 +3553,39 @@ fn snapshot_v12_preserves_code_size_misc_enable_tsc_aux_dr() {
     }
 }
 
+/// v13 appended 12 bytes of HPET per-timer period state right
+/// after the v11 HPET MMIO buffer. Without it, a snapshot taken
+/// while a periodic-mode HPET timer is auto-advancing would
+/// restore with period=0 — the kernel's "tick at 1 ms" timer
+/// silently turns into a one-shot. This test pins the v13
+/// integration at the Vm round-trip: seed periods, snapshot,
+/// restore, verify exact bytes round-tripped. Mirror of the v14
+/// PIT ch2 test below.
+#[test]
+fn snapshot_v13_preserves_hpet_per_timer_periods_through_vm_round_trip() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // Three distinct non-zero periods, one per HPET timer.
+    let seed = [
+        0x78, 0x56, 0x34, 0x12, // T0 period 0x12345678
+        0xCD, 0xAB, 0x00, 0x00, // T1 period 0x0000ABCD
+        0xEF, 0xBE, 0xAD, 0xDE, // T2 period 0xDEADBEEF
+    ];
+    vm.mem.restore_hpet_period(&seed).expect("seed periods");
+    assert_eq!(vm.mem.hpet_period_bytes(), seed, "seed check");
+
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v13 restore");
+
+    assert_eq!(
+        vm2.mem.hpet_period_bytes(),
+        seed,
+        "HPET per-timer period bytes must round-trip exactly"
+    );
+}
+
 /// v14 added a 13-byte PIT trailer covering channel 2 (the path
 /// Linux's `pit_calibrate_tsc` uses on the boot CPU). The Pit-
 /// level unit test in `crates/devices/src/pit.rs` covers the
