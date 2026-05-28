@@ -2466,6 +2466,40 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// Decode-coverage medley: a sum-of-squares loop compiled the way
+/// gcc -m32 would, exercising a representative spread of 32-bit
+/// opcodes end-to-end. Computes 1²+2²+3²+4²+5² = 55 in EAX.
+///
+///   xor  eax, eax          ; accumulator
+///   mov  ecx, 1            ; counter
+/// loop:
+///   mov  ebx, ecx
+///   imul ebx, ecx          ; ebx = ecx²
+///   add  eax, ebx
+///   inc  ecx
+///   cmp  ecx, 6
+///   jne  loop
+///   hlt
+#[test]
+fn decode_medley_sum_of_squares_reaches_55() {
+    let code: &[u8] = &[
+        0x66, 0x31, 0xC0, // xor eax, eax
+        0x66, 0xB9, 0x01, 0x00, 0x00, 0x00, // mov ecx, 1
+        // loop: (offset 9)
+        0x66, 0x89, 0xCB, // mov ebx, ecx
+        0x66, 0x0F, 0xAF, 0xD9, // imul ebx, ecx
+        0x66, 0x01, 0xD8, // add eax, ebx
+        0x66, 0x41, // inc ecx
+        0x66, 0x83, 0xF9, 0x06, // cmp ecx, 6
+        0x75, 0xEE, // jne loop (rel8 = -18: IP 27 → offset 9)
+        0xF4, // hlt
+    ];
+    let (cpu, _, _) = run_payload(code, 200);
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(0), 55, "sum of squares 1..5");
+    assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
+}
+
 /// 0x64 — FS segment-override prefix. `mov al, fs:[0x10]` reads
 /// from FS.base + 0x10, the way Linux fetches per-CPU data.
 #[test]

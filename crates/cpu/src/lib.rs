@@ -3365,24 +3365,39 @@ impl Cpu {
             }
 
             // INC r16 (0x40-0x47) / DEC r16 (0x48-0x4F). Per the 8086,
-            // these preserve CF and update ZF/SF/PF/OF/AF.
+            // these preserve CF and update ZF/SF/PF/OF/AF. Under 0x66
+            // they operate on the full 32-bit register.
             0x40..=0x47 => {
                 let i = opcode - 0x40;
-                let a = self.read_r16(i);
-                let r = a.wrapping_add(1);
                 let cf_before = self.has(flag::CF);
-                self.flags_add16(a, 1, 0, r);
+                if self.op_size_32 {
+                    let a = self.read_r32(i);
+                    let r = a.wrapping_add(1);
+                    self.flags_add32(a, 1, 0, r);
+                    self.write_r32(i, r);
+                } else {
+                    let a = self.read_r16(i);
+                    let r = a.wrapping_add(1);
+                    self.flags_add16(a, 1, 0, r);
+                    self.write_r16(i, r);
+                }
                 self.set_flag(flag::CF, cf_before);
-                self.write_r16(i, r);
             }
             0x48..=0x4F => {
                 let i = opcode - 0x48;
-                let a = self.read_r16(i);
-                let r = a.wrapping_sub(1);
                 let cf_before = self.has(flag::CF);
-                self.flags_sub16(a, 1, 0, r);
+                if self.op_size_32 {
+                    let a = self.read_r32(i);
+                    let r = a.wrapping_sub(1);
+                    self.flags_sub32(a, 1, 0, r);
+                    self.write_r32(i, r);
+                } else {
+                    let a = self.read_r16(i);
+                    let r = a.wrapping_sub(1);
+                    self.flags_sub16(a, 1, 0, r);
+                    self.write_r16(i, r);
+                }
                 self.set_flag(flag::CF, cf_before);
-                self.write_r16(i, r);
             }
 
             // MOV AL, moffs8 / MOV moffs8, AL (0xA0/0xA2) and the
