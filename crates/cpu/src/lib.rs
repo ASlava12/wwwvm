@@ -460,6 +460,27 @@ impl Cpu {
         }
     }
 
+    /// If we're in PE mode and the current CPL exceeds the IOPL
+    /// field in EFLAGS, raise #GP(0) from `op_ip` and return true —
+    /// the caller should immediately `return Ok(())`. IOPL gates
+    /// the IF-modifying and port-IO instructions (CLI/STI/IN/OUT);
+    /// most kernels run user processes with IOPL=0 so any of these
+    /// from CPL=3 must trap.
+    fn raise_gp_if_below_iopl(&mut self, op_ip: u32, mem: &mut Memory) -> bool {
+        if self.cr0 & 1 == 0 {
+            return false;
+        }
+        let cpl = (self.sregs[sreg::CS] & 3) as u8;
+        let iopl = ((self.flags >> 12) & 3) as u8;
+        if cpl > iopl {
+            self.ip = op_ip;
+            self.do_interrupt_with_error(13, Some(0), mem);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn write_sreg(&mut self, idx: usize, value: u16, mem: &Memory) {
         if idx >= 6 {
             return;
@@ -2480,9 +2501,17 @@ impl Cpu {
                 self.halted = true;
             }
             0xFA => {
+                // CLI is IOPL-sensitive — fault if CPL > IOPL.
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 self.set_flag(flag::IF, false);
             }
             0xFB => {
+                // STI shares CLI's IOPL guard.
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 self.set_flag(flag::IF, true);
             }
             0xFC => {
