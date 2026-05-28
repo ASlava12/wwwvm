@@ -354,6 +354,10 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
 ///     bits 0..7, CL bits 6..7 = cyl bits 8..9, CL bits 0..5 = sector
 ///     (1-based!), DH = head, DL = drive (0x80 = boot drive). The
 ///     destination buffer is ES:BX.
+///   * AH=0x03 — Write sectors. Mirror of AH=0x02 with the same
+///     CHS layout; source buffer is ES:BX. The disk image grows on
+///     demand (via `Disk::write_sectors`) so a guest can format a
+///     fresh image.
 ///   * AH=0x08 — Get drive parameters. Returns the canonical 1.44 MB
 ///     floppy geometry (80 cyl × 2 heads × 18 sec/track) in CH/CL/
 ///     DH, drive count 1 in DL, and BL = 0x04 (1.44 MB floppy type).
@@ -394,6 +398,31 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
                 cpu.mem_write_u8(mem, dest_linear.wrapping_add(i as u32), b);
             }
             // Success: CF=0, AH=0. AL keeps the requested sector count.
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            cpu.write_r8(4, 0);
+            true
+        }
+        // Write sectors — mirror of AH=0x02 with data flowing
+        // toward the disk. Same CHS layout in CH/CL/DH/DL/AL,
+        // same ES:BX source buffer.
+        0x03 => {
+            let count = cpu.read_r8(0) as usize;
+            let ch = cpu.read_r8(5) as u32;
+            let cl = cpu.read_r8(1) as u32;
+            let dh = cpu.read_r8(6) as u32;
+            let _dl = cpu.read_r8(2);
+            let cyl = ((cl & 0xC0) << 2) | ch;
+            let sector = (cl & 0x3F).saturating_sub(1);
+            let head = dh;
+            let lba = (cyl * 2 + head) * 18 + sector;
+            let bx = cpu.read_r16(3);
+            let src_linear = cpu.linear_seg(wwwvm_cpu::sreg::ES, bx as u32);
+            let total = count * wwwvm_devices::DISK_SECTOR_SIZE;
+            let mut buf = Vec::with_capacity(total);
+            for i in 0..total {
+                buf.push(cpu.mem_read_u8(mem, src_linear.wrapping_add(i as u32)));
+            }
+            io.disk_mut().write_sectors(lba, &buf);
             cpu.flags &= !wwwvm_cpu::flag::CF;
             cpu.write_r8(4, 0);
             true

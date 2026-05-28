@@ -1242,11 +1242,56 @@ fn make_pt_load(p_offset: u32, p_vaddr: u32, p_size: u32) -> Vec<u8> {
     p
 }
 
-/// INT 0x13 with AL > 1 reads multiple sectors contiguously. Verifies
-/// the per-byte mem_write_u8 loop in `bios_int13` doesn't truncate
-/// after the first sector. Disk has 4 marker sectors (0xAA / 0xBB /
-/// 0xCC / 0xDD); we load sectors 1 + 2 via a single INT 0x13 AL=2
-/// call and expect them to land back-to-back at ES:BX.
+/// INT 0x13 AH=0x03 writes through to the disk image, mirror of
+/// AH=0x02. The round-trip: place a known string in memory, write
+/// to sector 1 via BIOS, zero out the buffer, read sector 1 back
+/// via BIOS, verify the bytes came through unchanged.
+#[test]
+fn bios_int13_write_sectors_round_trips_through_disk() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Pre-place the payload at DS:0x9000.
+    let pattern = b"Hello, BIOS write!";
+    vm.mem.write_slice(0x9000, pattern);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            // Write 1 sector from ES:BX = 0:0x9000 to LBA 1.
+            0xBB, 0x00, 0x90, // MOV BX, 0x9000
+            0xB8, 0x01, 0x03, // MOV AX, 0x0301  (AH=0x03, AL=1)
+            0xB9, 0x02, 0x00, // MOV CX, 0x0002  (cyl 0, sector 2 = LBA 1)
+            0xBA, 0x80, 0x00, // MOV DX, 0x0080  (head 0, drive 0x80)
+            0xCD, 0x13, // INT 0x13
+            // Zero the buffer so the next read has to refill it.
+            0xBF, 0x00, 0x90, // MOV DI, 0x9000
+            0xB9, 0x00, 0x02, // MOV CX, 0x0200  (512 bytes)
+            0xB0, 0x00, // MOV AL, 0
+            0xF3, 0xAA, // REP STOSB
+            // Read it back to the same buffer.
+            0xBB, 0x00, 0x90, // MOV BX, 0x9000
+            0xB8, 0x01, 0x02, // MOV AX, 0x0201
+            0xB9, 0x02, 0x00, // MOV CX, 0x0002
+            0xBA, 0x80, 0x00, // MOV DX, 0x0080
+            0xCD, 0x13, // INT 0x13
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(64);
+    assert!(vm.is_halted());
+    // The first `pattern.len()` bytes of the read-back match what
+    // we wrote. Bytes past the pattern read as zero (the rest of
+    // the sector was zero before the write).
+    for (i, &b) in pattern.iter().enumerate() {
+        assert_eq!(vm.mem().read_u8(0x9000 + i as u32), b, "byte {i}");
+    }
+    assert_eq!(
+        vm.mem().read_u8(0x9000 + pattern.len() as u32),
+        0,
+        "zero past pattern"
+    );
+}
+
 #[test]
 fn bios_int13_get_drive_parameters_reports_floppy_geometry() {
     let mut vm = Vm::new();
@@ -1304,6 +1349,12 @@ fn bios_int13_lba_extensions_check_reports_not_supported() {
     );
 }
 
+/// INT 0x13 with AL > 1 reads multiple sectors contiguously.
+/// Verifies the per-byte mem_write_u8 loop in `bios_int13` doesn't
+/// truncate after the first sector. Disk has 4 marker sectors
+/// (0xAA / 0xBB / 0xCC / 0xDD); we load sectors 1 + 2 via a
+/// single INT 0x13 AL=2 call and expect them to land back-to-back
+/// at ES:BX.
 #[test]
 fn bios_int13_reads_multiple_sectors_contiguously() {
     let mut vm = Vm::new();
