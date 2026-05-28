@@ -424,6 +424,21 @@ impl Cpu {
     /// We bypass protection / NULL-selector checks for now — the
     /// goal of this step is just to wire the cache. Limit
     /// violations and #GP faults arrive in a later iteration.
+    /// In PE mode, return true if `selector` indexes past the GDT
+    /// limit (the LDT case is not modeled — TI bit is ignored). In
+    /// real mode every selector is valid; the cache simply derives
+    /// `base = sel << 4`. Used by the segment-load helpers to raise
+    /// #GP(selector) instead of decoding garbage as a descriptor.
+    pub fn selector_out_of_gdt(&self, selector: u16) -> bool {
+        if self.cr0 & 1 == 0 {
+            return false;
+        }
+        let index = (selector & 0xFFF8) as u32;
+        // The 8-byte descriptor at `index..index+7` must lie within
+        // the table; GDTR.limit is the largest valid byte offset.
+        index + 7 > self.gdtr.limit as u32
+    }
+
     pub fn write_sreg(&mut self, idx: usize, value: u16, mem: &Memory) {
         if idx >= 6 {
             return;
@@ -2731,7 +2746,11 @@ impl Cpu {
 
             // MOV sreg, r/m16 — load segment register from r/m.
             // Loading CS is normally illegal but we allow it for now;
-            // a future iteration may reject it like real x86.
+            // a future iteration may reject it like real x86. In PE
+            // mode, a selector indexing past the GDT limit raises
+            // #GP(selector & ~3) — the error-code shape Intel defines
+            // (RPL bits become EXT/IDT, both zero for instruction-
+            // caused faults; TI bit and index pass through).
             0x8E => {
                 let (_, sreg_idx, rm) = self.fetch_modrm(mem);
                 if sreg_idx > 5 {
@@ -2742,6 +2761,11 @@ impl Cpu {
                     });
                 }
                 let v = self.read_rm16(rm, mem);
+                if self.selector_out_of_gdt(v) {
+                    self.ip = op_ip;
+                    self.do_interrupt_with_error(13, Some((v & 0xFFFC) as u32), mem);
+                    return Ok(());
+                }
                 self.write_sreg(sreg_idx as usize, v, mem);
             }
 

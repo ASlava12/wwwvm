@@ -3950,6 +3950,67 @@ fn ud2_vectors_through_ivt_and_pushes_faulting_ip() {
     assert!(!cpu.has(flag::IF));
 }
 
+/// In PE mode, MOV sreg with a selector past the GDT limit raises
+/// #GP with the selector as the error code (RPL bits dropped — the
+/// Intel error-code shape: EXT, IDT, TI then 13-bit index). Without
+/// this guard the dispatcher would decode garbage past the GDT as
+/// a descriptor and silently install nonsense into the segment cache.
+#[test]
+fn mov_sreg_in_pm_with_bad_selector_raises_gp_with_selector() {
+    let mut mem = Memory::new(0x10_0000);
+    // GDT[0..1] valid (limit = 0x0F means 16 bytes = two 8-byte slots).
+    // GDT[1] is a code descriptor at base 0x9000 (from cpu_pe_setup).
+    cpu_pe_setup(&mut mem);
+    // IDT[13] = #GP gate at 0x4000 + 13*8 = 0x4068. 16-bit interrupt
+    // gate so the frame layout is the simple word-pushed kind.
+    mem.write_slice(
+        0x4068,
+        &[
+            0x00, 0x03, // offset 15:0 = 0x0300
+            0x08, 0x00, // selector = GDT[1]
+            0x00, // reserved
+            0x86, // P=1, DPL=0, 16-bit interrupt gate
+            0x00, 0x00, // offset 31:16
+        ],
+    );
+    // Handler at CS_base 0x9000 + 0x0300 = 0x9300: set AX, HLT.
+    mem.write_slice(0x9300, &[0xB8, 0x0D, 0x00, 0xF4]);
+    // Boot code at 0x7C00:  MOV AX, 0x18 ; MOV ES, AX ; HLT
+    //   AX = 0x18 → selector index 3 (byte offset 0x18). With
+    //   GDTR.limit = 0x0F only indices 0 and 1 are valid, so this
+    //   must fault.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xB8, 0x18, 0x00, // MOV AX, 0x0018  (bogus selector)
+            0x8E, 0xC0, // MOV ES, AX      ← #GP(0x18)
+            0xF4, // HLT  (never reached)
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE — activate the bad-selector check
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x000F;
+    cpu.idtr.base = 0x4000;
+    cpu.idtr.limit = 0x07FF;
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0x000D, "handler ran");
+    // Stack frame (16-bit gate, 4 words pushed: EC, IP, CS, FLAGS).
+    // Initial SP = 0x7C00; final SP = 0x7BF8.
+    //   mem[0x7BF8] = error code = 0x18 & ~3 = 0x18 (no RPL bits set)
+    //   mem[0x7BFA] = saved IP = 0x7C03 (start of MOV ES, AX)
+    assert_eq!(mem.read_u16(0x7BF8), 0x0018, "error code = bad selector");
+    assert_eq!(mem.read_u16(0x7BFA), 0x7C03, "saved IP = start of MOV sreg");
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
