@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**363 теста** зелёные (mem 6 + devices 31 + cpu 262 + vm 56 +
+**364 теста** зелёные (mem 6 + devices 31 + cpu 263 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -157,7 +157,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   RDTSC, CPUID, SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
   CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
   RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe),
-  MOV sreg на селекторе вне GDT.limit раздаёт #GP(selector).
+  MOV/POP sreg и LES/LDS на селекторе вне GDT.limit раздают
+  #GP(selector) через общий raise_gp_if_bad_selector.
 - **x87 FPU**: 8×f64 register-stack с TOP, FLD/FST/FSTP (m32/m64),
   FILD/FISTP, FADD/FMUL/FSUB(R)/FDIV(R) + ...P-формы, FCHS/FABS/
   FSQRT/FRNDINT, константы (FLD1/FLDPI/...), FCOM/FTST + FNSTSW.
@@ -212,7 +213,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 363 пройденных теста на текущий момент. CI
+Должно вывести 364 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

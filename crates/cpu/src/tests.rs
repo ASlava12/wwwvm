@@ -4011,6 +4011,48 @@ fn mov_sreg_in_pm_with_bad_selector_raises_gp_with_selector() {
     assert_eq!(mem.read_u16(0x7BFA), 0x7C03, "saved IP = start of MOV sreg");
 }
 
+/// POP DS (and the other POP sreg / LES / LDS forms) share the same
+/// #GP path. Pre-push a bogus selector, then `POP DS`, and verify
+/// the same shape of vector-13 fault as the MOV sreg case — proving
+/// every segment-load entrypoint funnels through the same helper.
+#[test]
+fn pop_ds_in_pm_with_bad_selector_raises_gp_with_selector() {
+    let mut mem = Memory::new(0x10_0000);
+    cpu_pe_setup(&mut mem);
+    // IDT[13] gate (16-bit interrupt gate to CS=0x08:0x0300).
+    mem.write_slice(0x4068, &[0x00, 0x03, 0x08, 0x00, 0x00, 0x86, 0x00, 0x00]);
+    mem.write_slice(0x9300, &[0xB8, 0x0D, 0x00, 0xF4]);
+    // Boot:  PUSH 0x18 (bogus selector); POP DS  ← #GP(0x18); HLT.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x68, 0x18, 0x00, // PUSH 0x0018
+            0x1F, // POP DS  ← #GP
+            0xF4, // HLT (never reached)
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x000F;
+    cpu.idtr.base = 0x4000;
+    cpu.idtr.limit = 0x07FF;
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0x000D);
+    // SP path: 0x7C00 → 0x7BFE (PUSH) → 0x7C00 (POP read) → 0x7BF8
+    // (4 fault-frame words). EC at SP+0, IP at SP+2.
+    assert_eq!(mem.read_u16(0x7BF8), 0x0018);
+    assert_eq!(mem.read_u16(0x7BFA), 0x7C03, "saved IP = start of POP DS");
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

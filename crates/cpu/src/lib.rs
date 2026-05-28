@@ -439,6 +439,23 @@ impl Cpu {
         index + 7 > self.gdtr.limit as u32
     }
 
+    /// If `selector` is out of GDT bounds in PE mode, raise #GP
+    /// (vector 13) with the selector as the error code (Intel
+    /// shape: RPL bits cleared, TI bit and index pass through),
+    /// rewind IP to `op_ip` so the fault frame names the offending
+    /// instruction, and return true — the caller should immediately
+    /// `return Ok(())`. False means the selector loaded cleanly and
+    /// the caller can continue.
+    fn raise_gp_if_bad_selector(&mut self, selector: u16, op_ip: u32, mem: &mut Memory) -> bool {
+        if self.selector_out_of_gdt(selector) {
+            self.ip = op_ip;
+            self.do_interrupt_with_error(13, Some((selector & 0xFFFC) as u32), mem);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn write_sreg(&mut self, idx: usize, value: u16, mem: &Memory) {
         if idx >= 6 {
             return;
@@ -2761,9 +2778,7 @@ impl Cpu {
                     });
                 }
                 let v = self.read_rm16(rm, mem);
-                if self.selector_out_of_gdt(v) {
-                    self.ip = op_ip;
-                    self.do_interrupt_with_error(13, Some((v & 0xFFFC) as u32), mem);
+                if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                     return Ok(());
                 }
                 self.write_sreg(sreg_idx as usize, v, mem);
@@ -2797,6 +2812,9 @@ impl Cpu {
                 let off_val = self.mem_read_u16(mem, base);
                 let seg_val =
                     self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                if self.raise_gp_if_bad_selector(seg_val, op_ip, mem) {
+                    return Ok(());
+                }
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::ES, seg_val, mem);
                 let _ = base;
@@ -2818,6 +2836,9 @@ impl Cpu {
                 let off_val = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
                 let seg_val =
                     self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                if self.raise_gp_if_bad_selector(seg_val, op_ip, mem) {
+                    return Ok(());
+                }
                 self.write_r16(reg, off_val);
                 self.write_sreg(sreg::DS, seg_val, mem);
             }
@@ -3545,14 +3566,23 @@ impl Cpu {
             }
             0x07 => {
                 let v = self.pop16(mem);
+                if self.raise_gp_if_bad_selector(v, op_ip, mem) {
+                    return Ok(());
+                }
                 self.write_sreg(sreg::ES, v, mem);
             }
             0x17 => {
                 let v = self.pop16(mem);
+                if self.raise_gp_if_bad_selector(v, op_ip, mem) {
+                    return Ok(());
+                }
                 self.write_sreg(sreg::SS, v, mem);
             }
             0x1F => {
                 let v = self.pop16(mem);
+                if self.raise_gp_if_bad_selector(v, op_ip, mem) {
+                    return Ok(());
+                }
                 self.write_sreg(sreg::DS, v, mem);
             }
 
@@ -5317,6 +5347,9 @@ impl Cpu {
                     }
                     0xA1 => {
                         let v = self.pop16(mem);
+                        if self.raise_gp_if_bad_selector(v, op_ip, mem) {
+                            return Ok(());
+                        }
                         self.write_sreg(sreg::FS, v, mem);
                     }
                     0xA8 => {
@@ -5325,6 +5358,9 @@ impl Cpu {
                     }
                     0xA9 => {
                         let v = self.pop16(mem);
+                        if self.raise_gp_if_bad_selector(v, op_ip, mem) {
+                            return Ok(());
+                        }
                         self.write_sreg(sreg::GS, v, mem);
                     }
                     // SHLD r/m16/32, r16/32, imm8 — 0x0F 0xA4.
