@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**333 теста** зелёные (mem 6 + devices 31 + cpu 232 + vm 56 +
+**335 тестов** зелёные (mem 6 + devices 31 + cpu 234 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -156,10 +156,16 @@ spinlock через LOCK CMPXCHG + PAUSE):
 - **Системное**: CR2/CR3/CR4, RDMSR/WRMSR (TSC/APIC/SYSENTER),
   RDTSC, CPUID, SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
   CLTS, INVLPG, WBINVD, PAUSE, LOCK.
+- **x87 FPU**: 8×f64 register-stack с TOP, FLD/FST/FSTP (m32/m64),
+  FILD/FISTP, FADD/FMUL/FSUB(R)/FDIV(R) + ...P-формы, FCHS/FABS/
+  FSQRT/FRNDINT, константы (FLD1/FLDPI/...), FCOM/FTST + FNSTSW.
+- **SSE/SSE2** (подмножество): XMM register file, MOVD/MOVDQA/
+  MOVDQU/MOVAPS/MOVUPS, MOVSS/MOVSD, PAND/POR/PXOR, PADD/PSUB
+  (B/W/D/Q), packed ADD/SUB/MUL/DIV (PS/PD) + скалярные (SS/SD).
 - **BIOS-shim**: INT 0x10 (TTY), 0x12, 0x13 (disk read), 0x15
   (E820 + AH=88), 0x16 (keyboard).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
-  header parser + loader. Снапшот v7 round-trip'ит всё состояние.
+  header parser + loader. Снапшот v9 round-trip'ит всё состояние.
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
@@ -168,8 +174,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
 
 | Блокер | Объём | Зачем |
 |--------|-------|-------|
-| FPU-арифметика (x87: FADD/FMUL/FLD/FSTP + register stack) | большой | Сейчас только control-stubs (FNINIT/FNSTSW/FLDCW); ядро/glibc реально считают на FPU |
-| MMX + SSE/SSE2 (XMM register file, ~250 опкодов) | очень большой | Современный Linux memcpy/clear_page = movdqa; Alpine ≥3.x линкуется с SSE2 |
+| x87 расширения (трансцендентные FSIN/FCOS/FPTAN/F2XM1, 80-бит m80, FPU-исключения) | средний | База (стек + арифметика + сравнения) уже есть; glibc местами зовёт трансцендентные |
+| MMX + остаток SSE/SSE2 (shuffles, converts CVTSI2SD/CVTTSD2SI, COMISS/UCOMISS, ~200 опкодов) | очень большой | Есть подмножество (movdqa/scalar/packed-arith); Alpine ≥3.x линкуется с полным SSE2 |
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
@@ -191,7 +197,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 333 пройденных теста на текущий момент. CI
+Должно вывести 335 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

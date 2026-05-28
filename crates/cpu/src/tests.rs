@@ -2673,6 +2673,90 @@ fn sse_mulpd_packed_double_multiply() {
     }
 }
 
+/// Scalar SSE via the F3 0F mandatory prefix: MOVSS load (zeroes
+/// upper lanes) + ADDSS (touches only the low lane, preserves the
+/// upper three). This is the path that used to mis-route into the
+/// REP string handler before the F3/F2 escape was added.
+#[test]
+fn sse_movss_addss_scalar_preserves_upper_lanes() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM0 source: low lane = 1.0f32, upper three are markers.
+    mem.write_u32(0x600, 1.0f32.to_bits());
+    mem.write_u32(0x604, 0xAAAA_AAAA);
+    mem.write_u32(0x608, 0xBBBB_BBBB);
+    mem.write_u32(0x60C, 0xCCCC_CCCC);
+    // XMM1 source: low lane = 2.0f32.
+    mem.write_u32(0x610, 2.0f32.to_bits());
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0xF3, 0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVSS XMM1, [0x610]
+            0xF3, 0x0F, 0x58, 0xC1, // ADDSS XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x620)), 3.0);
+    assert_eq!(mem.read_u32(0x624), 0xAAAA_AAAA);
+    assert_eq!(mem.read_u32(0x628), 0xBBBB_BBBB);
+    assert_eq!(mem.read_u32(0x62C), 0xCCCC_CCCC);
+}
+
+/// Scalar double-precision via F2 0F: MOVSD + MULSD, with the
+/// 128-bit unaligned MOVDQU (F3 0F 6F/7F) moving the vector in and
+/// out. Confirms the low f64 lane is computed and the high lane is
+/// left untouched.
+#[test]
+fn sse_movsd_mulsd_scalar_via_movdqu() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM0 source: low f64 = 1.5, high qword = recognizable marker.
+    let lo = 1.5f64.to_bits();
+    let hi_marker: u64 = 0x1122_3344_5566_7788;
+    mem.write_u32(0x600, lo as u32);
+    mem.write_u32(0x604, (lo >> 32) as u32);
+    mem.write_u32(0x608, hi_marker as u32);
+    mem.write_u32(0x60C, (hi_marker >> 32) as u32);
+    // XMM1 source: low f64 = 4.0.
+    let mul = 4.0f64.to_bits();
+    mem.write_u32(0x610, mul as u32);
+    mem.write_u32(0x614, (mul >> 32) as u32);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xF3, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQU XMM0, [0x600]
+            0xF2, 0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVSD XMM1, [0x610]
+            0xF2, 0x0F, 0x59, 0xC1, // MULSD XMM0, XMM1
+            0xF3, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQU [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    let result_lo = (mem.read_u32(0x620) as u64) | ((mem.read_u32(0x624) as u64) << 32);
+    assert_eq!(f64::from_bits(result_lo), 6.0);
+    let result_hi = (mem.read_u32(0x628) as u64) | ((mem.read_u32(0x62C) as u64) << 32);
+    assert_eq!(result_hi, hi_marker);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

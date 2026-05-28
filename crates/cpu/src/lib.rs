@@ -641,6 +641,28 @@ impl Cpu {
         }
     }
 
+    /// Read a scalar 32-bit SSE operand: the low dword of an XMM
+    /// register or a 32-bit memory value. The `*SS` / MOVSS forms.
+    fn read_xmm_rm32(&self, rm: Rm, mem: &Memory) -> u32 {
+        match rm {
+            Rm::Reg(i) => self.xmm[i as usize] as u32,
+            Rm::Mem(ea) => self.mem_read_u32(mem, self.linear_seg(ea.seg, ea.off)),
+        }
+    }
+
+    /// Read a scalar 64-bit SSE operand: the low qword of an XMM
+    /// register or a 64-bit memory value. The `*SD` / MOVSD forms.
+    fn read_xmm_rm64(&self, rm: Rm, mem: &Memory) -> u64 {
+        match rm {
+            Rm::Reg(i) => self.xmm[i as usize] as u64,
+            Rm::Mem(ea) => {
+                let a = self.linear_seg(ea.seg, ea.off);
+                (self.mem_read_u32(mem, a) as u64)
+                    | ((self.mem_read_u32(mem, a.wrapping_add(4)) as u64) << 32)
+            }
+        }
+    }
+
     /// Read a 128-bit value (an XMM operand) as four little-endian
     /// dwords. Used by the SSE move/arith instructions.
     pub fn mem_read_u128(&self, m: &Memory, linear: u32) -> u128 {
@@ -656,6 +678,118 @@ impl Cpu {
         for i in 0..4u32 {
             self.mem_write_u32(m, linear.wrapping_add(i * 4), (value >> (i * 32)) as u32);
         }
+    }
+
+    /// Mandatory-prefix scalar SSE: the F3/F2 + 0F escape. `is_f3`
+    /// (the 0xF3 prefix) selects single-precision / MOVSS; F2 selects
+    /// double / MOVSD. `op2` is the opcode byte after 0x0F. Scalar
+    /// forms touch only the low lane and preserve the rest of the
+    /// destination register; memory loads zero-extend the upper bits.
+    fn sse_scalar(
+        &mut self,
+        is_f3: bool,
+        op2: u8,
+        mem: &mut Memory,
+        op_cs: u16,
+        op_ip: u32,
+    ) -> Result<(), CpuError> {
+        const LO32: u128 = 0xFFFF_FFFF;
+        const LO64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
+        match op2 {
+            // MOVSS/MOVSD xmm, xmm/m — load the low lane. Reg-reg
+            // preserves the destination's upper bits; a memory load
+            // zero-extends them.
+            0x10 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let (v, mask) = if is_f3 {
+                    (self.read_xmm_rm32(rm, mem) as u128, LO32)
+                } else {
+                    (self.read_xmm_rm64(rm, mem) as u128, LO64)
+                };
+                self.xmm[reg as usize] = match rm {
+                    Rm::Reg(_) => (self.xmm[reg as usize] & !mask) | v,
+                    Rm::Mem(_) => v,
+                };
+            }
+            // MOVSS/MOVSD xmm/m, xmm — store the low lane.
+            0x11 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let v = self.xmm[reg as usize] as u32;
+                    match rm {
+                        Rm::Reg(i) => {
+                            self.xmm[i as usize] = (self.xmm[i as usize] & !LO32) | (v as u128);
+                        }
+                        Rm::Mem(ea) => {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            self.mem_write_u32(mem, a, v);
+                        }
+                    }
+                } else {
+                    let v = self.xmm[reg as usize] as u64;
+                    match rm {
+                        Rm::Reg(i) => {
+                            self.xmm[i as usize] = (self.xmm[i as usize] & !LO64) | (v as u128);
+                        }
+                        Rm::Mem(ea) => {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            self.mem_write_u32(mem, a, v as u32);
+                            self.mem_write_u32(mem, a.wrapping_add(4), (v >> 32) as u32);
+                        }
+                    }
+                }
+            }
+            // MOVDQU — unaligned 128-bit move (F3 0F 6F load / 7F
+            // store). Identical to MOVDQA here; we don't fault on
+            // misalignment. Only the F3 encoding is defined.
+            0x6F if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = v;
+            }
+            0x7F if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.xmm[reg as usize];
+                self.write_xmm_rm(rm, mem, v);
+            }
+            // Scalar float arithmetic — compute only the low lane,
+            // preserve the rest of the destination.
+            //   58 ADD   59 MUL   5C SUB   5E DIV
+            0x58 | 0x59 | 0x5C | 0x5E => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let a = f32::from_bits(self.xmm[reg as usize] as u32);
+                    let b = f32::from_bits(self.read_xmm_rm32(rm, mem));
+                    let r = match op2 {
+                        0x58 => a + b,
+                        0x59 => a * b,
+                        0x5C => a - b,
+                        _ => a / b,
+                    };
+                    self.xmm[reg as usize] =
+                        (self.xmm[reg as usize] & !LO32) | (r.to_bits() as u128);
+                } else {
+                    let a = f64::from_bits(self.xmm[reg as usize] as u64);
+                    let b = f64::from_bits(self.read_xmm_rm64(rm, mem));
+                    let r = match op2 {
+                        0x58 => a + b,
+                        0x59 => a * b,
+                        0x5C => a - b,
+                        _ => a / b,
+                    };
+                    self.xmm[reg as usize] =
+                        (self.xmm[reg as usize] & !LO64) | (r.to_bits() as u128);
+                }
+            }
+            _ => {
+                return Err(CpuError::Unimplemented {
+                    opcode: op2,
+                    cs: op_cs,
+                    ip: op_ip,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn fetch_u8(&mut self, mem: &Memory) -> u8 {
@@ -2253,13 +2387,20 @@ impl Cpu {
                         _ => break b,
                     }
                 };
-                // PAUSE = F3 90. The 0xF3 prefix on a NOP is the
-                // spin-loop hint, *not* a REP NOP — spinlocks emit it
-                // constantly. Treat it as a no-op and stop here rather
-                // than falling into the string-op loop (which would
-                // reject 0x90).
-                if inner == 0x90 {
-                    // PAUSE / REP NOP — nothing to do.
+                // F2/F3 + 0F is *not* a REP string op — it's the
+                // mandatory-prefix escape for scalar SSE (MOVSS/MOVSD,
+                // ADDSS..DIVSD) and MOVDQU. Dispatch those before the
+                // string-loop logic; F3 selects single-precision /
+                // MOVSS, F2 selects double / MOVSD.
+                if inner == 0x0F {
+                    let op2 = self.fetch_u8(mem);
+                    self.sse_scalar(rep_zero, op2, mem, op_cs, op_ip)?;
+                } else if inner == 0x90 {
+                    // PAUSE = F3 90. The 0xF3 prefix on a NOP is the
+                    // spin-loop hint, *not* a REP NOP — spinlocks emit
+                    // it constantly. Treat it as a no-op rather than
+                    // falling into the string-op loop (which rejects
+                    // 0x90).
                 } else {
                     let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
                     loop {
