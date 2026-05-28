@@ -1403,6 +1403,11 @@ impl Vm {
     /// hand-off would have produced, minus the trampoline bytes.
     /// `autorun` bytes still arrive via the UART for guests that
     /// read input there.
+    ///
+    /// Per the Linux x86 boot protocol (§4.1), `%esi` must point at
+    /// the real-mode kernel header — that's where the kernel reads
+    /// boot_params from. The setup block lives at 0x90000 (where
+    /// `load_bzimage` puts it), so that's what we load into ESI.
     pub fn start_protected_mode_at(&mut self, entry: u32) {
         // Flat-segments GDT: null + ring-0 code + ring-0 data, all
         // base 0 / limit 4 GiB. Placed at 0x500 (between the BIOS
@@ -1429,6 +1434,10 @@ impl Vm {
         self.cpu.write_sreg(wwwvm_cpu::sreg::SS, 0x10, &self.mem);
         self.cpu.stack_size_32 = true;
         self.cpu.ip = entry;
+        // ESI = setup block linear address (boot_params live here).
+        // `load_bzimage` places the setup header at 0x90000 — the
+        // historical SETUPSEG slot the boot protocol bakes in.
+        self.cpu.write_r32(wwwvm_cpu::r16::SI as u8, 0x0009_0000);
         self.io.uart_mut().push_rx(&self.autorun);
         self.autorun.clear();
         self.booted = true;

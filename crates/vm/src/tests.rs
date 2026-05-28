@@ -905,6 +905,40 @@ fn start_protected_mode_at_jumps_into_pm_kernel() {
     assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::CS] & 3, 0);
     assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::CS], 0x08);
     assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::SS], 0x10);
+    // bzImage boot protocol §4.1: ESI points at the setup header
+    // (linear 0x90000) so the kernel can find boot_params.
+    assert_eq!(vm.cpu().read_r32(wwwvm_cpu::r16::SI as u8), 0x0009_0000);
+}
+
+/// The kernel reads boot_params via `[%esi]`. After
+/// `start_protected_mode_at`, a kernel payload that copies
+/// `[esi+0x1F1]` (the setup-sectors byte) into EAX must see the
+/// value `load_bzimage` wrote at linear 0x901F1 — i.e. 1. This
+/// confirms ESI actually points where the setup header lives.
+#[test]
+fn start_protected_mode_at_lets_kernel_read_setup_via_esi() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1; // setup_sects
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    // Kernel payload:
+    //   8B 86 F1 01 00 00   MOV EAX, [ESI + 0x1F1]
+    //   F4                  HLT
+    // After the MOV, the low byte of EAX should be the setup_sects
+    // value (1). Higher bytes pick up adjacent setup-header bytes
+    // (0xAA55 starts at 0x1FE, two bytes past our read window) —
+    // we only check the low byte for stability.
+    bz.extend_from_slice(&[0x8B, 0x86, 0xF1, 0x01, 0x00, 0x00, 0xF4]);
+
+    let mut vm = Vm::with_ram_size(0x0020_0000);
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(16);
+
+    assert!(vm.is_halted());
+    assert_eq!(vm.cpu().read_r32(0) & 0xFF, 1);
 }
 
 /// The three bzImage handoff functions compose: loading a bzImage,
