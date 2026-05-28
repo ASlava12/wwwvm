@@ -2500,6 +2500,51 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// INT 0x80 legacy-syscall round-trip — the Linux i386 syscall ABI
+/// shape. User code loads argument registers, INT 0x80 vectors to a
+/// handler that computes a result into EAX, and IRET returns to the
+/// instruction after the INT with the result visible. Exercises the
+/// register-passing convention end-to-end (not just a sentinel).
+#[test]
+fn int_0x80_syscall_returns_computed_result() {
+    let mut mem = Memory::new(0x10_0000);
+    // IVT[0x80] at linear 0x80*4 = 0x200: IP=0x9000, CS=0x0000.
+    mem.write_u16(0x200, 0x9000);
+    mem.write_u16(0x202, 0x0000);
+    // Boot stub: EBX=10, ECX=32, INT 0x80, HLT. Expect EAX=42.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBB, 0x0A, 0x00, 0x00, 0x00, // MOV EBX, 10
+            0x66, 0xB9, 0x20, 0x00, 0x00, 0x00, // MOV ECX, 32
+            0xCD, 0x80, // INT 0x80
+            0xF4, // HLT
+        ],
+    );
+    // Handler at 0x9000: EAX = EBX + ECX ; IRET.
+    mem.write_slice(
+        0x9000,
+        &[
+            0x66, 0x89, 0xD8, // MOV EAX, EBX
+            0x66, 0x01, 0xC8, // ADD EAX, ECX
+            0xCF, // IRET
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "must return from the syscall and reach HLT");
+    assert_eq!(cpu.read_r32(0), 42, "EAX = EBX + ECX from the handler");
+    // IRET landed on the HLT right after INT 0x80 (offset 14 → 0x7C0E).
+    assert_eq!(cpu.ip, 0x7C0F, "resumed past INT, ran the 1-byte HLT");
+}
+
 /// 64-bit add via ADD + ADC across a dword pair — the multi-precision
 /// pattern the kernel uses for 64-bit counters (jiffies, ktime) on a
 /// 32-bit CPU. Verifies CF produced by the low ADD feeds the high ADC.
