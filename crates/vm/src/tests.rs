@@ -1265,6 +1265,83 @@ fn bzimage_kernel_handles_demand_paging_round_trip() {
     assert_eq!(vm.cpu().cr0 & 0x8000_0001, 0x8000_0001);
 }
 
+/// CR0.WP + COW shape end-to-end. The kernel maps a 4-MiB region
+/// read-only (PDE.RW=0), sets CR0.WP, and tries to write to it —
+/// real silicon raises #PF with P=1 (page IS present) | W=1
+/// (write), and Linux's COW handler patches the PDE to RW=1 and
+/// IRETs back to the same store. This pins the full chain
+/// through `cpu.step()`, not just `translate_write` in isolation.
+#[test]
+fn bzimage_kernel_handles_wp_cow_round_trip() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel at code32_start = 0x100000:
+    //   - Install IDT[14] = 32-bit interrupt gate to phys 0x800.
+    //   - LIDT.
+    //   - PD at 0x200000:
+    //       PDE[0] = PSE identity, R/W=1  (kernel itself, writable)
+    //       PDE[1] = PSE @ 0x400000, R/W=0 (target page, read-only)
+    //   - CR3 + CR4.PSE + CR0.PG | CR0.WP (bit 16).
+    //   - MOV DWORD [0x400000], 0xCAFEBABE  ; #PF (P=1 | W=1) first time,
+    //                                       ; retries after handler patches PDE[1].
+    //   - HLT
+    let kernel: &[u8] = &[
+        0xC7, 0x05, 0x70, 0x10, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x74, 0x10, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, // LIDT
+        // PDE[0] = PSE identity 0x0000_0083 (R/W=1).
+        0xC7, 0x05, 0x00, 0x00, 0x20, 0x00, 0x83, 0x00, 0x00, 0x00, //
+        // PDE[1] = PSE 0x0040_0081 (R/W=0, P=1, PS=1).
+        0xC7, 0x05, 0x04, 0x00, 0x20, 0x00, 0x81, 0x00, 0x40, 0x00, //
+        // Load CR3.
+        0xB8, 0x00, 0x00, 0x20, 0x00, 0x0F, 0x22, 0xD8, //
+        // CR4 |= PSE.
+        0x0F, 0x20, 0xE0, 0x83, 0xC8, 0x10, 0x0F, 0x22, 0xE0, //
+        // CR0 |= PG | WP (bits 31 + 16).
+        0x0F, 0x20, 0xC0, 0x0D, 0x00, 0x00, 0x01, 0x80, 0x0F, 0x22, 0xC0, //
+        // MOV DWORD [0x400000], 0xCAFEBABE — write to RO page → #PF.
+        0xC7, 0x05, 0x00, 0x00, 0x40, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    // Handler at phys 0x800:
+    //   58                              POP EAX (discard error code)
+    //   0F 20 D3                        MOV EBX, CR2
+    //   C7 05 04 00 20 00 83 00 40 00   MOV DWORD [0x200004], 0x00400083
+    //                                                  (PDE[1] = RW=1)
+    //   CF                              IRETD
+    vm.mem.write_slice(
+        0x0800,
+        &[
+            0x58, 0x0F, 0x20, 0xD3, 0xC7, 0x05, 0x04, 0x00, 0x20, 0x00, 0x83, 0x00, 0x40, 0x00,
+            0xCF,
+        ],
+    );
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(256);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    // Retry landed: linear 0x400000 → phys 0x400000 now has the sentinel.
+    assert_eq!(vm.mem().read_u32(0x0040_0000), 0xCAFE_BABE);
+    // CR2 captured by handler (must be 0x400000).
+    assert_eq!(vm.cpu().read_r32(3), 0x0040_0000);
+    // PDE[1] was patched to RW=1.
+    assert_eq!(vm.mem().read_u32(0x0020_0004), 0x0040_0083);
+    // CR0.WP stayed on.
+    assert_eq!(vm.cpu().cr0 & 0x0001_0000, 0x0001_0000);
+}
+
 /// PIT IRQ delivery in PM with paging on — the actual Linux
 /// runtime tick path. The kernel installs an IDT entry for
 /// vector 0x08 (PIC default IRQ-0 vector), programs the PIT for
