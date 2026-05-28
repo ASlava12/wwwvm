@@ -397,6 +397,78 @@ fn bios_int15_88_returns_extended_memory_kib() {
     assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
 }
 
+/// INT 0x15 AH=0x86 — busy-wait CX:DX microseconds. Our emulator
+/// has no wall-clock concept between step()s so the wait completes
+/// instantly; CF=0 signals success.
+#[test]
+fn bios_int15_86_wait_microseconds_returns_success() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Set CF before the call (via STC = 0xF9), call AH=0x86, then
+    // HLT. The handler must clear CF on its way out.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xF9, // STC (poison CF)
+            0xB4, 0x86, // MOV AH, 0x86
+            0xB9, 0xE8, 0x03, // MOV CX, 1000 (low half of microsec count)
+            0xBA, 0x00, 0x00, // MOV DX, 0
+            0xCD, 0x15, // INT 0x15
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0, "CF cleared");
+}
+
+/// INT 0x15 AH=0xC0 — Get System Config. We don't supply a config
+/// table; report "unsupported" (CF=1, AH=0x86) so setup.bin falls
+/// back to defaults.
+#[test]
+fn bios_int15_c0_get_system_config_reports_unsupported() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0xC0, // MOV AH, 0xC0
+            0xCD, 0x15, // INT 0x15
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    assert!(vm.cpu().flags & wwwvm_cpu::flag::CF != 0);
+    assert_eq!(vm.cpu().read_r8(4), 0x86, "AH = unsupported");
+}
+
+/// INT 0x15 AX=0xE801 — older "give me the memory map" alternative
+/// to E820. Returns memory 1MB..16MB in KiB (AX=CX, capped at 15
+/// MiB = 0x3C00) and memory > 16MB in 64KB blocks (BX=DX). With a
+/// 32 MiB VM: lo = 15360 (capped), hi = 16 MiB / 64KB = 256.
+#[test]
+fn bios_int15_e801_partitions_memory_above_and_below_16mb() {
+    let mut vm = Vm::with_ram_size(0x0200_0000); // 32 MiB
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB8, 0x01, 0xE8, // MOV AX, 0xE801
+            0xCD, 0x15, // INT 0x15
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::AX], 0x3C00, "AX = lo KiB capped");
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::CX], 0x3C00);
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::BX], 256, "BX = hi 64K-blocks");
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::DX], 256);
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0);
+}
+
 /// INT 0x15 AH=0x88 with a VM ≤ 1 MiB returns 0 (no extended memory).
 #[test]
 fn bios_int15_88_returns_zero_when_no_extended_memory() {

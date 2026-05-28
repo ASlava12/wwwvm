@@ -398,6 +398,45 @@ fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
         cpu.flags &= !wwwvm_cpu::flag::CF;
         return true;
     }
+    // AH=0x86 — wait CX:DX microseconds. Real silicon busy-waits;
+    // since our model has no notion of wall-clock time between
+    // step()s, the wait completes instantly. CF=0 = success.
+    if ax >> 8 == 0x86 {
+        cpu.flags &= !wwwvm_cpu::flag::CF;
+        return true;
+    }
+    // AH=0xC0 — Get System Config (returns ES:BX → a 16-byte
+    // hardware descriptor table on real BIOSes). We don't supply
+    // the table; reply "function not supported" per the legacy
+    // contract (CF=1, AH=0x86) so setup.bin falls back to defaults.
+    if ax >> 8 == 0xC0 {
+        cpu.write_r8(4, 0x86);
+        cpu.flags |= wwwvm_cpu::flag::CF;
+        return true;
+    }
+    // AX=0xE801 — Get Memory Size (older alternative to E820 some
+    // loaders prefer). Returns memory 1MB..16MB in KiB (AX = CX,
+    // capped at 0x3C00 = 15 MiB) and memory above 16MB in 64KB
+    // blocks (BX = DX, capped at 0xFFFF).
+    if ax == 0xE801 {
+        let ram = mem.size() as u64;
+        let lo_kb = if ram > 0x10_0000 {
+            ((ram - 0x10_0000) / 1024).min(0x3C00)
+        } else {
+            0
+        };
+        let hi_blocks = if ram > 0x0100_0000 {
+            ((ram - 0x0100_0000) / (64 * 1024)).min(0xFFFF)
+        } else {
+            0
+        };
+        cpu.regs[wwwvm_cpu::r16::AX] = lo_kb as u16;
+        cpu.regs[wwwvm_cpu::r16::CX] = lo_kb as u16;
+        cpu.regs[wwwvm_cpu::r16::BX] = hi_blocks as u16;
+        cpu.regs[wwwvm_cpu::r16::DX] = hi_blocks as u16;
+        cpu.flags &= !wwwvm_cpu::flag::CF;
+        return true;
+    }
     if ax != 0xE820 {
         return false;
     }
