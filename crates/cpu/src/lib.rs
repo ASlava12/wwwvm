@@ -213,6 +213,14 @@ pub struct Cpu {
     /// into the kernel. RDTSCP returns this value in ECX. Stored
     /// only; we don't model multiple CPUs.
     pub tsc_aux: u32,
+    /// IA32_EFER (MSR 0xC0000080). Bits we'd care about if we
+    /// modelled them: SCE (bit 0 — syscall enable), NXE (bit 11 —
+    /// no-execute), LME (bit 8 — long-mode enable). We don't model
+    /// any of these — the field round-trips so the kernel's
+    /// `setup_efer` doesn't oops on its writeback verification.
+    /// Not snapshotted past Cpu::new() defaults; the kernel
+    /// reconfigures on next boot.
+    pub efer: u64,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -358,6 +366,7 @@ impl Cpu {
             sysenter_eip: 0,
             misc_enable: 0,
             tsc_aux: 0,
+            efer: 0,
             pending_fault: Cell::new(None),
             last_op_ip: 0,
             a20: true,
@@ -410,6 +419,7 @@ impl Cpu {
         self.sysenter_eip = 0;
         self.misc_enable = 0;
         self.tsc_aux = 0;
+        self.efer = 0;
         self.pending_fault.set(None);
         self.last_op_ip = 0;
         self.a20 = true;
@@ -5021,6 +5031,12 @@ impl Cpu {
                             // so Linux skips machine-check setup
                             // entirely.
                             0x179 => 0,
+                            // IA32_EFER (0xC0000080). Linux probes for
+                            // NXE / SCE bits. Returning whatever was
+                            // last written lets `setup_efer`'s read-
+                            // back verification pass without a #GP-
+                            // recovery roundtrip.
+                            0xC000_0080 => self.efer,
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);
@@ -5065,6 +5081,13 @@ impl Cpu {
                             // per-CPU in cpu_init() so the vDSO can
                             // identify which CPU answered a syscall.
                             0xC000_0103 => self.tsc_aux = lo,
+                            // IA32_EFER: store the full 64-bit value
+                            // so `setup_efer`'s read-back sees what
+                            // it just wrote. We don't act on NXE/SCE/
+                            // LME bits — those would require modelling
+                            // NX in the walker and 64-bit mode, both
+                            // out of scope.
+                            0xC000_0080 => self.efer = (lo as u64) | ((hi as u64) << 32),
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);

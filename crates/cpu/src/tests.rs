@@ -5142,6 +5142,38 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// IA32_EFER (0xC0000080) round-trips through WRMSR / RDMSR.
+/// Linux's `setup_efer` writes the EFER value with NXE/SCE bits
+/// and reads it back to verify. Without a stub the writeback
+/// path #GP'd via `wrmsr_safe`, recoverable but noisy.
+#[test]
+fn efer_round_trips_through_wrmsr_rdmsr() {
+    // MOV ECX, 0xC0000080
+    // MOV EAX, 0xCAFE_BABE   ; SCE/NXE/etc. encoded somewhere here
+    // MOV EDX, 0x0000_0001   ; high half
+    // WRMSR
+    // XOR EAX, EAX           ; prove RDMSR rewrites
+    // XOR EDX, EDX
+    // RDMSR
+    // HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x80, 0x00, 0x00, 0xC0, // MOV ECX, 0xC0000080
+            0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // MOV EAX, 0xCAFEBABE
+            0x66, 0xBA, 0x01, 0x00, 0x00, 0x00, // MOV EDX, 1
+            0x0F, 0x30, // WRMSR
+            0x66, 0x31, 0xC0, // XOR EAX, EAX
+            0x66, 0x31, 0xD2, // XOR EDX, EDX
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        32,
+    );
+    assert_eq!(cpu.efer, 0x0000_0001_CAFE_BABE);
+    assert_eq!(cpu.read_r32(0), 0xCAFE_BABE);
+    assert_eq!(cpu.read_r32(2), 0x0000_0001);
+}
+
 /// IA32_FEATURE_CONTROL (0x3A) and IA32_MCG_CAP (0x179) are
 /// probed unconditionally by Linux on boot. Stubbing both keeps
 /// the kernel log noise-free:
