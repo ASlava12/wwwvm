@@ -7778,10 +7778,29 @@ fn shrd_r16_imm8_fills_high_from_source_low() {
 #[test]
 fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {
     let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
-    assert_eq!(cpu.read_r32(0), 1);
+    // Max basic leaf = 2 (we answer leaves 0, 1, and 2 — cache
+    // descriptors). Linux's CPUID-walking code stops here.
+    assert_eq!(cpu.read_r32(0), 2);
     assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"WWWV"));
     assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"MxRu"));
     assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"st  "));
+}
+
+/// CPUID leaf 2 — cache descriptors. Returns EAX bits 7:0 = 0x01
+/// ("one call needed") with all descriptor bytes zero. Linux's
+/// intel_detect_cache reads this leaf and gracefully treats the
+/// all-zero descriptor set as "no info" — it falls through to
+/// the deterministic-cache leaf or to defaults.
+#[test]
+fn cpuid_leaf_2_returns_one_iteration_and_no_descriptors() {
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x02, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
+    // EAX bits 7:0 — iterations needed (1 = "all in this call").
+    assert_eq!(cpu.read_r32(0) & 0xFF, 1);
+    // All other slots are zero (no descriptors).
+    assert_eq!(cpu.read_r32(0) >> 8, 0);
+    assert_eq!(cpu.read_r32(3), 0);
+    assert_eq!(cpu.read_r32(2), 0);
+    assert_eq!(cpu.read_r32(1), 0);
 }
 
 /// CPUID leaf 1 must advertise the ISA we actually implement: FPU,

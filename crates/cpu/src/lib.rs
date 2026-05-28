@@ -6847,7 +6847,7 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
     match leaf {
         // Standard leaves.
         0 => {
-            cpu.write_r32(0, 1); // max basic leaf = 1
+            cpu.write_r32(0, 2); // max basic leaf = 2 (cache descriptors)
                                  // Vendor string "WWWVMxRust  " in EBX, EDX, ECX.
             cpu.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX
             cpu.write_r32(1, u32::from_le_bytes(*b"MxRu")); // EDX
@@ -6861,6 +6861,20 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             cpu.write_r32(3, CPUID_LEAF1_EBX); // EBX (brand idx / cflush / max-logical / APIC ID)
             cpu.write_r32(2, 0); // ECX (SSE3+)
             cpu.write_r32(1, CPUID_LEAF1_EDX); // EDX
+        }
+        2 => {
+            // Cache descriptor leaf. EAX bits 7:0 = "iterations
+            // needed minus 1" (so 0x01 means "one call gives you
+            // everything"). Remaining bytes are descriptor codes;
+            // 0x00 means "no descriptor in this slot". Linux's
+            // arch/x86/kernel/cpu/intel.c::intel_detect_cache reads
+            // this leaf and tolerates an all-zero descriptor set —
+            // it just falls through to the deterministic-cache
+            // leaf (4) or to defaults.
+            cpu.write_r32(0, 0x0000_0001);
+            cpu.write_r32(3, 0); // EBX
+            cpu.write_r32(2, 0); // ECX
+            cpu.write_r32(1, 0); // EDX
         }
         // Extended leaves.
         0x8000_0000 => {
