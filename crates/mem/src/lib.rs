@@ -61,6 +61,16 @@ impl Memory {
         lapic[0x32] = 0x06;
         // ID register at 0x020 already reads zero — that's the
         // canonical BSP APIC ID for our single-CPU model.
+        //
+        // SVR (Spurious Interrupt Vector, 0xF0): pre-set bit 8
+        // (Software-Enable) so LAPIC delivery starts working out
+        // of the box. Real silicon defaults to SVR=0 and the kernel
+        // writes bit 8 during apic_init; our default-on convention
+        // saves test kernels a 10-byte SVR-write boilerplate, and
+        // any guest that explicitly clears bit 8 (S3 suspend, etc.)
+        // still sees the gate take effect through the LAPIC tick
+        // path.
+        lapic[0xF1] = 0x01;
 
         let mut hpet = [0u8; HPET_SIZE as usize];
         // General Capabilities register at offset 0x000 (64-bit).
@@ -194,7 +204,15 @@ impl Memory {
         ]);
         let masked = lvt & (1 << 16) != 0;
         let periodic = (lvt >> 17) & 0b11 == 0b01;
-        if !masked {
+        // Honor the LAPIC software-enable bit in SVR (Spurious
+        // Interrupt Vector Register, offset 0xF0 bit 8). Linux
+        // writes SVR with this bit set during apic_init; until
+        // then the LAPIC must stay silent. Without this gate the
+        // timer would fire during BIOS execution and the kernel
+        // would see ghost ticks before installing its handler.
+        // SVR bit 8 of the u32 maps to byte index 0xF1 bit 0 LE.
+        let svr_enabled = self.lapic[0xF1] & 0x01 != 0;
+        if svr_enabled && !masked {
             // Don't overwrite an already-pending IRQ — the kernel
             // hasn't drained it yet. Real silicon would coalesce
             // via the LAPIC IRR / ISR; our minimal model just drops
@@ -290,7 +308,11 @@ impl Memory {
                 self.hpet[fsb_off + 2],
                 self.hpet[fsb_off + 3],
             ]);
-            if self.pending_lapic_irq.is_none() {
+            // FSB delivery targets the LAPIC; honor LAPIC software-
+            // enable like the timer path does. A HPET configured
+            // before the kernel enables LAPIC must stay silent.
+            let svr_enabled = self.lapic[0xF1] & 0x01 != 0;
+            if svr_enabled && self.pending_lapic_irq.is_none() {
                 self.pending_lapic_irq = Some(fsb_val as u8);
             }
         }

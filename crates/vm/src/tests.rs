@@ -1504,8 +1504,7 @@ fn hpet_main_counter_advances_when_enabled_and_freezes_when_disabled() {
     );
 
     // Enable the counter via the General Configuration register.
-    vm.cpu
-        .mem_write_u32(&mut vm.mem, 0xFED0_0010, 0x0000_0001);
+    vm.cpu.mem_write_u32(&mut vm.mem, 0xFED0_0010, 0x0000_0001);
 
     let baseline = vm.cpu().mem_read_u32(vm.mem(), 0xFED0_00F0);
     vm.run_steps(32);
@@ -1521,6 +1520,64 @@ fn hpet_main_counter_advances_when_enabled_and_freezes_when_disabled() {
         "advanced too few steps (got {})",
         after - baseline
     );
+}
+
+/// LAPIC software-disable via SVR (Spurious Vector Register
+/// bit 8 cleared): timer ticks the Current Count, but no IRQs
+/// fire even on the zero crossing. Linux flips this bit to fully
+/// silence the LAPIC during S3 / power transitions; the mask
+/// bit (LVT_TIMER bit 16) is per-vector, this is global.
+#[test]
+fn lapic_software_disable_via_svr_silences_delivery() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel: clear SVR.SW_EN, set up periodic LAPIC timer
+    // (unmasked, periodic), busy-loop, HLT. Without the gate the
+    // timer would fire ~250 times in the loop; with SVR.SW_EN
+    // cleared it must stay silent.
+    let kernel: &[u8] = &[
+        // IDT[0x40] @ idt_base + 0x40*8 = 0x1200.
+        0xC7, 0x05, 0x00, 0x12, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x04, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // SVR = 0x00000000 — disable (bit 8 clear).
+        0xC7, 0x05, 0xF0, 0x00, 0xE0, 0xFE, 0x00, 0x00, 0x00, 0x00, //
+        // LVT_TIMER = 0x00020040 — vector 0x40, periodic, unmasked.
+        0xC7, 0x05, 0x20, 0x03, 0xE0, 0xFE, 0x40, 0x00, 0x02, 0x00, //
+        // Initial Count = 32.
+        0xC7, 0x05, 0x80, 0x03, 0xE0, 0xFE, 0x20, 0x00, 0x00, 0x00, //
+        0xFB, // STI
+        // Busy loop: MOV ECX, 0x1000; DEC ECX; JNZ -3; HLT.
+        0xB9, 0x00, 0x10, 0x00, 0x00, 0x49, 0x75, 0xFD, 0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    vm.mem
+        .write_slice(0x0800, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(20_000);
+
+    assert!(vm.is_halted());
+    assert_eq!(
+        vm.mem().read_u8(0x900),
+        0,
+        "SVR.SW_EN=0 must silence delivery (got {})",
+        vm.mem().read_u8(0x900)
+    );
+    // Counter still ticks (just no IRQs) — Linux's calibration
+    // path reads the counter directly regardless of SVR.SW_EN.
+    let counter = vm.mem().read_u32(0xFEE0_0390);
+    assert!(counter < 0x20, "counter advanced (got {counter:#x})");
 }
 
 /// LAPIC mask bit (LVT_TIMER bit 16): when set, no IRQ fires on
