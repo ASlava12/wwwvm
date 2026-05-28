@@ -240,6 +240,10 @@ pub struct Cpu {
     /// stream — hit the cache and skip the PDE + PTE walks. Real
     /// silicon caches this in the L1 ITLB; we just cache one slot
     /// since sequential fetches mostly stay on the same page.
+    /// (We measured a 2-entry direct-mapped variant on the Linux
+    /// boot test: dead flat, no win — confirmed empirically that
+    /// the hot fetch path doesn't bounce across page boundaries
+    /// often enough to matter, so the 1-slot version stays.)
     /// Cleared on CR3 reload, INVLPG, CR0.PG toggle, write_sreg(CS)
     /// (CPL transition may change U/S semantics), and CPU reset.
     /// The tuple is `(linear_page, phys_frame_after_a20, a20_state)`
