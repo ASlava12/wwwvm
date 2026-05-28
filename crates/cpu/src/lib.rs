@@ -4196,6 +4196,18 @@ impl Cpu {
                             }
                         }
                     }
+                    // UD2 (0F 0B) — the guaranteed-#UD instruction.
+                    // Compilers emit this where control-flow must not
+                    // reach (BUG()/unreachable()/panic) so the kernel's
+                    // #UD handler can print a backtrace pointing at the
+                    // exact byte. The fault frame saves the *start* of
+                    // UD2, so the kernel can decode the bytes after it
+                    // as a BUG-table key (this is how panic_on_oops
+                    // finds its message).
+                    0x0B => {
+                        self.ip = op_ip;
+                        self.do_interrupt(6, mem);
+                    }
                     // MOV r32, CRn — 0x0F 0x20 /reg. CR0/CR2/CR3 routed
                     // through the full 32-bit GPR (write_r32) so the
                     // upper half of each control register survives.

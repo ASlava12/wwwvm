@@ -3900,6 +3900,56 @@ fn sse_maskmovdqu_writes_only_selected_bytes() {
     }
 }
 
+/// UD2 raises #UD (vector 6) through the real-mode IVT: the IVT
+/// entry at 6×4 = 0x0018 points at a handler that sets a sentinel
+/// in AX and halts. We also verify the saved IP on the stack is
+/// the start of UD2 (the fault-frame convention) rather than the
+/// byte after — this is what BUG() / panic_on_oops rely on to find
+/// the bug-table entry that immediately follows the UD2.
+#[test]
+fn ud2_vectors_through_ivt_and_pushes_faulting_ip() {
+    let mut mem = Memory::new(0x10_0000);
+    // IVT[6] — handler at 0:0x7C20.
+    mem.write_u8(0x0018, 0x20); // offset low
+    mem.write_u8(0x0019, 0x7C); // offset high
+    mem.write_u8(0x001A, 0x00); // segment low
+    mem.write_u8(0x001B, 0x00); // segment high
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x0F, 0x0B, // UD2 — should fault here
+            0xF4, // HLT — should never be reached
+        ],
+    );
+    mem.write_slice(
+        0x7C20,
+        &[
+            0xB8, 0xEF, 0xBE, // MOV AX, 0xBEEF
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // The handler executed.
+    assert_eq!(cpu.regs[r16::AX], 0xBEEF);
+    // The fault frame pushed (FLAGS, CS, IP) — initial SP=0x7C00
+    // dropped to 0x7BFA after three 16-bit pushes. Saved IP must
+    // point at the start of UD2 (0x7C00), not the byte after.
+    let saved_ip = mem.read_u16(0x7BFA);
+    assert_eq!(saved_ip, 0x7C00);
+    // IF must be cleared inside the handler (we executed it to HLT
+    // with IF=0).
+    assert!(!cpu.has(flag::IF));
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
