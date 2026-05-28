@@ -5,11 +5,17 @@
 //! Minimal register subset:
 //!   * THR (offset 0) — write transmits a byte to host output buffer
 //!   * RBR (offset 0) — read pops a byte from host input buffer
-//!   * IER (offset 1) — bit 0 enables Received Data Available IRQ
+//!   * IER (offset 1) — bit 0 = RDA IRQ enable, bit 1 = THRE IRQ enable
+//!   * IIR (offset 2) — read returns 0x04 (RDA) | 0x02 (THRE) | 0x01
+//!     (no IRQ pending), so Linux's 8250 driver can dispatch
 //!   * LSR (offset 5) — bit 0 (DR) = input available, bit 5 (THRE) = always 1
 //!
-//! Other registers (IIR, MCR, scratch, DLAB) return 0 and accept writes
-//! silently. Enough for a guest that polls LSR or that uses IRQ 4.
+//! Other registers (MCR, scratch, DLAB) return 0 and accept writes
+//! silently. THRE IRQ (transmit-ready) is needed for Linux's
+//! user-mode tty write path — kernel printk uses polled writes
+//! (spins on LSR.THRE), but user-mode writes go through `uart_write`
+//! → `start_tx` → "enable THRE IRQ, send on each IRQ" and stall
+//! indefinitely if the IRQ never fires.
 
 use std::collections::VecDeque;
 
@@ -59,12 +65,21 @@ impl Uart {
         self.rx_buffer.len()
     }
 
-    /// True if the UART has a level-high interrupt line right now: rx
-    /// data is available AND the guest has enabled the RDA interrupt
-    /// in IER bit 0. `IoBus::refresh_irqs` polls this each step and
-    /// latches it into the PIC's IRR.
+    /// True if the UART has a level-high interrupt line right now.
+    /// Two sources can drive it:
+    ///   * RDA (IER bit 0) — guest has enabled the receive IRQ and
+    ///     `rx_buffer` is non-empty.
+    ///   * THRE (IER bit 1) — guest has enabled the transmit-ready
+    ///     IRQ. Our model has zero TX latency: every write to THR
+    ///     completes immediately, so the transmitter is *always*
+    ///     ready and the IRQ stays asserted while IER bit 1 is set.
+    ///     Linux's serial driver drains the circ_buf one byte per
+    ///     IRQ delivery and clears IER bit 1 when there's nothing
+    ///     left to send.
     pub fn irq_pending(&self) -> bool {
-        (self.ier & 0x01) != 0 && !self.rx_buffer.is_empty()
+        let rx = (self.ier & 0x01) != 0 && !self.rx_buffer.is_empty();
+        let tx = (self.ier & 0x02) != 0;
+        rx || tx
     }
 
     /// Serialize UART state into `out`. Format: IER (u8), tx_len
@@ -121,6 +136,22 @@ impl IoDevice for Uart {
         match port - self.base {
             0 => self.rx_buffer.pop_front().unwrap_or(0),
             1 => self.ier,
+            // IIR — Interrupt Identification Register. Linux's 8250
+            // handler reads this immediately on IRQ entry to decide
+            // which path to take. Encode the same priority order as
+            // a real 16450: receive line status > RDA > THRE >
+            // modem status. We don't model line-status or modem
+            // events, so it's just RDA vs THRE vs "nothing pending"
+            // (bit 0 = 1 means no IRQ; bits 3:1 = cause code).
+            2 => {
+                if (self.ier & 0x01) != 0 && !self.rx_buffer.is_empty() {
+                    0x04 // RDA
+                } else if (self.ier & 0x02) != 0 {
+                    0x02 // THRE
+                } else {
+                    0x01 // no IRQ pending
+                }
+            }
             5 => {
                 let dr = if self.rx_buffer.is_empty() { 0 } else { 1 };
                 let thre = 1 << 5;
@@ -178,5 +209,38 @@ mod tests {
         assert!(u.irq_pending());
         assert_eq!(u.read(Uart::COM1_BASE), b'x');
         assert!(!u.irq_pending());
+    }
+
+    /// THRE IRQ stays asserted while IER bit 1 is set — our model
+    /// has zero TX latency so the transmitter is always ready. This
+    /// is the path Linux's user-mode serial write relies on: enable
+    /// THRE IRQ, drain one byte per delivery, disable when done.
+    #[test]
+    fn thre_irq_fires_while_ier_bit1_set() {
+        let mut u = Uart::com1();
+        assert!(!u.irq_pending());
+        u.write(Uart::COM1_BASE + 1, 0x02); // enable THRE
+        assert!(u.irq_pending());
+        // IIR reads as 0x02 (THRE) so the kernel handler knows to
+        // drain `circ_buf` into THR rather than handle an RDA.
+        assert_eq!(u.read(Uart::COM1_BASE + 2), 0x02);
+        // Disable THRE — IRQ stops.
+        u.write(Uart::COM1_BASE + 1, 0x00);
+        assert!(!u.irq_pending());
+        assert_eq!(u.read(Uart::COM1_BASE + 2), 0x01);
+    }
+
+    /// RDA wins priority over THRE in IIR, matching real-silicon
+    /// dispatch (RX line status is the highest, then RDA, then
+    /// THRE, then modem status).
+    #[test]
+    fn iir_prioritizes_rda_over_thre() {
+        let mut u = Uart::com1();
+        u.write(Uart::COM1_BASE + 1, 0x03); // RDA + THRE enabled
+        u.push_rx(b"a");
+        assert_eq!(u.read(Uart::COM1_BASE + 2), 0x04, "RDA wins");
+        // After draining RX, IIR reports THRE.
+        assert_eq!(u.read(Uart::COM1_BASE), b'a');
+        assert_eq!(u.read(Uart::COM1_BASE + 2), 0x02);
     }
 }
