@@ -4148,6 +4148,64 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
     assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
 }
 
+/// IRET to a higher-privilege CS (CPL goes from 0 to 3) pops the
+/// additional SS:ESP frame Real silicon expects, switching to the
+/// caller's user-mode stack. Same-ring IRET (the existing tests)
+/// stays unchanged. This is the entry point for ring 3 transitions;
+/// kernel→user-mode returns go through this exact shape.
+#[test]
+fn iret_to_higher_ring_pops_extra_ss_esp_and_switches_stack() {
+    let mut mem = Memory::new(0x10_0000);
+    // GDT at 0x500. Five entries: null + ring-0 code (0x08) +
+    // ring-0 data (0x10) + ring-3 code (0x18, RPL=3 = 0x1B) +
+    // ring-3 data (0x20, RPL=3 = 0x23).
+    let gdt: [u8; 40] = [
+        0, 0, 0, 0, 0, 0, 0, 0, // null
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // ring-0 code
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // ring-0 data
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, // ring-3 code
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, // ring-3 data
+    ];
+    mem.write_slice(0x500, &gdt);
+
+    // IRET frame at 0x6000 (low → high, popped in this order):
+    //   IP = 0x0000, CS = 0x001B, FLAGS = 0x0202,
+    //   SP = 0x4000, SS = 0x0023.
+    mem.write_u16(0x6000, 0x0000);
+    mem.write_u16(0x6002, 0x001B);
+    mem.write_u16(0x6004, 0x0202);
+    mem.write_u16(0x6006, 0x4000);
+    mem.write_u16(0x6008, 0x0023);
+
+    // IRET (0xCF) at linear 0x7C00 — that's where reset_to_boot
+    // points CS:IP (CS=0 / IP=0x7C00). We later swap CS to ring-0
+    // selector 0x08 via write_sreg; that descriptor has base 0, so
+    // CS:IP still resolves to linear 0x7C00.
+    mem.write_u8(0x7C00, 0xCF);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x27; // five 8-byte entries
+
+    cpu.write_sreg(sreg::CS, 0x08, &mem); // ring-0 code
+    cpu.write_sreg(sreg::SS, 0x10, &mem); // ring-0 data
+    cpu.regs[r16::SP] = 0x6000;
+    cpu.ip = 0x7C00;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+
+    // CPL went 0 → 3, so the extra SS:SP frame got popped and
+    // applied.
+    assert_eq!(cpu.sregs[sreg::CS], 0x001B, "CS = ring-3 code");
+    assert_eq!(cpu.sregs[sreg::SS], 0x0023, "SS = ring-3 data");
+    assert_eq!(cpu.regs[r16::SP], 0x4000, "SP = caller's user stack");
+    assert_eq!(cpu.ip, 0x0000, "IP = popped value");
+    assert_eq!(cpu.flags, 0x0202, "FLAGS restored");
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

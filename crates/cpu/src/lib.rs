@@ -3811,21 +3811,63 @@ impl Cpu {
             // 0x66 prefix (IRETD), pops a dword frame; otherwise a
             // word frame. The IF/TF state before the original INT is
             // restored as part of FLAGS.
+            //
+            // Cross-ring return: when in PE mode and the popped CS's
+            // RPL is greater than the current CPL, real silicon also
+            // pops the caller's SS:ESP (a five-word / five-dword
+            // frame instead of three). That's how a kernel returns
+            // to user-space via IRET. We honour that here so a
+            // future ring 3 + TSS implementation can land cleanly.
             0xCF => {
+                let is_pe = (self.cr0 & 1) != 0;
+                let cpl_before = if is_pe {
+                    (self.sregs[sreg::CS] & 3) as u8
+                } else {
+                    0
+                };
                 if self.op_size_32 {
-                    self.ip = self.pop32(mem);
-                    let cs = self.pop32(mem) as u16;
-                    self.write_sreg(sreg::CS, cs, mem);
+                    let new_ip = self.pop32(mem);
+                    let new_cs = self.pop32(mem) as u16;
                     // EFLAGS pop — only the low 16 are modelled; the
                     // upper half (resume / V86 / AC bits) reads back
                     // but isn't acted upon yet.
-                    let eflags = self.pop32(mem);
-                    self.flags = eflags as u16;
+                    let new_eflags = self.pop32(mem);
+                    let cpl_after = if is_pe { (new_cs & 3) as u8 } else { 0 };
+                    let cross_ring = cpl_after > cpl_before;
+                    let (popped_esp, popped_ss) = if cross_ring {
+                        let esp = self.pop32(mem);
+                        let ss = self.pop32(mem) as u16;
+                        (Some(esp), Some(ss))
+                    } else {
+                        (None, None)
+                    };
+                    self.ip = new_ip;
+                    self.write_sreg(sreg::CS, new_cs, mem);
+                    self.flags = new_eflags as u16;
+                    if let (Some(esp), Some(ss)) = (popped_esp, popped_ss) {
+                        self.write_sreg(sreg::SS, ss, mem);
+                        self.write_r32(r16::SP as u8, esp);
+                    }
                 } else {
-                    self.ip = self.pop16(mem) as u32;
-                    let cs = self.pop16(mem);
-                    self.write_sreg(sreg::CS, cs, mem);
-                    self.flags = self.pop16(mem);
+                    let new_ip = self.pop16(mem) as u32;
+                    let new_cs = self.pop16(mem);
+                    let new_flags = self.pop16(mem);
+                    let cpl_after = if is_pe { (new_cs & 3) as u8 } else { 0 };
+                    let cross_ring = cpl_after > cpl_before;
+                    let (popped_sp, popped_ss) = if cross_ring {
+                        let sp = self.pop16(mem);
+                        let ss = self.pop16(mem);
+                        (Some(sp), Some(ss))
+                    } else {
+                        (None, None)
+                    };
+                    self.ip = new_ip;
+                    self.write_sreg(sreg::CS, new_cs, mem);
+                    self.flags = new_flags;
+                    if let (Some(sp), Some(ss)) = (popped_sp, popped_ss) {
+                        self.write_sreg(sreg::SS, ss, mem);
+                        self.regs[r16::SP] = sp;
+                    }
                 }
             }
 
