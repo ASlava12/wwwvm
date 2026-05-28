@@ -781,6 +781,46 @@ impl Cpu {
                         (self.xmm[reg as usize] & !LO64) | (r.to_bits() as u128);
                 }
             }
+            // CVTSI2SS / CVTSI2SD — signed int32 (GP r/m32) → scalar
+            // float in the low lane of the XMM dest, upper bits kept.
+            //   F3 0F 2A  CVTSI2SS    F2 0F 2A  CVTSI2SD
+            0x2A => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let src = self.read_rm32(rm, mem) as i32;
+                if is_f3 {
+                    let v = (src as f32).to_bits() as u128;
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO32) | v;
+                } else {
+                    let v = (src as f64).to_bits() as u128;
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO64) | v;
+                }
+            }
+            // CVT(T)SS2SI / CVT(T)SD2SI — scalar float (XMM/m) → signed
+            // int32 in a GP register. The 0x2C forms truncate toward
+            // zero; 0x2D round to nearest-even (default MXCSR mode).
+            //   F3 0F 2C/2D  *SS2SI    F2 0F 2C/2D  *SD2SI
+            0x2C | 0x2D => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let truncate = op2 == 0x2C;
+                let result = if is_f3 {
+                    let f = f32::from_bits(self.read_xmm_rm32(rm, mem));
+                    let f = if truncate {
+                        f.trunc()
+                    } else {
+                        f.round_ties_even()
+                    };
+                    f as i32
+                } else {
+                    let f = f64::from_bits(self.read_xmm_rm64(rm, mem));
+                    let f = if truncate {
+                        f.trunc()
+                    } else {
+                        f.round_ties_even()
+                    };
+                    f as i32
+                };
+                self.write_r32(reg, result as u32);
+            }
             _ => {
                 return Err(CpuError::Unimplemented {
                     opcode: op2,
@@ -4376,6 +4416,30 @@ impl Cpu {
                         let v = self.xmm[reg as usize];
                         self.write_xmm_rm(rm, mem, v);
                     }
+                    // [U]COMISS / [U]COMISD (0F 2E ordered-quiet, 0F 2F
+                    // signaling — identical for flag purposes here).
+                    // Compare the low scalar lane and set ZF/PF/CF per
+                    // the x86 result encoding; OF/SF are cleared. The
+                    // 0x66 prefix selects the double-precision form.
+                    // Compilers emit these for `if (x < y)` on floats.
+                    0x2E | 0x2F => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let ord = if self.op_size_32 {
+                            let a = f64::from_bits(self.xmm[reg as usize] as u64);
+                            let b = f64::from_bits(self.read_xmm_rm64(rm, mem));
+                            a.partial_cmp(&b)
+                        } else {
+                            let a = f32::from_bits(self.xmm[reg as usize] as u32);
+                            let b = f32::from_bits(self.read_xmm_rm32(rm, mem));
+                            a.partial_cmp(&b)
+                        };
+                        let (zf, pf, cf) = comis_flags(ord);
+                        self.set_flag(flag::ZF, zf);
+                        self.set_flag(flag::PF, pf);
+                        self.set_flag(flag::CF, cf);
+                        self.set_flag(flag::OF, false);
+                        self.set_flag(flag::SF, false);
+                    }
                     // MOVD/MOVQ and MOVDQA. The 0x66 prefix (op_size_32)
                     // selects the integer-SSE forms:
                     //   66 0F 6E  MOVD xmm, r/m32   (GP/mem → low dword)
@@ -5246,6 +5310,20 @@ fn packed_f64(a: u128, b: u128, f: impl Fn(f64, f64) -> f64) -> u128 {
         out |= (f(la, lb).to_bits() as u128) << shift;
     }
     out
+}
+
+/// Map a float comparison result to the (ZF, PF, CF) the x86
+/// [U]COMISS/[U]COMISD instructions write. `None` (a NaN operand) is
+/// the "unordered" case and sets all three. OF/SF are cleared by the
+/// caller; AF we don't model.
+fn comis_flags(ord: Option<std::cmp::Ordering>) -> (bool, bool, bool) {
+    use std::cmp::Ordering::*;
+    match ord {
+        None => (true, true, true),             // unordered (NaN)
+        Some(Greater) => (false, false, false), // a > b
+        Some(Less) => (false, false, true),     // a < b
+        Some(Equal) => (true, false, false),    // a == b
+    }
 }
 
 // SHLD/SHRD helpers — free fns to keep the dispatcher above readable.

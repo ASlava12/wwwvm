@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**335 тестов** зелёные (mem 6 + devices 31 + cpu 234 + vm 56 +
+**337 тестов** зелёные (mem 6 + devices 31 + cpu 236 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -161,7 +161,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   FSQRT/FRNDINT, константы (FLD1/FLDPI/...), FCOM/FTST + FNSTSW.
 - **SSE/SSE2** (подмножество): XMM register file, MOVD/MOVDQA/
   MOVDQU/MOVAPS/MOVUPS, MOVSS/MOVSD, PAND/POR/PXOR, PADD/PSUB
-  (B/W/D/Q), packed ADD/SUB/MUL/DIV (PS/PD) + скалярные (SS/SD).
+  (B/W/D/Q), packed ADD/SUB/MUL/DIV (PS/PD) + скалярные (SS/SD),
+  CVTSI2SS/SD + CVT(T)SS/SD2SI, [U]COMISS/[U]COMISD (флаги).
 - **BIOS-shim**: INT 0x10 (TTY), 0x12, 0x13 (disk read), 0x15
   (E820 + AH=88), 0x16 (keyboard).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
@@ -175,7 +176,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Блокер | Объём | Зачем |
 |--------|-------|-------|
 | x87 расширения (трансцендентные FSIN/FCOS/FPTAN/F2XM1, 80-бит m80, FPU-исключения) | средний | База (стек + арифметика + сравнения) уже есть; glibc местами зовёт трансцендентные |
-| MMX + остаток SSE/SSE2 (shuffles, converts CVTSI2SD/CVTTSD2SI, COMISS/UCOMISS, ~200 опкодов) | очень большой | Есть подмножество (movdqa/scalar/packed-arith); Alpine ≥3.x линкуется с полным SSE2 |
+| MMX + остаток SSE/SSE2 (shuffles SHUFPS/PSHUFD, unpacks, MIN/MAX/SQRT, конверты PS↔PD, ~180 опкодов) | очень большой | Есть подмножество (movdqa/scalar/packed-arith/converts/compares); Alpine ≥3.x линкуется с полным SSE2 |
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
@@ -197,7 +198,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 335 пройденных тестов на текущий момент. CI
+Должно вывести 337 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

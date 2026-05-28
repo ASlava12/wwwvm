@@ -2757,6 +2757,86 @@ fn sse_movsd_mulsd_scalar_via_movdqu() {
     assert_eq!(result_hi, hi_marker);
 }
 
+/// SSE int↔float converts: CVTSI2SD lifts an int into a double,
+/// MULSD scales it, then CVTTSD2SI (truncate) and CVTSD2SI (round)
+/// bring it back — exercising both rounding modes off one value.
+#[test]
+fn sse_cvt_int_float_roundtrip() {
+    let mut mem = Memory::new(0x10_0000);
+    // 7 * 1.53 = 10.71  → trunc 10, round 11.
+    let scale = 1.53f64.to_bits();
+    mem.write_u32(0x600, scale as u32);
+    mem.write_u32(0x604, (scale >> 32) as u32);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xB8, 0x07, 0x00, 0x00, 0x00, // MOV EAX, 7
+            0xF2, 0x0F, 0x2A, 0xC0, // CVTSI2SD XMM0, EAX
+            0xF2, 0x0F, 0x10, 0x0E, 0x00, 0x06, // MOVSD XMM1, [0x600]
+            0xF2, 0x0F, 0x59, 0xC1, // MULSD XMM0, XMM1
+            0xF2, 0x0F, 0x2C, 0xD8, // CVTTSD2SI EBX, XMM0 (trunc)
+            0xF2, 0x0F, 0x2D, 0xC8, // CVTSD2SI ECX, XMM0  (round)
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(3), 10); // EBX = trunc(10.71)
+    assert_eq!(cpu.read_r32(1), 11); // ECX = round(10.71)
+}
+
+/// COMISD sets ZF/PF/CF from the ordering of the low f64 lanes.
+/// Checks the three ordered cases (less / equal / greater) by
+/// running a tiny compare program per scenario.
+#[test]
+fn sse_comisd_sets_ordering_flags() {
+    fn compare(a: f64, b: f64) -> (bool, bool, bool) {
+        let mut mem = Memory::new(0x10_0000);
+        let ab = a.to_bits();
+        let bb = b.to_bits();
+        mem.write_u32(0x600, ab as u32);
+        mem.write_u32(0x604, (ab >> 32) as u32);
+        mem.write_u32(0x610, bb as u32);
+        mem.write_u32(0x614, (bb >> 32) as u32);
+        mem.write_slice(
+            0x7C00,
+            &[
+                0xF2, 0x0F, 0x10, 0x06, 0x00, 0x06, // MOVSD XMM0, [0x600]
+                0xF2, 0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVSD XMM1, [0x610]
+                0x66, 0x0F, 0x2F, 0xC1, // COMISD XMM0, XMM1
+                0xF4,
+            ],
+        );
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..16 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert!(cpu.halted);
+        (cpu.has(flag::ZF), cpu.has(flag::PF), cpu.has(flag::CF))
+    }
+    // a > b → all clear.
+    assert_eq!(compare(3.0, 2.0), (false, false, false));
+    // a < b → CF only.
+    assert_eq!(compare(2.0, 3.0), (false, false, true));
+    // a == b → ZF only.
+    assert_eq!(compare(2.5, 2.5), (true, false, false));
+    // unordered (NaN) → ZF, PF, CF all set.
+    assert_eq!(compare(f64::NAN, 1.0), (true, true, true));
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
