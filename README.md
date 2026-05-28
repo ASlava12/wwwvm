@@ -281,7 +281,11 @@ commit `milestone: Linux 6.12 boots to userspace`.
 
 Регрессионный тест milestone'а зафиксирован в
 [crates/vm/tests/linux_userspace.rs](crates/vm/tests/linux_userspace.rs)
-и помечен `#[ignore]` (потому что зависит от vmlinuz файла).
+и помечен `#[ignore]` (потому что зависит от vmlinuz файла). Тест
+двухэтапный: сначала ждёт `HELLO FROM USERSPACE` (write-syscall +
+THRE), потом — kernel panic с `exitcode=0x00002a00` (sys_exit +
+panic-on-init-exit). Оба маркера обычно попадают в один drain,
+поэтому overhead второго чека ≈ 0с — итого те же ~55 секунд.
 Запуск: `WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz cargo test
 --release --test linux_userspace -- --ignored`. Если файла нет —
 тест silently skip'ается; на CI без vmlinuz просто пропустит.

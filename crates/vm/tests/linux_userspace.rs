@@ -118,38 +118,58 @@ fn build_initramfs_hello() -> Vec<u8> {
     archive
 }
 
-/// Drive the boot for up to `STEP_BUDGET` instructions, draining
-/// UART output in 100M-step chunks, and look for the literal
-/// "HELLO FROM USERSPACE" anywhere in the cumulative output.
-/// Returns Ok(()) on first hit, Err with the cumulative output
-/// on budget exhaustion.
-fn run_until_hello(vm: &mut Vm) -> Result<u64, String> {
-    const STEP_BUDGET: u64 = 16_000_000_000;
+/// Drive the boot for up to `step_budget` instructions, draining
+/// UART output in 100M-step chunks, appending it to `cumulative`,
+/// and looking for `needle` anywhere in the cumulative output.
+/// Returns Ok(step_count_at_hit) or Err(()) on budget exhaustion;
+/// `cumulative` is updated either way so the caller can inspect
+/// or continue searching for a later marker.
+fn run_until_marker(
+    vm: &mut Vm,
+    needle: &[u8],
+    step_budget: u64,
+    cumulative: &mut Vec<u8>,
+) -> Result<u64, ()> {
+    // The caller may have already drained the bytes we want into
+    // `cumulative` on a previous run_until_marker pass — e.g. stage
+    // 1 drained the chunk containing both HELLO and the panic line,
+    // returned at HELLO, and stage 2's needle is now sitting in
+    // cumulative before we step a single instruction. Check first
+    // before entering the chunk loop.
+    if cumulative.windows(needle.len()).any(|w| w == needle) {
+        return Ok(0);
+    }
     let chunk = 10_000_000u32;
     let mut steps = 0u64;
-    let mut cumulative = Vec::<u8>::new();
-    while steps < STEP_BUDGET {
+    while steps < step_budget {
         let (s, _) = vm.run_steps_idle_aware(chunk);
         steps += s as u64;
         if steps % 100_000_000 < chunk as u64 {
             let out = vm.drain_output();
             if !out.is_empty() {
                 cumulative.extend_from_slice(&out);
-                if cumulative.windows(20).any(|w| w == b"HELLO FROM USERSPACE") {
+                if cumulative.windows(needle.len()).any(|w| w == needle) {
                     return Ok(steps);
                 }
             }
         }
     }
-    let cumulative_str = String::from_utf8_lossy(&cumulative).into_owned();
-    Err(cumulative_str)
+    Err(())
 }
 
 /// Full Linux 6.12 boot to userspace. Skipped if the kernel file
 /// isn't present (so contributors without the binary can still
 /// run `cargo test -- --ignored`).
+///
+/// Two-stage check: first wait for `HELLO FROM USERSPACE`
+/// (validates write-syscall + THRE path), then keep stepping past
+/// /init's `exit(42)` until the kernel panics with the matching
+/// exitcode (validates sys_exit + the kernel's panic-on-init-exit
+/// shutdown sequence). The second stage adds maybe 30s wall-clock
+/// but pins the *full* documented end-to-end chain from the README
+/// instead of trusting that "if HELLO works, exit must too."
 #[test]
-#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~55s wall-clock"]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~80s wall-clock"]
 fn linux_userspace_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
@@ -171,18 +191,42 @@ fn linux_userspace_milestone() {
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
 
-    match run_until_hello(&mut vm) {
-        Ok(steps) => {
-            eprintln!("HELLO FROM USERSPACE found after {steps} steps");
-        }
-        Err(cumulative) => {
-            // Dump the last 1 KiB so the failure is debuggable.
-            let tail_start = cumulative.len().saturating_sub(1024);
-            panic!(
-                "HELLO FROM USERSPACE not seen in 16 B steps; \
-                 last 1 KiB of UART output:\n{}",
-                &cumulative[tail_start..]
-            );
-        }
-    }
+    let mut cumulative = Vec::<u8>::new();
+    let hello_steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        let tail_start = cumulative.len().saturating_sub(1024);
+        panic!(
+            "HELLO FROM USERSPACE not seen in 16 B steps; \
+             last 1 KiB of UART output:\n{}",
+            String::from_utf8_lossy(&cumulative[tail_start..])
+        )
+    });
+    eprintln!("HELLO FROM USERSPACE found after {hello_steps} steps");
+
+    // /init has exited; keep stepping until the kernel completes
+    // do_exit cleanup + panic-on-init-exit and prints the exitcode
+    // line. exit(42) → exitcode=0x00002a00 (42 << 8). A 4 B step
+    // budget is ~3 seconds of guest time at our throughput; the
+    // panic message typically lands within a few hundred M steps
+    // after HELLO.
+    let panic_steps = run_until_marker(
+        &mut vm,
+        b"exitcode=0x00002a00",
+        4_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        let tail_start = cumulative.len().saturating_sub(1024);
+        panic!(
+            "kernel panic line `exitcode=0x00002a00` not seen in \
+             +4 B steps after HELLO; last 1 KiB of UART:\n{}",
+            String::from_utf8_lossy(&cumulative[tail_start..])
+        )
+    });
+    eprintln!("panic exit code seen after {panic_steps} additional steps");
 }
