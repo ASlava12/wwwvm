@@ -874,6 +874,55 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 ///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
 ///      asserts AL = 0xCD after the run.
 ///
+/// The three bzImage handoff functions compose: loading a bzImage,
+/// setting a cmdline, and placing an initrd all write into the
+/// setup header at 0x90000. The risk is that a later call might
+/// clobber the field a prior call set. This test runs all three
+/// in sequence and verifies the resulting memory layout matches
+/// exactly what a real GRUB/syslinux would have prepared — every
+/// kernel-readable pointer + length present at the right offset
+/// with the right value, simultaneously.
+#[test]
+fn bzimage_load_cmdline_ramdisk_compose_without_clobbering() {
+    // Build a v2.10 synthetic bzImage with a 3-byte payload.
+    let mut bz_bytes = vec![0u8; 1024];
+    bz_bytes[0x1F1] = 1; // setup_sects = 1
+    bz_bytes[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz_bytes[0x202..0x206].copy_from_slice(b"HdrS");
+    bz_bytes[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz_bytes[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // code32_start
+    bz_bytes[0x234] = 1; // relocatable_kernel
+    bz_bytes[0x238..0x23C].copy_from_slice(&2048u32.to_le_bytes()); // cmdline_size
+    bz_bytes[0x260..0x264].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // init_size = 1 MiB
+    bz_bytes.extend_from_slice(&[0xB0, 0xCD, 0xF4]); // MOV AL, 0xCD ; HLT
+
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    let bz = vm.load_bzimage(&bz_bytes).expect("bzImage load");
+    vm.set_kernel_cmdline("root=/dev/ram0 console=ttyS0");
+    let initrd = vec![0xCDu8; 4096]; // exactly one page
+    vm.set_ramdisk(&initrd).expect("initrd fits");
+
+    // (1) code32_start (the loader's own write, at 0x214 of the
+    //     setup header copy) still reads 0x0010_0000.
+    assert_eq!(vm.mem().read_u32(0x9_0000 + 0x214), 0x0010_0000);
+    // (2) cmd_line_ptr was set by set_kernel_cmdline.
+    assert_eq!(vm.mem().read_u32(0x9_0228), 0x9_0800);
+    // (3) ramdisk_image / size set by set_ramdisk.
+    //     16 MiB - 4 KiB (aligned size) = 0x00FF_F000.
+    assert_eq!(vm.mem().read_u32(0x9_0218), 0x00FF_F000);
+    assert_eq!(vm.mem().read_u32(0x9_021C), 4096);
+    // (4) The cmdline string is intact at 0x90800.
+    assert_eq!(vm.mem().read_u8(0x9_0800), b'r');
+    assert_eq!(vm.mem().read_u8(0x9_0800 + 5), b'/');
+    // (5) The initrd payload is intact at top of RAM.
+    assert_eq!(vm.mem().read_u8(0x00FF_F000), 0xCD);
+    assert_eq!(vm.mem().read_u8(0x00FF_F000 + 4095), 0xCD);
+    // (6) The kernel payload lives at code32_start.
+    assert_eq!(vm.mem().read_u8(bz.code32_start), 0xB0);
+    assert_eq!(vm.mem().read_u8(bz.code32_start + 1), 0xCD);
+    assert_eq!(vm.mem().read_u8(bz.code32_start + 2), 0xF4);
+}
+
 /// `set_ramdisk` places the initrd at the top of physical memory
 /// (page-aligned downward) and writes both ramdisk_image and
 /// ramdisk_size into the setup header so the kernel can find it.
