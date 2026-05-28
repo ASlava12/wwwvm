@@ -3916,38 +3916,74 @@ impl Cpu {
             // bits 3..4 select ES/CS/SS/DS in that order. POP CS (0x0F)
             // is the 2-byte opcode escape on 80286+ and undefined as
             // POP on 8086 — we leave it Unimplemented.
+            // PUSH segment register: under 32-bit operand size the
+            // selector is zero-extended to 32 bits and the push
+            // decrements ESP by 4. Without this, a Linux kernel
+            // entry path that pushes DS/ES/FS/SS as part of saving
+            // user-mode segment state ends up with ESP misaligned
+            // by 2 bytes on each push, eventually feeding wild
+            // pointers back to the kernel via subsequent stack
+            // reads at the wrong offset.
             0x06 => {
-                let v = self.sregs[sreg::ES];
-                self.push16(mem, v);
+                let v = self.sregs[sreg::ES] as u32;
+                if self.op_size_32 {
+                    self.push32(mem, v);
+                } else {
+                    self.push16(mem, v as u16);
+                }
             }
             0x0E => {
-                let v = self.sregs[sreg::CS];
-                self.push16(mem, v);
+                let v = self.sregs[sreg::CS] as u32;
+                if self.op_size_32 {
+                    self.push32(mem, v);
+                } else {
+                    self.push16(mem, v as u16);
+                }
             }
             0x16 => {
-                let v = self.sregs[sreg::SS];
-                self.push16(mem, v);
+                let v = self.sregs[sreg::SS] as u32;
+                if self.op_size_32 {
+                    self.push32(mem, v);
+                } else {
+                    self.push16(mem, v as u16);
+                }
             }
             0x1E => {
-                let v = self.sregs[sreg::DS];
-                self.push16(mem, v);
+                let v = self.sregs[sreg::DS] as u32;
+                if self.op_size_32 {
+                    self.push32(mem, v);
+                } else {
+                    self.push16(mem, v as u16);
+                }
             }
             0x07 => {
-                let v = self.pop16(mem);
+                let v = if self.op_size_32 {
+                    self.pop32(mem) as u16
+                } else {
+                    self.pop16(mem)
+                };
                 if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                     return Ok(());
                 }
                 self.write_sreg(sreg::ES, v, mem);
             }
             0x17 => {
-                let v = self.pop16(mem);
+                let v = if self.op_size_32 {
+                    self.pop32(mem) as u16
+                } else {
+                    self.pop16(mem)
+                };
                 if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                     return Ok(());
                 }
                 self.write_sreg(sreg::SS, v, mem);
             }
             0x1F => {
-                let v = self.pop16(mem);
+                let v = if self.op_size_32 {
+                    self.pop32(mem) as u16
+                } else {
+                    self.pop16(mem)
+                };
                 if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                     return Ok(());
                 }
@@ -6032,23 +6068,42 @@ impl Cpu {
                     // PUSH FS / POP FS / PUSH GS / POP GS. Linux uses
                     // FS (and GS on x86-64) for per-CPU / TLS bases, so
                     // these show up in entry/exit paths constantly.
+                    // Operand size determines push/pop width: in 32-bit
+                    // code default is 32, so the selector is zero-
+                    // extended to 4 bytes and ESP moves by 4.
                     0xA0 => {
-                        let v = self.sregs[sreg::FS];
-                        self.push16(mem, v);
+                        let v = self.sregs[sreg::FS] as u32;
+                        if self.op_size_32 {
+                            self.push32(mem, v);
+                        } else {
+                            self.push16(mem, v as u16);
+                        }
                     }
                     0xA1 => {
-                        let v = self.pop16(mem);
+                        let v = if self.op_size_32 {
+                            self.pop32(mem) as u16
+                        } else {
+                            self.pop16(mem)
+                        };
                         if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                             return Ok(());
                         }
                         self.write_sreg(sreg::FS, v, mem);
                     }
                     0xA8 => {
-                        let v = self.sregs[sreg::GS];
-                        self.push16(mem, v);
+                        let v = self.sregs[sreg::GS] as u32;
+                        if self.op_size_32 {
+                            self.push32(mem, v);
+                        } else {
+                            self.push16(mem, v as u16);
+                        }
                     }
                     0xA9 => {
-                        let v = self.pop16(mem);
+                        let v = if self.op_size_32 {
+                            self.pop32(mem) as u16
+                        } else {
+                            self.pop16(mem)
+                        };
                         if self.raise_gp_if_bad_selector(v, op_ip, mem) {
                             return Ok(());
                         }

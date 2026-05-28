@@ -84,15 +84,74 @@ fn main() {
     // (CR2 transition from 0 to non-zero) so we can dump physical
     // memory at that exact step, not millions of steps later.
     let stop_at_first_pf = env::var("WWWVM_STOP_AT_FIRST_PF").is_ok();
+    // WWWVM_TRACE_ESP_ALIGN=1: after CR0.PG=1 switch to single-step
+    // mode and report every ESP alignment transition (4-byte align
+    // bit flipping). Kernel stacks are 4-byte aligned; the first
+    // sustained misalignment is the lead for the unaligned-ESP at
+    // first #PF, which then misreads stack values and feeds a wild
+    // pointer into a kernel write.
+    let trace_esp_align = env::var("WWWVM_TRACE_ESP_ALIGN").is_ok();
     let mut stop = Stop::StepBudget;
+    let mut last_esp = 0u32;
+    let mut last_esp_align = true;
+    let mut last_eip = 0u32;
+    let mut transitions = 0u32;
     while steps < STEP_BUDGET {
-        let chunk = if stop_at_first_pf && vm.cpu().cr0 & (1 << 31) != 0 {
+        let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
+        let chunk = if stop_at_first_pf && pg_on {
             100
+        } else if trace_esp_align && pg_on {
+            1
         } else {
             chunk
         };
+        // Capture EIP/ESP BEFORE the step so we can name the
+        // instruction that retired into the transition.
+        let pre_eip = vm.cpu().ip;
+        let _ = pre_eip;
         let (s, st) = vm.run_steps(chunk);
         steps += s as u64;
+        if trace_esp_align && pg_on {
+            let esp = vm.cpu().read_r32(4);
+            let aligned = esp & 3 == 0;
+            if aligned != last_esp_align && transitions < 80 {
+                // The instruction that retired is at last_eip — we
+                // snapshotted it before the step. Read the bytes
+                // through the kernel page tables.
+                let cr3 = vm.cpu().cr3 & !0xFFF;
+                let pde = vm.mem().read_u32(cr3 + ((last_eip >> 22) & 0x3FF) * 4);
+                let phys = if pde & 1 != 0 {
+                    let pt = pde & !0xFFF;
+                    let pte = vm.mem().read_u32(pt + ((last_eip >> 12) & 0x3FF) * 4);
+                    if pte & 1 != 0 {
+                        Some((pte & !0xFFF) | (last_eip & 0xFFF))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut bytes = [0u8; 8];
+                if let Some(p) = phys {
+                    for (i, b) in bytes.iter_mut().enumerate() {
+                        *b = vm.mem().read_u8(p.wrapping_add(i as u32));
+                    }
+                }
+                println!(
+                    "[{:>10}] ESP {} ({:#X} -> {:#X})  retired EIP={:08X}  bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    steps,
+                    if aligned { "REALIGNED" } else { "MISALIGNED" },
+                    last_esp,
+                    esp,
+                    last_eip,
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+                );
+                transitions += 1;
+            }
+            last_esp = esp;
+            last_esp_align = aligned;
+            last_eip = vm.cpu().ip;
+        }
         if stop_at_first_pf && vm.cpu().cr2 != 0 {
             println!(
                 "[{:>10}] FIRST #PF observed: CR2={:08X} EIP={:08X} ESP={:08X}",
