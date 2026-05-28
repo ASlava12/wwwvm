@@ -891,6 +891,63 @@ fn make_pt_load(p_offset: u32, p_vaddr: u32, p_size: u32) -> Vec<u8> {
 /// 0xCC / 0xDD); we load sectors 1 + 2 via a single INT 0x13 AL=2
 /// call and expect them to land back-to-back at ES:BX.
 #[test]
+fn bios_int13_get_drive_parameters_reports_floppy_geometry() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Poison the registers we expect the handler to overwrite so a
+    // missed write would show up as a test failure rather than
+    // silently passing.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x08, // MOV AH, 0x08
+            0xB2, 0x80, // MOV DL, 0x80
+            0xB7, 0xFF, // MOV BH, 0xFF (poison — must stay; handler doesn't touch it)
+            0xCD, 0x13, // INT 0x13
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(4), 0, "AH = 0 (success)");
+    assert_eq!(cpu.read_r8(0), 0, "AL = 0 (reserved)");
+    assert_eq!(cpu.read_r8(3), 0x04, "BL = 1.44MB floppy");
+    assert_eq!(cpu.read_r8(5), 79, "CH = max cylinder");
+    assert_eq!(cpu.read_r8(1) & 0x3F, 18, "CL[5:0] = sectors per track");
+    assert_eq!(cpu.read_r8(6), 1, "DH = max head");
+    assert_eq!(cpu.read_r8(2), 1, "DL = drive count");
+    // BH must not have been clobbered (the handler doesn't touch it).
+    assert_eq!(cpu.read_r8(7), 0xFF);
+    // Success → CF = 0.
+    assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
+}
+
+#[test]
+fn bios_int13_lba_extensions_check_reports_not_supported() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x41, // MOV AH, 0x41
+            0xBB, 0xAA, 0x55, // MOV BX, 0x55AA  (signature)
+            0xB2, 0x80, // MOV DL, 0x80
+            0xCD, 0x13, // INT 0x13
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(4), 0x01, "AH = 0x01 (invalid function)");
+    assert!(
+        cpu.flags & wwwvm_cpu::flag::CF != 0,
+        "CF set means extensions absent"
+    );
+}
+
+#[test]
 fn bios_int13_reads_multiple_sectors_contiguously() {
     let mut vm = Vm::new();
     vm.install_bios();

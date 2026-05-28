@@ -293,6 +293,12 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
 ///     bits 0..7, CL bits 6..7 = cyl bits 8..9, CL bits 0..5 = sector
 ///     (1-based!), DH = head, DL = drive (0x80 = boot drive). The
 ///     destination buffer is ES:BX.
+///   * AH=0x08 — Get drive parameters. Returns the canonical 1.44 MB
+///     floppy geometry (80 cyl × 2 heads × 18 sec/track) in CH/CL/
+///     DH, drive count 1 in DL, and BL = 0x04 (1.44 MB floppy type).
+///     Called by bzImage `setup.bin` while probing the boot drive.
+///   * AH=0x41 — Check LBA extensions. We report "not supported"
+///     (CF=1, AH=0x01) so callers fall back to CHS/AH=0x02 reads.
 ///
 /// The geometry is the canonical 1.44 MB floppy: 80 cylinders, 2
 /// heads, 18 sectors/track. We use it for hard disks too, which is
@@ -329,6 +335,31 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
             // Success: CF=0, AH=0. AL keeps the requested sector count.
             cpu.flags &= !wwwvm_cpu::flag::CF;
             cpu.write_r8(4, 0);
+            true
+        }
+        // Get drive parameters. Reports the 1.44 MB floppy geometry
+        // we already use for AH=0x02 — max-cyl 79, max-head 1, 18
+        // sectors per track. Drive count = 1 (we only have one).
+        0x08 => {
+            cpu.write_r8(4, 0); // AH = 0 (success)
+            cpu.write_r8(0, 0); // AL = 0 (reserved)
+            cpu.write_r8(3, 0x04); // BL = drive type: 1.44 MB floppy
+            cpu.write_r8(5, 79); // CH = max cylinder bits 0..7
+                                 // CL bits 6..7 = cyl bits 8..9 (zero for cyl <= 255);
+                                 // CL bits 0..5 = max sectors per track = 18.
+            cpu.write_r8(1, 18);
+            cpu.write_r8(6, 1); // DH = max head
+            cpu.write_r8(2, 1); // DL = drive count
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            true
+        }
+        // Check LBA extensions. Real INT 13h extensions are advertised
+        // here; we report "not supported" so callers fall back to the
+        // CHS path (AH=0x02). Per the spec, failure means CF=1 and
+        // AH = 0x01 (invalid function).
+        0x41 => {
+            cpu.write_r8(4, 0x01);
+            cpu.flags |= wwwvm_cpu::flag::CF;
             true
         }
         _ => false,
