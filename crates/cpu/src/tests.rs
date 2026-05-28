@@ -7178,16 +7178,18 @@ fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
     assert_eq!(cpu.read_r32(0), 0x0000_0664);
     let edx = cpu.read_r32(1);
     assert_ne!(edx & (1 << 0), 0, "FPU");
+    assert_ne!(edx & (1 << 3), 0, "PSE (4 MiB pages)");
     assert_ne!(edx & (1 << 4), 0, "TSC");
     assert_ne!(edx & (1 << 5), 0, "MSR");
+    assert_ne!(edx & (1 << 8), 0, "CX8 (CMPXCHG8B)");
     assert_ne!(edx & (1 << 11), 0, "SEP");
+    assert_ne!(edx & (1 << 13), 0, "PGE");
     assert_ne!(edx & (1 << 15), 0, "CMOV");
     assert_ne!(edx & (1 << 24), 0, "FXSR");
     assert_ne!(edx & (1 << 25), 0, "SSE");
     assert_ne!(edx & (1 << 26), 0, "SSE2");
     // Things we don't implement must NOT be set.
     assert_eq!(edx & (1 << 6), 0, "PAE absent");
-    assert_eq!(edx & (1 << 8), 0, "CX8 absent");
     assert_eq!(edx & (1 << 23), 0, "MMX absent");
 }
 

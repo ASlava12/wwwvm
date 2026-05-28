@@ -6711,10 +6711,20 @@ const CPUID_BRAND: &[u8; 48] = b"wwwvm Rust software-only x86 CPU               
 /// that correspond to ISA we actually implement so the kernel takes
 /// the fast paths (FXSAVE, SSE2 memcpy, SYSENTER, CMOV, etc.)
 /// instead of i386 fallbacks.
+///
+/// PSE (bit 3) and PGE (bit 13) are advertised because the page
+/// walker honors CR4.PSE + PDE.PS (4 MiB pages). PGE is a TLB-only
+/// optimization: without a TLB it's functionally a no-op, but
+/// advertising it lets Linux's optimized paging paths apply.
+/// CX8 (bit 8) is the CMPXCHG8B opcode — the kernel checks this
+/// before emitting per-CPU cmpxchg64 sequences.
 const CPUID_LEAF1_EDX: u32 = (1 << 0)        // FPU
+        | (1 << 3)                                   // PSE (4 MiB pages)
         | (1 << 4)                                   // TSC
         | (1 << 5)                                   // MSR
+        | (1 << 8)                                   // CX8 (CMPXCHG8B)
         | (1 << 11)                                  // SEP (SYSENTER)
+        | (1 << 13)                                  // PGE (no-op without TLB)
         | (1 << 15)                                  // CMOV
         | (1 << 24)                                  // FXSR
         | (1 << 25)                                  // SSE
