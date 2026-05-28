@@ -79,10 +79,31 @@ fn main() {
     let mut last_eip_region: Option<u32> = None;
     let mut last_eip_sample = 0u32;
     let mut stuck_chunks = 0u32;
+    // WWWVM_STOP_AT_FIRST_PF=1: replace the coarse chunk loop with
+    // a fine 100-step loop that halts on the first observable #PF
+    // (CR2 transition from 0 to non-zero) so we can dump physical
+    // memory at that exact step, not millions of steps later.
+    let stop_at_first_pf = env::var("WWWVM_STOP_AT_FIRST_PF").is_ok();
     let mut stop = Stop::StepBudget;
     while steps < STEP_BUDGET {
+        let chunk = if stop_at_first_pf && vm.cpu().cr0 & (1 << 31) != 0 {
+            100
+        } else {
+            chunk
+        };
         let (s, st) = vm.run_steps(chunk);
         steps += s as u64;
+        if stop_at_first_pf && vm.cpu().cr2 != 0 {
+            println!(
+                "[{:>10}] FIRST #PF observed: CR2={:08X} EIP={:08X} ESP={:08X}",
+                steps,
+                vm.cpu().cr2,
+                vm.cpu().ip,
+                vm.cpu().read_r32(4)
+            );
+            stop = st;
+            break;
+        }
         if matches!(st, Stop::CpuError(_) | Stop::Halted) {
             stop = st;
             break;
