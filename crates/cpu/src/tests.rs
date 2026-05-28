@@ -2500,6 +2500,55 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// 64-bit add via ADD + ADC across a dword pair — the multi-precision
+/// pattern the kernel uses for 64-bit counters (jiffies, ktime) on a
+/// 32-bit CPU. Verifies CF produced by the low ADD feeds the high ADC.
+///
+///   0x1_FFFF_FFFF + 0x3_0000_0002 = 0x5_0000_0001
+///   (low: 0xFFFFFFFF+2 = 0x1_00000001 → 0x00000001 + carry;
+///    high: 1 + 3 + carry = 5)
+#[test]
+fn multiword_add_propagates_carry_through_adc() {
+    let mut mem = Memory::new(0x10_0000);
+    // operand A at 0x600 (lo, hi), operand B at 0x608.
+    mem.write_u32(0x600, 0xFFFF_FFFF);
+    mem.write_u32(0x604, 0x0000_0001);
+    mem.write_u32(0x608, 0x0000_0002);
+    mem.write_u32(0x60C, 0x0000_0003);
+    // mov eax, [0x600]      ; 66 A1 00 06
+    // add eax, [0x608]      ; 66 03 06 08 06   (low → CF=1)
+    // mov [0x610], eax      ; 66 A3 10 06
+    // mov eax, [0x604]      ; 66 A1 04 06
+    // adc eax, [0x60C]      ; 66 13 06 0C 06   (high + carry)
+    // mov [0x614], eax      ; 66 A3 14 06
+    // hlt
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xA1, 0x00, 0x06, // mov eax, [0x600]
+            0x66, 0x03, 0x06, 0x08, 0x06, // add eax, [0x608]
+            0x66, 0xA3, 0x10, 0x06, // mov [0x610], eax
+            0x66, 0xA1, 0x04, 0x06, // mov eax, [0x604]
+            0x66, 0x13, 0x06, 0x0C, 0x06, // adc eax, [0x60C]
+            0x66, 0xA3, 0x14, 0x06, // mov [0x614], eax
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // 0x1_FFFFFFFF + 0x3_00000002 = 0x5_00000001.
+    assert_eq!(mem.read_u32(0x610), 0x0000_0001, "low dword");
+    assert_eq!(mem.read_u32(0x614), 0x0000_0005, "high dword w/ carry");
+}
+
 /// Recursive factorial — the deepest end-to-end control-flow test
 /// so far. fact(5)=120 via cdecl recursion: argument on the stack,
 /// EBP-relative frame access, 32-bit CALL/RET (each pushing a dword
