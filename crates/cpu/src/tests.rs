@@ -5717,6 +5717,60 @@ fn rdmsr_for_ia32_apic_base_returns_canonical_value() {
     assert_eq!(cpu.read_r32(2), 0);
 }
 
+/// `RDMSR(IA32_MISC_ENABLE)` returns whatever the kernel wrote
+/// last; `WRMSR` round-trips through the stored `misc_enable`
+/// slot. Linux's arch/x86/kernel/cpu/intel.c reads this MSR
+/// unconditionally, so a #GP here would surface as an oops on
+/// every boot.
+#[test]
+fn rdmsr_wrmsr_round_trip_through_ia32_misc_enable() {
+    // WRMSR(0x1A0) writes 0xCAFE_BABE into the low half; the
+    // value should be readable back via RDMSR(0x1A0). The 0x66
+    // prefix is applied per-instruction so each MOV imm32 sees a
+    // 32-bit operand, and the read-back MOV uses 0x66 too so the
+    // upper half of EAX survives into EBX.
+    //   66 B9 A0 01 00 00      MOV ECX, 0x1A0
+    //   66 B8 BE BA FE CA      MOV EAX, 0xCAFEBABE
+    //   66 BA 00 00 00 00      MOV EDX, 0
+    //   0F 30                  WRMSR
+    //   66 31 C0               XOR EAX, EAX  (prove RDMSR rewrites EAX)
+    //   0F 32                  RDMSR
+    //   66 89 C3               MOV EBX, EAX (32-bit form)
+    //   F4
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0xA0, 0x01, 0x00, 0x00, // MOV ECX, 0x1A0
+            0x66, 0xB8, 0xBE, 0xBA, 0xFE, 0xCA, // MOV EAX, imm32
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x00, // MOV EDX, 0
+            0x0F, 0x30, // WRMSR
+            0x66, 0x31, 0xC0, // XOR EAX, EAX
+            0x0F, 0x32, // RDMSR
+            0x66, 0x89, 0xC3, // MOV EBX, EAX
+            0xF4,
+        ],
+        32,
+    );
+    assert_eq!(cpu.misc_enable, 0xCAFE_BABE);
+    assert_eq!(cpu.read_r32(3), 0xCAFE_BABE);
+}
+
+/// `RDMSR(IA32_BIOS_SIGN_ID)` returns 0 — i.e. "no microcode
+/// loaded". Linux's microcode_intel_init does this read and
+/// branches on the value; a #GP here would oops at early init.
+#[test]
+fn rdmsr_for_ia32_bios_sign_id_returns_zero() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x8B, 0x00, 0x00, 0x00, // MOV ECX, 0x8B
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.read_r32(0), 0);
+    assert_eq!(cpu.read_r32(2), 0);
+}
+
 /// 0x0F 0xAE /0 — FXSAVE m512. Stub writes 512 zeros at EA.
 #[test]
 fn fxsave_writes_512_zero_bytes() {

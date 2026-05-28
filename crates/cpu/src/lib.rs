@@ -199,6 +199,14 @@ pub struct Cpu {
     pub sysenter_cs: u32,
     pub sysenter_esp: u32,
     pub sysenter_eip: u32,
+    /// IA32_MISC_ENABLE (MSR 0x1A0). Linux's
+    /// arch/x86/kernel/cpu/intel.c reads this very early to learn
+    /// what the BIOS/microcode pre-enabled (FAST_STRING, NX-bit
+    /// disable, PEBS disable, BIOS unlock, ...). The kernel only
+    /// reads the bits it cares about; we just store the whole
+    /// 64-bit value so writes round-trip. Not snapshotted yet —
+    /// guests can re-write this on the next boot.
+    pub misc_enable: u64,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -323,6 +331,7 @@ impl Cpu {
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
+            misc_enable: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -372,6 +381,7 @@ impl Cpu {
         self.sysenter_cs = 0;
         self.sysenter_esp = 0;
         self.sysenter_eip = 0;
+        self.misc_enable = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         self.code_size_32 = false;
@@ -4713,6 +4723,25 @@ impl Cpu {
                             0x174 => self.sysenter_cs as u64,  // IA32_SYSENTER_CS
                             0x175 => self.sysenter_esp as u64, // IA32_SYSENTER_ESP
                             0x176 => self.sysenter_eip as u64, // IA32_SYSENTER_EIP
+                            // IA32_PLATFORM_ID (0x17): top byte of EDX
+                            // encodes processor-family info; 0 is a
+                            // benign read for a generic family-6 CPU.
+                            0x17 => 0,
+                            // IA32_BIOS_SIGN_ID (0x8B): microcode rev,
+                            // read by Linux's microcode_intel_init.
+                            // Reporting "no microcode loaded" (0) is
+                            // what an un-patched CPU returns.
+                            0x8B => 0,
+                            // IA32_MISC_ENABLE (0x1A0): Linux's
+                            // arch/x86/kernel/cpu/intel.c reads this on
+                            // every boot. Stored value below; default
+                            // 0 means "nothing special enabled".
+                            0x1A0 => self.misc_enable,
+                            // IA32_MTRR_DEF_TYPE (0x2FF): top byte holds
+                            // E (enable) + FE (fixed-range enable). 0 =
+                            // MTRRs disabled — Linux treats that as
+                            // "fall back to PAT only", which is fine.
+                            0x2FF => 0,
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);
@@ -4731,6 +4760,15 @@ impl Cpu {
                             0x174 => self.sysenter_cs = lo,
                             0x175 => self.sysenter_esp = lo,
                             0x176 => self.sysenter_eip = lo,
+                            // IA32_MISC_ENABLE — kernel toggles a few
+                            // bits here (FAST_STRING, NHM_PEBS_DISABLE,
+                            // BIOS_ENABLE etc.). Storing the value is
+                            // enough; we don't act on any bit.
+                            0x1A0 => self.misc_enable = lo as u64,
+                            // IA32_BIOS_SIGN_ID write means "trigger a
+                            // microcode update read-back". We don't
+                            // model microcode at all — silently accept.
+                            0x8B => {}
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);
