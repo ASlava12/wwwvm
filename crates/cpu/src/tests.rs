@@ -2996,6 +2996,130 @@ fn sse_unpcklps_interleaves_low_lanes() {
     assert_eq!(mem.read_u32(0x62C), 0xBBBB_BBBB); // b1
 }
 
+/// PSHUFD reverse + SHUFPS combining two sources. PSHUFD's imm 0x1B
+/// reverses lane order; SHUFPS then picks lanes 0,2 from the result
+/// and lanes 1,3 from a second register, giving a mixed output.
+#[test]
+fn sse_pshufd_then_shufps_combines_lanes() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let b = [0xAAAA_AAAAu32, 0xBBBB_BBBB, 0xCCCC_CCCC, 0xDDDD_DDDD];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize]);
+        mem.write_u32(0x610 + i * 4, b[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x70, 0xD0, 0x1B, // PSHUFD XMM2, XMM0, 0x1B (reverse)
+            0x0F, 0xC6, 0xD1, 0xD8, // SHUFPS XMM2, XMM1, 0xD8
+            0x66, 0x0F, 0x7F, 0x16, 0x20, 0x06, // MOVDQA [0x620], XMM2
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // After PSHUFD reverse XMM2 = [a3, a2, a1, a0].
+    // SHUFPS imm=0xD8 picks src1 lanes (0,2) and src2 lanes (1,3):
+    //   lane 0 = src1[0] = a3,  lane 1 = src1[2] = a1,
+    //   lane 2 = src2[1] = b1,  lane 3 = src2[3] = b3.
+    assert_eq!(mem.read_u32(0x620), 0x4444_4444);
+    assert_eq!(mem.read_u32(0x624), 0x2222_2222);
+    assert_eq!(mem.read_u32(0x628), 0xBBBB_BBBB);
+    assert_eq!(mem.read_u32(0x62C), 0xDDDD_DDDD);
+}
+
+/// MOVLPS + MOVHPS assemble a 16-byte XMM register from two
+/// separate 8-byte memory loads — the standard pair compilers emit
+/// for an unaligned 128-bit load split across two qwords.
+#[test]
+fn sse_movlps_movhps_assemble_xmm() {
+    let mut mem = Memory::new(0x10_0000);
+    // Two distinct 8-byte payloads at adjacent addresses.
+    let low_pat: [u32; 2] = [0x4433_2211, 0x8877_6655];
+    let high_pat: [u32; 2] = [0xDDCC_BBAA, 0x1100_FFEE];
+    mem.write_u32(0x600, low_pat[0]);
+    mem.write_u32(0x604, low_pat[1]);
+    mem.write_u32(0x608, high_pat[0]);
+    mem.write_u32(0x60C, high_pat[1]);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x0F, 0x12, 0x06, 0x00, 0x06, // MOVLPS XMM0, [0x600]
+            0x0F, 0x16, 0x06, 0x08, 0x06, // MOVHPS XMM0, [0x608]
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x620), low_pat[0]);
+    assert_eq!(mem.read_u32(0x624), low_pat[1]);
+    assert_eq!(mem.read_u32(0x628), high_pat[0]);
+    assert_eq!(mem.read_u32(0x62C), high_pat[1]);
+}
+
+/// MOVHLPS reg-form: the high 64 bits of the source overwrite the
+/// low 64 of the destination; the destination's upper 64 survive.
+#[test]
+fn sse_movhlps_reg_form_overwrites_low_preserves_high() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM0 init: low = 0xDEAD..., high = 0x5555... (will be preserved).
+    mem.write_u32(0x600, 0xDEAD_BEEF);
+    mem.write_u32(0x604, 0xCAFE_BABE);
+    mem.write_u32(0x608, 0x5555_5555);
+    mem.write_u32(0x60C, 0x6666_6666);
+    // XMM1 high = 0x9999...8888..., low irrelevant.
+    mem.write_u32(0x610, 0x0000_0000);
+    mem.write_u32(0x614, 0x0000_0000);
+    mem.write_u32(0x618, 0x8888_8888);
+    mem.write_u32(0x61C, 0x9999_9999);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x0F, 0x12, 0xC1, // MOVHLPS XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Low 64 of XMM0 := high 64 of XMM1 = 0x9999...8888...
+    assert_eq!(mem.read_u32(0x620), 0x8888_8888);
+    assert_eq!(mem.read_u32(0x624), 0x9999_9999);
+    // High 64 of XMM0 preserved.
+    assert_eq!(mem.read_u32(0x628), 0x5555_5555);
+    assert_eq!(mem.read_u32(0x62C), 0x6666_6666);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

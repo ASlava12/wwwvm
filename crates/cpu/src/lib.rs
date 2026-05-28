@@ -4623,6 +4623,127 @@ impl Cpu {
                         };
                     }
 
+                    // MOVHLPS / MOVLPS (0F 12). The encoding splits on
+                    // the ModR/M mode: a register source is MOVHLPS
+                    // (xmm2 high → xmm1 low, xmm1 high preserved); a
+                    // memory source is MOVLPS (m64 → xmm1 low, upper
+                    // preserved). Compilers emit MOVLPS for unaligned
+                    // 8-byte loads into the low lane of an XMM.
+                    0x12 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let new_low = match rm {
+                            Rm::Reg(i) => (self.xmm[i as usize] >> 64) as u64,
+                            Rm::Mem(ea) => {
+                                let a = self.linear_seg(ea.seg, ea.off);
+                                (self.mem_read_u32(mem, a) as u64)
+                                    | ((self.mem_read_u32(mem, a.wrapping_add(4)) as u64) << 32)
+                            }
+                        };
+                        self.xmm[reg as usize] =
+                            (self.xmm[reg as usize] & !(u64::MAX as u128)) | (new_low as u128);
+                    }
+                    // MOVLPS m64, xmm (0F 13) — store the low 64 bits
+                    // of an XMM to memory. The register form is
+                    // reserved; fall through to the unimplemented
+                    // default if it ever appears.
+                    0x13 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if let Rm::Mem(ea) = rm {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            let v = self.xmm[reg as usize] as u64;
+                            self.mem_write_u32(mem, a, v as u32);
+                            self.mem_write_u32(mem, a.wrapping_add(4), (v >> 32) as u32);
+                        } else {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                    // MOVLHPS / MOVHPS (0F 16). Mirror of 0F 12 on the
+                    // upper lane: reg form is MOVLHPS (xmm2 low → xmm1
+                    // high, xmm1 low preserved); mem form is MOVHPS
+                    // (m64 → xmm1 high). Compilers pair MOVLPS+MOVHPS
+                    // to assemble a misaligned 16-byte load.
+                    0x16 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let new_high = match rm {
+                            Rm::Reg(i) => self.xmm[i as usize] as u64,
+                            Rm::Mem(ea) => {
+                                let a = self.linear_seg(ea.seg, ea.off);
+                                (self.mem_read_u32(mem, a) as u64)
+                                    | ((self.mem_read_u32(mem, a.wrapping_add(4)) as u64) << 32)
+                            }
+                        };
+                        self.xmm[reg as usize] = (self.xmm[reg as usize] & (u64::MAX as u128))
+                            | ((new_high as u128) << 64);
+                    }
+                    // MOVHPS m64, xmm (0F 17) — store the high 64 bits
+                    // of an XMM to memory. Register form is reserved.
+                    0x17 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        if let Rm::Mem(ea) = rm {
+                            let a = self.linear_seg(ea.seg, ea.off);
+                            let v = (self.xmm[reg as usize] >> 64) as u64;
+                            self.mem_write_u32(mem, a, v as u32);
+                            self.mem_write_u32(mem, a.wrapping_add(4), (v >> 32) as u32);
+                        } else {
+                            return Err(CpuError::Unimplemented {
+                                opcode: op2,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+
+                    // PSHUFD (66 0F 70 /r ib) — shuffle four dwords of
+                    // the source into the destination, with two-bit
+                    // selectors packed into the imm8. Each dest lane
+                    // can pick any source lane (including duplicates),
+                    // so this is the workhorse "broadcast / permute"
+                    // for SSE2 integer code. The F3/F2 0F 70 variants
+                    // (PSHUFHW/PSHUFLW) go through sse_scalar — they
+                    // are not implemented here yet.
+                    0x70 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let imm = self.fetch_u8(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        let mut out: u128 = 0;
+                        for i in 0..4u32 {
+                            let sel = ((imm >> (2 * i)) & 0b11) as u32;
+                            let lane = (src >> (sel * 32)) & 0xFFFF_FFFF;
+                            out |= lane << (i * 32);
+                        }
+                        self.xmm[reg as usize] = out;
+                    }
+
+                    // SHUFPS / SHUFPD (0F C6 /r ib). SHUFPS picks two
+                    // 32-bit lanes from the destination for result
+                    // lanes 0,1 and two from the source for lanes 2,3
+                    // (two bits per selector in imm). SHUFPD (with the
+                    // 0x66 prefix) uses 64-bit lanes and a single bit
+                    // per selector — only imm[0] and imm[1] are read.
+                    0xC6 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let imm = self.fetch_u8(mem);
+                        let src1 = self.xmm[reg as usize];
+                        let src2 = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            let qw = |v: u128, i: u32| (v >> (i * 64)) & 0xFFFF_FFFF_FFFF_FFFF;
+                            qw(src1, (imm & 1) as u32) | (qw(src2, ((imm >> 1) & 1) as u32) << 64)
+                        } else {
+                            let mut out: u128 = 0;
+                            for i in 0..4u32 {
+                                let sel = ((imm >> (2 * i)) & 0b11) as u32;
+                                let src = if i < 2 { src1 } else { src2 };
+                                let lane = (src >> (sel * 32)) & 0xFFFF_FFFF;
+                                out |= lane << (i * 32);
+                            }
+                            out
+                        };
+                    }
+
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
                     // into the destination only if the condition
