@@ -5,12 +5,13 @@
 //!     WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz \
 //!     cargo test --release -- --ignored linux_userspace_milestone
 //!
-//! The test is `#[ignore]` because:
-//!   * it depends on a vmlinuz file we don't ship (Tinycore Core
-//!     ISO `boot/vmlinuz`, 5.85 MB);
-//!   * one run takes ~10 minutes wall-clock at ~17 MIPS;
-//!   * `cargo test --workspace` mustn't slow down to a crawl on
-//!     every regression sweep.
+//! The test is `#[ignore]` because it depends on a vmlinuz file
+//! we don't ship (Tinycore Core ISO `boot/vmlinuz`, 5.85 MB). One
+//! run is ~95 seconds wall-clock — the test bails the moment
+//! HELLO shows up, vs. the linux_boot example which intentionally
+//! runs the full 16 B-step budget for diagnostics and clocks
+//! ~10 min. Even at 95 seconds, this isn't something to put in
+//! the default sweep.
 //!
 //! What it locks in: the kernel runs all the way through
 //! `driver_init` + `do_initcalls`, mounts our minimal initramfs,
@@ -148,7 +149,7 @@ fn run_until_hello(vm: &mut Vm) -> Result<u64, String> {
 /// isn't present (so contributors without the binary can still
 /// run `cargo test -- --ignored`).
 #[test]
-#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~10 min wall-clock"]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~95s wall-clock"]
 fn linux_userspace_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());

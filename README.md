@@ -266,14 +266,25 @@ WWWVM_INITRD_BUILTIN=1 cargo run --release --example linux_boot
 Минимальный initramfs (136-байтный ELF /init + /dev/console)
 собирается inline в [crates/vm/examples/linux_boot.rs](crates/vm/examples/linux_boot.rs);
 для своих init-ELF'ов передавайте `WWWVM_INITRD=path/to/cpio`.
-Прогон занимает ~10 минут wall-clock (≈17 MIPS на одном ядре,
-≈11 миллиардов CPU-инструкций до panic'а на `init exit`). В UART
-видна вся последовательность kernel boot → driver_init →
-do_initcalls → run_init_process → пользовательский `int 0x80`
-write → THRE IRQ → host stdout → пользовательский exit → kernel
-panic с `exitcode=0x00002a00` (= exit(42) << 8). Подробности
-end-to-end syscall-цепочки — в commit `milestone: Linux 6.12
-boots to userspace`.
+Полный прогон через linux_boot example ~10 минут wall-clock —
+там работает кучка per-step диагностики (EIP region tracking, IF
+transitions, stuck detection) которая интересна для отладки но
+жрёт ~5x времени. Чистый прогон без диагностики (см. integration
+test ниже) занимает **~95 секунд** на той же машине: эффективные
+≈85 MIPS, ≈8 миллиардов CPU-инструкций до момента когда /init
+успевает напечатать HELLO. В UART видна вся последовательность
+kernel boot → driver_init → do_initcalls → run_init_process →
+пользовательский `int 0x80` write → THRE IRQ → host stdout →
+пользовательский exit → kernel panic с `exitcode=0x00002a00`
+(= exit(42) << 8). Подробности end-to-end syscall-цепочки — в
+commit `milestone: Linux 6.12 boots to userspace`.
+
+Регрессионный тест milestone'а зафиксирован в
+[crates/vm/tests/linux_userspace.rs](crates/vm/tests/linux_userspace.rs)
+и помечен `#[ignore]` (потому что зависит от vmlinuz файла).
+Запуск: `WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz cargo test
+--release --test linux_userspace -- --ignored`. Если файла нет —
+тест silently skip'ается; на CI без vmlinuz просто пропустит.
 
 Что нужно vmlinuz: положите его в `/tmp/wwwvm-linux/vmlinuz` или
 укажите путь через `WWWVM_KERNEL=...`. Tinycore Core ISO извлекает
