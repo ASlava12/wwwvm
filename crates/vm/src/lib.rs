@@ -1432,6 +1432,13 @@ impl Vm {
     /// = 0x9000:0000 — and the protected-mode kernel payload lands at
     /// `code32_start` from the header (typically 0x10_0000).
     ///
+    /// If the bzImage advertises a v2.10 `init_size`, we validate that
+    /// the VM has at least `code32_start + init_size` bytes of RAM —
+    /// a relocatable kernel writes that much while decompressing, so
+    /// loading into too-small a VM would corrupt host data structures
+    /// or crash partway through. Older images (init_size = 0) skip
+    /// the check, matching the pre-2.10 contract.
+    ///
     /// Returns the parsed [`BzImage`] so the caller can read fields it
     /// also needs (entry, ramdisk pointers, etc.).
     ///
@@ -1441,6 +1448,16 @@ impl Vm {
     /// real-mode setup execution flow.
     pub fn load_bzimage(&mut self, bytes: &[u8]) -> Result<BzImage, BzImageError> {
         let bz = bzimage::parse(bytes)?;
+        // Validate init_size against available RAM. The check uses
+        // u64 arithmetic to avoid the corner where code32_start +
+        // init_size overflows u32 on a maliciously-large header.
+        if bz.init_size != 0 {
+            let need = bz.code32_start as u64 + bz.init_size as u64;
+            let have = self.mem.size() as u64;
+            if need > have {
+                return Err(BzImageError::NotEnoughRam { need, have });
+            }
+        }
         // Setup blob at linear 0x90000.
         self.mem.write_slice(0x9_0000, &bytes[..bz.payload_offset]);
         // 32-bit payload at code32_start.

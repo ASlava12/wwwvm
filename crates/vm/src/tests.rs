@@ -874,6 +874,54 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 ///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
 ///      asserts AL = 0xCD after the run.
 ///
+/// A v2.10 bzImage that declares `init_size` larger than the VM
+/// gets rejected up front rather than being half-loaded and then
+/// faulting mid-decompression. Real silicon doesn't enforce this
+/// — the kernel just overruns and crashes — but catching it at
+/// load time gives the host a meaningful error.
+#[test]
+fn load_bzimage_rejects_init_size_exceeding_ram() {
+    let mut bz_bytes = vec![0u8; 1024];
+    bz_bytes[0x1F1] = 1;
+    bz_bytes[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz_bytes[0x202..0x206].copy_from_slice(b"HdrS");
+    bz_bytes[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz_bytes[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    // init_size = 256 MiB; with a 16 MiB VM that's far too much.
+    bz_bytes[0x260..0x264].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    let err = vm.load_bzimage(&bz_bytes).unwrap_err();
+    match err {
+        BzImageError::NotEnoughRam { need, have } => {
+            // code32_start (1 MiB) + init_size (256 MiB) = 257 MiB.
+            assert_eq!(need, 0x0010_0000 + 0x1000_0000);
+            assert_eq!(have, 0x0100_0000);
+        }
+        other => panic!("expected NotEnoughRam, got {other:?}"),
+    }
+}
+
+/// A pre-v2.10 image with `init_size = 0` skips the RAM check and
+/// loads cleanly. This is the legacy contract: older kernels
+/// didn't advertise their decompression memory needs, and the
+/// loader can't second-guess that.
+#[test]
+fn load_bzimage_loads_pre_v2_10_image_without_init_size_check() {
+    let mut bz_bytes = vec![0u8; 1024];
+    bz_bytes[0x1F1] = 1;
+    bz_bytes[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz_bytes[0x202..0x206].copy_from_slice(b"HdrS");
+    bz_bytes[0x206..0x208].copy_from_slice(&0x0204u16.to_le_bytes());
+    bz_bytes[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    // init_size left at 0 — older field, not present in v2.04.
+
+    let mut vm = Vm::with_ram_size(0x0100_0000);
+    let bz = vm.load_bzimage(&bz_bytes).expect("legacy image must load");
+    assert_eq!(bz.init_size, 0);
+    assert_eq!(bz.code32_start, 0x0010_0000);
+}
+
 /// The point: this is the final handoff a real Linux bzImage
 /// expects, exercised end-to-end on a binary that goes through the
 /// actual `load_bzimage` parser instead of a hand-crafted ELF.

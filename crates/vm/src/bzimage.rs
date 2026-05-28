@@ -86,6 +86,10 @@ pub enum BzImageError {
     BadBootFlag(u16),
     /// `HdrS` magic at offset 0x202 didn't match `b"HdrS"`.
     BadHeaderMagic([u8; 4]),
+    /// `init_size` declares the kernel needs more RAM than the VM
+    /// has. Real silicon doesn't enforce this — the kernel just
+    /// overruns and faults — but our loader catches it up front.
+    NotEnoughRam { need: u64, have: u64 },
 }
 
 impl std::fmt::Display for BzImageError {
@@ -98,6 +102,10 @@ impl std::fmt::Display for BzImageError {
             Self::BadHeaderMagic(m) => write!(
                 f,
                 "HdrS magic at 0x202 mismatch: got {m:?}, expected [b'H', b'd', b'r', b'S']"
+            ),
+            Self::NotEnoughRam { need, have } => write!(
+                f,
+                "bzImage init_size says kernel needs {need} bytes; VM has {have}"
             ),
         }
     }
