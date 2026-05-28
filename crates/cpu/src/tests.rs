@@ -5963,6 +5963,39 @@ fn rdtscp_returns_tsc_and_zero_aux() {
     assert_eq!(cpu.read_r32(1), 0); // ECX = TSC_AUX = 0 (CPU 0)
 }
 
+/// WRMSR(IA32_TSC_AUX) round-trips through RDMSR *and* through
+/// RDTSCP's ECX. Linux's `cpu_init()` writes the CPU number here
+/// on every AP bring-up; the vDSO's `__vdso_getcpu` reads it back
+/// through RDTSCP to answer `getcpu(2)` without a syscall. If the
+/// write didn't stick — say, RDTSCP always returned 0 — every
+/// userspace `getcpu()` call would lie about the current CPU.
+#[test]
+fn tsc_aux_round_trips_through_wrmsr_rdmsr_and_rdtscp() {
+    // 66 B9 03 01 00 C0     MOV ECX, 0xC0000103
+    // 66 B8 2A 00 00 00     MOV EAX, 42
+    // 66 BA 00 00 00 00     MOV EDX, 0
+    // 0F 30                 WRMSR
+    // 0F 32                 RDMSR             ; EAX should be 42 again
+    // 0F 01 F9              RDTSCP            ; ECX should be 42
+    // F4                    HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x03, 0x01, 0x00, 0xC0, // MOV ECX, MSR id
+            0x66, 0xB8, 0x2A, 0x00, 0x00, 0x00, // MOV EAX, 42
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x00, // MOV EDX, 0
+            0x0F, 0x30, // WRMSR
+            0x0F, 0x32, // RDMSR
+            0x0F, 0x01, 0xF9, // RDTSCP
+            0xF4,
+        ],
+        32,
+    );
+    // Stored MSR value.
+    assert_eq!(cpu.tsc_aux, 42);
+    // After RDTSCP, ECX holds TSC_AUX.
+    assert_eq!(cpu.read_r32(1), 42);
+}
+
 /// RDPMC — 0x0F 0x33. Reads PMC[ECX] into EDX:EAX. We have no
 /// PMCs, so every read returns zero. Linux's perf-event sampling
 /// path uses this; a #UD would oops `perf_event_open`.

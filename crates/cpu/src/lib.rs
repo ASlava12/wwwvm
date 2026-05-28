@@ -207,6 +207,12 @@ pub struct Cpu {
     /// 64-bit value so writes round-trip. Not snapshotted yet —
     /// guests can re-write this on the next boot.
     pub misc_enable: u64,
+    /// IA32_TSC_AUX (MSR 0xC0000103). The kernel writes the CPU
+    /// number here on each AP bring-up so the vDSO's `vget_cpu()`
+    /// can identify which CPU answered an RDTSCP without trapping
+    /// into the kernel. RDTSCP returns this value in ECX. Stored
+    /// only; we don't model multiple CPUs.
+    pub tsc_aux: u32,
     /// Set by `translate()` when a page walk hits a non-present
     /// entry. Read at the end of each `step()`; if set, the CPU
     /// dispatches INT 14 with the error code pushed on the stack,
@@ -332,6 +338,7 @@ impl Cpu {
             sysenter_esp: 0,
             sysenter_eip: 0,
             misc_enable: 0,
+            tsc_aux: 0,
             pending_fault: Cell::new(None),
             a20: true,
             bios_hook: None,
@@ -382,6 +389,7 @@ impl Cpu {
         self.sysenter_esp = 0;
         self.sysenter_eip = 0;
         self.misc_enable = 0;
+        self.tsc_aux = 0;
         self.pending_fault.set(None);
         self.a20 = true;
         self.code_size_32 = false;
@@ -4480,7 +4488,7 @@ impl Cpu {
                             if let Rm::Reg(1) = rm {
                                 self.write_r32(0, self.tsc as u32);
                                 self.write_r32(2, (self.tsc >> 32) as u32);
-                                self.write_r32(1, 0); // ECX = TSC_AUX = 0
+                                self.write_r32(1, self.tsc_aux);
                                 return Ok(());
                             }
                         }
@@ -4770,6 +4778,11 @@ impl Cpu {
                             // MTRRs disabled — Linux treats that as
                             // "fall back to PAT only", which is fine.
                             0x2FF => 0,
+                            // IA32_TSC_AUX (0xC0000103). vDSO writes
+                            // the CPU number here; the kernel reads it
+                            // back via RDTSCP (or directly via this
+                            // MSR) to identify the current CPU.
+                            0xC000_0103 => self.tsc_aux as u64,
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);
@@ -4797,6 +4810,10 @@ impl Cpu {
                             // microcode update read-back". We don't
                             // model microcode at all — silently accept.
                             0x8B => {}
+                            // IA32_TSC_AUX: the kernel writes this
+                            // per-CPU in cpu_init() so the vDSO can
+                            // identify which CPU answered a syscall.
+                            0xC000_0103 => self.tsc_aux = lo,
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);
