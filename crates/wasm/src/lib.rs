@@ -180,6 +180,22 @@ impl WwwVm {
         self.inner.cpu().flags
     }
 
+    /// Read a control register by its x86 encoding index:
+    ///   0 CR0, 2 CR2, 3 CR3, 4 CR4. Anything else returns 0.
+    /// CR1 and CR5..7 are reserved on real silicon and not modelled
+    /// here. A JS debugger panel shows CR0.PE/PG, CR2 (last #PF
+    /// linear), CR3 (page directory base), CR4.PSE/PGE.
+    pub fn read_control_register(&self, idx: u8) -> u32 {
+        let cpu = self.inner.cpu();
+        match idx {
+            0 => cpu.cr0,
+            2 => cpu.cr2,
+            3 => cpu.cr3,
+            4 => cpu.cr4,
+            _ => 0,
+        }
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -493,6 +509,15 @@ mod tests {
         assert_eq!(vm.get_eflags() & 0x0200, 0, "IF clear");
         // Out-of-range index returns 0 (no panic).
         assert_eq!(vm.read_register_u32(42), 0);
+        // Control register accessors: CR0 has PE set (start_protected_mode_at
+        // flipped it on). CR2/3/4 are zero on this minimal kernel.
+        assert_eq!(vm.read_control_register(0) & 1, 1, "CR0.PE");
+        assert_eq!(vm.read_control_register(2), 0, "CR2 untouched");
+        assert_eq!(vm.read_control_register(3), 0, "CR3 not set by kernel");
+        assert_eq!(vm.read_control_register(4), 0, "CR4 not set by kernel");
+        // CR1 / CR5+ are reserved/unmodelled — return 0.
+        assert_eq!(vm.read_control_register(1), 0);
+        assert_eq!(vm.read_control_register(7), 0);
     }
 
     #[test]
