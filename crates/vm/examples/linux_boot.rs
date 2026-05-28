@@ -66,7 +66,9 @@ fn main() {
     // which our kernel hasn't reached yet — so without lpj we hit
     // a soft hang in calibrate_delay_converge. Setting lpj declares
     // a pre-computed value and skips calibration entirely.
-    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 initcall_debug",
+    );
 
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);

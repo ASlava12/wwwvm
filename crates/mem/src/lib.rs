@@ -218,17 +218,24 @@ impl Memory {
         // Diagnostic watchpoint: print every write within a
         // configurable physical range. Used to find what kernel
         // code path stores to a struct field of interest (e.g.
-        // boot_cpu_data.x86_capability[0] at phys 0xB70128).
-        if let Ok(spec) = std::env::var("WWWVM_WATCH_PHYS") {
-            if let Some((lo, hi)) = spec.split_once(':') {
-                if let (Ok(lo), Ok(hi)) = (
-                    u32::from_str_radix(lo.trim_start_matches("0x"), 16),
-                    u32::from_str_radix(hi.trim_start_matches("0x"), 16),
-                ) {
-                    if addr >= lo && addr < hi {
-                        eprintln!("[WATCH] phys[{:08X}] <- {:02X}", addr, value);
-                    }
-                }
+        // boot_cpu_data.x86_capability[0] at phys 0xB70128). The
+        // env-var is read exactly once per process via OnceLock —
+        // a per-write getenv is a syscall in the hottest path the
+        // CPU has, and the Linux boot probe slows by 5×+ without
+        // this cache.
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+        let cached = SPEC.get_or_init(|| {
+            let spec = std::env::var("WWWVM_WATCH_PHYS").ok()?;
+            let (lo, hi) = spec.split_once(':')?;
+            Some((
+                u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
+                u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
+            ))
+        });
+        if let Some((lo, hi)) = cached {
+            if addr >= *lo && addr < *hi {
+                eprintln!("[WATCH] phys[{:08X}] <- {:02X}", addr, value);
             }
         }
         if a < self.bytes.len() {

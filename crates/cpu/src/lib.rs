@@ -894,38 +894,10 @@ impl Cpu {
         if had_fault || self.pending_fault.get().is_some() {
             return;
         }
-        // Diagnostic watchpoint: print every write within a
-        // configurable physical range, including the EIP of the
-        // executing instruction and a short call-stack of return
-        // addresses pulled from [ESP] / [ESP+4] / [ESP+8] via
-        // paging. Used to find what kernel code path stores a
-        // particular value to a particular addr.
-        if let Ok(spec) = std::env::var("WWWVM_WATCH_WRITE") {
-            if let Some((lo, hi)) = spec.split_once(':') {
-                if let (Ok(lo), Ok(hi)) = (
-                    u32::from_str_radix(lo.trim_start_matches("0x"), 16),
-                    u32::from_str_radix(hi.trim_start_matches("0x"), 16),
-                ) {
-                    if phys >= lo && phys < hi {
-                        let esp = self.read_r32(r16::SP as u8);
-                        let read = |va: u32| -> u32 {
-                            let pa = self.translate(m, va);
-                            m.read_u32(pa)
-                        };
-                        eprintln!(
-                            "[W] phys[{:08X}] (VA={:08X}) <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
-                            phys,
-                            linear,
-                            value,
-                            self.last_op_ip,
-                            read(esp),
-                            read(esp.wrapping_add(4)),
-                            read(esp.wrapping_add(8))
-                        );
-                    }
-                }
-            }
-        }
+        // Diagnostic watchpoint — see `watch_write` for the cached
+        // env-var path. Sharing the helper means a single OnceLock
+        // bound, used by both the byte and aligned paths.
+        self.watch_write(m, linear, phys, value);
         m.write_u8(phys, value);
     }
 
@@ -994,32 +966,43 @@ impl Cpu {
     }
 
     fn watch_write(&self, m: &Memory, linear: u32, phys: u32, value: u8) {
-        if let Ok(spec) = std::env::var("WWWVM_WATCH_WRITE") {
-            if let Some((lo, hi)) = spec.split_once(':') {
-                if let (Ok(lo), Ok(hi)) = (
-                    u32::from_str_radix(lo.trim_start_matches("0x"), 16),
-                    u32::from_str_radix(hi.trim_start_matches("0x"), 16),
-                ) {
-                    if phys >= lo && phys < hi {
-                        let esp = self.read_r32(r16::SP as u8);
-                        let read = |va: u32| -> u32 {
-                            let pa = self.translate(m, va);
-                            m.read_u32(pa)
-                        };
-                        eprintln!(
-                            "[W] phys[{:08X}] (VA={:08X}) <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
-                            phys,
-                            linear,
-                            value,
-                            self.last_op_ip,
-                            read(esp),
-                            read(esp.wrapping_add(4)),
-                            read(esp.wrapping_add(8))
-                        );
-                    }
-                }
+        if let Some((lo, hi)) = *Self::watch_write_range() {
+            if phys >= lo && phys < hi {
+                let esp = self.read_r32(r16::SP as u8);
+                let read = |va: u32| -> u32 {
+                    let pa = self.translate(m, va);
+                    m.read_u32(pa)
+                };
+                eprintln!(
+                    "[W] phys[{:08X}] (VA={:08X}) <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
+                    phys,
+                    linear,
+                    value,
+                    self.last_op_ip,
+                    read(esp),
+                    read(esp.wrapping_add(4)),
+                    read(esp.wrapping_add(8))
+                );
             }
         }
+    }
+
+    /// Cached parse of WWWVM_WATCH_WRITE so the diagnostic path is
+    /// a single pointer-compare on the hot byte-write path instead
+    /// of a per-call getenv syscall + hex parse. Returning the
+    /// `Option<(lo,hi)>` by reference lets the caller take the
+    /// branch when unset for free.
+    fn watch_write_range() -> &'static Option<(u32, u32)> {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+        SPEC.get_or_init(|| {
+            let spec = std::env::var("WWWVM_WATCH_WRITE").ok()?;
+            let (lo, hi) = spec.split_once(':')?;
+            Some((
+                u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
+                u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
+            ))
+        })
     }
 
     /// Read an SSE r/m operand: an XMM register (mod=11) or a 128-bit
