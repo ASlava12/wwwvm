@@ -987,6 +987,35 @@ impl Cpu {
         }
     }
 
+    /// One-line trace per IRQ dispatch when WWWVM_TRACE_IRQ=1 is
+    /// set. Print rate is capped via OnceLock-cached counters so a
+    /// runaway IRQ source doesn't flood the log past the first few
+    /// thousand events. Used to confirm whether the kernel is
+    /// actually being ticked at all — Linux's silent stall after
+    /// `random: crng init done` could equally be "scheduler never
+    /// runs because timer IRQ never fires" or "userspace stuck in
+    /// a loop"; the count tells them apart.
+    fn trace_irq(&self, vector: u8, source: &str) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let on = *ENABLED.get_or_init(|| std::env::var_os("WWWVM_TRACE_IRQ").is_some());
+        if !on {
+            return;
+        }
+        // Per-vector counters. Index by vector (0..=255). All start
+        // at 0; we increment atomically and only log the first 5 of
+        // each vector so the trace remains useful.
+        static COUNTS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
+        let n = COUNTS[vector as usize].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 5 || n.is_multiple_of(10_000) {
+            eprintln!(
+                "[IRQ] vec={:02X} src={source} count={n} EIP={:08X}",
+                vector, self.last_op_ip
+            );
+        }
+    }
+
     /// Cached parse of WWWVM_WATCH_WRITE so the diagnostic path is
     /// a single pointer-compare on the hot byte-write path instead
     /// of a per-call getenv syscall + hex parse. Returning the
@@ -2951,11 +2980,13 @@ impl Cpu {
             // expects them to fire promptly so the tick rate stays
             // stable.
             if let Some(vec) = mem.take_pending_lapic_irq() {
+                self.trace_irq(vec, "LAPIC");
                 self.do_interrupt(vec, mem);
                 return Ok(());
             }
             if let Some(vec) = io.pending_irq_vector() {
                 io.ack_irq();
+                self.trace_irq(vec, "PIC");
                 self.do_interrupt(vec, mem);
                 return Ok(());
             }
