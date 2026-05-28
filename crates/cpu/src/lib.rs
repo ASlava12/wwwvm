@@ -306,6 +306,18 @@ pub enum Rm {
     Mem(EffAddr),
 }
 
+/// Access type fed to the page walker. The variant drives the W
+/// and I/D bits in the #PF error code so the handler can tell
+/// a fetch from a read from a write — Linux's `do_page_fault`
+/// branches on these bits to decide what to map (executable vs
+/// data) and whether to grant write permission.
+#[derive(Copy, Clone, Debug)]
+enum Access {
+    Read,
+    Write,
+    Fetch,
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self::new()
@@ -644,18 +656,29 @@ impl Cpu {
     ///
     /// Defaults to a read access; writes go through `translate_write`
     /// so the W bit in the #PF error code reflects the access type.
+    /// Instruction fetches go through `translate_fetch` so the I/D
+    /// bit (bit 4) is set — Linux's `do_page_fault` reads this bit
+    /// to know whether the kernel tried to execute the page.
     pub fn translate(&self, mem: &Memory, linear: u32) -> u32 {
-        self.translate_inner(mem, linear, false)
+        self.translate_inner(mem, linear, Access::Read)
     }
 
     /// Same as `translate` but tags the resulting #PF (if any) with
     /// W=1 in the error code so the handler knows a write was the
     /// trigger. Used by `mem_write_u8/16/32`.
     pub fn translate_write(&self, mem: &Memory, linear: u32) -> u32 {
-        self.translate_inner(mem, linear, true)
+        self.translate_inner(mem, linear, Access::Write)
     }
 
-    fn translate_inner(&self, mem: &Memory, linear: u32, write: bool) -> u32 {
+    /// Same as `translate` but tags the resulting #PF with I/D=1
+    /// (bit 4) so the handler can tell an instruction-fetch fault
+    /// from a data read. Used by `fetch_u8` for opcode and immediate
+    /// bytes.
+    pub fn translate_fetch(&self, mem: &Memory, linear: u32) -> u32 {
+        self.translate_inner(mem, linear, Access::Fetch)
+    }
+
+    fn translate_inner(&self, mem: &Memory, linear: u32, access: Access) -> u32 {
         let phys = if self.cr0 & 0x8000_0000 == 0 {
             linear
         } else {
@@ -664,11 +687,19 @@ impl Cpu {
             let page_offset = linear & 0xFFF;
             let pd_base = self.cr3 & 0xFFFF_F000;
             let pde = mem.read_u32(pd_base.wrapping_add(pd_index * 4));
+            let write = matches!(access, Access::Write);
             let w_bit: u32 = if write { 0b10 } else { 0 };
-            // Present bit (bit 0) clear -> #PF with P=0. W bit reflects
-            // the access type. U/S stays zero (always supervisor for now).
+            let id_bit: u32 = if matches!(access, Access::Fetch) {
+                0b1_0000
+            } else {
+                0
+            };
+            let extra: u32 = w_bit | id_bit;
+            // Present bit (bit 0) clear -> #PF with P=0. Error code
+            // also carries W (write) and I/D (instruction-fetch) so
+            // the handler can tell read / write / fetch apart.
             if pde & 1 == 0 {
-                self.raise_fault(linear, w_bit);
+                self.raise_fault(linear, extra);
                 return 0;
             }
             // PSE (CR4.PSE = bit 4) + PDE.PS (bit 7) collapses the
@@ -686,7 +717,7 @@ impl Cpu {
                 // a write to a page whose R/W bit is clear, raise
                 // #PF with P=1 (page IS present) | W=1.
                 if write && self.cr0 & 0x0001_0000 != 0 && pde & 0b10 == 0 {
-                    self.raise_fault(linear, w_bit | 1);
+                    self.raise_fault(linear, extra | 1);
                     return 0;
                 }
                 let frame = pde & 0xFFC0_0000;
@@ -696,7 +727,7 @@ impl Cpu {
                 let pt_base = pde & 0xFFFF_F000;
                 let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
                 if pte & 1 == 0 {
-                    self.raise_fault(linear, w_bit);
+                    self.raise_fault(linear, extra);
                     return 0;
                 }
                 // CR0.WP: a supervisor write to a present page whose
@@ -706,7 +737,7 @@ impl Cpu {
                 // would silently land in the parent's pages.
                 let effective_rw = (pde & 0b10) & (pte & 0b10);
                 if write && self.cr0 & 0x0001_0000 != 0 && effective_rw == 0 {
-                    self.raise_fault(linear, w_bit | 1);
+                    self.raise_fault(linear, extra | 1);
                     return 0;
                 }
                 let frame = pte & 0xFFFF_F000;
@@ -779,6 +810,14 @@ impl Cpu {
     /// page-frame the guest sees.
     pub fn mem_read_u8(&self, m: &Memory, linear: u32) -> u8 {
         m.read_u8(self.translate(m, linear))
+    }
+
+    /// Paging-aware instruction-byte read. Identical to `mem_read_u8`
+    /// at the physical-address level — but any #PF raised has the
+    /// I/D bit (bit 4) set, so the handler can branch on "exec vs
+    /// data".  Used by `fetch_u8` and the immediate-byte fetchers.
+    pub fn mem_fetch_u8(&self, m: &Memory, linear: u32) -> u8 {
+        m.read_u8(self.translate_fetch(m, linear))
     }
 
     pub fn mem_write_u8(&self, m: &mut Memory, linear: u32, value: u8) {
@@ -1139,7 +1178,7 @@ impl Cpu {
     fn fetch_u8(&mut self, mem: &Memory) -> u8 {
         let addr = self.linear_seg(sreg::CS, self.ip);
         self.ip = self.ip.wrapping_add(1);
-        self.mem_read_u8(mem, addr)
+        self.mem_fetch_u8(mem, addr)
     }
 
     fn fetch_u16(&mut self, mem: &Memory) -> u16 {

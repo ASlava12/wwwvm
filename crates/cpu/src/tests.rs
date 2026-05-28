@@ -2775,6 +2775,43 @@ fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// `translate_fetch` sets the I/D bit (bit 4) on any #PF it
+/// raises; `translate` / `translate_write` leave it clear. Linux's
+/// `do_page_fault` looks at this bit to decide whether to map an
+/// executable or a data page.
+#[test]
+fn fetch_path_pf_carries_id_bit_data_path_does_not() {
+    let mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // PG
+    cpu.cr3 = 0x0000_1000;
+    // PD entirely zero — every access faults.
+
+    // Data fetch (read) → I/D clear, W clear.
+    let _ = cpu.translate(&mem, 0x0001_0000);
+    let pf = cpu.pending_fault().expect("read must #PF");
+    assert_eq!(pf.error_code & 0b1_0010, 0, "I/D and W clear on read");
+
+    // Reset and try a write.
+    cpu.pending_fault.set(None);
+    let _ = cpu.translate_write(&mem, 0x0001_0000);
+    let pf = cpu.pending_fault().expect("write must #PF");
+    assert_eq!(pf.error_code & 0b10, 0b10, "W bit set on write");
+    assert_eq!(pf.error_code & 0b1_0000, 0, "I/D clear on data write");
+
+    // Reset and try an instruction fetch.
+    cpu.pending_fault.set(None);
+    let _ = cpu.translate_fetch(&mem, 0x0001_0000);
+    let pf = cpu.pending_fault().expect("fetch must #PF");
+    assert_eq!(pf.error_code & 0b10, 0, "W clear on fetch");
+    assert_eq!(
+        pf.error_code & 0b1_0000,
+        0b1_0000,
+        "I/D set on instruction fetch"
+    );
+}
+
 /// Demand paging on *instruction fetch*. A kernel JMP target
 /// that lives in an unmapped page must fault, vector through the
 /// #PF handler, get fixed up, and resume — same loop as the
