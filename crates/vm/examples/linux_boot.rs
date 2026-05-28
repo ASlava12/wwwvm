@@ -122,15 +122,24 @@ fn main() {
             ),
             Err(e) => eprintln!("set_ramdisk: {e:?}"),
         }
-        if let Some(b) = echo_byte {
-            // Push the byte AND a newline — Linux's default tty
-            // line discipline (`n_tty`) is in canonical mode and
-            // buffers stdin per line, only releasing on '\n'. A
-            // bare 'Q' would sit in the line buffer forever and
-            // /init's read(0, …) would block past STEP_BUDGET.
-            vm.send_input(&[b, b'\n']);
-            println!("pushed {:#04X} + 0x0A to UART rx queue", b);
-        }
+        // NOTE: the byte itself is NOT pushed here. The 8250
+        // driver's autoconfig path reads RBR a few times during
+        // probe (loopback test + scratch-register check), and any
+        // byte we queued at boot time gets consumed there. We
+        // stash it instead and the main step loop pushes it the
+        // moment /init's "echo " prefix surfaces in the UART
+        // output — at that point autoconfig has long since
+        // finished and /init is blocking on `read(0, ...)`.
+    }
+    // Box the deferred echo-byte into the closure scope so the
+    // step loop can see it.
+    let deferred_echo = env::var("WWWVM_INIT_INPUT")
+        .ok()
+        .filter(|_| env::var_os("WWWVM_INITRD_BUILTIN").is_some())
+        .and_then(|s| s.bytes().next());
+    let mut pending_echo = deferred_echo;
+    if pending_echo.is_some() {
+        println!("echo byte armed — will push on first '/init' UART trace");
     }
 
     vm.start_protected_mode_at(bz.code32_start);
@@ -458,6 +467,19 @@ fn main() {
         if (steps % 100_000_000) < (chunk as u64) {
             let out = vm.drain_output();
             if !out.is_empty() {
+                // Late-push the echo byte: once `/init`'s "echo "
+                // prefix appears in the UART stream we *know*
+                // /init is in user mode and blocking on
+                // `read(0, ...)`. Pushing now bypasses any byte
+                // the 8250 autoconfig probe path might have
+                // swallowed during driver init.
+                if let Some(b) = pending_echo {
+                    if out.windows(5).any(|w| w == b"echo ") {
+                        vm.send_input(&[b, b'\n']);
+                        println!("[{:>10}] pushed {:#04X} + 0x0A to UART rx queue", steps, b);
+                        pending_echo = None;
+                    }
+                }
                 println!(
                     "[{:>10}] UART pushed {} bytes: {:?}",
                     steps,
