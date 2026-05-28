@@ -2652,14 +2652,23 @@ impl Cpu {
         // instead of one boundary late. Refresh first so devices that
         // assert their line (e.g. UART with rx data and IER set) get
         // latched into the PIC's IRR for this turn.
-        // LAPIC timer ticks once per CPU step. The current-count
-        // MMIO register decrements toward zero; Linux's calibration
-        // path reads the delta against TSC to derive the bus ratio.
-        // We don't fire timer interrupts yet — Linux falls back to
-        // the legacy PIC for actual scheduling ticks.
+        // LAPIC timer ticks once per CPU step. tick_lapic_timer
+        // decrements the Current Count MMIO register; on the zero
+        // crossing (LVT_TIMER vector not masked) it queues a
+        // pending IRQ. Linux's calibration measures the delta
+        // against TSC to derive the bus ratio; periodic mode keeps
+        // the kernel's scheduler tick alive.
         mem.tick_lapic_timer();
         io.refresh_irqs();
         if self.has(flag::IF) {
+            // LAPIC IRQs win over legacy PIC — they're the higher-
+            // priority source on real silicon, and the kernel
+            // expects them to fire promptly so the tick rate stays
+            // stable.
+            if let Some(vec) = mem.take_pending_lapic_irq() {
+                self.do_interrupt(vec, mem);
+                return Ok(());
+            }
             if let Some(vec) = io.pending_irq_vector() {
                 io.ack_irq();
                 self.do_interrupt(vec, mem);

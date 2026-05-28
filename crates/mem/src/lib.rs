@@ -41,6 +41,13 @@ pub struct Memory {
     /// the kernel's presence probe sees 3 timers, a 64-bit counter,
     /// vendor ID 0x8086, and a 100 ns counter period.
     hpet: [u8; HPET_SIZE as usize],
+    /// LAPIC timer interrupt request — set by `tick_lapic_timer`
+    /// when Current Count crosses zero with a non-masked LVT_TIMER.
+    /// The CPU's `step()` drains this and dispatches the vector;
+    /// the kernel's handler acks via the LAPIC EOI register
+    /// (0xFEE0_00B0, which is a plain scratch write here). Transient
+    /// — not snapshotted, since restoring mid-IRQ is a niche case.
+    pending_lapic_irq: Option<u8>,
 }
 
 impl Memory {
@@ -77,6 +84,7 @@ impl Memory {
             bytes: vec![0; size],
             lapic,
             hpet,
+            pending_lapic_irq: None,
         }
     }
 
@@ -149,24 +157,69 @@ impl Memory {
     }
 
     /// Tick the LAPIC timer once. Decrements the Current Count
-    /// (LAPIC offset 0x390) by 1, saturating to 0. The CPU calls
-    /// this once per step; Linux's LAPIC calibration measures the
-    /// delta against TSC to learn the bus-clock ratio. We don't
-    /// model the divide-config register (every step counts as one
-    /// LAPIC tick) — Linux's calibration computes whatever ratio
-    /// it observes; the *delta* is what matters.
+    /// (LAPIC offset 0x390) by 1; on the zero crossing, fires the
+    /// vector from LVT_TIMER (offset 0x320) unless masked, and
+    /// either reloads from Initial Count (periodic mode) or stays
+    /// at zero (one-shot). The CPU calls this once per step;
+    /// Linux's tick path then sees both the calibration delta and
+    /// the periodic interrupt source.
+    ///
+    /// LVT_TIMER layout:
+    ///   bits  7:0  vector
+    ///   bit  16    mask (1 = no interrupt fires)
+    ///   bits 18:17 timer mode (00 = one-shot, 01 = periodic, 10 = TSC-deadline)
+    /// We don't model TSC-deadline.
     pub fn tick_lapic_timer(&mut self) {
-        let off = 0x390;
+        let cur_off = 0x390;
         let cur = u32::from_le_bytes([
-            self.lapic[off],
-            self.lapic[off + 1],
-            self.lapic[off + 2],
-            self.lapic[off + 3],
+            self.lapic[cur_off],
+            self.lapic[cur_off + 1],
+            self.lapic[cur_off + 2],
+            self.lapic[cur_off + 3],
         ]);
-        if cur > 0 {
-            let next = cur - 1;
-            self.lapic[off..off + 4].copy_from_slice(&next.to_le_bytes());
+        if cur == 0 {
+            return;
         }
+        let next = cur - 1;
+        self.lapic[cur_off..cur_off + 4].copy_from_slice(&next.to_le_bytes());
+        if next != 0 {
+            return;
+        }
+        // Zero crossing — check LVT_TIMER.
+        let lvt = u32::from_le_bytes([
+            self.lapic[0x320],
+            self.lapic[0x321],
+            self.lapic[0x322],
+            self.lapic[0x323],
+        ]);
+        let masked = lvt & (1 << 16) != 0;
+        let periodic = (lvt >> 17) & 0b11 == 0b01;
+        if !masked {
+            // Don't overwrite an already-pending IRQ — the kernel
+            // hasn't drained it yet. Real silicon would coalesce
+            // via the LAPIC IRR / ISR; our minimal model just drops
+            // the new edge (matches "lost tick" behavior, which
+            // Linux already tolerates).
+            if self.pending_lapic_irq.is_none() {
+                self.pending_lapic_irq = Some(lvt as u8);
+            }
+        }
+        if periodic {
+            let init = u32::from_le_bytes([
+                self.lapic[0x380],
+                self.lapic[0x381],
+                self.lapic[0x382],
+                self.lapic[0x383],
+            ]);
+            self.lapic[cur_off..cur_off + 4].copy_from_slice(&init.to_le_bytes());
+        }
+    }
+
+    /// CPU-side: drain the pending LAPIC timer IRQ, if any. The
+    /// `step()` loop calls this in the IF-enabled fast path,
+    /// alongside the legacy-PIC vector check.
+    pub fn take_pending_lapic_irq(&mut self) -> Option<u8> {
+        self.pending_lapic_irq.take()
     }
 
     pub fn read_u16(&self, addr: u32) -> u16 {

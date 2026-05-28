@@ -1279,6 +1279,64 @@ fn bzimage_kernel_handles_demand_paging_round_trip() {
 /// All pieces individually tested elsewhere — this is the
 /// composition that matches a real Linux scheduler tick.
 #[test]
+fn lapic_timer_fires_periodic_irq_through_32_bit_gate() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel at code32_start = 0x100000.
+    //   - Install IDT[0x40] = 32-bit interrupt gate to phys 0x800.
+    //   - LIDT.
+    //   - Program LAPIC LVT_TIMER (0xFEE0_0320) = 0x00020040
+    //       (vector 0x40, mask=0, mode=periodic).
+    //   - Program LAPIC Initial Count (0xFEE0_0380) = 64.
+    //   - STI.
+    //   - Loop until [0x900] >= 3, then HLT.
+    let kernel: &[u8] = &[
+        // IDT[0x40] @ idt_base + 0x40*8 = 0x1200.
+        0xC7, 0x05, 0x00, 0x12, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x04, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // LVT_TIMER = 0x00020040 — vector 0x40, periodic.
+        0xC7, 0x05, 0x20, 0x03, 0xE0, 0xFE, 0x40, 0x00, 0x02, 0x00, //
+        // Initial Count = 64. Current Count snaps to the same value.
+        0xC7, 0x05, 0x80, 0x03, 0xE0, 0xFE, 0x40, 0x00, 0x00, 0x00, //
+        // STI.
+        0xFB, //
+        // Loop: CMP byte [0x900], 3; JNZ -9; HLT.
+        0x80, 0x3D, 0x00, 0x09, 0x00, 0x00, 0x03, //
+        0x75, 0xF7, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    // Handler at phys 0x800: INC [0x900]; IRETD (no EOI needed —
+    // the kernel doesn't write to 0xFEE0_00B0 in this minimal
+    // test, and our model doesn't require it: take_pending_lapic_irq
+    // already consumed the slot on dispatch).
+    vm.mem
+        .write_slice(0x0800, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(8_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert!(
+        vm.mem().read_u8(0x900) >= 3,
+        "tick counter must reach 3 (got {})",
+        vm.mem().read_u8(0x900)
+    );
+}
+
+#[test]
 fn bzimage_kernel_handles_pit_irq_in_pm_with_paging() {
     let mut bz = vec![0u8; 1024];
     bz[0x1F1] = 1;
