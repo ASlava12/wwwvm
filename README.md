@@ -137,24 +137,51 @@ throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
 `docs/HAND_ASSEMBLY.md` — любое смещение между документацией и
 поведением VM ловит CI.
 
-## Что НЕ работает (дорожная карта)
+## Что уже работает (i386-ядро)
 
-Полноценная поддержка Alpine/Linux требует серьёзного развития CPU
-и устройств — таблица ниже описывает крупные оставшиеся шаги.
+Непривилегированный + системный i386/i486/Pentium набор по сути
+готов и широко проверен realistic end-to-end медли (sum-of-squares
+loop, SIB array + CALL, рекурсивный factorial по cdecl, 64-битная
+ADC/SBB-арифметика, INT 0x80 syscall, strlen через REPNE SCASB,
+spinlock через LOCK CMPXCHG + PAUSE):
 
-| Шаг | Объём | Зачем |
-|-----|-------|-------|
-| Protected mode (CR0.PE, GDT, дескрипторы, IDT-gates) | большой | Любое современное ядро. **В процессе**: CR0/GDTR/IDTR-регистры, опкоды `MOV CR0, r` / `MOV r, CR0`, `LGDT`/`LIDT` уже есть как stubs (значения сохраняются, ещё не используются) |
-| 32-бит (i386): operand/address-size префиксы 0x66/0x67, новые регистры EAX..EDI | большой | 32-битный код |
-| Long mode (x86_64), CR4/EFER, страничная трансляция 4 уровня | большой | 64-битные ядра |
-| Страничная трансляция (CR0.PG, CR3, PDE/PTE) | большой | Любое ядро использующее MMU |
-| BIOS-handler'ы по векторам (0x10 VGA, 0x13 disk, 0x16 KBD, 0x19 boot) | средний | Гости, ожидающие стандартного PC BIOS API |
-| IDE/ATA или virtio-blk | средний | Чтение rootfs с эмулированного диска |
-| ne2k или virtio-net + slirp-подобный TCP/IP | средний | Сеть из гостя через имеющийся `crates/proxy` |
-| VGA graphics (≥320×200), framebuffer-mapping | средний | Графические гости, fbcon |
-| RTC alarm IRQ (через slave PIC), 8042 controller commands | малый | Полнота PC-периферии |
-| Keyboard scan-code translation (Set 1) на host-стороне | малый | Маппинг JS keyboard event → guest |
-| 9P / passthrough FS поверх postMessage | малый | Передача файлов между host и гостем |
+- **Protected mode**: CR0.PE, GDT/LDT-дескрипторы, segment cache,
+  16- и 32-битные IDT-gates, #PF с CR2 и error-code, IRET/IRETD.
+- **Paging**: CR0.PG, CR3, 2-уровневый walk PDE/PTE, A20-gate.
+- **32-бит**: полный EIP, операнд/адрес-префиксы 0x66/0x67, SIB,
+  ESP-стек, все ALU/shift/rotate/mul/div формы, TEST/XCHG/IMUL
+  (2- и 3-операндные), MOVZX/MOVSX, CMOVcc/SETcc, BT/BTS/BTR/BTC,
+  BSF/BSR/BSWAP, XADD/CMPXCHG, SHLD/SHRD, far/near jumps + Jcc rel32,
+  ENTER/LEAVE, PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
+- **Системное**: CR2/CR3/CR4, RDMSR/WRMSR (TSC/APIC/SYSENTER),
+  RDTSC, CPUID, SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
+  CLTS, INVLPG, WBINVD, PAUSE, LOCK.
+- **BIOS-shim**: INT 0x10 (TTY), 0x12, 0x13 (disk read), 0x15
+  (E820 + AH=88), 0x16 (keyboard).
+- **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
+  header parser + loader. Снапшот v7 round-trip'ит всё состояние.
+
+## Что НЕ работает (дорожная карта к Alpine)
+
+Между «исполняет обычный 32-битный код» и «грузит Alpine» —
+большая дистанция. Крупные оставшиеся блокеры, по приоритету:
+
+| Блокер | Объём | Зачем |
+|--------|-------|-------|
+| FPU-арифметика (x87: FADD/FMUL/FLD/FSTP + register stack) | большой | Сейчас только control-stubs (FNINIT/FNSTSW/FLDCW); ядро/glibc реально считают на FPU |
+| MMX + SSE/SSE2 (XMM register file, ~250 опкодов) | очень большой | Современный Linux memcpy/clear_page = movdqa; Alpine ≥3.x линкуется с SSE2 |
+| Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
+| Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
+| Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
+| Все исключения кроме #PF (#GP/#UD/#DF/#NP/#SS) | средний | Ядро ставит обработчики на весь IDT |
+| IDE/ATA (порты 0x1F0) или virtio-blk | средний | Чтение rootfs напрямую (мимо BIOS-shim) |
+| APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
+| ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
+| VGA graphics, framebuffer | средний | fbcon, графические гости |
+
+Честная оценка: до первой попытки boot минимального Linux —
+сотни инкрементов; до работающего Alpine userspace — кратно больше.
+Текущий цикл закрывает их по одному с тестом на каждый шаг.
 
 ## Сборка и запуск
 
