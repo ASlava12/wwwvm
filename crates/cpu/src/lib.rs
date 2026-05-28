@@ -4894,7 +4894,13 @@ impl Cpu {
                     }
                     // CLTS — 0x0F 0x06. Clear Task-Switched flag in
                     // CR0 (bit 3). Used by FPU context-switch code.
-                    0x06 => self.cr0 &= !(1 << 3),
+                    // CPL=0 only — modifies a control register.
+                    0x06 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
+                        self.cr0 &= !(1 << 3);
+                    }
                     // INVD — 0x0F 0x08. Invalidate internal caches
                     // without write-back. CPL=0 only — from ring 3
                     // raise #GP(0) per the Intel SDM. We don't model
@@ -4919,14 +4925,21 @@ impl Cpu {
                         self.write_r32(2, (self.tsc >> 32) as u32);
                     }
                     // RDPMC — 0x0F 0x33. Reads performance counter
-                    // ECX into EDX:EAX. Real CPUs raise #GP for
-                    // out-of-range counters or when CR4.PCE=0 in
-                    // CPL>0. We don't model PMCs at all, so every
-                    // read returns zero — the kernel uses RDPMC
-                    // during perf-event sampling, and zero just
-                    // means "no events" which is correct for a
-                    // single-threaded VM with no real counters.
+                    // ECX into EDX:EAX. From CPL>0, real silicon
+                    // gates on CR4.PCE (bit 8): bit clear → #GP(0).
+                    // CPL=0 always succeeds. We don't model PMCs,
+                    // so the success path returns zero — Linux's
+                    // perf-event sampler sees "no events", which
+                    // is correct for a single-threaded VM.
                     0x33 => {
+                        if self.cr0 & 1 != 0
+                            && (self.sregs[sreg::CS] & 3) != 0
+                            && self.cr4 & (1 << 8) == 0
+                        {
+                            self.ip = op_ip;
+                            self.do_interrupt_with_error(13, Some(0), mem);
+                            return Ok(());
+                        }
                         self.write_r32(0, 0);
                         self.write_r32(2, 0);
                     }
