@@ -2546,6 +2546,114 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// x87 m64 (double) load + memory-operand FADD + store. `d + 0.25`
+/// where d is a double in memory.
+#[test]
+fn fpu_double_load_memory_add_store() {
+    let mut mem = Memory::new(0x10_0000);
+    let w64 = |mem: &mut Memory, addr: u32, v: f64| {
+        let b = v.to_bits();
+        mem.write_u32(addr, b as u32);
+        mem.write_u32(addr + 4, (b >> 32) as u32);
+    };
+    w64(&mut mem, 0x600, 10.5);
+    w64(&mut mem, 0x608, 0.25);
+    // FLD m64 [0x600]      ; DD /0, modrm 00 000 110
+    // FADD m64 [0x608]     ; DC /0, modrm 00 000 110
+    // FSTP m64 [0x610]     ; DD /3, modrm 00 011 110
+    // HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, // FLD m64 [0x600]
+            0xDC, 0x06, 0x08, 0x06, // FADD m64 [0x608]
+            0xDD, 0x1E, 0x10, 0x06, // FSTP m64 [0x610]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    let lo = mem.read_u32(0x610) as u64;
+    let hi = mem.read_u32(0x614) as u64;
+    assert_eq!(f64::from_bits(lo | (hi << 32)), 10.75);
+}
+
+/// FILD / FISTP — integer↔float conversion. `(int)((double)7 * 1.5)`
+/// = (int)10.5 = 10 (truncated).
+#[test]
+fn fpu_fild_fistp_int_conversion() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 7); // integer 7
+    mem.write_u32(0x604, 1.5f32.to_bits());
+    // FILD m32 [0x600]   ; DB /0  → ST0 = 7.0
+    // FLD  m32 [0x604]   ; D9 /0  → ST0 = 1.5, ST1 = 7
+    // FMULP              ; DE C9  → ST0 = 10.5
+    // FISTP m32 [0x608]  ; DB /3  → store (int)10.5 = 10
+    // HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600]
+            0xD9, 0x06, 0x04, 0x06, // FLD m32 [0x604]
+            0xDE, 0xC9, // FMULP
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 10, "(int)(7 * 1.5) = 10");
+}
+
+/// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
+/// the "wrong" order, fix with FXCH, FSUBP.
+#[test]
+fn fpu_fxch_swaps_top() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 3.0f32.to_bits());
+    mem.write_u32(0x604, 10.0f32.to_bits());
+    // FLD [0x600] (3) ; FLD [0x604] (10) ; FXCH (now ST0=3,ST1=10)
+    // FSUBP ST(1),ST(0): ST(1)=ST(1)-ST(0)=10-3=7, pop ; FSTP [0x608]
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x06, 0x00, 0x06, // FLD [0x600] = 3
+            0xD9, 0x06, 0x04, 0x06, // FLD [0x604] = 10
+            0xD9, 0xC9, // FXCH ST(1)  → ST0=3, ST1=10
+            0xDE, 0xE9, // FSUBP ST(1),ST(0) → 10-3=7
+            0xD9, 0x1E, 0x08, 0x06, // FSTP [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x608)), 7.0);
+}
+
 /// x87 FPU: FLD / FADDP / FSTP round-trip. Loads two f32s onto the
 /// stack, adds them, stores the result. 1.5 + 2.25 = 3.75. First
 /// real floating-point arithmetic — the start of the FPU blocker.

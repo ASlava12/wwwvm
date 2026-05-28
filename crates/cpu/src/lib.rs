@@ -651,6 +651,40 @@ impl Cpu {
         self.fpu_st[idx] = value;
     }
 
+    /// Apply an x87 arithmetic sub-op (the 3-bit reg field of D8/DC/DE)
+    /// to (a, b). FADD/FMUL are symmetric; FSUB/FDIV and their "reverse"
+    /// variants differ in operand order. Returns None for the compare
+    /// forms (FCOM/FCOMP), which don't produce a result.
+    fn fpu_arith(op: u8, a: f64, b: f64) -> Option<f64> {
+        match op {
+            0 => Some(a + b), // FADD
+            1 => Some(a * b), // FMUL
+            2 | 3 => None,    // FCOM / FCOMP (compare; handled separately)
+            4 => Some(a - b), // FSUB
+            5 => Some(b - a), // FSUBR
+            6 => Some(a / b), // FDIV
+            7 => Some(b / a), // FDIVR
+            _ => None,
+        }
+    }
+
+    /// Set the x87 condition-code bits C3/C2/C0 (status word bits
+    /// 14/10/8) from a compare of `a` vs `b`, mirroring FCOM. Linux/
+    /// glibc test these via FNSTSW + SAHF or `sahf; jcc`.
+    fn fpu_compare(&mut self, a: f64, b: f64) {
+        // Clear C3 (0x4000), C2 (0x0400), C0 (0x0100).
+        self.fpu_sw &= !0x4500;
+        if a.is_nan() || b.is_nan() {
+            self.fpu_sw |= 0x4500; // unordered: C3=C2=C0=1
+        } else if a > b {
+            // all three already 0
+        } else if a < b {
+            self.fpu_sw |= 0x0100; // C0
+        } else {
+            self.fpu_sw |= 0x4000; // C3 (equal)
+        }
+    }
+
     /// Fetch the direct memory offset that follows a `moffs`-form MOV
     /// (0xA0..0xA3). 16-bit under the default address size, 32-bit
     /// when the 0x67 prefix set `addr_size_32`.
@@ -4501,22 +4535,54 @@ impl Cpu {
             // notice when a real FPU instruction matters.
             0xDB => {
                 let modrm = self.fetch_u8(mem);
-                match modrm {
-                    0xE3 => {
-                        // FNINIT — reset SW to 0, CW to 0x037F.
-                        self.fpu_sw = 0;
-                        self.fpu_cw = 0x037F;
+                let mode = modrm >> 6;
+                let sub = (modrm >> 3) & 0x07;
+                if mode == 0b11 {
+                    match modrm {
+                        0xE3 => {
+                            // FNINIT — reset SW to 0, CW to 0x037F.
+                            self.fpu_sw = 0;
+                            self.fpu_cw = 0x037F;
+                        }
+                        0xE2 => {
+                            // FNCLEX — clear exception flags (SW bits 0..7).
+                            self.fpu_sw &= !0x00FF;
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
                     }
-                    0xE2 => {
-                        // FNCLEX — clear exception flags (bits 0..7 of SW).
-                        self.fpu_sw &= !0x00FF;
-                    }
-                    _ => {
-                        return Err(CpuError::Unimplemented {
-                            opcode,
-                            cs: op_cs,
-                            ip: op_ip,
-                        });
+                } else {
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    match sub {
+                        // FILD m32 — load a 32-bit signed integer, push
+                        // as float. The `(double)int` conversion.
+                        0 => {
+                            let v = self.mem_read_u32(mem, addr) as i32;
+                            self.fpu_push(v as f64);
+                        }
+                        // FISTP m32 — pop and store as truncated i32.
+                        // The `(int)double` conversion.
+                        3 => {
+                            let v = self.fpu_pop();
+                            self.mem_write_u32(mem, addr, (v as i32) as u32);
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
                     }
                 }
             }
@@ -4543,6 +4609,19 @@ impl Cpu {
                     match modrm {
                         0xE8 => self.fpu_push(1.0), // FLD1
                         0xEE => self.fpu_push(0.0), // FLDZ
+                        // D9 C8+i — FXCH ST(i): swap ST(0) and ST(i).
+                        0xC8..=0xCF => {
+                            let i = modrm & 0x07;
+                            let st0 = self.fpu_st(0);
+                            let sti = self.fpu_st(i);
+                            self.fpu_set_st(0, sti);
+                            self.fpu_set_st(i, st0);
+                        }
+                        // D9 C0+i — FLD ST(i): push a copy of ST(i).
+                        0xC0..=0xC7 => {
+                            let v = self.fpu_st(modrm & 0x07);
+                            self.fpu_push(v);
+                        }
                         _ => {
                             return Err(CpuError::Unimplemented {
                                 opcode,
@@ -4624,6 +4703,127 @@ impl Cpu {
                 };
                 self.fpu_set_st(i, r);
                 let _ = self.fpu_pop();
+            }
+            // D8 — arithmetic with ST(0) as destination, source is a
+            // 32-bit memory float or ST(i). FADD/FMUL/FSUB/etc.
+            0xD8 => {
+                let modrm = self.fetch_u8(mem);
+                let mode = modrm >> 6;
+                let op = (modrm >> 3) & 0x07;
+                let src = if mode == 0b11 {
+                    self.fpu_st(modrm & 0x07)
+                } else {
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    f32::from_bits(self.mem_read_u32(mem, addr)) as f64
+                };
+                let st0 = self.fpu_st(0);
+                if op == 2 || op == 3 {
+                    self.fpu_compare(st0, src);
+                    if op == 3 {
+                        let _ = self.fpu_pop(); // FCOMP pops
+                    }
+                } else if let Some(r) = Self::fpu_arith(op, st0, src) {
+                    self.fpu_set_st(0, r);
+                }
+            }
+            // DC — like D8 but the memory operand is a 64-bit double;
+            // the register forms target ST(i) (reversed).
+            0xDC => {
+                let modrm = self.fetch_u8(mem);
+                let mode = modrm >> 6;
+                let op = (modrm >> 3) & 0x07;
+                if mode == 0b11 {
+                    // DC C0+i: ST(i) = ST(i) op ST(0).
+                    let i = modrm & 0x07;
+                    let dst = self.fpu_st(i);
+                    let st0 = self.fpu_st(0);
+                    if let Some(r) = Self::fpu_arith(op, dst, st0) {
+                        self.fpu_set_st(i, r);
+                    }
+                } else {
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    let src = f64::from_bits(
+                        self.mem_read_u32(mem, addr) as u64
+                            | ((self.mem_read_u32(mem, addr.wrapping_add(4)) as u64) << 32),
+                    );
+                    let st0 = self.fpu_st(0);
+                    if op == 2 || op == 3 {
+                        self.fpu_compare(st0, src);
+                        if op == 3 {
+                            let _ = self.fpu_pop();
+                        }
+                    } else if let Some(r) = Self::fpu_arith(op, st0, src) {
+                        self.fpu_set_st(0, r);
+                    }
+                }
+            }
+            // DD — m64 load/store plus register stores/FFREE.
+            0xDD => {
+                let modrm = self.fetch_u8(mem);
+                let mode = modrm >> 6;
+                let sub = (modrm >> 3) & 0x07;
+                if mode == 0b11 {
+                    match sub {
+                        // DD D0+i FST ST(i) / DD D8+i FSTP ST(i).
+                        2 => self.fpu_set_st(modrm & 0x07, self.fpu_st(0)),
+                        3 => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(modrm & 0x07, v);
+                            let _ = self.fpu_pop();
+                        }
+                        // DD C0+i FFREE — mark a register free; we don't
+                        // model tags, so it's a no-op.
+                        0 => {}
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                } else {
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    match sub {
+                        0 => {
+                            // FLD m64.
+                            let lo = self.mem_read_u32(mem, addr) as u64;
+                            let hi = self.mem_read_u32(mem, addr.wrapping_add(4)) as u64;
+                            self.fpu_push(f64::from_bits(lo | (hi << 32)));
+                        }
+                        2 | 3 => {
+                            // FST/FSTP m64.
+                            let v = self.fpu_st(0).to_bits();
+                            self.mem_write_u32(mem, addr, v as u32);
+                            self.mem_write_u32(mem, addr.wrapping_add(4), (v >> 32) as u32);
+                            if sub == 3 {
+                                let _ = self.fpu_pop();
+                            }
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
+                }
             }
 
             _ => {
