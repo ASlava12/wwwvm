@@ -80,6 +80,14 @@ fn main() {
     // and either succeed or panic with a useful "Failed to execute
     // /init" message we can iterate on. WWWVM_INITRD points at a
     // .cpio (raw or gzipped — Linux's unpack_to_rootfs autodetects).
+    // Pick an initramfs in priority order:
+    //   1. WWWVM_INITRD=path/to/file  (raw or gzipped cpio)
+    //   2. WWWVM_INITRD_BUILTIN=1     (the in-process minimal
+    //      ELF /init + /dev/console — reproduces the
+    //      "HELLO FROM USERSPACE" milestone with zero extra files)
+    //   3. nothing                    (kernel will panic at
+    //      mount_root, but that's a useful place to land for
+    //      pre-userspace debugging)
     if let Ok(path) = env::var("WWWVM_INITRD") {
         match std::fs::read(&path) {
             Ok(b) => match vm.set_ramdisk(&b) {
@@ -87,6 +95,12 @@ fn main() {
                 Err(e) => eprintln!("set_ramdisk: {e:?}"),
             },
             Err(e) => eprintln!("initrd read {path}: {e}"),
+        }
+    } else if env::var_os("WWWVM_INITRD_BUILTIN").is_some() {
+        let cpio = build_builtin_initramfs();
+        match vm.set_ramdisk(&cpio) {
+            Ok(()) => println!("loaded builtin initrd: {} bytes", cpio.len()),
+            Err(e) => eprintln!("set_ramdisk: {e:?}"),
         }
     }
 
@@ -674,4 +688,124 @@ fn main() {
             println!("dumped 16 MiB phys 0x100000..0x1100000 at stop -> {path}");
         }
     }
+}
+
+/// Build the minimal newc cpio archive that reproduces the
+/// "HELLO FROM USERSPACE" milestone. Contains three entries:
+/// `/init` (136-byte static i386 ELF that issues
+/// `write(1, msg, 21); exit(42)` via int 0x80), `/dev` (directory
+/// so Linux can mount the console node into it), and
+/// `/dev/console` (S_IFCHR, major=5 minor=1 — the TTYAUX node
+/// `console_on_rootfs` opens to seed PID 1's stdin/stdout/stderr).
+/// Threading this into the example removes the off-tree setup
+/// step from the reproduction recipe.
+fn build_builtin_initramfs() -> Vec<u8> {
+    const LOAD_ADDR: u32 = 0x0804_8000;
+    const ELF_HEADER_LEN: u32 = 52;
+    const PHDR_LEN: u32 = 32;
+    const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+
+    // Build the code twice — once with a placeholder for msg_addr
+    // so we can measure code_len, then once with the real address.
+    let build_code = |msg_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (sys_write)
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+        out.push(0xB9); // mov ecx, imm32
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA]); // mov edx, imm32
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (sys_exit)
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]); // mov ebx, 42
+        out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        out
+    };
+    let code_len = build_code(0).len() as u32;
+    let msg_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
+    let mut body = build_code(msg_addr);
+    body.extend_from_slice(msg);
+    let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
+
+    // ELF32 header.
+    let mut elf: Vec<u8> = Vec::with_capacity(52);
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf.push(1); // EI_CLASS = ELF32
+    elf.push(1); // EI_DATA  = LSB
+    elf.push(1); // EI_VERSION = 1
+    elf.push(0); // EI_OSABI = SysV
+    elf.extend_from_slice(&[0u8; 8]); // padding
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&3u16.to_le_bytes()); // e_machine = EM_386
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&(LOAD_ADDR + ENTRY_OFFSET).to_le_bytes()); // e_entry
+    elf.extend_from_slice(&ELF_HEADER_LEN.to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHDR_LEN as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    debug_assert_eq!(elf.len() as u32, ELF_HEADER_LEN);
+
+    // Single PT_LOAD covering the whole file.
+    let mut phdr: Vec<u8> = Vec::with_capacity(32);
+    phdr.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    phdr.extend_from_slice(&0u32.to_le_bytes()); // p_offset
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_vaddr
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_paddr
+    phdr.extend_from_slice(&filesz.to_le_bytes()); // p_filesz
+    phdr.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
+    phdr.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R | X
+    phdr.extend_from_slice(&0x1000u32.to_le_bytes()); // p_align
+    debug_assert_eq!(phdr.len() as u32, PHDR_LEN);
+
+    let mut binary = elf;
+    binary.extend_from_slice(&phdr);
+    binary.extend_from_slice(&body);
+
+    // CPIO newc helper. 6-byte ASCII "070701" magic + 13 8-byte
+    // ASCII hex fields (ino, mode, uid, gid, nlink, mtime,
+    // filesize, devmaj, devmin, rdevmaj, rdevmin, namesize,
+    // check), name + NUL padded to 4, then file data padded to 4.
+    fn cpio_entry(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
+        let namesize = name.len() as u32 + 1;
+        let filesize = data.len() as u32;
+        let fields = [
+            0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
+        ];
+        let mut hdr = Vec::with_capacity(110);
+        hdr.extend_from_slice(b"070701");
+        for f in fields {
+            hdr.extend_from_slice(format!("{f:08X}").as_bytes());
+        }
+        hdr.extend_from_slice(name.as_bytes());
+        hdr.push(0);
+        while hdr.len() & 3 != 0 {
+            hdr.push(0);
+        }
+        let mut out = hdr;
+        out.extend_from_slice(data);
+        while out.len() & 3 != 0 {
+            out.push(0);
+        }
+        out
+    }
+    const S_IFREG: u32 = 0o100_000;
+    const S_IFDIR: u32 = 0o040_000;
+    const S_IFCHR: u32 = 0o020_000;
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", &binary, S_IFREG | 0o755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], S_IFDIR | 0o755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], S_IFCHR | 0o600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
 }
