@@ -7622,6 +7622,54 @@ fn bt_imm8_reads_bit_into_cf() {
     assert_eq!(cpu.regs[r16::AX], 0x0080, "BT must not modify the operand");
 }
 
+/// 0x0F 0xAB / 0xB3 with a memory operand and a register bit index >31
+/// — the index must address into the bit-string, advancing by
+/// (bit_idx / 32) dwords, not be masked to the operand width. This is
+/// the semantic Linux relies on when it does `set_bit(nr, addr)` on a
+/// per-cpu cap array: nr can be hundreds. Earlier we masked to bit&31
+/// for both Reg and Mem variants, which collapsed all writes into the
+/// first dword and silently corrupted the cap bitmap.
+#[test]
+fn bts_btr_mem_advances_address_for_bit_index_over_31() {
+    // Real-mode boot stub with 0x66 (op size 32) + 0x67 (addr size 32)
+    // prefixes. EBX=112 → dword_off=3, bit_in_dword=16. Memory at
+    // 0x10000..0x10010 starts all-zero, then BTS [0x10000], EBX sets
+    // bit 16 of dword 3 → mem[0x1000C] = 0x00, mem[0x1000D] = 0x00,
+    // mem[0x1000E] = 0x01, mem[0x1000F] = 0x00. Then BTR with EDX=143
+    // (= bit 15 of dword 4) clears bit 15 of dword 4 — but the dword
+    // was 0xFFFF_FFFF so it falls to 0xFFFF_7FFF.
+    let mut mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    mem.write_u32(0x0001_0010, 0xFFFF_FFFF);
+    let prog = [
+        0x66, 0xBB, 0x70, 0x00, 0x00, 0x00, // MOV EBX, 112
+        0x66, 0xBA, 0x8F, 0x00, 0x00, 0x00, // MOV EDX, 143
+        // BTS [0x10000], EBX — 66 67 0F AB 1D 00 00 01 00
+        0x66, 0x67, 0x0F, 0xAB, 0x1D, 0x00, 0x00, 0x01, 0x00,
+        // BTR [0x10000], EDX — 66 67 0F B3 15 00 00 01 00
+        0x66, 0x67, 0x0F, 0xB3, 0x15, 0x00, 0x00, 0x01, 0x00, 0xF4,
+    ];
+    mem.write_slice(0x7C00, &prog);
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // BTS set bit 16 of dword 3 (= byte 0x1000E bit 0).
+    assert_eq!(mem.read_u32(0x0001_000C), 0x0001_0000);
+    // BTR cleared bit 15 of dword 4 (= byte 0x10011 bit 7).
+    assert_eq!(mem.read_u32(0x0001_0010), 0xFFFF_7FFF);
+    // CF should reflect the *old* bit of the second op (BTR), which
+    // was 1 in 0xFFFF_FFFF.
+    assert!(cpu.has(flag::CF));
+}
+
 /// 0x0F 0xB3 — BTR r/m16, r16. Clears bit.
 #[test]
 fn btr_r16_clears_bit_taking_index_from_reg() {

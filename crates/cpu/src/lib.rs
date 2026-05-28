@@ -5429,44 +5429,102 @@ impl Cpu {
                     // 0xB3 (BTR), 0xBB (BTC). Reads/modifies bit
                     // `r` within `r/m`. CF takes the old value of
                     // the tested bit.
-                    // Simplified: we ignore the "address advances
-                    // by bit/8 on memory operand" semantics — the
-                    // bit index is taken modulo operand width, and
-                    // we operate on the existing r/m word/dword.
-                    // That matches every Linux set_bit / test_bit
-                    // call where the bitmap word index is computed
-                    // before the instruction.
+                    //
+                    // Memory-operand variant uses signed-arithmetic
+                    // bit-position semantics per Intel SDM: the
+                    // r-operand bit index addresses an arbitrary
+                    // bit in the underlying bit-string, not just
+                    // one of 16/32 bits within the named r/m. So
+                    // `BTS [arr], r32` with r32=100 walks to
+                    // byte arr+12, bit 4 within that dword — Linux
+                    // uses this on per-cpu cap bitmaps where the
+                    // feature index can be hundreds.
+                    //
+                    // Register-operand variant masks the bit index
+                    // to the operand width (no addressing change),
+                    // which is what the simplified path used to do
+                    // for both.
                     0xA3 | 0xAB | 0xB3 | 0xBB => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         if self.op_size_32 {
-                            let v = self.read_rm32(rm, mem);
-                            let bit = self.read_r32(reg) & 31;
-                            let mask = 1u32 << bit;
-                            self.set_flag(flag::CF, v & mask != 0);
-                            let new = match op2 {
-                                0xA3 => v,         // BT — no write
-                                0xAB => v | mask,  // BTS
-                                0xB3 => v & !mask, // BTR
-                                0xBB => v ^ mask,  // BTC
-                                _ => unreachable!(),
+                            let bit_idx = self.read_r32(reg) as i32;
+                            let (v, write_back): (u32, Option<u32>) = match rm {
+                                Rm::Reg(_) => {
+                                    let v = self.read_rm32(rm, mem);
+                                    let mask = 1u32 << (bit_idx & 31);
+                                    self.set_flag(flag::CF, v & mask != 0);
+                                    let new = match op2 {
+                                        0xA3 => v,
+                                        0xAB => v | mask,
+                                        0xB3 => v & !mask,
+                                        0xBB => v ^ mask,
+                                        _ => unreachable!(),
+                                    };
+                                    (v, if op2 != 0xA3 { Some(new) } else { None })
+                                }
+                                Rm::Mem(ea) => {
+                                    let base = self.linear_seg(ea.seg, ea.off);
+                                    // Signed arithmetic shift: -1 / 32 = -1, etc.
+                                    let dword_off = bit_idx >> 5;
+                                    let addr = base.wrapping_add((dword_off as u32) * 4);
+                                    let v = self.mem_read_u32(mem, addr);
+                                    let mask = 1u32 << (bit_idx & 31);
+                                    self.set_flag(flag::CF, v & mask != 0);
+                                    let new = match op2 {
+                                        0xA3 => v,
+                                        0xAB => v | mask,
+                                        0xB3 => v & !mask,
+                                        0xBB => v ^ mask,
+                                        _ => unreachable!(),
+                                    };
+                                    if op2 != 0xA3 {
+                                        self.mem_write_u32(mem, addr, new);
+                                    }
+                                    (v, None)
+                                }
                             };
-                            if op2 != 0xA3 {
+                            // Already wrote in the Mem branch; this
+                            // handles only Reg.
+                            if let Some(new) = write_back {
                                 self.write_rm32(rm, mem, new);
                             }
+                            let _ = v;
                         } else {
-                            let v = self.read_rm16(rm, mem);
-                            let bit = self.read_r16(reg) & 15;
-                            let mask = 1u16 << bit;
-                            self.set_flag(flag::CF, v & mask != 0);
-                            let new = match op2 {
-                                0xA3 => v,
-                                0xAB => v | mask,
-                                0xB3 => v & !mask,
-                                0xBB => v ^ mask,
-                                _ => unreachable!(),
-                            };
-                            if op2 != 0xA3 {
-                                self.write_rm16(rm, mem, new);
+                            let bit_idx = self.read_r16(reg) as i16;
+                            match rm {
+                                Rm::Reg(_) => {
+                                    let v = self.read_rm16(rm, mem);
+                                    let mask = 1u16 << ((bit_idx as u16) & 15);
+                                    self.set_flag(flag::CF, v & mask != 0);
+                                    let new = match op2 {
+                                        0xA3 => v,
+                                        0xAB => v | mask,
+                                        0xB3 => v & !mask,
+                                        0xBB => v ^ mask,
+                                        _ => unreachable!(),
+                                    };
+                                    if op2 != 0xA3 {
+                                        self.write_rm16(rm, mem, new);
+                                    }
+                                }
+                                Rm::Mem(ea) => {
+                                    let base = self.linear_seg(ea.seg, ea.off);
+                                    let word_off = bit_idx >> 4;
+                                    let addr = base.wrapping_add((word_off as u32) * 2);
+                                    let v = self.mem_read_u16(mem, addr);
+                                    let mask = 1u16 << ((bit_idx as u16) & 15);
+                                    self.set_flag(flag::CF, v & mask != 0);
+                                    let new = match op2 {
+                                        0xA3 => v,
+                                        0xAB => v | mask,
+                                        0xB3 => v & !mask,
+                                        0xBB => v ^ mask,
+                                        _ => unreachable!(),
+                                    };
+                                    if op2 != 0xA3 {
+                                        self.mem_write_u16(mem, addr, new);
+                                    }
+                                }
                             }
                         }
                     }

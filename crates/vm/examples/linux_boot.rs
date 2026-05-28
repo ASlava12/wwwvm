@@ -89,6 +89,9 @@ fn main() {
     // a fine 100-step loop that halts on the first observable #PF
     // (CR2 transition from 0 to non-zero) so we can dump physical
     // memory at that exact step, not millions of steps later.
+    // Note CR2 stays set after the handler runs — so once we detect
+    // a transition we then switch to single-step until we *catch*
+    // the next CR2 update, giving us the exact faulting EIP.
     let stop_at_first_pf = env::var("WWWVM_STOP_AT_FIRST_PF").is_ok();
     // WWWVM_TRACE_ESP_ALIGN=1: after CR0.PG=1 switch to single-step
     // mode and report every ESP alignment transition (4-byte align
@@ -209,12 +212,18 @@ fn main() {
             break;
         }
         if stop_at_first_pf && vm.cpu().cr2 != 0 {
+            // CR2 became non-zero — a #PF was raised somewhere in
+            // the last `chunk` steps. The current EIP is *after*
+            // the dispatch (or after the handler returned), not the
+            // faulting instruction itself — CR2 stays set so we
+            // can't rewind. Report and stop; for finer-grained
+            // probing, use WWWVM_STOP_AT_FIRST_EXC instead.
             println!(
-                "[{:>10}] FIRST #PF observed: CR2={:08X} EIP={:08X} ESP={:08X}",
+                "[{:>10}] CR2 first set: CR2={:08X} (within last {} steps), EIP now {:08X}",
                 steps,
                 vm.cpu().cr2,
-                vm.cpu().ip,
-                vm.cpu().read_r32(4)
+                chunk,
+                vm.cpu().ip
             );
             stop = st;
             break;
@@ -403,12 +412,31 @@ fn main() {
     );
 
     // Dump 16 bytes around EIP — what the next opcode looks like.
+    // EIP is virtual; the kernel image is at phys ~0x100000+, so a
+    // bare phys read of `eip` returns zero. Walk CR3 first so the
+    // bytes shown match what the CPU is actually decoding.
+    let walk_byte = |va: u32| -> Option<u32> {
+        let cr3 = cpu.cr3 & !0xFFF;
+        let pde = mem.read_u32(cr3 + ((va >> 22) & 0x3FF) * 4);
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            return Some((pde & 0xFFC0_0000) | (va & 0x003F_FFFF));
+        }
+        let pte = mem.read_u32((pde & !0xFFF) + ((va >> 12) & 0x3FF) * 4);
+        if pte & 1 == 0 {
+            return None;
+        }
+        Some((pte & !0xFFF) | (va & 0xFFF))
+    };
     let base = eip.saturating_sub(4);
     let mut win = Vec::new();
     for i in 0..16 {
-        win.push(mem.read_u8(base + i));
+        let b = walk_byte(base + i).map(|p| mem.read_u8(p)).unwrap_or(0xFF);
+        win.push(b);
     }
-    print!("  bytes @ EIP-4: ");
+    print!("  bytes @ EIP-4 (paged): ");
     for (i, b) in win.iter().enumerate() {
         if base + i as u32 == eip {
             print!("[{:02X}] ", b);
@@ -510,40 +538,38 @@ fn main() {
         );
     }
 
-    // Dump 256 bytes at the physical location the handler maps to —
-    // if it's all zeros we have a decompressor-output bug; if it's
-    // non-zero our paging walks to the wrong physical address.
-    let phys = (mem.read_u32(0x00C5CC08) & !0xFFF) // PDE[770] of CR3
-        .wrapping_add(0); // first PT
-    let pt_pa = mem.read_u32(0x00C5CC08) & !0xFFF;
-    let pte_pa = pt_pa + 137 * 4;
-    let pte_val = mem.read_u32(pte_pa);
-    let phys_page = pte_val & !0xFFF;
-    let phys_eip = phys_page | (eip & 0xFFF);
-    println!("  physical EIP page: {phys_page:08X}  (PTE @ {pte_pa:08X} = {pte_val:08X})");
-    // Scan 4096 bytes (whole page) to see how much is zero vs non-zero.
-    let mut nonzero = 0;
-    let mut first_nz = None;
-    for i in 0..4096 {
-        let b = mem.read_u8(phys_page + i);
-        if b != 0 {
-            nonzero += 1;
-            if first_nz.is_none() {
-                first_nz = Some((i, b));
+    // Resolve EIP's physical page via the same paging walk we use
+    // elsewhere — earlier diagnostics assumed PDE always points to a
+    // PT, which is wrong when PDE.PS=1 (4 MiB super-pages cover most
+    // of the kernel linear region). Scan that page for content
+    // density and dump 32 bytes at the resolved phys address so we
+    // can tell "page is wiped" from "diagnostic was reading wrong
+    // phys area".
+    if let Some(phys_eip) = walk(eip) {
+        let phys_page = phys_eip & !0xFFF;
+        let mut nonzero = 0;
+        let mut first_nz = None;
+        for i in 0..4096 {
+            let b = mem.read_u8(phys_page + i);
+            if b != 0 {
+                nonzero += 1;
+                if first_nz.is_none() {
+                    first_nz = Some((i, b));
+                }
             }
         }
+        println!(
+            "  resolved phys EIP={phys_eip:08X}, page {phys_page:08X} contents: {nonzero}/4096 non-zero, first @ {:?}",
+            first_nz
+        );
+        print!("  phys @ {phys_eip:08X}:");
+        for i in 0..32 {
+            print!(" {:02X}", mem.read_u8(phys_eip + i));
+        }
+        println!();
+    } else {
+        println!("  EIP {eip:08X} has no valid page translation");
     }
-    println!(
-        "  page {phys_page:08X} contents: {nonzero}/4096 non-zero bytes, first @ offset {:?}",
-        first_nz
-    );
-    // 64-byte snapshot of the actual physical bytes at EIP.
-    print!("  phys @ {phys_eip:08X}:");
-    for i in 0..32 {
-        print!(" {:02X}", mem.read_u8(phys_eip + i));
-    }
-    println!();
-    let _ = phys; // silence unused
 
     // Walk the page directory to see how EIP's page is mapped.
     // VA bits 31:22 = PDE index, 21:12 = PTE index, 11:0 = offset.
