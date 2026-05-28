@@ -1124,6 +1124,90 @@ fn bzimage_kernel_handles_demand_paging_round_trip() {
     assert_eq!(vm.cpu().cr0 & 0x8000_0001, 0x8000_0001);
 }
 
+/// PIT IRQ delivery in PM with paging on — the actual Linux
+/// runtime tick path. The kernel installs an IDT entry for
+/// vector 0x08 (PIC default IRQ-0 vector), programs the PIT for
+/// a short reload, builds a PSE page directory, enables PG,
+/// unmasks IRQ 0, and STIs. Each PIT tick fires through the
+/// 32-bit interrupt gate; the handler increments a tick counter
+/// at [0x900], sends EOI, and IRETs. The kernel polls the
+/// counter and HLTs once it reaches 3.
+///
+/// Composes: PM with paging, IDT install, LIDT, PIT programming,
+/// PIC unmask, STI, IRQ dispatch through 32-bit gate, EOI, IRETD.
+/// All pieces individually tested elsewhere — this is the
+/// composition that matches a real Linux scheduler tick.
+#[test]
+fn bzimage_kernel_handles_pit_irq_in_pm_with_paging() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel at code32_start = 0x100000.
+    let kernel: &[u8] = &[
+        // IDT[8] = 32-bit interrupt gate to phys 0x800 with selector 0x08.
+        0xC7, 0x05, 0x40, 0x10, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x44, 0x10, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc at 0x600 + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // PIT: mode 2, channel 0, lobyte+hibyte, reload = 50.
+        0xB0, 0x34, 0xE6, 0x43, //
+        0xB0, 0x32, 0xE6, 0x40, //
+        0x30, 0xC0, 0xE6, 0x40, //
+        // PD at 0x200000: PDE[0] = PSE identity.
+        0xC7, 0x05, 0x00, 0x00, 0x20, 0x00, 0x83, 0x00, 0x00, 0x00, //
+        // Load CR3 / CR4.PSE / CR0.PG.
+        0xB8, 0x00, 0x00, 0x20, 0x00, //
+        0x0F, 0x22, 0xD8, //
+        0x0F, 0x20, 0xE0, //
+        0x83, 0xC8, 0x10, //
+        0x0F, 0x22, 0xE0, //
+        0x0F, 0x20, 0xC0, //
+        0x0D, 0x00, 0x00, 0x00, 0x80, //
+        0x0F, 0x22, 0xC0, //
+        // Unmask IRQ 0 on master PIC.
+        0xB0, 0xFE, 0xE6, 0x21, //
+        // Enable interrupts.
+        0xFB, //
+        // Wait for 3 ticks. Loop: CMP byte [0x900], 3; JNZ -9; HLT.
+        0x80, 0x3D, 0x00, 0x09, 0x00, 0x00, 0x03, //
+        0x75, 0xF7, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    // Handler at phys 0x800:
+    //   FE 05 00 09 00 00   INC byte [0x900]
+    //   B0 20 E6 20         MOV AL, 0x20; OUT 0x20, AL  (EOI to master PIC)
+    //   CF                  IRETD
+    vm.mem.write_slice(
+        0x0800,
+        &[
+            0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xB0, 0x20, 0xE6, 0x20, 0xCF,
+        ],
+    );
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(8_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert!(
+        vm.mem().read_u8(0x900) >= 3,
+        "tick counter must reach 3 (got {})",
+        vm.mem().read_u8(0x900)
+    );
+    // Paging + PSE still on after the IRQ round trips.
+    assert_eq!(vm.cpu().cr0 & 0x8000_0001, 0x8000_0001);
+    assert_eq!(vm.cpu().cr4 & 0x10, 0x10);
+}
+
 /// `head_32`-shape integration: a synthetic bzImage kernel runs
 /// the full early-Linux startup chain through real instruction
 /// execution. The kernel
