@@ -54,16 +54,20 @@ function pump() {
   // First line: high-level status. Second line: register dump that's
   // useful when watching a PM kernel — CR0.PE/PG, CR3 (page-dir base),
   // EIP (PC), EAX (often a return/exit value), low 16 of EFLAGS, TSC
-  // low half so users can see the VM ticking.
+  // low half so users can see the VM ticking. Third line: timer state
+  // — LAPIC current count and HPET main counter (low 32).
   const eip = hex(vm.get_eip());
   const eax = hex(vm.read_register_u32(0));
   const flags = hex(vm.get_eflags(), 4);
   const cr0 = hex(vm.read_control_register(0));
   const cr3 = hex(vm.read_control_register(3));
   const tsc = hex(vm.get_tsc_low());
+  const lapic = hex(vm.get_lapic_current_count());
+  const hpet = hex(vm.get_hpet_counter_low());
   $("diag").textContent =
     `booted=${vm.is_booted()}  halted=${vm.is_halted()}  steps/frame=${steps}\n` +
-    `EIP=${eip}  EAX=${eax}  EFLAGS=${flags}  CR0=${cr0}  CR3=${cr3}  TSC=${tsc}`;
+    `EIP=${eip}  EAX=${eax}  EFLAGS=${flags}  CR0=${cr0}  CR3=${cr3}  TSC=${tsc}\n` +
+    `LAPIC_CURR=${lapic}  HPET=${hpet}`;
   // VGA snapshot — only render when the buffer has something visible
   // so the pane doesn't get flooded with 25 lines of blank for guests
   // that never touch 0xB8000.

@@ -164,11 +164,14 @@ spinlock через LOCK CMPXCHG + PAUSE):
   SHLD/SHRD, far/near jumps + Jcc rel32, ENTER/LEAVE,
   PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
 - **Системное**: CR2/CR3/CR4, MOV DR0..7 (stub-only),
-  RDMSR/WRMSR (TSC/APIC/SYSENTER + MISC_ENABLE/BIOS_SIGN_ID/
-  TSC_AUX/PLATFORM_ID/MTRR_DEF_TYPE), RDTSC + RDTSCP (с TSC_AUX
-  в ECX) + RDPMC (stub возвращает 0). CPUID: leaf 0/1/2 + ext
-  0x80000000..4. EDX-флаги: FPU/PSE/TSC/MSR/CX8/SEP/PGE/CMOV/
-  CLFLUSH/FXSR/SSE/SSE2. EBX содержит CLFLUSH line size = 64 байт.
+  RDMSR/WRMSR (TSC read+write/APIC/SYSENTER + MISC_ENABLE
+  (64-bit dword pair) /BIOS_SIGN_ID/TSC_AUX/PLATFORM_ID/
+  MTRR_DEF_TYPE/FEATURE_CONTROL/MCG_CAP/EFER), RDTSC + RDTSCP
+  (с TSC_AUX в ECX) + RDPMC (через CR4.PCE из CPL>0, stub
+  возвращает 0). CPUID: leaf 0/1/2 + ext 0x80000000..0x80000008
+  (включая address widths). EDX-флаги: FPU/PSE/TSC/MSR/CX8/SEP/
+  PGE/CMOV/CLFLUSH/FXSR/SSE/SSE2. EBX содержит CLFLUSH line
+  size = 64 байт.
   SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
   CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
   RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe),
@@ -234,11 +237,15 @@ spinlock через LOCK CMPXCHG + PAUSE):
   Доставка идёт впереди legacy-PIC очереди в step(). EOI-запись
   в 0x0B0 — no-op (scratch). IA32_APIC_BASE MSR не выставляет
   enable-bit; Linux всё ещё видит и LAPIC, и legacy PIC.
-- **HPET MMIO** (0xFED0_0000 + 1 KiB): пока стаб. General Caps на
-  offset 0x000 = 0x05F5_E100_8086_A201 (3 таймера, 64-битный
-  counter, vendor 0x8086, 100 ns период); остальное — scratch buffer.
-  Без доставки прерываний — ядро видит, что HPET присутствует, но
-  фактический таймер идёт через PIT или LAPIC.
+- **HPET MMIO** (0xFED0_0000 + 1 KiB): General Caps на 0x000 =
+  0x05F5_E100_8086_A201 (3 таймера, 64-битный counter, vendor
+  0x8086, 100 ns период). Main Counter (0x0F0) тикает на cpu.step
+  когда General Configuration's ENABLE_CNF (0x010 бит 0) выставлен.
+  На каждом инкременте проверяются 3 таймера: если у таймера
+  INT_ENB_CNF (бит 2) и FSB_EN_CNF (бит 14) выставлены, а Main
+  Counter совпал с Comparator — диспетчится IRQ по вектору из
+  FSB_INT_VAL (Linux'овский MSI-driver HPET). LAPIC и HPET делят
+  слот pending_lapic_irq (обе цели — local APIC).
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
