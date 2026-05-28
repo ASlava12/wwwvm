@@ -3505,6 +3505,170 @@ fn sse_cvtdq2pd_widens_two_ints_to_doubles() {
     assert_eq!(f64::from_bits(hi), -7.0);
 }
 
+/// Packed saturation arithmetic. PADDUSB clamps each byte to 0xFF
+/// instead of wrapping; PADDSB clamps to the signed i8 range. The
+/// first four bytes of each input are chosen so both directions of
+/// saturation fire (overflow and underflow).
+#[test]
+fn sse_packed_sat_arith_clamps_at_lane_bounds() {
+    let mut mem = Memory::new(0x10_0000);
+    // PADDUSB pair — unsigned saturation.
+    let ua = [0xF0u8, 0x10, 0x80, 0x01];
+    let ub = [0x20u8, 0x10, 0x80, 0xFF];
+    // PADDSB pair — signed saturation (high bit = negative).
+    let sa = [0x70u8, 0xF0, 0x80, 0x7F]; //  +112, -16,  -128, +127
+    let sb = [0x20u8, 0xF0, 0x80, 0x01]; //  +32,  -16,  -128,   +1
+    for i in 0..4 {
+        mem.write_u8(0x600 + i, ua[i as usize]);
+        mem.write_u8(0x610 + i, ub[i as usize]);
+        mem.write_u8(0x620 + i, sa[i as usize]);
+        mem.write_u8(0x630 + i, sb[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            // PADDUSB XMM0, XMM1 → [0x640]
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0xDC, 0xC1, // PADDUSB XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x40, 0x06, // MOVDQA [0x640], XMM0
+            // PADDSB XMM2, XMM3 → [0x650]
+            0x66, 0x0F, 0x6F, 0x16, 0x20, 0x06, // MOVDQA XMM2, [0x620]
+            0x66, 0x0F, 0x6F, 0x1E, 0x30, 0x06, // MOVDQA XMM3, [0x630]
+            0x66, 0x0F, 0xEC, 0xD3, // PADDSB XMM2, XMM3
+            0x66, 0x0F, 0x7F, 0x16, 0x50, 0x06, // MOVDQA [0x650], XMM2
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..30 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // PADDUSB: 0xF0+0x20=0x110→0xFF;  0x10+0x10=0x20;
+    //          0x80+0x80=0x100→0xFF;  0x01+0xFF=0x100→0xFF.
+    assert_eq!(mem.read_u8(0x640), 0xFF);
+    assert_eq!(mem.read_u8(0x641), 0x20);
+    assert_eq!(mem.read_u8(0x642), 0xFF);
+    assert_eq!(mem.read_u8(0x643), 0xFF);
+    // PADDSB: +112+32=+144→+127(0x7F); -16+-16=-32(0xE0);
+    //         -128+-128=-256→-128(0x80); +127+1=+128→+127(0x7F).
+    assert_eq!(mem.read_u8(0x650), 0x7F);
+    assert_eq!(mem.read_u8(0x651), 0xE0);
+    assert_eq!(mem.read_u8(0x652), 0x80);
+    assert_eq!(mem.read_u8(0x653), 0x7F);
+}
+
+/// PACKSSWB narrows i16 words to i8 bytes with signed saturation.
+/// Each lane of XMM0 produces a byte in the low half of the result;
+/// each lane of XMM1 a byte in the high half.
+#[test]
+fn sse_packsswb_clamps_words_to_signed_bytes() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM0: positive overflow, in-range, negative overflow, in-range,
+    //       max i16, min i16, zero, zero.
+    let a_words: [u16; 8] = [
+        100,
+        200, // 100 fits; 200 → +127
+        ((-100i16) as u16),
+        ((-200i16) as u16), // -100 fits; -200 → -128
+        0x7FFF,
+        0x8000, //  max i16 → +127; min i16 → -128
+        0,
+        0,
+    ];
+    // XMM1: all clearly in-range to confirm the high-half copy.
+    let b_words: [u16; 8] = [1, 2, 3, 4, ((-5i16) as u16), ((-6i16) as u16), 7, 8];
+    for i in 0..8u32 {
+        mem.write_u8(0x600 + i * 2, (a_words[i as usize] & 0xFF) as u8);
+        mem.write_u8(0x600 + i * 2 + 1, (a_words[i as usize] >> 8) as u8);
+        mem.write_u8(0x610 + i * 2, (b_words[i as usize] & 0xFF) as u8);
+        mem.write_u8(0x610 + i * 2 + 1, (b_words[i as usize] >> 8) as u8);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x63, 0xC1, // PACKSSWB XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Low 8 bytes from XMM0 lanes.
+    let want_low: [i8; 8] = [100, 127, -100, -128, 127, -128, 0, 0];
+    for i in 0..8u32 {
+        let got = mem.read_u8(0x620 + i) as i8;
+        assert_eq!(got, want_low[i as usize], "low byte {i}");
+    }
+    // High 8 bytes from XMM1 lanes (all in-range, copied verbatim).
+    let want_high: [i8; 8] = [1, 2, 3, 4, -5, -6, 7, 8];
+    for i in 0..8u32 {
+        let got = mem.read_u8(0x628 + i) as i8;
+        assert_eq!(got, want_high[i as usize], "high byte {i}");
+    }
+}
+
+/// PSHUFLW shuffles the low 4 words by imm8, leaving the high 4
+/// untouched; PSHUFHW is the mirror. Applying both in sequence
+/// with the same selector fully reverses the 8 words.
+#[test]
+fn sse_pshuflw_and_pshufhw_word_shuffles() {
+    let mut mem = Memory::new(0x10_0000);
+    let words: [u16; 8] = [
+        0x1111, 0x2222, 0x3333, 0x4444, 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD,
+    ];
+    for i in 0..8u32 {
+        mem.write_u8(0x600 + i * 2, (words[i as usize] & 0xFF) as u8);
+        mem.write_u8(0x600 + i * 2 + 1, (words[i as usize] >> 8) as u8);
+    }
+    // imm 0x1B = 0b00_01_10_11 reverses a 4-word group.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0xF2, 0x0F, 0x70, 0xC0, 0x1B, // PSHUFLW XMM0, XMM0, 0x1B
+            0xF3, 0x0F, 0x70, 0xC0, 0x1B, // PSHUFHW XMM0, XMM0, 0x1B
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // After both shuffles the word order is fully reversed.
+    let expected: [u16; 8] = [
+        0x4444, 0x3333, 0x2222, 0x1111, 0xDDDD, 0xCCCC, 0xBBBB, 0xAAAA,
+    ];
+    for i in 0..8u32 {
+        let lo = mem.read_u8(0x620 + i * 2) as u16;
+        let hi = mem.read_u8(0x620 + i * 2 + 1) as u16;
+        assert_eq!(lo | (hi << 8), expected[i as usize], "word {i}");
+    }
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

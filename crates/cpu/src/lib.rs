@@ -894,6 +894,38 @@ impl Cpu {
                     self.xmm[reg as usize] = lo | (hi << 32);
                 }
             }
+            // PSHUFHW (F3 0F 70 ib) / PSHUFLW (F2 0F 70 ib) — shuffle
+            // either the high four or low four 16-bit lanes by an
+            // imm8 selector (two bits per output lane); the untouched
+            // half copies through verbatim. PSHUFD's word-level kin —
+            // typical use is rearranging the bytes of a string lane
+            // before a comparison.
+            0x70 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let imm = self.fetch_u8(mem);
+                let src = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = if is_f3 {
+                    // PSHUFHW: low 64 bits unchanged; high 4 words
+                    // selected from positions [4..7] of the source.
+                    let mut out = src & ((1u128 << 64) - 1);
+                    for i in 0..4u32 {
+                        let sel = ((imm >> (2 * i)) & 0b11) as u32;
+                        let w = (src >> (64 + sel * 16)) & 0xFFFF;
+                        out |= w << (64 + i * 16);
+                    }
+                    out
+                } else {
+                    // PSHUFLW: high 64 bits unchanged; low 4 words
+                    // selected from positions [0..3].
+                    let mut out = src & !((1u128 << 64) - 1);
+                    for i in 0..4u32 {
+                        let sel = ((imm >> (2 * i)) & 0b11) as u32;
+                        let w = (src >> (sel * 16)) & 0xFFFF;
+                        out |= w << (i * 16);
+                    }
+                    out
+                };
+            }
             _ => {
                 return Err(CpuError::Unimplemented {
                     opcode: op2,
@@ -4714,6 +4746,44 @@ impl Cpu {
                         let a = self.xmm[reg as usize];
                         self.xmm[reg as usize] = pmaddwd(a, b);
                     }
+                    // Packed saturation arithmetic (66 0F):
+                    //   D8/D9  PSUBUSB / PSUBUSW   (unsigned saturate)
+                    //   DC/DD  PADDUSB / PADDUSW
+                    //   E8/E9  PSUBSB  / PSUBSW    (signed saturate)
+                    //   EC/ED  PADDSB  / PADDSW
+                    // Clamps instead of wraps — what audio mixers and
+                    // colour blends actually want.
+                    0xD8 | 0xD9 | 0xDC | 0xDD | 0xE8 | 0xE9 | 0xEC | 0xED if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = match op2 {
+                            0xD8 => packed_sat_sub_unsigned(a, b, 8),
+                            0xD9 => packed_sat_sub_unsigned(a, b, 16),
+                            0xDC => packed_sat_add_unsigned(a, b, 8),
+                            0xDD => packed_sat_add_unsigned(a, b, 16),
+                            0xE8 => packed_sat_sub_signed(a, b, 8),
+                            0xE9 => packed_sat_sub_signed(a, b, 16),
+                            0xEC => packed_sat_add_signed(a, b, 8),
+                            _ => packed_sat_add_signed(a, b, 16), // 0xED
+                        };
+                    }
+                    // Packs (66 0F):
+                    //   63  PACKSSWB  (words → bytes, signed-saturate)
+                    //   67  PACKUSWB  (words → bytes, unsigned-saturate)
+                    //   6B  PACKSSDW  (dwords → words, signed-saturate)
+                    // The destination's lanes occupy the low half of
+                    // the result; the source's lanes the high half.
+                    0x63 | 0x67 | 0x6B if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = match op2 {
+                            0x63 => packsswb(a, b),
+                            0x67 => packuswb(a, b),
+                            _ => packssdw(a, b),
+                        };
+                    }
                     // Packed precision converts (0F 5A):
                     //   no prefix → CVTPS2PD (2×f32 → 2×f64)
                     //   0x66      → CVTPD2PS (2×f64 → 2×f32, low half;
@@ -5746,6 +5816,99 @@ fn packed_shift_arithmetic_right(a: u128, lane_bits: u32, count: u32) -> u128 {
         let signed = if x & sb != 0 { x | !mask } else { x };
         ((signed as i128) >> count) as u128 & mask
     })
+}
+
+/// Packed saturating add — unsigned (PADDUSB/PADDUSW). Lanes that
+/// would overflow past the lane's max clamp to that max.
+fn packed_sat_add_unsigned(a: u128, b: u128, lane_bits: u32) -> u128 {
+    packed_lanes(a, b, lane_bits, |x, y, mask| {
+        let s = x + y; // fits within u128 even when both lanes are the lane's max
+        if s > mask {
+            mask
+        } else {
+            s
+        }
+    })
+}
+
+/// Packed saturating subtract — unsigned (PSUBUSB/PSUBUSW). Lanes
+/// that would underflow below zero clamp to zero.
+fn packed_sat_sub_unsigned(a: u128, b: u128, lane_bits: u32) -> u128 {
+    packed_lanes(a, b, lane_bits, |x, y, _| x.saturating_sub(y))
+}
+
+/// Packed saturating add — signed (PADDSB/PADDSW). The signed range
+/// of the lane bounds the result; both operands sign-extend first.
+fn packed_sat_add_signed(a: u128, b: u128, lane_bits: u32) -> u128 {
+    let lo: i64 = -(1i64 << (lane_bits - 1));
+    let hi: i64 = (1i64 << (lane_bits - 1)) - 1;
+    packed_lanes(a, b, lane_bits, |x, y, mask| {
+        let sx = sign_extend_lane(x, lane_bits);
+        let sy = sign_extend_lane(y, lane_bits);
+        ((sx + sy).clamp(lo, hi) as u128) & mask
+    })
+}
+
+/// Packed saturating subtract — signed (PSUBSB/PSUBSW).
+fn packed_sat_sub_signed(a: u128, b: u128, lane_bits: u32) -> u128 {
+    let lo: i64 = -(1i64 << (lane_bits - 1));
+    let hi: i64 = (1i64 << (lane_bits - 1)) - 1;
+    packed_lanes(a, b, lane_bits, |x, y, mask| {
+        let sx = sign_extend_lane(x, lane_bits);
+        let sy = sign_extend_lane(y, lane_bits);
+        ((sx - sy).clamp(lo, hi) as u128) & mask
+    })
+}
+
+/// Sign-extend a masked lane value to i64. Used by the signed
+/// saturation helpers and any other lane-aware signed compare/arith.
+fn sign_extend_lane(v: u128, lane_bits: u32) -> i64 {
+    match lane_bits {
+        8 => v as u8 as i8 as i64,
+        16 => v as u16 as i16 as i64,
+        32 => v as u32 as i32 as i64,
+        _ => v as i64,
+    }
+}
+
+/// PACKSSWB — pack eight i16 words to eight i8 bytes per source,
+/// signed-saturated. Destination's lanes occupy the low 8 bytes of
+/// the result; source's lanes the high 8.
+fn packsswb(a: u128, b: u128) -> u128 {
+    let mut out: u128 = 0;
+    for i in 0..8u32 {
+        let av = sign_extend_lane((a >> (i * 16)) & 0xFFFF, 16);
+        let bv = sign_extend_lane((b >> (i * 16)) & 0xFFFF, 16);
+        out |= ((av.clamp(-128, 127) as u8) as u128) << (i * 8);
+        out |= ((bv.clamp(-128, 127) as u8) as u128) << ((i + 8) * 8);
+    }
+    out
+}
+
+/// PACKUSWB — pack eight signed-i16 words to eight u8 bytes
+/// (unsigned saturation: negatives clamp to 0, > 255 clamp to 255).
+fn packuswb(a: u128, b: u128) -> u128 {
+    let mut out: u128 = 0;
+    for i in 0..8u32 {
+        let av = sign_extend_lane((a >> (i * 16)) & 0xFFFF, 16);
+        let bv = sign_extend_lane((b >> (i * 16)) & 0xFFFF, 16);
+        out |= ((av.clamp(0, 255) as u8) as u128) << (i * 8);
+        out |= ((bv.clamp(0, 255) as u8) as u128) << ((i + 8) * 8);
+    }
+    out
+}
+
+/// PACKSSDW — pack four i32 dwords to four i16 words per source,
+/// signed-saturated.
+fn packssdw(a: u128, b: u128) -> u128 {
+    let mut out: u128 = 0;
+    for i in 0..4u32 {
+        let av = sign_extend_lane((a >> (i * 32)) & 0xFFFF_FFFF, 32);
+        let bv = sign_extend_lane((b >> (i * 32)) & 0xFFFF_FFFF, 32);
+        out |= ((av.clamp(-32768, 32767) as u16) as u128) << (i * 16);
+        out |= ((bv.clamp(-32768, 32767) as u16) as u128) << ((i + 4) * 16);
+    }
+    out
 }
 
 /// PMULLW — packed 16×16 multiply, keep low 16 of each product.
