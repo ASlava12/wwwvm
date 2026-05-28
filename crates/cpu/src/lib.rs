@@ -6799,7 +6799,11 @@ const CPUID_BRAND: &[u8; 48] = b"wwwvm Rust software-only x86 CPU               
 /// optimization: without a TLB it's functionally a no-op, but
 /// advertising it lets Linux's optimized paging paths apply.
 /// CX8 (bit 8) is the CMPXCHG8B opcode — the kernel checks this
-/// before emitting per-CPU cmpxchg64 sequences.
+/// before emitting per-CPU cmpxchg64 sequences. CLFLUSH (bit 19)
+/// is implemented as a no-op since we don't model caches, but
+/// Linux uses the CPUID bit to gate emitting CLFLUSH sequences
+/// (e.g. for DMA buffer flushing) and reads EBX[15:8] for the
+/// associated cache-line size.
 const CPUID_LEAF1_EDX: u32 = (1 << 0)        // FPU
         | (1 << 3)                                   // PSE (4 MiB pages)
         | (1 << 4)                                   // TSC
@@ -6808,9 +6812,20 @@ const CPUID_LEAF1_EDX: u32 = (1 << 0)        // FPU
         | (1 << 11)                                  // SEP (SYSENTER)
         | (1 << 13)                                  // PGE (no-op without TLB)
         | (1 << 15)                                  // CMOV
+        | (1 << 19)                                  // CLFLUSH (no-op stub)
         | (1 << 24)                                  // FXSR
         | (1 << 25)                                  // SSE
         | (1 << 26); // SSE2
+
+/// CPUID leaf 1 EBX. Layout per Intel SDM Vol. 2A:
+///   31:24  initial APIC ID                 = 0 (single CPU)
+///   23:16  max logical processors          = 1 (single-threaded VM)
+///   15: 8  CLFLUSH line size / 8           = 8 (64-byte cache line)
+///    7: 0  brand index                     = 0 (not used)
+/// Linux uses bits 15:8 for kmalloc cache-line alignment and 31:24
+/// for SMP CPU enumeration. Returning 0 made the kernel think the
+/// cache line was 0 bytes — kmalloc would then pick odd alignments.
+const CPUID_LEAF1_EBX: u32 = (1 << 16) | (8 << 8);
 
 /// Write a 4-byte chunk of the brand string into a u32 register,
 /// little-endian (the order Linux reconstructs the string in).
@@ -6843,7 +6858,7 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             // class shape. Family-6 keeps the kernel on its modern
             // probe paths rather than the antique-i386 branches.
             cpu.write_r32(0, 0x0000_0664);
-            cpu.write_r32(3, 0); // EBX (brand index / cflush / APIC ID)
+            cpu.write_r32(3, CPUID_LEAF1_EBX); // EBX (brand idx / cflush / max-logical / APIC ID)
             cpu.write_r32(2, 0); // ECX (SSE3+)
             cpu.write_r32(1, CPUID_LEAF1_EDX); // EDX
         }

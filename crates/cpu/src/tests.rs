@@ -7516,12 +7516,21 @@ fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
     assert_ne!(edx & (1 << 11), 0, "SEP");
     assert_ne!(edx & (1 << 13), 0, "PGE");
     assert_ne!(edx & (1 << 15), 0, "CMOV");
+    assert_ne!(edx & (1 << 19), 0, "CLFLUSH");
     assert_ne!(edx & (1 << 24), 0, "FXSR");
     assert_ne!(edx & (1 << 25), 0, "SSE");
     assert_ne!(edx & (1 << 26), 0, "SSE2");
     // Things we don't implement must NOT be set.
     assert_eq!(edx & (1 << 6), 0, "PAE absent");
     assert_eq!(edx & (1 << 23), 0, "MMX absent");
+    // EBX layout: 31:24 APIC ID, 23:16 max-logical, 15:8 CLFLUSH/8,
+    // 7:0 brand idx. Linux uses 15:8 for kmalloc cache-line
+    // alignment; 0 there would make the kernel pick odd alignments.
+    let ebx = cpu.read_r32(3);
+    assert_eq!((ebx >> 24) & 0xFF, 0, "APIC ID = 0");
+    assert_eq!((ebx >> 16) & 0xFF, 1, "max logical processors = 1");
+    assert_eq!((ebx >> 8) & 0xFF, 8, "CLFLUSH line size / 8 = 8");
+    assert_eq!(ebx & 0xFF, 0, "brand index = 0");
 }
 
 /// CPUID extended leaves 0x80000002..4 return a 48-byte brand
