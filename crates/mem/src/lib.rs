@@ -629,6 +629,52 @@ mod tests {
         );
     }
 
+    /// LAPIC timer in periodic mode (LVT bits 18:17 = 01) must
+    /// reload Current Count from Initial Count on the zero-
+    /// crossing tick — that's how the kernel's scheduler tick
+    /// stays alive at HZ. A regression that dropped the reload
+    /// branch turns periodic into one-shot and `jiffies` stops
+    /// after the first tick. End-to-end this would surface as a
+    /// frozen Linux boot, but the integration test budget is too
+    /// large to be a good early signal. Pin the reload here.
+    #[test]
+    fn tick_lapic_timer_periodic_mode_reloads_current_from_initial() {
+        let mut m = Memory::new(64);
+        // Initial Count at 0x380 = 7. Current Count at 0x390 = 1
+        // (one tick away from zero-crossing).
+        m.write_u32(LAPIC_BASE + 0x380, 7);
+        m.write_u32(LAPIC_BASE + 0x390, 1);
+        // LVT Timer: vector 0x40, periodic mode (bit 17 set).
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0040 | (1 << 17));
+
+        m.tick_lapic_timer();
+        // Zero-crossing fires the IRQ.
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x40));
+        // Current Count reloaded from Initial Count (= 7).
+        assert_eq!(m.read_u32(LAPIC_BASE + 0x390), 7);
+    }
+
+    /// One-shot LAPIC timer (LVT bits 18:17 = 00, the architectural
+    /// reset state) MUST NOT reload — it counts down once and stays
+    /// at 0. Pins the negative side of the periodic gate so a future
+    /// refactor of the `(lvt >> 17) & 0b11 == 0b01` check can't
+    /// silently make every timer periodic.
+    #[test]
+    fn tick_lapic_timer_one_shot_mode_does_not_reload_current_count() {
+        let mut m = Memory::new(64);
+        m.write_u32(LAPIC_BASE + 0x380, 7);
+        m.write_u32(LAPIC_BASE + 0x390, 1);
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0040); // bits 18:17 = 00
+
+        m.tick_lapic_timer();
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x40));
+        assert_eq!(
+            m.read_u32(LAPIC_BASE + 0x390),
+            0,
+            "one-shot must stay at zero, not reload"
+        );
+    }
+
     /// Positive companion to the SVR-disabled test above: with SVR
     /// enabled (the default), the same zero-crossing setup *does*
     /// queue an IRQ at the LVT vector. Together the two tests pin
