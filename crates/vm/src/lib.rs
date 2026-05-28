@@ -897,6 +897,15 @@ impl Vm {
         self.mem.read_u16(addr)
     }
 
+    /// Read a 32-bit little-endian dword from guest RAM. Lets JS
+    /// peek a sentinel (e.g. a `MOV [addr], 0xDEADBEEF` outcome)
+    /// in one call instead of four byte reads. Used by the
+    /// head_32-shaped boot-pipeline demos and by integration tests
+    /// that need to assert on a full register width.
+    pub fn read_mem_u32(&self, addr: u32) -> u32 {
+        self.mem.read_u32(addr)
+    }
+
     /// Capture the VM's state as a compact byte buffer for later
     /// `restore()`. Format v1: 16-byte header (magic + version +
     /// reserved) + 36-byte CPU image + 1 MB memory image. Total

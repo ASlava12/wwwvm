@@ -147,6 +147,14 @@ impl WwwVm {
         self.inner.read_mem_u16(addr)
     }
 
+    /// Read a 32-bit little-endian dword from guest RAM. JS hosts
+    /// use this to peek at a sentinel a freshly-handed-off kernel
+    /// just wrote (e.g. confirming the head_32-shaped demo's
+    /// `MOV [0x900], 0xDEADBEEF` step actually ran).
+    pub fn read_mem_u32(&self, addr: u32) -> u32 {
+        self.inner.read_mem_u32(addr)
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -348,6 +356,36 @@ mod tests {
         // lives at memory + entry.
         assert_eq!(vm.read_mem_u8(entry), 0xB8);
         assert_eq!(vm.read_mem_u8(entry + 1), 0xEF);
+    }
+
+    /// `read_mem_u32` lets JS check a 32-bit sentinel in one call.
+    /// A freshly-handed-off kernel that does `MOV [0x900],
+    /// 0xCAFEBABE; HLT` should leave the dword readable through
+    /// the wrapper — without forcing JS to compose four byte reads.
+    #[test]
+    fn js_facing_read_mem_u32_reads_kernel_written_sentinel() {
+        let mut bz = vec![0u8; 1024];
+        bz[0x1F1] = 1;
+        bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        bz[0x202..0x206].copy_from_slice(b"HdrS");
+        bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+        bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        // 32-bit kernel payload (CS.D=1 default):
+        //   C7 05 00 09 00 00 BE BA FE CA   MOV DWORD [0x900], 0xCAFEBABE
+        //   F4                              HLT
+        bz.extend_from_slice(&[
+            0xC7, 0x05, 0x00, 0x09, 0x00, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4,
+        ]);
+
+        let mut vm = WwwVm::new_with_ram_size(0x0020_0000);
+        let entry = vm.load_bzimage(&bz).expect("load_bzimage");
+        vm.start_protected_mode_at(entry);
+        vm.run(16);
+
+        assert!(vm.is_halted());
+        // Single 32-bit read — would need four read_mem_u8 calls
+        // and bit-shifting on the JS side without this wrapper.
+        assert_eq!(vm.read_mem_u32(0x900), 0xCAFE_BABE);
     }
 
     #[test]
