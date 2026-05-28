@@ -37,6 +37,7 @@ term.onData((data) => {
 
 let rafHandle = 0;
 const outputListeners = new Set();
+const hex = (v, w = 8) => v.toString(16).padStart(w, "0").toUpperCase();
 function pump() {
   // Each frame: budget for ~50k CPU steps, then read output.
   const steps = vm.run(50_000);
@@ -50,8 +51,17 @@ function pump() {
     $("diag").textContent = vm.last_error;
     return;
   }
+  // First line: high-level status. Second line: register dump that's
+  // useful when watching a PM kernel — CR0.PE/PG, CR3 (page-dir base),
+  // EIP (PC), EAX (often a return/exit value), low 16 of EFLAGS.
+  const eip = hex(vm.get_eip());
+  const eax = hex(vm.read_register_u32(0));
+  const flags = hex(vm.get_eflags(), 4);
+  const cr0 = hex(vm.read_control_register(0));
+  const cr3 = hex(vm.read_control_register(3));
   $("diag").textContent =
-    `booted=${vm.is_booted()}  halted=${vm.is_halted()}  steps/frame=${steps}`;
+    `booted=${vm.is_booted()}  halted=${vm.is_halted()}  steps/frame=${steps}\n` +
+    `EIP=${eip}  EAX=${eax}  EFLAGS=${flags}  CR0=${cr0}  CR3=${cr3}`;
   // VGA snapshot — only render when the buffer has something visible
   // so the pane doesn't get flooded with 25 lines of blank for guests
   // that never touch 0xB8000.
