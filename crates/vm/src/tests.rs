@@ -1336,6 +1336,75 @@ fn lapic_timer_fires_periodic_irq_through_32_bit_gate() {
     );
 }
 
+/// LAPIC one-shot mode (LVT_TIMER bits 18:17 = 0b00): the timer
+/// fires exactly once on the first zero crossing. Current Count
+/// stays at zero afterwards — no reload from Initial Count. If
+/// our mode handling treated all modes as periodic, this test
+/// would see [0x900] = N rather than 1.
+#[test]
+fn lapic_timer_one_shot_fires_exactly_once() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel at code32_start = 0x100000.
+    //   - Install IDT[0x40] = 32-bit interrupt gate to phys 0x800.
+    //   - LIDT.
+    //   - Program LAPIC LVT_TIMER (0xFEE0_0320) = 0x00000040
+    //       (vector 0x40, mask=0, mode = one-shot = 0b00).
+    //   - Program LAPIC Initial Count (0xFEE0_0380) = 32.
+    //   - STI.
+    //   - Busy loop: MOV ECX, 0x1000; DEC ECX; JNZ -3; HLT.
+    //     ~8K cycles — periodic timer would fire ~256 times in
+    //     that window; one-shot must fire exactly once.
+    let kernel: &[u8] = &[
+        // IDT[0x40] @ idt_base + 0x40*8 = 0x1200.
+        0xC7, 0x05, 0x00, 0x12, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x04, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // LVT_TIMER = 0x00000040 (vector 0x40, mode one-shot).
+        0xC7, 0x05, 0x20, 0x03, 0xE0, 0xFE, 0x40, 0x00, 0x00, 0x00, //
+        // Initial Count = 32.
+        0xC7, 0x05, 0x80, 0x03, 0xE0, 0xFE, 0x20, 0x00, 0x00, 0x00, //
+        // STI.
+        0xFB, //
+        // Busy loop: MOV ECX, 0x1000; .loop: DEC ECX; JNZ -3; HLT.
+        //   B9 00 10 00 00   MOV ECX, 0x1000
+        //   49               DEC ECX
+        //   75 FD            JNZ -3
+        //   F4               HLT
+        0xB9, 0x00, 0x10, 0x00, 0x00, //
+        0x49, //
+        0x75, 0xFD, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    vm.mem
+        .write_slice(0x0800, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(20_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert_eq!(
+        vm.mem().read_u8(0x900),
+        1,
+        "one-shot must fire exactly once (got {})",
+        vm.mem().read_u8(0x900)
+    );
+    // Current Count stays at 0 after the one-shot fire.
+    assert_eq!(vm.mem().read_u32(0xFEE0_0390), 0);
+}
+
 #[test]
 fn bzimage_kernel_handles_pit_irq_in_pm_with_paging() {
     let mut bz = vec![0u8; 1024];
