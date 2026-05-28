@@ -2775,6 +2775,33 @@ fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// U/S bit (bit 2) of the #PF error code is set iff the faulting
+/// access came from CPL=3. Linux's `do_page_fault` branches on
+/// this — userspace faults get a SIGSEGV path, kernel faults get
+/// the fixup table path. Same fault, very different handling.
+#[test]
+fn pf_error_code_us_bit_set_only_for_cpl3_access() {
+    let mem = Memory::new(0x10_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0001; // PG | PE — both required so RPL is meaningful
+    cpu.cr3 = 0x0000_1000;
+    // PD entirely zero.
+
+    // CPL=0 (kernel) — boot CS selector is 0 — U/S clear.
+    cpu.sregs[sreg::CS] = 0x08; // RPL=0
+    let _ = cpu.translate(&mem, 0x0001_0000);
+    let pf = cpu.pending_fault().expect("must #PF");
+    assert_eq!(pf.error_code & 0b100, 0, "U/S clear at CPL=0");
+    cpu.pending_fault.set(None);
+
+    // CPL=3 — selector RPL is 3 — U/S set.
+    cpu.sregs[sreg::CS] = 0x1B; // index 3 << 3 | RPL=3
+    let _ = cpu.translate(&mem, 0x0001_0000);
+    let pf = cpu.pending_fault().expect("must #PF");
+    assert_eq!(pf.error_code & 0b100, 0b100, "U/S set at CPL=3");
+}
+
 /// `translate_fetch` sets the I/D bit (bit 4) on any #PF it
 /// raises; `translate` / `translate_write` leave it clear. Linux's
 /// `do_page_fault` looks at this bit to decide whether to map an

@@ -694,7 +694,17 @@ impl Cpu {
             } else {
                 0
             };
-            let extra: u32 = w_bit | id_bit;
+            // U/S bit: 1 if the access came from CPL=3, else 0. Read
+            // CPL from CS.RPL — only meaningful in PE mode (real mode
+            // is always "supervisor" semantically). Linux's
+            // do_page_fault uses this to split userspace SIGSEGV
+            // from kernel-mode fixup paths.
+            let us_bit: u32 = if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) == 3 {
+                0b100
+            } else {
+                0
+            };
+            let extra: u32 = w_bit | id_bit | us_bit;
             // Present bit (bit 0) clear -> #PF with P=0. Error code
             // also carries W (write) and I/D (instruction-fetch) so
             // the handler can tell read / write / fetch apart.
