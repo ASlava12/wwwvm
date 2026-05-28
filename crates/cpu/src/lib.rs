@@ -559,6 +559,26 @@ impl Cpu {
         }
     }
 
+    /// Strict CPL=0 gate. PE mode + any non-zero CPL on the active
+    /// CS raises #GP(0) and returns true; CPL=0 (or real mode)
+    /// returns false. Used by LLDT/LTR/LGDT/LIDT/LMSW/INVLPG and
+    /// the cache-flush opcodes (INVD/WBINVD), all of which the
+    /// Intel SDM classifies as "supervisor-only" with the same
+    /// fault shape as HLT.
+    fn raise_gp_if_user(&mut self, op_ip: u32, mem: &mut Memory) -> bool {
+        if self.cr0 & 1 == 0 {
+            return false;
+        }
+        let cpl = (self.sregs[sreg::CS] & 3) as u8;
+        if cpl > 0 {
+            self.ip = op_ip;
+            self.do_interrupt_with_error(13, Some(0), mem);
+            true
+        } else {
+            false
+        }
+    }
+
     /// If we're in PE mode and the current CPL exceeds the IOPL
     /// field in EFLAGS, raise #GP(0) from `op_ip` and return true —
     /// the caller should immediately `return Ok(())`. IOPL gates
@@ -4555,15 +4575,29 @@ impl Cpu {
                         let (_, sub, rm) = self.fetch_modrm(mem);
                         match sub {
                             0 => {
+                                // SLDT — unprivileged read.
                                 let v = self.ldtr;
                                 self.write_rm16(rm, mem, v);
                             }
                             1 => {
+                                // STR — unprivileged read.
                                 let v = self.tr;
                                 self.write_rm16(rm, mem, v);
                             }
-                            2 => self.ldtr = self.read_rm16(rm, mem),
-                            3 => self.tr = self.read_rm16(rm, mem),
+                            2 => {
+                                // LLDT — CPL=0 only.
+                                if self.raise_gp_if_user(op_ip, mem) {
+                                    return Ok(());
+                                }
+                                self.ldtr = self.read_rm16(rm, mem);
+                            }
+                            3 => {
+                                // LTR — CPL=0 only.
+                                if self.raise_gp_if_user(op_ip, mem) {
+                                    return Ok(());
+                                }
+                                self.tr = self.read_rm16(rm, mem);
+                            }
                             _ => {
                                 return Err(CpuError::Unimplemented {
                                     opcode: op2,
@@ -4581,11 +4615,16 @@ impl Cpu {
                         // mod=11. The other sub-ops require memory.
                         match sub {
                             4 => {
+                                // SMSW — unprivileged read of CR0 low 16.
                                 let v = self.cr0 as u16;
                                 self.write_rm16(rm, mem, v);
                                 return Ok(());
                             }
                             6 => {
+                                // LMSW — CPL=0 only.
+                                if self.raise_gp_if_user(op_ip, mem) {
+                                    return Ok(());
+                                }
                                 let v = self.read_rm16(rm, mem);
                                 self.cr0 = (self.cr0 & !0xF) | (v as u32 & 0xF);
                                 return Ok(());
@@ -4636,8 +4675,11 @@ impl Cpu {
                                     (desc.base >> 16) as u16,
                                 );
                             }
-                            // LGDT / LIDT — load pseudo-descriptor.
+                            // LGDT / LIDT — load pseudo-descriptor. CPL=0 only.
                             2 | 3 => {
+                                if self.raise_gp_if_user(op_ip, mem) {
+                                    return Ok(());
+                                }
                                 let base_linear = self.linear_seg(ea.seg, ea.off);
                                 let limit = self.mem_read_u16(mem, base_linear);
                                 let base_lo = self.mem_read_u16(mem, base_linear.wrapping_add(2));
@@ -4650,8 +4692,11 @@ impl Cpu {
                                     self.idtr = desc;
                                 }
                             }
-                            // INVLPG m — invalidate TLB entry.
+                            // INVLPG m — invalidate TLB entry. CPL=0 only.
                             7 => {
+                                if self.raise_gp_if_user(op_ip, mem) {
+                                    return Ok(());
+                                }
                                 let _ = self.linear_seg(ea.seg, ea.off);
                             }
                             _ => {
@@ -4841,17 +4886,13 @@ impl Cpu {
                     // raise #GP(0) per the Intel SDM. We don't model
                     // caches, so the privileged form is a no-op.
                     0x08 => {
-                        if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) != 0 {
-                            self.ip = op_ip;
-                            self.do_interrupt_with_error(13, Some(0), mem);
+                        if self.raise_gp_if_user(op_ip, mem) {
                             return Ok(());
                         }
                     }
                     // WBINVD — 0x0F 0x09. Same privilege rule as INVD.
                     0x09 => {
-                        if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) != 0 {
-                            self.ip = op_ip;
-                            self.do_interrupt_with_error(13, Some(0), mem);
+                        if self.raise_gp_if_user(op_ip, mem) {
                             return Ok(());
                         }
                     }

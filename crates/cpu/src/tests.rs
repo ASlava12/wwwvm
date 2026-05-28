@@ -5086,6 +5086,62 @@ fn hlt_in_ring_3_raises_gp_via_cross_ring_entry() {
     assert_eq!(mem.read_u32(0x3000 - 24), 0);
 }
 
+/// LGDT from CPL=3 raises #GP(0). Real silicon classifies the
+/// descriptor-table-loading instructions (LGDT/LIDT/LLDT/LTR) as
+/// supervisor-only — userspace LGDT must trap so a malicious
+/// process can't relocate the kernel's GDT.
+#[test]
+fn lgdt_in_ring_3_raises_gp() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    // Pseudo-descriptor at 0x8100 (limit=0, base=0) — won't actually
+    // load because the #GP fires first.
+    mem.write_slice(0x8100, &[0, 0, 0, 0, 0, 0]);
+    // User-mode LGDT [0x8100]:
+    //   0F 01 15 00 81 00 00  — opcode 0F 01, modrm=00 010 101 (sub=2, [disp32]), disp32=0x8100.
+    mem.write_slice(0x8000, &[0x0F, 0x01, 0x15, 0x00, 0x81, 0x00, 0x00]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_sreg(sreg::DS, 0x0023, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step LGDT");
+
+    // #GP gate dispatched.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+    assert_eq!(cpu.ip, 0x9000);
+    // GDTR untouched.
+    assert_eq!(cpu.gdtr.base, 0x0500);
+    assert_eq!(cpu.gdtr.limit, 0x2F);
+    // Saved IP names the start of LGDT (fault, not trap).
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+}
+
 /// WBINVD from CPL=3 raises #GP(0), just like HLT. The kernel
 /// is the only legitimate caller (cache hygiene during context
 /// switches, MTRR updates, etc.); userspace WBINVD must fault.
