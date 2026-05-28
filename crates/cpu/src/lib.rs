@@ -4607,8 +4607,31 @@ impl Cpu {
                 // Register-form constant loads: FLD1 (E8) / FLDZ (EE).
                 if mode == 0b11 {
                     match modrm {
-                        0xE8 => self.fpu_push(1.0), // FLD1
-                        0xEE => self.fpu_push(0.0), // FLDZ
+                        0xE8 => self.fpu_push(1.0),                       // FLD1
+                        0xE9 => self.fpu_push(std::f64::consts::LOG2_10), // FLDL2T
+                        0xEA => self.fpu_push(std::f64::consts::LOG2_E),  // FLDL2E
+                        0xEB => self.fpu_push(std::f64::consts::PI),      // FLDPI
+                        0xEC => self.fpu_push(std::f64::consts::LOG10_2), // FLDLG2
+                        0xED => self.fpu_push(std::f64::consts::LN_2),    // FLDLN2
+                        0xEE => self.fpu_push(0.0),                       // FLDZ
+                        // FCHS — negate ST(0).
+                        0xE0 => self.fpu_set_st(0, -self.fpu_st(0)),
+                        // FABS — absolute value of ST(0).
+                        0xE1 => self.fpu_set_st(0, self.fpu_st(0).abs()),
+                        // FTST — compare ST(0) with 0.0.
+                        0xE4 => {
+                            let st0 = self.fpu_st(0);
+                            self.fpu_compare(st0, 0.0);
+                        }
+                        // FSQRT — square root of ST(0).
+                        0xFA => self.fpu_set_st(0, self.fpu_st(0).sqrt()),
+                        // FRNDINT — round ST(0) to integer (nearest-even,
+                        // the default rounding mode; we don't model the
+                        // RC field yet).
+                        0xFC => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.round_ties_even());
+                        }
                         // D9 C8+i — FXCH ST(i): swap ST(0) and ST(i).
                         0xC8..=0xCF => {
                             let i = modrm & 0x07;

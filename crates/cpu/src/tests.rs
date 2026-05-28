@@ -2546,6 +2546,68 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// Unary x87 ops: FSQRT, FCHS, FABS. sqrt(16)=4, negate → -4,
+/// abs → 4.
+#[test]
+fn fpu_unary_sqrt_chs_abs() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 16.0f32.to_bits());
+    // FLD [0x600] (16) ; FSQRT (4) ; FCHS (-4) ; FABS (4) ; FSTP [0x604]
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x06, 0x00, 0x06, // FLD m32 [0x600]
+            0xD9, 0xFA, // FSQRT  → 4
+            0xD9, 0xE0, // FCHS   → -4
+            0xD9, 0xE1, // FABS   → 4
+            0xD9, 0x1E, 0x04, 0x06, // FSTP m32 [0x604]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x604)), 4.0);
+}
+
+/// FLDPI pushes π; storing it back round-trips the constant.
+#[test]
+fn fpu_fldpi_constant() {
+    let mut mem = Memory::new(0x10_0000);
+    // FLDPI ; FSTP m64 [0x600]
+    let w64_read = |mem: &Memory, addr: u32| -> f64 {
+        let lo = mem.read_u32(addr) as u64;
+        let hi = mem.read_u32(addr + 4) as u64;
+        f64::from_bits(lo | (hi << 32))
+    };
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0xEB, // FLDPI
+            0xDD, 0x1E, 0x00, 0x06, // FSTP m64 [0x600]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(w64_read(&mem, 0x600), std::f64::consts::PI);
+}
+
 /// FPU compare → branch: `if (a > b)` on floats. FCOMP sets the
 /// C0/C2/C3 condition bits, FNSTSW AX copies the status word to AX,
 /// SAHF moves C0→CF / C3→ZF, and JA branches when above. This is
