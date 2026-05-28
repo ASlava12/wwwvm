@@ -350,6 +350,10 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
 
 /// INT 0x13 — disk services. We model:
 ///
+///   * AH=0x00 — Reset disk system. We have no state to reset;
+///     return success silently.
+///   * AH=0x01 — Get status of last operation. We never report
+///     errors, so AH=0 / AL=0 / CF=0 always.
 ///   * AH=0x02 — Read sectors. Inputs: AL = sector count, CH = cyl
 ///     bits 0..7, CL bits 6..7 = cyl bits 8..9, CL bits 0..5 = sector
 ///     (1-based!), DH = head, DL = drive (0x80 = boot drive). The
@@ -376,6 +380,24 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
 fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
     let ah = cpu.read_r8(4);
     match ah {
+        // Reset disk system. Nothing to reset in our model — the
+        // controller has no transient state between commands. Boot
+        // loaders call this once before their read loop; without
+        // the handler the BIOS shim falls through to the host and
+        // the loader stalls.
+        0x00 => {
+            cpu.write_r8(4, 0); // AH = 0 (success)
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            true
+        }
+        // Status of last operation. Since AH=0x02/0x03 never report
+        // errors, the answer is permanently "no error".
+        0x01 => {
+            cpu.write_r8(4, 0); // AH = 0
+            cpu.write_r8(0, 0); // AL = 0 (status byte)
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            true
+        }
         0x02 => {
             let count = cpu.read_r8(0) as usize; // AL
             let ch = cpu.read_r8(5) as u32; // CH

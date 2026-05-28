@@ -1242,6 +1242,38 @@ fn make_pt_load(p_offset: u32, p_vaddr: u32, p_size: u32) -> Vec<u8> {
     p
 }
 
+/// Bootloader-shaped sequence: reset the disk system (AH=0x00),
+/// then immediately poll the last-operation status (AH=0x01). Both
+/// should return CF=0 with AH=0, no error. Before this handler
+/// existed the reset fell through to the host and the loader
+/// stalled.
+#[test]
+fn bios_int13_reset_then_status_both_succeed() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            // Poison CF + AH so the handlers have to clear them.
+            0xF9, // STC
+            0xB4, 0x00, // MOV AH, 0x00  (reset)
+            0xB2, 0x80, // MOV DL, 0x80
+            0xCD, 0x13, // INT 0x13
+            // Now AH=0x01 to query the (no-)error status.
+            0xB4, 0x01, // MOV AH, 0x01
+            0xB0, 0xFF, // MOV AL, 0xFF  (poison — handler must overwrite)
+            0xCD, 0x13, // INT 0x13
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(4), 0, "AH = 0 after status query");
+    assert_eq!(cpu.read_r8(0), 0, "AL = 0 (no-error status byte)");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0, "CF cleared");
+}
+
 /// INT 0x13 AH=0x03 writes through to the disk image, mirror of
 /// AH=0x02. The round-trip: place a known string in memory, write
 /// to sector 1 via BIOS, zero out the buffer, read sector 1 back
