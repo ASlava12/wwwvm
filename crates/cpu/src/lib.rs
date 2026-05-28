@@ -848,7 +848,16 @@ impl Cpu {
     /// visible memory access (instruction fetch, ModR/M reads, stack
     /// pops, string ops) so toggling CR0.PG actually changes which
     /// page-frame the guest sees.
+    ///
+    /// If a fault is already pending (from an earlier byte of a
+    /// multi-byte access), short-circuit to 0 — real x86 would have
+    /// aborted the instruction; our continue-on-fault model must at
+    /// least stop chaining new translates so subsequent CR2 updates
+    /// don't clobber the first faulting address.
     pub fn mem_read_u8(&self, m: &Memory, linear: u32) -> u8 {
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
         m.read_u8(self.translate(m, linear))
     }
 
@@ -857,11 +866,27 @@ impl Cpu {
     /// I/D bit (bit 4) set, so the handler can branch on "exec vs
     /// data".  Used by `fetch_u8` and the immediate-byte fetchers.
     pub fn mem_fetch_u8(&self, m: &Memory, linear: u32) -> u8 {
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
         m.read_u8(self.translate_fetch(m, linear))
     }
 
     pub fn mem_write_u8(&self, m: &mut Memory, linear: u32, value: u8) {
+        // Abort the write if a fault is already pending (an earlier
+        // byte of a multi-byte access faulted) or if THIS translate
+        // raises a fresh fault. Real x86 aborts the instruction on
+        // the first faulting access; our model continues but must
+        // not let the bogus phys=0 sentinel that translate returns
+        // for a fault actually clobber DRAM. Without this guard,
+        // Linux's millions of stack pushes to unmapped vmalloc
+        // pages turn into millions of writes to physical 0, which
+        // walks across the kernel image and corrupts .text.
+        let had_fault = self.pending_fault.get().is_some();
         let phys = self.translate_write(m, linear);
+        if had_fault || self.pending_fault.get().is_some() {
+            return;
+        }
         m.write_u8(phys, value);
     }
 
@@ -1729,12 +1754,23 @@ impl Cpu {
     }
 
     /// Push a 16-bit value onto SS:[ESP|SP]. The stack pointer
-    /// decrements by 2 before the write. In 32-bit-stack mode the
-    /// full ESP moves; in 16-bit-stack mode only the low SP moves.
+    /// decrements by 2 before the write — but only if the write
+    /// itself completes without a page fault. On real x86 a #PF on
+    /// the destination aborts the instruction; SP must therefore
+    /// stay at its pre-push value so that IRET from the kernel's
+    /// #PF handler resumes at a sane stack pointer instead of one
+    /// that has drifted downward through millions of repeated
+    /// faulting pushes (Linux's recursive-fault scenario).
     fn push16(&mut self, mem: &mut Memory, value: u16) {
-        let sp = self.read_stack_ptr().wrapping_sub(2);
-        self.write_stack_ptr(sp);
-        self.mem_write_u16(mem, self.linear_seg(sreg::SS, sp), value);
+        if self.pending_fault.get().is_some() {
+            return; // earlier push in this op already faulted
+        }
+        let new_sp = self.read_stack_ptr().wrapping_sub(2);
+        self.mem_write_u16(mem, self.linear_seg(sreg::SS, new_sp), value);
+        if self.pending_fault.get().is_some() {
+            return;
+        }
+        self.write_stack_ptr(new_sp);
     }
 
     /// Pop a 16-bit value from SS:[ESP|SP]. SP increments *after*
@@ -1747,11 +1783,18 @@ impl Cpu {
     }
 
     /// Push a 32-bit value onto SS:[ESP|SP]. SP decrements by 4
-    /// before the write.
+    /// before the write — but only if the write completes without a
+    /// fault (see push16 for the rationale).
     fn push32(&mut self, mem: &mut Memory, value: u32) {
-        let sp = self.read_stack_ptr().wrapping_sub(4);
-        self.write_stack_ptr(sp);
-        self.mem_write_u32(mem, self.linear_seg(sreg::SS, sp), value);
+        if self.pending_fault.get().is_some() {
+            return; // earlier push in this op already faulted
+        }
+        let new_sp = self.read_stack_ptr().wrapping_sub(4);
+        self.mem_write_u32(mem, self.linear_seg(sreg::SS, new_sp), value);
+        if self.pending_fault.get().is_some() {
+            return;
+        }
+        self.write_stack_ptr(new_sp);
     }
 
     /// Pop a 32-bit value from SS:[ESP|SP]. SP increments by 4

@@ -19,6 +19,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::time::Instant;
 use wwwvm_vm::{Stop, Vm};
 
@@ -106,6 +107,29 @@ fn main() {
                 steps,
                 vm.cpu().ip
             );
+            // Snapshot physical memory just after the decompressor
+            // hands off to the kernel — this is what the kernel
+            // sees in low physical RAM. Compare against the bytes
+            // gunzip extracts from the bzImage to find where (and
+            // how) decompression deviates.
+            if let Ok(path) = env::var("WWWVM_DUMP_AT_PG") {
+                let mut f = match std::fs::File::create(&path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("dump create {path}: {e}");
+                        continue;
+                    }
+                };
+                let mut buf = vec![0u8; 0x0100_0000]; // 16 MiB
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = vm.mem().read_u8(0x0010_0000 + i as u32);
+                }
+                if let Err(e) = f.write_all(&buf) {
+                    eprintln!("dump write: {e}");
+                } else {
+                    println!("  dumped 16 MiB phys 0x100000..0x1100000 -> {path}");
+                }
+            }
         }
         last_cr0_pg = pg;
         last_cs_hi = cs_hi;
@@ -362,5 +386,27 @@ fn main() {
     if let Stop::CpuError(e) = stop {
         println!("\nCPU error detail: {e}");
         std::process::exit(2);
+    }
+
+    // Optional second dump at the stopping point. Compare against
+    // the WWWVM_DUMP_AT_PG dump to see what memory regions changed
+    // between the decompressor handoff and the wall we hit.
+    if let Ok(path) = env::var("WWWVM_DUMP_AT_STOP") {
+        let mut f = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("dump create {path}: {e}");
+                return;
+            }
+        };
+        let mut buf = vec![0u8; 0x0100_0000];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = vm.mem().read_u8(0x0010_0000 + i as u32);
+        }
+        if let Err(e) = f.write_all(&buf) {
+            eprintln!("dump write: {e}");
+        } else {
+            println!("dumped 16 MiB phys 0x100000..0x1100000 at stop -> {path}");
+        }
     }
 }
