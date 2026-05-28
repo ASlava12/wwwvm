@@ -2141,36 +2141,45 @@ impl Cpu {
                         _ => break b,
                     }
                 };
-                let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
-                loop {
-                    let counter_done = if self.addr_size_32 {
-                        self.read_r32(r16::CX as u8) == 0
-                    } else {
-                        self.regs[r16::CX] == 0
-                    };
-                    if counter_done {
-                        break;
-                    }
-                    if !self.step_string(inner, mem) {
-                        return Err(CpuError::Unimplemented {
-                            opcode: inner,
-                            cs: op_cs,
-                            ip: op_ip,
-                        });
-                    }
-                    if self.addr_size_32 {
-                        let c = self.read_r32(r16::CX as u8).wrapping_sub(1);
-                        self.write_r32(r16::CX as u8, c);
-                    } else {
-                        self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
-                    }
-                    if conditional {
-                        let zf = self.has(flag::ZF);
-                        if rep_zero && !zf {
+                // PAUSE = F3 90. The 0xF3 prefix on a NOP is the
+                // spin-loop hint, *not* a REP NOP — spinlocks emit it
+                // constantly. Treat it as a no-op and stop here rather
+                // than falling into the string-op loop (which would
+                // reject 0x90).
+                if inner == 0x90 {
+                    // PAUSE / REP NOP — nothing to do.
+                } else {
+                    let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
+                    loop {
+                        let counter_done = if self.addr_size_32 {
+                            self.read_r32(r16::CX as u8) == 0
+                        } else {
+                            self.regs[r16::CX] == 0
+                        };
+                        if counter_done {
                             break;
                         }
-                        if !rep_zero && zf {
-                            break;
+                        if !self.step_string(inner, mem) {
+                            return Err(CpuError::Unimplemented {
+                                opcode: inner,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                        if self.addr_size_32 {
+                            let c = self.read_r32(r16::CX as u8).wrapping_sub(1);
+                            self.write_r32(r16::CX as u8, c);
+                        } else {
+                            self.regs[r16::CX] = self.regs[r16::CX].wrapping_sub(1);
+                        }
+                        if conditional {
+                            let zf = self.has(flag::ZF);
+                            if rep_zero && !zf {
+                                break;
+                            }
+                            if !rep_zero && zf {
+                                break;
+                            }
                         }
                     }
                 }

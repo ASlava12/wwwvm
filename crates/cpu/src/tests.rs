@@ -2500,6 +2500,74 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// F3 90 — PAUSE. The spin-loop hint a `while (locked) cpu_relax()`
+/// emits. Must decode as a no-op, not as REP NOP (which would
+/// reject 0x90).
+#[test]
+fn pause_decodes_as_noop() {
+    // PAUSE ; MOV AL, 0x7E ; HLT — proves execution continues past it.
+    let (cpu, _, _) = run_payload(&[0xF3, 0x90, 0xB0, 0x7E, 0xF4], 8);
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(0), 0x7E);
+}
+
+/// Decode-coverage survey: a batch of common instruction encodings
+/// must all decode (not return Unimplemented). Each entry is a
+/// complete instruction; we place it at the boot address, single-
+/// step once, and require the step to succeed. This is a wide net
+/// for decode regressions across the opcode map in one test.
+#[test]
+fn decode_survey_common_encodings_all_accepted() {
+    let cases: &[(&str, &[u8])] = &[
+        ("mov eax,imm32", &[0x66, 0xB8, 0x01, 0x02, 0x03, 0x04]),
+        ("add eax,ebx", &[0x66, 0x01, 0xD8]),
+        ("sub eax,ebx", &[0x66, 0x29, 0xD8]),
+        ("xor eax,eax", &[0x66, 0x31, 0xC0]),
+        ("and eax,ebx", &[0x66, 0x21, 0xD8]),
+        ("or eax,ebx", &[0x66, 0x09, 0xD8]),
+        ("cmp eax,ebx", &[0x66, 0x39, 0xD8]),
+        ("test eax,eax", &[0x66, 0x85, 0xC0]),
+        ("imul eax,ebx", &[0x66, 0x0F, 0xAF, 0xC3]),
+        ("shl eax,1", &[0x66, 0xD1, 0xE0]),
+        ("sar eax,cl", &[0x66, 0xD3, 0xF8]),
+        ("shld eax,ebx,4", &[0x66, 0x0F, 0xA4, 0xD8, 0x04]),
+        ("bt eax,3", &[0x66, 0x0F, 0xBA, 0xE0, 0x03]),
+        ("bsf eax,ebx", &[0x66, 0x0F, 0xBC, 0xC3]),
+        ("movzx eax,bl", &[0x66, 0x0F, 0xB6, 0xC3]),
+        ("movsx eax,bl", &[0x66, 0x0F, 0xBE, 0xC3]),
+        ("cmovz eax,ebx", &[0x66, 0x0F, 0x44, 0xC3]),
+        ("setz al", &[0x0F, 0x94, 0xC0]),
+        ("xadd eax,ebx", &[0x66, 0x0F, 0xC1, 0xD8]),
+        ("cmpxchg eax,ebx", &[0x66, 0x0F, 0xB1, 0xD8]),
+        ("bswap eax", &[0x66, 0x0F, 0xC8]),
+        ("push eax", &[0x66, 0x50]),
+        ("pop eax", &[0x66, 0x58]),
+        ("inc eax", &[0x66, 0x40]),
+        ("lea eax,[bx]", &[0x66, 0x8D, 0x07]),
+        ("movzx via 0F B7", &[0x66, 0x0F, 0xB7, 0xC3]),
+        ("cdq", &[0x66, 0x99]),
+        ("pause", &[0xF3, 0x90]),
+        ("rdtsc", &[0x0F, 0x31]),
+        ("cpuid", &[0x0F, 0xA2]),
+        ("clc", &[0xF8]),
+        ("std", &[0xFD]),
+        ("nop", &[0x90]),
+        ("multibyte nop", &[0x0F, 0x1F, 0xC0]),
+    ];
+    for (name, bytes) in cases {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, bytes);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        let res = cpu.step(&mut mem, &mut io);
+        assert!(
+            res.is_ok(),
+            "encoding {name:?} ({bytes:02X?}) failed to decode: {res:?}"
+        );
+    }
+}
+
 /// 64-bit subtract via SUB + SBB across a dword pair — the borrow-
 /// chain counterpart to the ADC test, used for 64-bit counter deltas.
 ///
