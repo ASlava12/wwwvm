@@ -6983,11 +6983,25 @@ const CPUID_BRAND: &[u8; 48] = b"wwwvm Rust software-only x86 CPU               
 /// Linux uses the CPUID bit to gate emitting CLFLUSH sequences
 /// (e.g. for DMA buffer flushing) and reads EBX[15:8] for the
 /// associated cache-line size.
+///
+/// APIC (bit 9) tells the kernel the on-chip Local APIC is present;
+/// without it Linux ignores 0xFEE0_0000 entirely even when the MMIO
+/// surface answers, falling back to PIC-only delivery. We have the
+/// LAPIC (timer, SVR, EOI scratch, ICR scratch) wired, so this is
+/// safe to advertise. MCE (bit 7) opts the kernel into Machine-
+/// Check init — it reads MCG_CAP/MCG_STATUS (we return zeros) and
+/// sets CR4.MCE; we never raise #MC so the post-init path is a
+/// no-op. DE (bit 2) says Debug Extensions are present — CR4.DE
+/// can be set; on real silicon it changes DR4/DR5 access to #UD,
+/// which Linux relies on to detect old vs new debug semantics.
 const CPUID_LEAF1_EDX: u32 = (1 << 0)        // FPU
+        | (1 << 2)                                   // DE (CR4.DE settable)
         | (1 << 3)                                   // PSE (4 MiB pages)
         | (1 << 4)                                   // TSC
         | (1 << 5)                                   // MSR
+        | (1 << 7)                                   // MCE (MCG_CAP/MCG_STATUS stubs)
         | (1 << 8)                                   // CX8 (CMPXCHG8B)
+        | (1 << 9)                                   // APIC (on-chip LAPIC present)
         | (1 << 11)                                  // SEP (SYSENTER)
         | (1 << 13)                                  // PGE (no-op without TLB)
         | (1 << 15)                                  // CMOV

@@ -8220,10 +8220,13 @@ fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
     assert_eq!(cpu.read_r32(0), 0x0000_0664);
     let edx = cpu.read_r32(1);
     assert_ne!(edx & (1 << 0), 0, "FPU");
+    assert_ne!(edx & (1 << 2), 0, "DE (CR4.DE settable)");
     assert_ne!(edx & (1 << 3), 0, "PSE (4 MiB pages)");
     assert_ne!(edx & (1 << 4), 0, "TSC");
     assert_ne!(edx & (1 << 5), 0, "MSR");
+    assert_ne!(edx & (1 << 7), 0, "MCE");
     assert_ne!(edx & (1 << 8), 0, "CX8 (CMPXCHG8B)");
+    assert_ne!(edx & (1 << 9), 0, "APIC (on-chip LAPIC)");
     assert_ne!(edx & (1 << 11), 0, "SEP");
     assert_ne!(edx & (1 << 13), 0, "PGE");
     assert_ne!(edx & (1 << 15), 0, "CMOV");
