@@ -299,7 +299,8 @@ pub mod snapshot {
     ///   IA32_SYSENTER MSRs (CS/ESP/EIP).
     /// * v8 — appends the x87 register stack: 8 × f64 (`fpu_st`) +
     ///   the TOP index (`fpu_top`).
-    pub const VERSION: u8 = 8;
+    /// * v9 — appends the SSE register file: 8 × u128 (`xmm`).
+    pub const VERSION: u8 = 9;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -332,6 +333,10 @@ pub mod snapshot {
     pub const CPU_V8_EXTRA: usize = 65;
     /// Total bytes a v8 CPU image takes.
     pub const CPU_V8_LEN: usize = CPU_V7_LEN + CPU_V8_EXTRA;
+    /// Extra bytes v9 adds: 8 × u128 xmm (128) = 128.
+    pub const CPU_V9_EXTRA: usize = 128;
+    /// Total bytes a v9 CPU image takes.
+    pub const CPU_V9_LEN: usize = CPU_V8_LEN + CPU_V9_EXTRA;
 
     #[derive(Debug)]
     pub enum SnapshotError {
@@ -456,7 +461,7 @@ impl Vm {
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
     pub fn snapshot(&self) -> Vec<u8> {
-        let total = snapshot::HEADER_LEN + snapshot::CPU_V8_LEN + self.mem.size();
+        let total = snapshot::HEADER_LEN + snapshot::CPU_V9_LEN + self.mem.size();
         let mut buf = Vec::with_capacity(total);
         // Header
         buf.extend_from_slice(snapshot::MAGIC);
@@ -525,6 +530,11 @@ impl Vm {
         }
         buf.push(self.cpu.fpu_top);
 
+        // v9 CPU extension — the SSE register file (8 × XMM, 128-bit each).
+        for x in &self.cpu.xmm {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
@@ -553,10 +563,11 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=8) {
+        if !matches!(version, 1..=9) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
+            9 => snapshot::CPU_V9_LEN,
             8 => snapshot::CPU_V8_LEN,
             7 => snapshot::CPU_V7_LEN,
             6 => snapshot::CPU_V6_LEN,
@@ -717,6 +728,16 @@ impl Vm {
             }
             fpu_top = bytes[ext + 64];
         }
+        let mut xmm = [0u128; 8];
+        if version >= 9 {
+            let ext = cpu_start + snapshot::CPU_V8_LEN;
+            for (i, slot) in xmm.iter_mut().enumerate() {
+                let o = ext + i * 16;
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&bytes[o..o + 16]);
+                *slot = u128::from_le_bytes(b);
+            }
+        }
 
         // Memory restore — `restore_full` validates size again as a
         // defense-in-depth check, but we already verified above.
@@ -778,6 +799,7 @@ impl Vm {
         self.cpu.sysenter_eip = sysenter_eip;
         self.cpu.fpu_st = fpu_st;
         self.cpu.fpu_top = fpu_top;
+        self.cpu.xmm = xmm;
         // Re-derive seg_cache from the visible selectors. For real-
         // mode snapshots this is exact (cache = sel << 4). For a
         // future PM snapshot the cache values would diverge from

@@ -1316,7 +1316,7 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
 /// stack_size_32, FPU control/status, SYSENTER MSRs, upper 16 of
 /// GPRs.
 #[test]
-fn snapshot_v8_preserves_i386_state() {
+fn snapshot_v9_preserves_i386_state() {
     let mut vm = Vm::new();
     vm.load_default_guest();
     vm.boot();
@@ -1347,9 +1347,11 @@ fn snapshot_v8_preserves_i386_state() {
     vm.cpu.fpu_st[0] = 1.875;
     vm.cpu.fpu_st[3] = -2.5;
     vm.cpu.fpu_top = 5;
+    vm.cpu.xmm[0] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+    vm.cpu.xmm[7] = u128::MAX;
     let snap = vm.snapshot();
     let mut vm2 = Vm::new();
-    vm2.restore(&snap).expect("v8 restore");
+    vm2.restore(&snap).expect("v9 restore");
     assert_eq!(vm2.cpu().cr0, 0x8000_0001);
     assert_eq!(vm2.cpu().gdtr.limit, 0x00FF);
     assert_eq!(vm2.cpu().gdtr.base, 0x0001_0000);
@@ -1374,6 +1376,8 @@ fn snapshot_v8_preserves_i386_state() {
     assert_eq!(vm2.cpu().fpu_st[0], 1.875);
     assert_eq!(vm2.cpu().fpu_st[3], -2.5);
     assert_eq!(vm2.cpu().fpu_top, 5);
+    assert_eq!(vm2.cpu().xmm[0], 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
+    assert_eq!(vm2.cpu().xmm[7], u128::MAX);
 }
 
 /// A v1 snapshot (synthesized by hand) must still restore the CPU
