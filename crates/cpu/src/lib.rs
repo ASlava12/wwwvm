@@ -596,7 +596,8 @@ impl Cpu {
     /// Not yet modelled: the R/W bit on the descriptor itself
     /// (protection violations vs. plain not-present), User/Supervisor
     /// (since we always run ring 0), and a TLB cache. 4 MiB pages
-    /// (PSE) are also out of scope.
+    /// (CR4.PSE + PDE.PS) collapse the second walk and are honored
+    /// here — Linux's `head_32.S` maps the kernel that way.
     ///
     /// Defaults to a read access; writes go through `translate_write`
     /// so the W bit in the #PF error code reflects the access type.
@@ -627,14 +628,31 @@ impl Cpu {
                 self.raise_fault(linear, w_bit);
                 return 0;
             }
-            let pt_base = pde & 0xFFFF_F000;
-            let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
-            if pte & 1 == 0 {
-                self.raise_fault(linear, w_bit);
-                return 0;
+            // PSE (CR4.PSE = bit 4) + PDE.PS (bit 7) collapses the
+            // PDE into a direct 4 MiB-page descriptor — no PTE
+            // walk. Linux's `head_32.S` uses this to map the entire
+            // kernel virtual range with a handful of PDEs instead of
+            // emitting a million PTEs at boot. PDE.PS without CR4.PSE
+            // is reserved on a 4 KiB-page MMU and would normally
+            // raise #PF with RSVD=1; we treat it as a regular 4 KiB
+            // PDE (i.e. ignore the PS bit) so a buggy guest doesn't
+            // get a phantom fault.
+            if self.cr4 & 0x10 != 0 && pde & 0x80 != 0 {
+                // 4 MiB pages: PDE[31:22] is the frame, linear[21:0]
+                // is the offset within it.
+                let frame = pde & 0xFFC0_0000;
+                let offset = linear & 0x003F_FFFF;
+                frame | offset
+            } else {
+                let pt_base = pde & 0xFFFF_F000;
+                let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
+                if pte & 1 == 0 {
+                    self.raise_fault(linear, w_bit);
+                    return 0;
+                }
+                let frame = pte & 0xFFFF_F000;
+                frame | page_offset
             }
-            let frame = pte & 0xFFFF_F000;
-            frame | page_offset
         };
         // A20 line gating happens *after* paging — it's a property of
         // the physical address bus. With A20 off (the 8086-compat

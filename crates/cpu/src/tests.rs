@@ -2330,6 +2330,42 @@ fn translate_with_non_present_pte_raises_page_fault() {
     assert_eq!(pf.addr, 0x0000_0123);
 }
 
+/// PSE — CR4 bit 4 — promotes a PDE with PS=1 to a 4 MiB-page
+/// descriptor: linear[31:22] picks the PDE, linear[21:0] indexes
+/// into the directly-mapped 4 MiB frame, no PTE walk. Linux's
+/// `head_32.S` flips this on so a handful of PDEs cover the whole
+/// kernel virtual range.
+#[test]
+fn translate_with_pse_pde_uses_4mib_page_directly() {
+    let mut mem = Memory::new(0x0080_0000);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // PG
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr3 = 0x0000_1000;
+    // PDE[1] maps the linear range [0x0040_0000, 0x0080_0000) to
+    // the 4 MiB frame at physical 0x0040_0000. P=1, RW=1, PS=1.
+    //   PS = bit 7, RW = bit 1, P = bit 0  →  0x0040_0000 | 0x83.
+    mem.write_u32(0x1004, 0x0040_0000 | 0x83);
+
+    // linear 0x0040_0000 + 0x12_3456 — should resolve to physical
+    // 0x0040_0000 + 0x12_3456, with no PTE involvement at all (PT
+    // base would point at zeros, so a PTE walk would #PF).
+    let phys = cpu.translate(&mem, 0x0040_0000 + 0x0012_3456);
+    assert!(
+        cpu.pending_fault().is_none(),
+        "no fault on a PSE-mapped read"
+    );
+    assert_eq!(phys, 0x0040_0000 + 0x0012_3456);
+
+    // And a write through the same PSE frame should match. We
+    // poke through write-translation explicitly to confirm both
+    // arms agree.
+    let phys_w = cpu.translate_write(&mem, 0x0040_0000 + 0x0000_0FFF);
+    assert!(cpu.pending_fault().is_none(), "no fault on PSE write");
+    assert_eq!(phys_w, 0x0040_0000 + 0x0000_0FFF);
+}
+
 /// End-to-end: a load that touches an unmapped page must vector
 /// through INT 14 with CR2 set. We identity-map the first 4 MiB so
 /// the boot code, the IVT, and the #PF handler are all reachable,
