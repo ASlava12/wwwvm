@@ -73,6 +73,93 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// Always 640 regardless of actual VM size (the historical PC
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
+/// End-to-end BIOS surface check: a setup.bin-shaped stub that
+/// clears the screen, prints a banner with write-string, reads a
+/// sector from disk into a scratch buffer, then positions the
+/// cursor and paints a marker with char+attribute. Verifies that
+/// four independent INT calls (0x10 AH=0/13, 0x13 AH=2, 0x10
+/// AH=2/9) compose without leaking state through registers or
+/// flags — the kind of multi-call interaction unit tests on the
+/// individual handlers can't catch.
+#[test]
+fn boot_stub_drives_bios_through_clear_print_read_paint() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Banner string at ES:BP = 0:0x9000.
+    vm.mem.write_slice(0x9000, b"BOOT OK");
+    // Sector 0 (boot sector) holds 0xAA; sector 1 holds 0x55 — we
+    // want sector 1 read into 0x8000.
+    let mut disk = vec![0xAA; 512];
+    disk.extend(std::iter::repeat_n(0x55u8, 512));
+    vm.load_disk_image(&disk);
+    // Pre-paint the screen with junk so the clear is observable.
+    for i in 0..(80 * 25) as u32 {
+        let off = i * 2;
+        vm.mem.write_u8(VGA_TEXT_BASE + off, b'!');
+        vm.mem.write_u8(VGA_TEXT_BASE + off + 1, 0x20);
+    }
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            // 1) Set video mode 3 → clear + cursor home.
+            0xB8, 0x03, 0x00, // MOV AX, 0x0003
+            0xCD, 0x10, // INT 0x10
+            // 2) Write banner "BOOT OK" with attr 0x0F (mode 1).
+            0xBD, 0x00, 0x90, // MOV BP, 0x9000
+            0xB9, 0x07, 0x00, // MOV CX, 7
+            0xBB, 0x0F, 0x00, // MOV BX, 0x000F
+            0xBA, 0x00, 0x00, // MOV DX, 0  (DH=0, DL=0)
+            0xB8, 0x01, 0x13, // MOV AX, 0x1301
+            0xCD, 0x10, // INT 0x10
+            // 3) Read sector 1 (LBA 1 / CHS = cyl 0 / head 0 / sec 2)
+            //    into ES:BX = 0:0x8000.
+            0xBB, 0x00, 0x80, // MOV BX, 0x8000
+            0xB8, 0x01, 0x02, // MOV AX, 0x0201
+            0xB9, 0x02, 0x00, // MOV CX, 0x0002
+            0xBA, 0x00, 0x00, // MOV DX, 0
+            0xCD, 0x13, // INT 0x13
+            // 4) Position cursor to (row 3, col 10).
+            0xB4, 0x02, // MOV AH, 0x02
+            0xBA, 0x0A, 0x03, // MOV DX, 0x030A
+            0xCD, 0x10, // INT 0x10
+            // 5) Paint 5 × '*' / 0x4F at the cursor (AH=0x09 does
+            //    NOT advance the cursor).
+            0xB8, 0x2A, 0x09, // MOV AX, 0x092A
+            0xBB, 0x4F, 0x00, // MOV BX, 0x004F
+            0xB9, 0x05, 0x00, // MOV CX, 5
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(200);
+    assert!(vm.is_halted());
+    // (a) Banner painted at row 0 with the bright attribute.
+    for (i, &ch) in b"BOOT OK".iter().enumerate() {
+        let off = i * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), ch);
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), 0x0F);
+    }
+    // (b) A cell well past the banner still holds the post-clear
+    //     fill (' ' / 0x07), proving the screen was cleared.
+    let mid = ((10 * 80) + 40) * 2;
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + mid as u32), b' ');
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + mid as u32 + 1), 0x07);
+    // (c) Sector 1 of the disk landed at 0x8000.
+    for i in 0..512u32 {
+        assert_eq!(vm.mem().read_u8(0x8000 + i), 0x55, "byte {i}");
+    }
+    // (d) The marker stars are at row 3 cols 10..14 with attr 0x4F.
+    for i in 0..5u32 {
+        let off = ((3 * 80) + 10 + i) * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off), b'*');
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off + 1), 0x4F);
+    }
+    // (e) Cursor stayed at (3, 10) — AH=0x09 leaves it put.
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_ROW), 3);
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_COL), 10);
+}
+
 #[test]
 fn bios_int10_write_string_mode1_uses_bl_attribute_and_advances_cursor() {
     let mut vm = Vm::new();
