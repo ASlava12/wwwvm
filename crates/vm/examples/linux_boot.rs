@@ -70,6 +70,26 @@ fn main() {
         "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 initcall_debug",
     );
 
+    // Optional initramfs — without one Linux 6.12 mounts an empty
+    // in-kernel rootfs and parks PID 1 in cpu_idle() because there's
+    // no /init to exec. We confirmed (via WWWVM_TRACE_IRQ) that the
+    // PIT timer fires ~10× per second of simulated time, so the
+    // silent stall after `random: crng init done` is not a
+    // scheduler/IRQ failure — it's a missing userspace. Feeding even
+    // a 1-byte cpio archive makes Linux at least try `unpack_to_rootfs`
+    // and either succeed or panic with a useful "Failed to execute
+    // /init" message we can iterate on. WWWVM_INITRD points at a
+    // .cpio (raw or gzipped — Linux's unpack_to_rootfs autodetects).
+    if let Ok(path) = env::var("WWWVM_INITRD") {
+        match std::fs::read(&path) {
+            Ok(b) => match vm.set_ramdisk(&b) {
+                Ok(()) => println!("loaded initrd: {} ({} bytes)", path, b.len()),
+                Err(e) => eprintln!("set_ramdisk: {e:?}"),
+            },
+            Err(e) => eprintln!("initrd read {path}: {e}"),
+        }
+    }
+
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);
 
