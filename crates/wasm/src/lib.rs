@@ -250,6 +250,23 @@ impl WwwVm {
         self.inner.cpu().idtr.limit
     }
 
+    /// Task Register selector. LTR writes this; the cross-ring
+    /// dispatch path reads `gdtr.base + (tr & 0xFFF8)` to find
+    /// the TSS descriptor and from there the kernel SS0:ESP0.
+    /// A debugger UI uses TR to walk to the active TSS.
+    pub fn get_tr(&self) -> u16 {
+        self.inner.cpu().tr
+    }
+
+    /// LDT Register selector. LLDT writes this. We don't yet walk
+    /// the LDT for descriptor lookups (every test pulls from GDT),
+    /// so this is mostly informational — JS debuggers display it
+    /// alongside the other selectors so the operator can spot
+    /// "kernel did LLDT" events.
+    pub fn get_ldtr(&self) -> u16 {
+        self.inner.cpu().ldtr
+    }
+
     /// Low 32 bits of the time-stamp counter. JS debuggers show
     /// this in the register panel so users can see the VM ticking.
     /// JS lacks a native u64; the high bits are accessible via
@@ -626,6 +643,10 @@ mod tests {
         assert!(vm.get_tsc_low() > 0, "TSC must advance from zero");
         // High half is 0 unless we ran for ~4B cycles.
         assert_eq!(vm.get_tsc_high(), 0);
+        // TR / LDTR — never loaded by this minimal kernel, both stay
+        // at Cpu::new() defaults.
+        assert_eq!(vm.get_tr(), 0);
+        assert_eq!(vm.get_ldtr(), 0);
     }
 
     #[test]
