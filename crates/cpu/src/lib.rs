@@ -5010,6 +5010,17 @@ impl Cpu {
                             // back via RDTSCP (or directly via this
                             // MSR) to identify the current CPU.
                             0xC000_0103 => self.tsc_aux as u64,
+                            // IA32_FEATURE_CONTROL (0x3A). bit 0 = lock,
+                            // bit 1 = enable-VMX-in-SMX, bit 2 = enable-
+                            // VMX-outside-SMX. Reporting 1 = "locked,
+                            // VMX disabled" tells Linux that the BIOS
+                            // never unlocked VMX, so VT-x isn't usable.
+                            0x3A => 1,
+                            // IA32_MCG_CAP (0x179). bits 7:0 = number of
+                            // MCE error-reporting banks. 0 = no banks,
+                            // so Linux skips machine-check setup
+                            // entirely.
+                            0x179 => 0,
                             _ => {
                                 self.ip = op_ip;
                                 self.do_interrupt_with_error(13, Some(0), mem);

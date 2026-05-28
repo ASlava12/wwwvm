@@ -5142,6 +5142,33 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// IA32_FEATURE_CONTROL (0x3A) and IA32_MCG_CAP (0x179) are
+/// probed unconditionally by Linux on boot. Stubbing both keeps
+/// the kernel log noise-free:
+///   0x3A → 1     "locked, VMX disabled" — Linux skips VT-x init
+///   0x179 → 0    "no MCE banks"          — Linux skips MCE init
+#[test]
+fn rdmsr_returns_safe_defaults_for_feature_control_and_mcg_cap() {
+    // MOV ECX, 0x3A ; RDMSR ; MOV EBX, EAX ; MOV ECX, 0x179 ; RDMSR ; HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB9, 0x3A, 0x00, 0x00, 0x00, // MOV ECX, 0x3A
+            0x0F, 0x32, // RDMSR
+            0x66, 0x89, 0xC3, // MOV EBX, EAX
+            0x66, 0xB9, 0x79, 0x01, 0x00, 0x00, // MOV ECX, 0x179
+            0x0F, 0x32, // RDMSR
+            0xF4,
+        ],
+        24,
+    );
+    // FEATURE_CONTROL — captured into EBX from the first RDMSR.
+    let ebx = cpu.regs[r16::BX] as u32 | ((cpu.regs_high[r16::BX] as u32) << 16);
+    assert_eq!(ebx, 1, "FEATURE_CONTROL = locked, VMX disabled");
+    // MCG_CAP — captured into EAX:EDX from the second RDMSR.
+    assert_eq!(cpu.read_r32(0), 0, "MCG_CAP low = 0 (no banks)");
+    assert_eq!(cpu.read_r32(2), 0, "MCG_CAP high = 0");
+}
+
 /// WRMSR to IA32_TSC (0x10) sets the time-stamp counter from
 /// EDX:EAX. Linux's TSC-sync path uses this on SMP bring-up; on
 /// our single-CPU model it's mostly a calibration latch, but
