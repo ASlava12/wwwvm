@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**391 тест** зелёный (mem 6 + devices 38 + cpu 266 + vm 73 +
+**394 теста** зелёные (mem 6 + devices 38 + cpu 266 + vm 76 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -188,7 +188,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   read sectors / 0x08 get drive params / 0x41 LBA ext check),
   0x15 (AH=0x86 wait µs / AH=0x88 ext-mem / AH=0xC0 config-stub /
   AX=0xE801 mem split / AX=0xE820), 0x16 (AH=0x00 read / 0x01
-  peek / 0x02 shift flags).
+  peek / 0x02 shift flags), 0x1A (AH=0x00 get tick / 0x01 set tick /
+  0x02 RTC time / 0x04 RTC date — BCD из CMOS).
 - **IDE/ATA два канала** (primary 0x1F0..0x1F7, secondary
   0x170..0x177): IDENTIFY DEVICE, READ SECTORS и WRITE SECTORS
   (LBA28). 16-битная передача данных приходит как пара байтовых
@@ -227,7 +228,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 391 пройденный тест на текущий момент. CI
+Должно вывести 394 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

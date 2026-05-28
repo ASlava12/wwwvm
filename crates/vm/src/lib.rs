@@ -69,6 +69,12 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///     banners and kernel panic messages.
 ///   * INT 0x16 AH=0x02 — get keyboard shift-flags. We don't model
 ///     modifier-key state, so always report 0 (no modifiers held).
+///   * INT 0x1A AH=0x00 — get system tick counter (CX:DX = BDA
+///     0x046C/0x046E; AL = midnight-rollover flag, always 0).
+///   * INT 0x1A AH=0x01 — set system tick counter from CX:DX.
+///   * INT 0x1A AH=0x02/0x04 — read RTC time/date from CMOS; the
+///     returned values are BCD-encoded (BIOS convention), regardless
+///     of the CMOS binary/BCD mode.
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
     match vector {
         0x10 => bios_int10(cpu, mem),
@@ -76,6 +82,7 @@ pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) ->
         0x13 => bios_int13(cpu, mem, io),
         0x15 => bios_int15(cpu, mem),
         0x16 => bios_int16(cpu, io),
+        0x1A => bios_int1a(cpu, mem, io),
         _ => false,
     }
 }
@@ -583,6 +590,72 @@ fn bios_int16(cpu: &mut Cpu, io: &mut IoBus) -> bool {
         // its default behaviour, which is what we want.
         0x02 => {
             cpu.write_r8(0, 0);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// BDA offsets the tick-counter lives at — IBM BIOS convention.
+const BDA_TICK_LOW: u32 = 0x046C; // u32 low word
+const BDA_TICK_HIGH: u32 = 0x046E; // u32 high word
+
+/// Convert a binary 0..99 byte to its packed-BCD form. INT 0x1A
+/// AH=0x02/0x04 return time/date as BCD regardless of the CMOS
+/// internal format, so we always convert on the way out.
+fn to_bcd(v: u8) -> u8 {
+    ((v / 10) << 4) | (v % 10)
+}
+
+fn bios_int1a(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
+    let ah = cpu.read_r8(4);
+    match ah {
+        // Get tick counter. CX = high word, DX = low word of the
+        // 32-bit count at BDA 0x046C/0x046E. AL = midnight rollover
+        // (we don't track it across reads, always 0).
+        0x00 => {
+            let lo = mem.read_u16(BDA_TICK_LOW);
+            let hi = mem.read_u16(BDA_TICK_HIGH);
+            cpu.regs[wwwvm_cpu::r16::CX] = hi;
+            cpu.regs[wwwvm_cpu::r16::DX] = lo;
+            cpu.write_r8(0, 0);
+            true
+        }
+        // Set tick counter from CX:DX (CX = high, DX = low).
+        0x01 => {
+            let hi = cpu.regs[wwwvm_cpu::r16::CX];
+            let lo = cpu.regs[wwwvm_cpu::r16::DX];
+            mem.write_u16(BDA_TICK_LOW, lo);
+            mem.write_u16(BDA_TICK_HIGH, hi);
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            true
+        }
+        // Read RTC time. CH=hours, CL=minutes, DH=seconds, DL=DST.
+        // The CMOS we model stores time in binary mode (Status B
+        // bit 2 set); BIOS callers expect BCD here, so we convert.
+        0x02 => {
+            let hours = io.cmos.storage_byte(wwwvm_devices::cmos_reg::HOURS);
+            let mins = io.cmos.storage_byte(wwwvm_devices::cmos_reg::MINUTES);
+            let secs = io.cmos.storage_byte(wwwvm_devices::cmos_reg::SECONDS);
+            cpu.write_r8(5, to_bcd(hours)); // CH
+            cpu.write_r8(1, to_bcd(mins)); // CL
+            cpu.write_r8(6, to_bcd(secs)); // DH
+            cpu.write_r8(2, 0); // DL = DST flag (none)
+            cpu.flags &= !wwwvm_cpu::flag::CF;
+            true
+        }
+        // Read RTC date. CH=century, CL=year, DH=month, DL=day —
+        // all BCD. We don't store century in CMOS, so hard-code
+        // 0x20 (the 21st century).
+        0x04 => {
+            let year = io.cmos.storage_byte(wwwvm_devices::cmos_reg::YEAR);
+            let month = io.cmos.storage_byte(wwwvm_devices::cmos_reg::MONTH);
+            let day = io.cmos.storage_byte(wwwvm_devices::cmos_reg::DAY_OF_MONTH);
+            cpu.write_r8(5, 0x20); // CH = century
+            cpu.write_r8(1, to_bcd(year)); // CL = year
+            cpu.write_r8(6, to_bcd(month)); // DH = month
+            cpu.write_r8(2, to_bcd(day)); // DL = day
+            cpu.flags &= !wwwvm_cpu::flag::CF;
             true
         }
         _ => false,

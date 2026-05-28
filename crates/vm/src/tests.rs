@@ -1,5 +1,89 @@
 use super::*;
 
+/// INT 0x1A AH=0x01 sets the BDA tick counter, AH=0x00 reads it
+/// back — the round-trip a guest expects when calibrating against
+/// the ~18.2 Hz timer tick.
+#[test]
+fn bios_int1a_set_then_read_tick_counter_round_trip() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // AH=0x01 with CX=0x1234, DX=0x5678 → BDA tick = 0x1234_5678.
+    // Then AH=0x00 should give back CX=0x1234, DX=0x5678, AL=0.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x01, // MOV AH, 0x01
+            0xB9, 0x34, 0x12, // MOV CX, 0x1234
+            0xBA, 0x78, 0x56, // MOV DX, 0x5678
+            0xCD, 0x1A, // INT 0x1A
+            // Poison CX/DX so the read has to overwrite them.
+            0xB9, 0xFF, 0xFF, // MOV CX, 0xFFFF
+            0xBA, 0xFF, 0xFF, // MOV DX, 0xFFFF
+            0xB4, 0x00, // MOV AH, 0x00
+            0xCD, 0x1A, // INT 0x1A
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::CX], 0x1234);
+    assert_eq!(cpu.regs[wwwvm_cpu::r16::DX], 0x5678);
+    assert_eq!(cpu.read_r8(0), 0, "AL = 0 (no midnight rollover)");
+}
+
+/// INT 0x1A AH=0x02 reads the RTC time from CMOS and returns it
+/// BCD-encoded — even though our CMOS stores binary internally,
+/// BIOS callers expect BCD on this path.
+#[test]
+fn bios_int1a_read_rtc_time_returns_bcd_from_cmos() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Seed CMOS to 23:45:09 (binary; BIOS will convert to BCD).
+    vm.io.cmos.set_time(26, 1, 1, 23, 45, 9);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x02, // MOV AH, 0x02
+            0xCD, 0x1A, // INT 0x1A
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(5), 0x23, "CH = hours (BCD)");
+    assert_eq!(cpu.read_r8(1), 0x45, "CL = minutes (BCD)");
+    assert_eq!(cpu.read_r8(6), 0x09, "DH = seconds (BCD)");
+    assert_eq!(cpu.read_r8(2), 0, "DL = DST flag = 0");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// INT 0x1A AH=0x04 reads the RTC date — century in CH (hard-coded
+/// to 0x20 since we don't track it), then year/month/day in
+/// CL/DH/DL, all BCD.
+#[test]
+fn bios_int1a_read_rtc_date_returns_bcd_from_cmos() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.io.cmos.set_time(26, 5, 27, 0, 0, 0);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x04, // MOV AH, 0x04
+            0xCD, 0x1A, // INT 0x1A
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(5), 0x20, "CH = 21st century");
+    assert_eq!(cpu.read_r8(1), 0x26, "CL = year 2026");
+    assert_eq!(cpu.read_r8(6), 0x05, "DH = May");
+    assert_eq!(cpu.read_r8(2), 0x27, "DL = day 27");
+}
+
 /// INT 0x16 AH=0x00 (blocking read). With a key already queued, the
 /// single INT call must consume it and return it in AL.
 #[test]
