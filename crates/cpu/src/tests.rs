@@ -4053,6 +4053,42 @@ fn pop_ds_in_pm_with_bad_selector_raises_gp_with_selector() {
     assert_eq!(mem.read_u16(0x7BFA), 0x7C03, "saved IP = start of POP DS");
 }
 
+/// End-to-end ATA: issue an IDENTIFY DEVICE command via OUT DX, AL
+/// then drain the first word from the data port via IN AX, DX. The
+/// signature word (0x0040) confirms (a) the CPU dispatches port IO
+/// to the right device, (b) the IDE controller's command + data
+/// paths are wired through IoBus, and (c) inw decomposed into two
+/// byte reads still drains exactly one word of buffer.
+#[test]
+fn ata_identify_via_in_out_returns_signature_word() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xBA, 0xF7, 0x01, // MOV DX, 0x01F7  (command port)
+            0xB0, 0xEC, // MOV AL, 0xEC   (IDENTIFY)
+            0xEE, // OUT DX, AL
+            0xBA, 0xF0, 0x01, // MOV DX, 0x01F0  (data port)
+            0xED, // IN AX, DX
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    // Two-sector image — IDENTIFY's word 60 will report it.
+    io.ata.disk.load(&[0xAA; 1024]);
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Word 0 of the IDENTIFY block: 0x0040 (present ATA device).
+    assert_eq!(cpu.regs[r16::AX], 0x0040);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

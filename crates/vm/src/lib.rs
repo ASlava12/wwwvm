@@ -142,7 +142,7 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
             let dest_linear = cpu.linear_seg(wwwvm_cpu::sreg::ES, bx as u32);
 
             let mut buf = vec![0u8; count * wwwvm_devices::DISK_SECTOR_SIZE];
-            io.disk.read_sectors(lba, count as u8, &mut buf);
+            io.disk().read_sectors(lba, count as u8, &mut buf);
             for (i, &b) in buf.iter().enumerate() {
                 cpu.mem_write_u8(mem, dest_linear.wrapping_add(i as u32), b);
             }
@@ -903,7 +903,7 @@ impl Vm {
     /// shim reads from here. `bytes.len()` need not be a sector
     /// multiple; bytes past the end read as zero.
     pub fn load_disk_image(&mut self, bytes: &[u8]) {
-        self.io.disk.load(bytes);
+        self.io.disk_mut().load(bytes);
     }
 
     /// Parse an ELF32 image and copy its PT_LOAD segments into guest
@@ -951,7 +951,7 @@ impl Vm {
     pub fn boot_from_disk(&mut self) {
         self.cpu.reset_to_boot();
         let mut buf = [0u8; wwwvm_devices::DISK_SECTOR_SIZE];
-        self.io.disk.read_sectors(0, 1, &mut buf);
+        self.io.disk().read_sectors(0, 1, &mut buf);
         self.mem.write_slice(BOOT_LOAD_ADDR, &buf);
         self.io.uart_mut().push_rx(&self.autorun);
         self.autorun.clear();

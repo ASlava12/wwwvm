@@ -22,6 +22,7 @@ pub trait IoDevice {
     fn write(&mut self, port: u16, value: u8);
 }
 
+mod ata;
 mod cmos;
 mod disk;
 mod keyboard;
@@ -29,6 +30,7 @@ mod pic;
 mod pit;
 mod uart;
 
+pub use ata::Ata;
 pub use cmos::{reg as cmos_reg, Cmos};
 pub use disk::{Disk, SECTOR_SIZE as DISK_SECTOR_SIZE};
 pub use keyboard::Keyboard;
@@ -50,10 +52,24 @@ pub struct IoBus {
     pub pit: Pit,
     pub kbd: Keyboard,
     pub cmos: Cmos,
-    /// In-memory boot disk. Empty by default; populated via
-    /// `Vm::load_disk_image`. The host-side BIOS shim consults this
-    /// for INT 0x13 reads. Not snapshotted yet.
-    pub disk: Disk,
+    /// Primary IDE channel + its in-memory boot disk. The disk is
+    /// owned by the controller; existing call sites that used to
+    /// reach for `io.disk` directly now go through `io.disk()` /
+    /// `io.disk_mut()` accessors. Not snapshotted yet.
+    pub ata: Ata,
+}
+
+impl IoBus {
+    /// Convenience accessor for code paths (the BIOS shim, the
+    /// snapshot of the boot sector) that only care about the
+    /// disk image, not the IDE controller's register state.
+    pub fn disk(&self) -> &Disk {
+        &self.ata.disk
+    }
+
+    pub fn disk_mut(&mut self) -> &mut Disk {
+        &mut self.ata.disk
+    }
 }
 
 impl IoBus {
@@ -67,7 +83,7 @@ impl IoBus {
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
-            disk: Disk::new(),
+            ata: Ata::new(),
         }
     }
 
@@ -81,7 +97,7 @@ impl IoBus {
             pit: Pit::standard(),
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
-            disk: Disk::new(),
+            ata: Ata::new(),
         }
     }
 
@@ -192,6 +208,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.slave_pic.read(port);
         }
+        let (lo, hi) = self.ata.port_range();
+        if port >= lo && port <= hi {
+            return self.ata.read(port);
+        }
         0xFF
     }
 
@@ -224,6 +244,11 @@ impl IoBus {
         let (lo, hi) = self.slave_pic.port_range();
         if port >= lo && port <= hi {
             self.slave_pic.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.ata.port_range();
+        if port >= lo && port <= hi {
+            self.ata.write(port, value);
         }
     }
 }
