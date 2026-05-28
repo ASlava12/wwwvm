@@ -4592,6 +4592,36 @@ impl Cpu {
                             packed_f32(s, s, |x, _| x.sqrt())
                         };
                     }
+                    // Packed bitwise logicals (0F 54-57): ANDPS/ANDNPS/
+                    // ORPS/XORPS. Lane-independent, so plain 128-bit
+                    // ops; the 0x66 (PD) forms use identical bits.
+                    // `xorps xmm,xmm` zeroes a register; ANDPS/ANDNPS
+                    // build the fabs / copysign sign-bit masks.
+                    0x54..=0x57 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = match op2 {
+                            0x54 => a & b,
+                            0x55 => !a & b, // ANDNPS: (NOT dest) AND src
+                            0x56 => a | b,
+                            _ => a ^ b,
+                        };
+                    }
+                    // UNPCKL/UNPCKH (0F 14/15) — interleave lanes from
+                    // the destination (SRC1) and r/m source (SRC2).
+                    // 0x66 selects 64-bit lanes (PD), else 32-bit (PS).
+                    0x14 | 0x15 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src2 = self.read_xmm_rm(rm, mem);
+                        let src1 = self.xmm[reg as usize];
+                        let high = op2 == 0x15;
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            unpck_pd(src1, src2, high)
+                        } else {
+                            unpck_ps(src1, src2, high)
+                        };
+                    }
 
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
@@ -5411,6 +5441,23 @@ fn fmin_max_f32(a: f32, b: f32, is_min: bool) -> f32 {
     } else {
         b
     }
+}
+
+/// UNPCKLPS/UNPCKHPS lane interleave (32-bit lanes). Low picks lanes
+/// 0,1; high picks lanes 2,3. The result alternates SRC1, SRC2:
+/// `[s1[i], s2[i], s1[i+1], s2[i+1]]`.
+fn unpck_ps(src1: u128, src2: u128, high: bool) -> u128 {
+    let lane = |v: u128, i: u32| (v >> (i * 32)) & 0xFFFF_FFFF;
+    let (i0, i1) = if high { (2, 3) } else { (0, 1) };
+    lane(src1, i0) | (lane(src2, i0) << 32) | (lane(src1, i1) << 64) | (lane(src2, i1) << 96)
+}
+
+/// UNPCKLPD/UNPCKHPD lane interleave (64-bit lanes): `[s1[i], s2[i]]`
+/// where i is 0 (low) or 1 (high).
+fn unpck_pd(src1: u128, src2: u128, high: bool) -> u128 {
+    let lane = |v: u128, i: u32| (v >> (i * 64)) & 0xFFFF_FFFF_FFFF_FFFF;
+    let i = if high { 1 } else { 0 };
+    lane(src1, i) | (lane(src2, i) << 64)
 }
 
 // SHLD/SHRD helpers — free fns to keep the dispatcher above readable.

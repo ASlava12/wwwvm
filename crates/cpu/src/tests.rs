@@ -2916,6 +2916,86 @@ fn sse_sqrtss_minss_scalar_preserves_upper() {
     assert_eq!(mem.read_u32(0x62C), 0xCCCC_CCCC);
 }
 
+/// SSE bitwise float logicals (ANDPS/ANDNPS/ORPS/XORPS). Runs each
+/// over a fixed lane pattern and checks the 128-bit result, with
+/// ANDNPS exercising the (NOT dest) AND src ordering specifically.
+#[test]
+fn sse_bitwise_logicals_andps_orps_xorps_andnps() {
+    fn logical(op: u8) -> u128 {
+        let (a, b) = (0xF0F0_F0F0u32, 0x0FF0_0FF0u32);
+        let mut mem = Memory::new(0x10_0000);
+        for i in 0..4u32 {
+            mem.write_u32(0x600 + i * 4, a);
+            mem.write_u32(0x610 + i * 4, b);
+        }
+        mem.write_slice(
+            0x7C00,
+            &[
+                0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+                0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+                0x0F, op, 0xC1, // <logical> XMM0, XMM1
+                0xF4,
+            ],
+        );
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..12 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert!(cpu.halted);
+        cpu.xmm[0]
+    }
+    let rep = |d: u32| {
+        let d = d as u128;
+        d | (d << 32) | (d << 64) | (d << 96)
+    };
+    assert_eq!(logical(0x54), rep(0x00F0_00F0)); // ANDPS  = A & B
+    assert_eq!(logical(0x56), rep(0xFFF0_FFF0)); // ORPS   = A | B
+    assert_eq!(logical(0x57), rep(0xFF00_FF00)); // XORPS  = A ^ B
+    assert_eq!(logical(0x55), rep(0x0F00_0F00)); // ANDNPS = !A & B
+}
+
+/// UNPCKLPS interleaves the low two 32-bit lanes of dest and source:
+/// [a0,a1,a2,a3] ∪ [b0,b1,b2,b3] → [a0,b0,a1,b1].
+#[test]
+fn sse_unpcklps_interleaves_low_lanes() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [0x1111_1111u32, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+    let b = [0xAAAA_AAAAu32, 0xBBBB_BBBB, 0xCCCC_CCCC, 0xDDDD_DDDD];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize]);
+        mem.write_u32(0x610 + i * 4, b[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x0F, 0x14, 0xC1, // UNPCKLPS XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x620), 0x1111_1111); // a0
+    assert_eq!(mem.read_u32(0x624), 0xAAAA_AAAA); // b0
+    assert_eq!(mem.read_u32(0x628), 0x2222_2222); // a1
+    assert_eq!(mem.read_u32(0x62C), 0xBBBB_BBBB); // b1
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
