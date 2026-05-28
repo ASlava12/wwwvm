@@ -121,9 +121,16 @@ fn main() {
     let stop_at_eip = env::var("WWWVM_STOP_AT_EIP")
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    // WWWVM_STOP_AT_CR2=0xVAL — halt at the first step where CR2
+    // equals the specified value. Use this to catch the precise
+    // moment of a known bad-pointer fault before Linux's #PF
+    // handler runs and rewrites the visible state.
+    let stop_at_cr2 = env::var("WWWVM_STOP_AT_CR2")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     while steps < STEP_BUDGET {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
-        let chunk = if pg_on && (stop_at_panic || stop_at_eip.is_some()) {
+        let chunk = if pg_on && (stop_at_panic || stop_at_eip.is_some() || stop_at_cr2.is_some()) {
             1
         } else if pg_on && (stop_at_first_pf || stop_at_first_exc) {
             100
@@ -210,6 +217,19 @@ fn main() {
             );
             stop = st;
             break;
+        }
+        if let Some(target) = stop_at_cr2 {
+            if pg_on && vm.cpu().cr2 == target {
+                println!(
+                    "[{:>10}] HIT CR2 target {:08X} at EIP={:08X} ESP={:08X}",
+                    steps,
+                    target,
+                    vm.cpu().ip,
+                    vm.cpu().read_r32(4)
+                );
+                stop = st;
+                break;
+            }
         }
         if stop_at_first_pf && vm.cpu().cr2 != 0 {
             // CR2 became non-zero — a #PF was raised somewhere in

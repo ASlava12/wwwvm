@@ -3437,14 +3437,29 @@ impl Cpu {
                 }
             }
 
-            // XCHG AX, r16 — short form. 0x90 (XCHG AX, AX) is NOP and
-            // is handled by the dedicated NOP arm above.
+            // XCHG AX, r16 — short form. Under 0x66 (or in a 32-bit
+            // code segment) this is XCHG EAX, r32 and must swap the
+            // full 32 bits, not just the low halves. 0x90 (XCHG AX,
+            // AX) is NOP and is handled by the dedicated NOP arm
+            // above. Linux's `__udelay`-family stubs call into
+            // helpers that XCHG EAX with a register-loaded pointer
+            // right after entry — losing the upper 16 bits there
+            // turns a kernel pointer into a low-memory address and
+            // the first deref BUGs with "unable to handle page
+            // fault for address: 000031ec"-style oopses.
             0x91..=0x97 => {
                 let i = (opcode - 0x90) as usize;
-                let ax = self.regs[r16::AX];
-                let other = self.regs[i];
-                self.regs[r16::AX] = other;
-                self.regs[i] = ax;
+                if self.op_size_32 {
+                    let eax = self.read_r32(r16::AX as u8);
+                    let other = self.read_r32(i as u8);
+                    self.write_r32(r16::AX as u8, other);
+                    self.write_r32(i as u8, eax);
+                } else {
+                    let ax = self.regs[r16::AX];
+                    let other = self.regs[i];
+                    self.regs[r16::AX] = other;
+                    self.regs[i] = ax;
+                }
             }
 
             // LES r16, m — load far pointer into reg + ES.

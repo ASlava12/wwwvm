@@ -2366,6 +2366,29 @@ fn translate_with_pse_pde_uses_4mib_page_directly() {
     assert_eq!(phys_w, 0x0040_0000 + 0x0000_0FFF);
 }
 
+/// 0x91..=0x97 short-form `XCHG AX, r16` becomes `XCHG EAX, r32`
+/// under the 0x66 operand-size prefix. We used to only swap the
+/// low 16 bits, silently turning `XCHG EAX, EDX` into "the low half
+/// of EDX moves to AX; the upper half of EAX stays put, the upper
+/// half of EDX is left in place" — a kernel pointer in EDX would
+/// lose its high half and the next deref BUG'd with
+/// "unable to handle page fault for address: 000031ec" oopses in
+/// Linux's __udelay helpers.
+#[test]
+fn xchg_eax_r32_short_form_swaps_full_32_bits() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x55, 0x55, 0xAA, 0xAA, // MOV EAX, 0xAAAA5555
+            0x66, 0xBA, 0xE0, 0x31, 0xAC, 0xC0, // MOV EDX, 0xC0AC31E0
+            0x66, 0x92, // XCHG EAX, EDX
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(0), 0xC0AC_31E0, "EAX must hold full EDX");
+    assert_eq!(cpu.read_r32(2), 0xAAAA_5555, "EDX must hold full EAX");
+}
+
 /// A multi-byte write whose target is *itself* the PDE that maps it
 /// must use the pre-write translation for every byte of the access.
 /// Real x86 caches the translation in the TLB at fetch + decode
