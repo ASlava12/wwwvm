@@ -74,7 +74,10 @@ fn main() {
     let mut last_cr4 = 0u32;
     let mut last_idtr_base = 0u32;
     let mut last_cr3 = 0u32;
+    let mut last_cr2 = 0u32;
     let mut last_eip_region: Option<u32> = None;
+    let mut last_eip_sample = 0u32;
+    let mut stuck_chunks = 0u32;
     let mut stop = Stop::StepBudget;
     while steps < STEP_BUDGET {
         let (s, st) = vm.run_steps(chunk);
@@ -152,6 +155,34 @@ fn main() {
             );
             last_eip_region = Some(region);
         }
+        // CR2 only updates on a #PF — every transition here is a
+        // new page-fault address. Spammy if the handler keeps
+        // page-faulting in a loop, which is itself useful info.
+        let cr2 = vm.cpu().cr2;
+        if cr2 != last_cr2 {
+            println!(
+                "[{:>10}] #PF CR2: {:08X} -> {:08X} (EIP={:08X})",
+                steps,
+                last_cr2,
+                cr2,
+                vm.cpu().ip
+            );
+            last_cr2 = cr2;
+        }
+        // Coarse stuck-detection: if EIP didn't move out of a
+        // 256-byte window across two consecutive chunks, the
+        // kernel is in a tight loop — log so we know when it
+        // started, even if no other transitions fire.
+        let eip = vm.cpu().ip;
+        if eip & !0xFF == last_eip_sample & !0xFF {
+            stuck_chunks += 1;
+            if stuck_chunks == 1 {
+                println!("[{:>10}] EIP stuck in {:08X}..+0x100", steps, eip & !0xFF);
+            }
+        } else {
+            stuck_chunks = 0;
+        }
+        last_eip_sample = eip;
         if (steps % 100_000_000) < (chunk as u64) {
             let out = vm.drain_output();
             if !out.is_empty() {
@@ -208,6 +239,113 @@ fn main() {
         }
     }
     println!();
+
+    // Stack contents — top 32 bytes (likely contain saved return
+    // addresses / register spills from the path that got us here).
+    print!("  stack @ ESP: ");
+    for i in 0..8 {
+        let w = mem.read_u32(esp.wrapping_add(i * 4));
+        print!("{w:08X} ");
+    }
+    println!();
+
+    // IDT[14] = #PF gate. IDTR base is a *virtual* address — we
+    // must walk through CR3 to read the gate. If our CPU's #PF
+    // dispatch doesn't do this walk, that's the bug.
+    let walk = |va: u32| -> Option<u32> {
+        let pde_idx = (va >> 22) as usize;
+        let pte_idx = ((va >> 12) & 0x3FF) as usize;
+        let pde = mem.read_u32((cpu.cr3 & !0xFFF) + pde_idx as u32 * 4);
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & 0x80 != 0 {
+            return Some((pde & 0xFFC0_0000) | (va & 0x003F_FFFF));
+        }
+        let pte = mem.read_u32((pde & !0xFFF) + pte_idx as u32 * 4);
+        if pte & 1 == 0 {
+            return None;
+        }
+        Some((pte & !0xFFF) | (va & 0xFFF))
+    };
+
+    let idt_base = cpu.idtr.base;
+    let idt14_va = idt_base.wrapping_add(14 * 8);
+    let (g_lo, g_hi) = match walk(idt14_va) {
+        Some(p_lo) => (mem.read_u32(p_lo), mem.read_u32(p_lo + 4)),
+        None => (0, 0),
+    };
+    let handler_off = (g_lo & 0xFFFF) | (g_hi & 0xFFFF_0000);
+    let handler_sel = (g_lo >> 16) & 0xFFFF;
+    let handler_type = (g_hi >> 8) & 0xFF;
+    println!(
+        "  IDT[14] (VA {idt14_va:08X}) = offset {handler_off:08X}  sel {handler_sel:04X}  type {handler_type:02X}"
+    );
+    if handler_off == eip {
+        println!("  -> EIP == IDT[14] offset: dispatch correctly entered do_page_fault");
+    } else {
+        println!(
+            "  -> EIP differs from IDT[14]: either dispatch is broken, or handler tail-jumped here"
+        );
+    }
+
+    // Dump 256 bytes at the physical location the handler maps to —
+    // if it's all zeros we have a decompressor-output bug; if it's
+    // non-zero our paging walks to the wrong physical address.
+    let phys = (mem.read_u32(0x00C5CC08) & !0xFFF) // PDE[770] of CR3
+        .wrapping_add(0); // first PT
+    let pt_pa = mem.read_u32(0x00C5CC08) & !0xFFF;
+    let pte_pa = pt_pa + 137 * 4;
+    let pte_val = mem.read_u32(pte_pa);
+    let phys_page = pte_val & !0xFFF;
+    let phys_eip = phys_page | (eip & 0xFFF);
+    println!("  physical EIP page: {phys_page:08X}  (PTE @ {pte_pa:08X} = {pte_val:08X})");
+    // Scan 4096 bytes (whole page) to see how much is zero vs non-zero.
+    let mut nonzero = 0;
+    let mut first_nz = None;
+    for i in 0..4096 {
+        let b = mem.read_u8(phys_page + i);
+        if b != 0 {
+            nonzero += 1;
+            if first_nz.is_none() {
+                first_nz = Some((i, b));
+            }
+        }
+    }
+    println!(
+        "  page {phys_page:08X} contents: {nonzero}/4096 non-zero bytes, first @ offset {:?}",
+        first_nz
+    );
+    // 64-byte snapshot of the actual physical bytes at EIP.
+    print!("  phys @ {phys_eip:08X}:");
+    for i in 0..32 {
+        print!(" {:02X}", mem.read_u8(phys_eip + i));
+    }
+    println!();
+    let _ = phys; // silence unused
+
+    // Walk the page directory to see how EIP's page is mapped.
+    // VA bits 31:22 = PDE index, 21:12 = PTE index, 11:0 = offset.
+    let pde_idx = (eip >> 22) as usize;
+    let pte_idx = ((eip >> 12) & 0x3FF) as usize;
+    let pde_addr = cpu.cr3 & !0xFFF | (pde_idx as u32 * 4);
+    let pde = mem.read_u32(pde_addr);
+    print!("  page walk EIP={eip:08X}: PDE[{pde_idx}] @ {pde_addr:08X} = {pde:08X}");
+    if pde & 1 == 0 {
+        println!("  (not present)");
+    } else if pde & 0x80 != 0 {
+        let phys = (pde & 0xFFC0_0000) | (eip & 0x003F_FFFF);
+        println!("  (PS=1, 4 MiB page) -> phys {phys:08X}");
+    } else {
+        let pt_addr = (pde & !0xFFF) + pte_idx as u32 * 4;
+        let pte = mem.read_u32(pt_addr);
+        let phys = if pte & 1 != 0 {
+            (pte & !0xFFF) | (eip & 0xFFF)
+        } else {
+            0
+        };
+        println!("  PTE[{pte_idx}] @ {pt_addr:08X} = {pte:08X}  -> phys {phys:08X}");
+    }
 
     // What did the UART receive? Drain everything pending.
     let out = vm.drain_output();
