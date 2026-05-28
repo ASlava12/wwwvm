@@ -256,11 +256,22 @@ pub struct Cpu {
     /// field loads, REP MOVSD source/dest — these all hit the
     /// same page for many bytes in a row, so caching the most
     /// recent (page, frame, a20) tuple lets us skip the PDE+PTE
-    /// walk on each follow-up byte. We don't cache *writes* —
-    /// write permission depends on CR0.WP + effective R/W + CPL
-    /// and the bookkeeping would dwarf the saved walk.
+    /// walk on each follow-up byte.
     /// Invalidations match `fetch_tlb`.
     read_tlb: Cell<Option<(u32, u32, bool)>>,
+    /// 1-entry data-write translation cache. Covers
+    /// `translate_write`. Stack pushes, struct field stores, REP
+    /// STOSD destination — these all keep writing to the same
+    /// page. Write *permission* (CR0.WP + effective R/W + CPL=3
+    /// U/S check) varies with state but all of those are
+    /// invalidated when they can change: CR3 reload (PDE/PTE
+    /// table swap), INVLPG (per-page R/W change), CR0 write
+    /// (CR0.WP toggle), and write_sreg(CS) (CPL transition).
+    /// As long as those four sites stay in `invalidate_fetch_tlb`,
+    /// caching a successful write translation is sound — the
+    /// permission check passed at cache time and nothing that
+    /// could change permissions has fired since.
+    write_tlb: Cell<Option<(u32, u32, bool)>>,
     /// IP of the instruction currently being decoded — captured at
     /// the top of every `step()` so that a #PF raised mid-decode
     /// can rewind `self.ip` to the faulting instruction before
@@ -405,6 +416,7 @@ impl Cpu {
             pending_fault: Cell::new(None),
             fetch_tlb: Cell::new(None),
             read_tlb: Cell::new(None),
+            write_tlb: Cell::new(None),
             // (the TLB slots are also explicitly cleared by
             // reset_to_boot — see `Cpu::reset_to_boot`).
             last_op_ip: 0,
@@ -462,6 +474,7 @@ impl Cpu {
         self.pending_fault.set(None);
         self.fetch_tlb.set(None);
         self.read_tlb.set(None);
+        self.write_tlb.set(None);
         self.last_op_ip = 0;
         self.a20 = true;
         self.code_size_32 = false;
@@ -809,7 +822,28 @@ impl Cpu {
     /// W=1 in the error code so the handler knows a write was the
     /// trigger. Used by `mem_write_u8/16/32`.
     pub fn translate_write(&self, mem: &Memory, linear: u32) -> u32 {
-        self.translate_inner(mem, linear, Access::Write)
+        // Same shape as `translate` (read fast path), just on a
+        // separate slot. See `write_tlb` doc-comment for the
+        // soundness argument re: CR0.WP / R/W / CPL invalidation.
+        if self.cr0 & 0x8000_0000 == 0 {
+            return if self.a20 {
+                linear
+            } else {
+                linear & 0xFFEF_FFFF
+            };
+        }
+        let page = linear & 0xFFFF_F000;
+        if let Some((cached_page, cached_frame, cached_a20)) = self.write_tlb.get() {
+            if cached_page == page && cached_a20 == self.a20 {
+                return cached_frame | (linear & 0xFFF);
+            }
+        }
+        let phys = self.translate_inner(mem, linear, Access::Write);
+        if self.pending_fault.get().is_none() {
+            self.write_tlb
+                .set(Some((page, phys & 0xFFFF_F000, self.a20)));
+        }
+        phys
     }
 
     /// Same as `translate` but tags the resulting #PF with I/D=1
@@ -859,10 +893,11 @@ impl Cpu {
     /// silicon and Linux never does that on the fetch path.
     fn invalidate_fetch_tlb(&self) {
         self.fetch_tlb.set(None);
-        // Read-side cache shares all the same invalidation
-        // triggers; clear both together so the call sites only
-        // have one helper to remember.
+        // Read- and write-side caches share all the same
+        // invalidation triggers; clear them together so the call
+        // sites only have one helper to remember.
         self.read_tlb.set(None);
+        self.write_tlb.set(None);
     }
 
     // PDE/PTE A/D bits are deliberately NOT updated by translate_inner.
