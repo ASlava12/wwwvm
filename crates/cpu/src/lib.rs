@@ -4261,6 +4261,54 @@ impl Cpu {
                         let v = self.xmm[reg as usize];
                         self.write_xmm_rm(rm, mem, v);
                     }
+                    // Packed-integer logicals (66 0F): PAND/POR/PXOR.
+                    // Lane-independent, so they're plain 128-bit bitops.
+                    // `pxor xmm, xmm` is the canonical XMM-zeroing idiom.
+                    0xDB if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] &= v;
+                    }
+                    0xEB if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] |= v;
+                    }
+                    0xEF if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] ^= v;
+                    }
+                    // Packed-integer add/sub with per-lane wrap. The
+                    // opcode's low bits pick the lane width:
+                    //   FC PADDB (8)  FD PADDW (16)  FE PADDD (32)
+                    //   D4 PADDQ (64)
+                    //   F8 PSUBB      F9 PSUBW       FA PSUBD
+                    //   FB PSUBQ
+                    0xFC | 0xFD | 0xFE | 0xD4 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lane = match op2 {
+                            0xFC => 8,
+                            0xFD => 16,
+                            0xFE => 32,
+                            _ => 64,
+                        };
+                        self.xmm[reg as usize] = packed_add(a, b, lane);
+                    }
+                    0xF8..=0xFB if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lane = match op2 {
+                            0xF8 => 8,
+                            0xF9 => 16,
+                            0xFA => 32,
+                            _ => 64,
+                        };
+                        self.xmm[reg as usize] = packed_sub(a, b, lane);
+                    }
 
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
@@ -4973,6 +5021,38 @@ impl Cpu {
             _ => false,
         }
     }
+}
+
+/// Packed per-lane add: split `a` and `b` into `lane_bits`-wide
+/// lanes (8/16/32/64), add each with wraparound, recombine. The
+/// SSE PADDB/PADDW/PADDD/PADDQ family.
+fn packed_add(a: u128, b: u128, lane_bits: u32) -> u128 {
+    packed_lanes(a, b, lane_bits, |x, y, mask| x.wrapping_add(y) & mask)
+}
+
+/// Packed per-lane subtract — PSUBB/PSUBW/PSUBD/PSUBQ.
+fn packed_sub(a: u128, b: u128, lane_bits: u32) -> u128 {
+    packed_lanes(a, b, lane_bits, |x, y, mask| x.wrapping_sub(y) & mask)
+}
+
+/// Apply `f` to each `lane_bits`-wide lane of `a` and `b`. `f`
+/// receives the two lane values (already masked) and the lane mask,
+/// and returns the masked result lane.
+fn packed_lanes(a: u128, b: u128, lane_bits: u32, f: impl Fn(u128, u128, u128) -> u128) -> u128 {
+    let mask: u128 = if lane_bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << lane_bits) - 1
+    };
+    let mut out: u128 = 0;
+    let mut shift = 0u32;
+    while shift < 128 {
+        let la = (a >> shift) & mask;
+        let lb = (b >> shift) & mask;
+        out |= (f(la, lb, mask) & mask) << shift;
+        shift += lane_bits;
+    }
+    out
 }
 
 // SHLD/SHRD helpers — free fns to keep the dispatcher above readable.

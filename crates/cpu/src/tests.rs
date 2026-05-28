@@ -2546,6 +2546,66 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// SSE packed add (PADDD) — four independent 32-bit lane adds, with
+/// the top lane proving per-lane wraparound (no carry across lanes).
+#[test]
+fn sse_paddd_packed_lane_add() {
+    let mut mem = Memory::new(0x10_0000);
+    // A = [1, 2, 3, 0xFFFFFFFF], B = [10, 20, 30, 1].
+    let a = [1u32, 2, 3, 0xFFFF_FFFF];
+    let b = [10u32, 20, 30, 1];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize]);
+        mem.write_u32(0x610 + i * 4, b[i as usize]);
+    }
+    // MOVDQA XMM0,[0x600] ; MOVDQA XMM1,[0x610] ; PADDD XMM0,XMM1 ;
+    // MOVDQA [0x620],XMM0 ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0xFE, 0xC1, // PADDD XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x620), 11);
+    assert_eq!(mem.read_u32(0x624), 22);
+    assert_eq!(mem.read_u32(0x628), 33);
+    // 0xFFFFFFFF + 1 wraps to 0 within the lane (no carry out).
+    assert_eq!(mem.read_u32(0x62C), 0);
+}
+
+/// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
+#[test]
+fn sse_pxor_self_zeroes_register() {
+    // MOV EAX, 0xFFFFFFFF ; MOVD XMM0, EAX (nonzero low lane) ;
+    // PXOR XMM0, XMM0 ; MOVD EBX, XMM0 ; HLT  → EBX = 0
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // MOV EAX, -1
+            0x66, 0x0F, 0x6E, 0xC0, // MOVD XMM0, EAX
+            0x66, 0x0F, 0xEF, 0xC0, // PXOR XMM0, XMM0
+            0x66, 0x0F, 0x7E, 0xC3, // MOVD EBX, XMM0
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(3), 0);
+    assert_eq!(cpu.xmm[0], 0);
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]
