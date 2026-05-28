@@ -737,7 +737,14 @@ pub mod snapshot {
     /// * v8 — appends the x87 register stack: 8 × f64 (`fpu_st`) +
     ///   the TOP index (`fpu_top`).
     /// * v9 — appends the SSE register file: 8 × u128 (`xmm`).
-    pub const VERSION: u8 = 9;
+    /// * v10 — appends the LAPIC MMIO scratch buffer (4 KiB)
+    ///   between the RAM section and the device blob. Lets a
+    ///   guest's kernel writes to SIV/TPR/etc. survive snapshot.
+    pub const VERSION: u8 = 10;
+    /// Bytes the v10 LAPIC section adds past the RAM region. Sized
+    /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
+    /// so the snapshot module is self-contained.
+    pub const LAPIC_LEN: usize = 4096;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -975,6 +982,11 @@ impl Vm {
         // Memory
         buf.extend_from_slice(self.mem.as_slice());
 
+        // v10 LAPIC scratch window (4 KiB). Lives between RAM and
+        // the device blob; written verbatim with no length prefix
+        // since the size is fixed by snapshot::LAPIC_LEN.
+        buf.extend_from_slice(self.mem.lapic_bytes());
+
         // Devices (v2-style length-prefixed records — see IoBus::snapshot).
         let dev = self.io.snapshot();
         let dev_len = dev.len() as u32;
@@ -1000,11 +1012,13 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=9) {
+        if !matches!(version, 1..=10) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            9 => snapshot::CPU_V9_LEN,
+            // v10 doesn't extend the CPU image — only appends a
+            // LAPIC section between RAM and the device blob.
+            10 | 9 => snapshot::CPU_V9_LEN,
             8 => snapshot::CPU_V8_LEN,
             7 => snapshot::CPU_V7_LEN,
             6 => snapshot::CPU_V6_LEN,
@@ -1184,9 +1198,31 @@ impl Vm {
                 expected,
                 actual: bytes.len() - mem_start,
             })?;
+        // v10 LAPIC scratch. v1..=9 snapshots predate this section,
+        // so we leave the LAPIC at its construction defaults
+        // (Version reg already populated by Memory::new). Newer
+        // snapshots overwrite verbatim.
+        let lapic_end = if version >= 10 {
+            let lapic_off = mem_start + ram_size;
+            if bytes.len() < lapic_off + snapshot::LAPIC_LEN {
+                return Err(SnapshotError::TooSmall {
+                    got: bytes.len(),
+                    need: lapic_off + snapshot::LAPIC_LEN,
+                });
+            }
+            self.mem
+                .restore_lapic(&bytes[lapic_off..lapic_off + snapshot::LAPIC_LEN])
+                .map_err(|expected| SnapshotError::MemorySizeMismatch {
+                    expected,
+                    actual: snapshot::LAPIC_LEN,
+                })?;
+            lapic_off + snapshot::LAPIC_LEN
+        } else {
+            mem_start + ram_size
+        };
         // Device section (v2 and v3). v1 snapshots have nothing here.
         if version >= 2 {
-            let dev_off = mem_start + ram_size;
+            let dev_off = lapic_end;
             if bytes.len() < dev_off + 4 {
                 return Err(SnapshotError::TooSmall {
                     got: bytes.len(),

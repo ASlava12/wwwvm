@@ -127,8 +127,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**408 тестов** зелёные (mem 9 + devices 45 + cpu 267 + vm 79 +
-tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
+**409 тестов** зелёные (mem 9 + devices 45 + cpu 267 + vm 80 +
+tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v10.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
@@ -198,7 +198,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   байтовых обращений подряд — оба продвигают буфер, в обе стороны
   (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
-  header parser + loader. Снапшот v9 round-trip'ит всё состояние.
+  header parser + loader. Снапшот v10 round-trip'ит всё состояние,
+  включая LAPIC scratch buffer.
 - **PCI** (порты 0xCF8/0xCFC, Mechanism #1): пустая шина — все
   чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
   Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются
@@ -239,7 +240,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 408 пройденных тестов на текущий момент. CI
+Должно вывести 409 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

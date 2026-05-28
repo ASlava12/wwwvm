@@ -2106,10 +2106,37 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.cmos.read(0x71), 26);
 }
 
-/// v7 snapshot must round-trip the full architectural i386 state:
+/// v10 adds a LAPIC section between RAM and the device blob. A
+/// kernel that writes to the SIV at 0xFEE0_00F0 (the canonical
+/// "enable + spurious vector" probe) must see its write survive
+/// snapshot/restore — without that, restored VMs would silently
+/// lose the kernel's APIC config and re-probe at the wrong state.
+#[test]
+fn snapshot_v10_preserves_lapic_writes_to_siv() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // Linux's idiomatic LAPIC enable: write 0x010F to the
+    // Spurious Interrupt Vector. Writing through the CPU's
+    // memory path makes sure the routing is engaged.
+    vm.cpu.mem_write_u32(&mut vm.mem, 0xFEE0_00F0, 0x0000_010F);
+    assert_eq!(vm.cpu.mem_read_u32(&vm.mem, 0xFEE0_00F0), 0x0000_010F);
+
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v10 restore");
+    // SIV came back intact through the LAPIC section.
+    assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFEE0_00F0), 0x0000_010F);
+    // Version register (set at construction, not by the guest)
+    // also survives — both default-populated bytes and guest
+    // writes share the same scratch buffer.
+    assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFEE0_0030), 0x0006_0014);
+}
+
+/// v9 snapshot must round-trip the full architectural i386 state:
 /// CR0/2/3/4, GDTR, IDTR, full 32-bit IP, TSC, LDTR, TR, A20,
-/// stack_size_32, FPU control/status, SYSENTER MSRs, upper 16 of
-/// GPRs.
+/// stack_size_32, FPU control/status, SYSENTER MSRs, x87 stack,
+/// XMM register file, upper 16 of GPRs.
 #[test]
 fn snapshot_v9_preserves_i386_state() {
     let mut vm = Vm::new();

@@ -126,6 +126,23 @@ impl Memory {
         self.bytes.copy_from_slice(data);
         Ok(())
     }
+
+    /// Borrow the 4 KiB LAPIC scratch window. Used by the VM
+    /// snapshot path to round-trip MMIO state alongside RAM.
+    pub fn lapic_bytes(&self) -> &[u8] {
+        &self.lapic
+    }
+
+    /// Replace the LAPIC scratch window in one shot. Returns Err
+    /// with the expected size on length mismatch — same shape as
+    /// `restore_full` for RAM.
+    pub fn restore_lapic(&mut self, data: &[u8]) -> Result<(), usize> {
+        if data.len() != self.lapic.len() {
+            return Err(self.lapic.len());
+        }
+        self.lapic.copy_from_slice(data);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
