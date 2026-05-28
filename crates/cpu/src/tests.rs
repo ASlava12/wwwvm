@@ -5312,6 +5312,106 @@ fn iret_to_higher_ring_pops_extra_ss_esp_and_switches_stack() {
     assert_eq!(cpu.flags, 0x0202, "FLAGS restored");
 }
 
+/// Full ring-3 round-trip — the kernel IRETs to user, user runs
+/// real instructions, then INTs 0x80 back to the kernel handler.
+/// This is the complete Linux syscall cycle composed end-to-end:
+///
+///   ring-0 kernel boot
+///       → push user IRET frame
+///       → IRETD     (cross-ring IRET, drops to CPL=3)
+///   ring-3 user code
+///       → MOV AL, 0x55
+///       → MOV byte [0x900], 0xCC
+///       → INT 0x80  (cross-ring entry via TSS.SS0:ESP0)
+///   ring-0 kernel handler
+///       → MOV AH, 0x77
+///       → HLT
+///
+/// The two existing cross-ring tests check each direction in
+/// isolation; only the composition proves that the kernel can
+/// actually descend to user, the user runs, and the user can
+/// syscall back without anything getting silently lost.
+#[test]
+fn ring_0_iret_to_user_runs_then_int_80_returns_to_kernel() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000); // TSS.ESP0
+    mem.write_u16(0x4008, 0x0010); // TSS.SS0
+                                   // IDT[0x80] DPL=3 gate to kernel CS at offset 0x9000.
+    mem.write_slice(0x6400, &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00]);
+
+    // Kernel boot at 0x7C00 (PM, CS.D=1):
+    //   68 23 00 00 00     PUSH 0x23      (user SS)
+    //   68 00 40 00 00     PUSH 0x4000    (user ESP)
+    //   68 02 02 00 00     PUSH 0x0202    (user EFLAGS — IF set)
+    //   68 1B 00 00 00     PUSH 0x1B      (user CS)
+    //   68 00 80 00 00     PUSH 0x8000    (user EIP)
+    //   CF                 IRETD          (drop to ring 3)
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x68, 0x23, 0x00, 0x00, 0x00, 0x68, 0x00, 0x40, 0x00, 0x00, 0x68, 0x02, 0x02, 0x00,
+            0x00, 0x68, 0x1B, 0x00, 0x00, 0x00, 0x68, 0x00, 0x80, 0x00, 0x00, 0xCF,
+        ],
+    );
+
+    // User code at 0x8000 (CPL=3):
+    //   B0 55              MOV AL, 0x55
+    //   C6 05 00 09 00 00 CC   MOV byte [0x900], 0xCC
+    //   CD 80              INT 0x80
+    mem.write_slice(
+        0x8000,
+        &[
+            0xB0, 0x55, 0xC6, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCC, 0xCD, 0x80,
+        ],
+    );
+
+    // Kernel syscall handler at 0x9000 (CPL=0):
+    //   B4 77              MOV AH, 0x77   (overwrite the high byte of EAX)
+    //   F4                 HLT
+    mem.write_slice(0x9000, &[0xB4, 0x77, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x0008, &mem);
+    cpu.write_sreg(sreg::SS, 0x0010, &mem);
+    cpu.write_sreg(sreg::DS, 0x0010, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x3000);
+    cpu.ip = 0x7C00;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "kernel handler must reach HLT");
+
+    // EAX = 0x77_55 — low byte set by user (0x55), high byte by
+    // kernel (0x77). If the user code didn't run, AL stays at 0;
+    // if the kernel didn't run, AH stays at 0.
+    assert_eq!(cpu.read_r8(0), 0x55, "user-side AL stuck");
+    assert_eq!(cpu.regs[r16::AX] >> 8, 0x77, "kernel-side AH stuck");
+    // User-side data write reached memory.
+    assert_eq!(mem.read_u8(0x900), 0xCC);
+    // After the INT, kernel CS and kernel SS are loaded.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
