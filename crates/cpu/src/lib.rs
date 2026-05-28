@@ -91,6 +91,12 @@ pub struct Cpu {
     /// snapshot v6 lands.
     pub ip: u32,
     pub flags: u16,
+    /// High 16 bits of EFLAGS (bits 16-31). Bits we don't model
+    /// (AC=18, ID=21, VIP=20, VIF=19, VM=17, RF=16) still need to
+    /// round-trip through PUSHFD/POPFD for Linux's 32-bit i486-vs-
+    /// i386 detect, which flips AC and checks whether it sticks.
+    /// We don't act on these bits, just preserve them.
+    pub flags_high: u16,
     pub halted: bool,
     /// Active segment-override prefix for the current instruction.
     /// Reset at the top of each `step()` and set when we consume a
@@ -340,6 +346,7 @@ impl Cpu {
             sregs: [0; 6],
             ip: 0,
             flags: 0,
+            flags_high: 0,
             halted: false,
             seg_override: None,
             op_size_32: false,
@@ -1228,6 +1235,48 @@ impl Cpu {
                     }
                     out
                 };
+            }
+            // TZCNT (F3 0F BC) / LZCNT (F3 0F BD) — BMI1 / ABM bit-
+            // counting instructions. Linux uses these for atomic
+            // bit-search paths via __ffs/__fls; on a CPU without BMI1
+            // the F3 prefix is silently ignored and BSF/BSR runs
+            // instead, but our model has to dispatch the right
+            // semantics. Difference vs BSF/BSR: on a zero source
+            // TZCNT/LZCNT return the operand size (32) and set CF=1,
+            // whereas BSF/BSR leave the destination architecturally
+            // undefined and set ZF=1.
+            0xBC | 0xBD if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let is_tzcnt = op2 == 0xBC;
+                if self.op_size_32 {
+                    let v = self.read_rm32(rm, mem);
+                    if v == 0 {
+                        self.set_flag(flag::CF, true);
+                        self.write_r32(reg, 32);
+                    } else {
+                        self.set_flag(flag::CF, false);
+                        let n = if is_tzcnt {
+                            v.trailing_zeros()
+                        } else {
+                            v.leading_zeros()
+                        };
+                        self.write_r32(reg, n);
+                    }
+                } else {
+                    let v = self.read_rm16(rm, mem);
+                    if v == 0 {
+                        self.set_flag(flag::CF, true);
+                        self.write_r16(reg, 16);
+                    } else {
+                        self.set_flag(flag::CF, false);
+                        let n = if is_tzcnt {
+                            v.trailing_zeros() as u16
+                        } else {
+                            (v.leading_zeros() as u16).wrapping_sub(16)
+                        };
+                        self.write_r16(reg, n);
+                    }
+                }
             }
             _ => {
                 return Err(CpuError::Unimplemented {
@@ -3234,6 +3283,29 @@ impl Cpu {
                 self.write_sreg(sreg_idx as usize, v, mem);
             }
 
+            // POP r/m16/32 — 0x8F /0. Pop from the stack into a memory
+            // location or register. Other /reg encodings (1..7) for
+            // 0x8F are undefined and we leave them unimplemented. Linux
+            // kernel uses this in function prologues / locals teardown:
+            // `POP [EBP-disp]` to restore a saved local from stack.
+            0x8F => {
+                let (_, reg_ext, rm) = self.fetch_modrm(mem);
+                if reg_ext != 0 {
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
+                }
+                if self.op_size_32 {
+                    let v = self.pop32(mem);
+                    self.write_rm32(rm, mem, v);
+                } else {
+                    let v = self.pop16(mem);
+                    self.write_rm16(rm, mem, v);
+                }
+            }
+
             // XCHG AX, r16 — short form. 0x90 (XCHG AX, AX) is NOP and
             // is handled by the dedicated NOP arm above.
             0x91..=0x97 => {
@@ -4205,7 +4277,10 @@ impl Cpu {
             // 16 bits of EFLAGS, so the high half pushes as zero.
             0x9C => {
                 if self.op_size_32 {
-                    self.push32(mem, self.flags as u32);
+                    // Combine low + preserved high halves so a PUSHFD
+                    // followed by POPFD round-trips AC/ID/etc.
+                    let full = (self.flags as u32) | ((self.flags_high as u32) << 16);
+                    self.push32(mem, full);
                 } else {
                     self.push16(mem, self.flags);
                 }
@@ -4221,11 +4296,21 @@ impl Cpu {
             // model VM/RF/NT here — those fields stay at their
             // current value implicitly via the mask.
             0x9D => {
-                let popped = if self.op_size_32 {
-                    self.pop32(mem) as u16
+                let popped_full = if self.op_size_32 {
+                    self.pop32(mem)
                 } else {
-                    self.pop16(mem)
+                    self.pop16(mem) as u32
                 };
+                let popped = popped_full as u16;
+                // POPFD restores the upper-16 EFLAGS half too. Mask
+                // out the always-zero bit 15 and reserved bit 22+,
+                // but keep AC (18), ID (21), VIP (20), VIF (19),
+                // VM (17), RF (16) so Linux's i486 detection (flip
+                // AC, see if it sticks) succeeds.
+                if self.op_size_32 {
+                    let high = ((popped_full >> 16) & 0x003F) as u16;
+                    self.flags_high = high;
+                }
                 self.flags = if self.cr0 & 1 != 0 {
                     let cpl = self.sregs[sreg::CS] & 3;
                     let iopl = (self.flags >> 12) & 3;

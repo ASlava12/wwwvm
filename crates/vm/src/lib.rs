@@ -1682,6 +1682,38 @@ impl Vm {
         self.cpu.write_r32(wwwvm_cpu::r16::SP as u8, 0x0000_7C00);
         // Protocol §4.1: interrupts must be disabled at entry.
         self.cpu.flags &= !wwwvm_cpu::flag::IF;
+        // Populate boot_params.e820_table with a memory map that
+        // covers our entire RAM. Without this Linux's early-init
+        // memblock_alloc_node_data() sees zero usable RAM and
+        // panics with "Failed to allocate %ld bytes for node %d
+        // memory map". The BIOS INT 0x15 E820 shim only matters
+        // for real-mode setup; a PM-direct entry never runs that.
+        //
+        // Layout: 0x0..0x9FC00 usable (DOS/conventional), 0x9FC00..
+        // 0xA0000 reserved (EBDA), 0xA0000..0x100000 reserved
+        // (video + BIOS ROM), 0x100000..ram_size usable (extended
+        // memory holding the kernel + everything past 1 MiB).
+        // 3 entries fit inside boot_params at offsets 0x1E8 (count)
+        // and 0x2D0 (table). Each entry is 20 bytes packed.
+        let bp = 0x9_0000u32;
+        const OFF_E820_ENTRIES: u32 = 0x1E8;
+        const OFF_E820_TABLE: u32 = 0x2D0;
+        let ram_size = self.mem.size() as u64;
+        let entries: [(u64, u64, u32); 3] = [
+            (0x0000_0000, 0x0009_FC00, 1), // usable conventional
+            (0x0009_FC00, 0x0006_0400, 2), // reserved BIOS / video
+            (0x0010_0000, ram_size.saturating_sub(0x10_0000), 1),
+        ];
+        self.mem
+            .write_u8(bp + OFF_E820_ENTRIES, entries.len() as u8);
+        for (i, (base, size, kind)) in entries.iter().enumerate() {
+            let off = bp + OFF_E820_TABLE + (i as u32) * 20;
+            self.mem.write_u32(off, *base as u32);
+            self.mem.write_u32(off + 4, (*base >> 32) as u32);
+            self.mem.write_u32(off + 8, *size as u32);
+            self.mem.write_u32(off + 12, (*size >> 32) as u32);
+            self.mem.write_u32(off + 16, *kind);
+        }
         self.io.uart_mut().push_rx(&self.autorun);
         self.autorun.clear();
         self.booted = true;

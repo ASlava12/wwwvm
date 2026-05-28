@@ -66,10 +66,7 @@ fn main() {
     // which our kernel hasn't reached yet — so without lpj we hit
     // a soft hang in calibrate_delay_converge. Setting lpj declares
     // a pre-computed value and skips calibration entirely.
-    vm.set_kernel_cmdline(
-        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
-         noefi efi=disable noapic nolapic nosmp acpi=off",
-    );
+    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000");
 
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);
@@ -113,9 +110,16 @@ fn main() {
     // The trace bookends gave us TSC=435422282 for the NULL-call
     // first exception; we want the stack contents at that moment.
     let stop_at_first_exc = env::var("WWWVM_STOP_AT_FIRST_EXC").is_ok();
+    // WWWVM_STOP_AT_PANIC: halt at the moment EIP first enters
+    // panic() (vmlinux disasm puts it at 0xC08730E0..0xC08731FF).
+    // The stack at that moment names the caller — i.e. what
+    // function decided this was unrecoverable.
+    let stop_at_panic = env::var("WWWVM_STOP_AT_PANIC").is_ok();
     while steps < STEP_BUDGET {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
-        let chunk = if pg_on && (stop_at_first_pf || stop_at_first_exc) {
+        let chunk = if pg_on && stop_at_panic {
+            1
+        } else if pg_on && (stop_at_first_pf || stop_at_first_exc) {
             100
         } else if trace_esp_align && pg_on {
             1
@@ -168,6 +172,16 @@ fn main() {
             last_esp = esp;
             last_esp_align = aligned;
             last_eip = vm.cpu().ip;
+        }
+        if stop_at_panic && pg_on && (0xC08730E0..0xC0873200).contains(&vm.cpu().ip) {
+            println!(
+                "[{:>10}] FIRST panic() entry: EIP={:08X} ESP={:08X}",
+                steps,
+                vm.cpu().ip,
+                vm.cpu().read_r32(4)
+            );
+            stop = st;
+            break;
         }
         // EIP in IDT[14] handler region = a fault was just dispatched
         // (this catches the NULL-call case where CR2 stays at 0).
