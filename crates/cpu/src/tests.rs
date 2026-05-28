@@ -2500,6 +2500,44 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// 64-bit subtract via SUB + SBB across a dword pair — the borrow-
+/// chain counterpart to the ADC test, used for 64-bit counter deltas.
+///
+///   0x5_0000_0001 - 0x1_FFFF_FFFF = 0x3_0000_0002
+///   (low: 1 - 0xFFFFFFFF = 2 with borrow; high: 5 - 1 - 1 = 3)
+#[test]
+fn multiword_sub_propagates_borrow_through_sbb() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 0x0000_0001); // A lo
+    mem.write_u32(0x604, 0x0000_0005); // A hi
+    mem.write_u32(0x608, 0xFFFF_FFFF); // B lo
+    mem.write_u32(0x60C, 0x0000_0001); // B hi
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xA1, 0x00, 0x06, // mov eax, [0x600]
+            0x66, 0x2B, 0x06, 0x08, 0x06, // sub eax, [0x608]
+            0x66, 0xA3, 0x10, 0x06, // mov [0x610], eax
+            0x66, 0xA1, 0x04, 0x06, // mov eax, [0x604]
+            0x66, 0x1B, 0x06, 0x0C, 0x06, // sbb eax, [0x60C]
+            0x66, 0xA3, 0x14, 0x06, // mov [0x614], eax
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x610), 0x0000_0002, "low dword w/ borrow");
+    assert_eq!(mem.read_u32(0x614), 0x0000_0003, "high dword");
+}
+
 /// strlen via REPNE SCASB — the canonical libc idiom. Scan ES:EDI
 /// for the AL=0 terminator with ECX=-1, then `not ecx; dec ecx` to
 /// recover the length. Exercises the 32-bit REPNE loop (ECX/EDI
