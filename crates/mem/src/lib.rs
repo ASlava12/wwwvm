@@ -163,6 +163,33 @@ impl Memory {
             if (0x380..0x384).contains(&off) {
                 self.lapic[0x390 + (off - 0x380)] = value;
             }
+            // ICR low (0x300..0x304): on completion of the dword write
+            // (high byte at 0x303 — Linux issues a single MOV in
+            // little-endian byte order), decode the command. A
+            // self-IPI (destination shorthand bits 19:18 = 01) or
+            // an all-including-self IPI (= 10) with fixed delivery
+            // (bits 10:8 = 000) queues the vector locally. Linux's
+            // apic_test_irq does a self-IPI to validate that the
+            // LAPIC actually delivers — without this, the test
+            // sees no IRQ and the kernel disables the APIC.
+            if off == 0x303 {
+                let icr_lo = u32::from_le_bytes([
+                    self.lapic[0x300],
+                    self.lapic[0x301],
+                    self.lapic[0x302],
+                    self.lapic[0x303],
+                ]);
+                let delivery_mode = (icr_lo >> 8) & 0b111;
+                let shorthand = (icr_lo >> 18) & 0b11;
+                let self_targeted = shorthand == 0b01 || shorthand == 0b10;
+                let svr_enabled = self.lapic[0xF1] & 0x01 != 0;
+                if delivery_mode == 0 && self_targeted && svr_enabled {
+                    let vector = (icr_lo & 0xFF) as u8;
+                    if self.pending_lapic_irq.is_none() {
+                        self.pending_lapic_irq = Some(vector);
+                    }
+                }
+            }
             return;
         }
         if Self::is_hpet(addr) {

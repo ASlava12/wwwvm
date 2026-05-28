@@ -1483,6 +1483,63 @@ fn hpet_timer_fsb_delivery_fires_irq_through_idt() {
     );
 }
 
+/// LAPIC ICR self-IPI (destination shorthand = "self", bits
+/// 19:18 = 01): the kernel writes a fixed-delivery IPI targeting
+/// itself and expects the vector to be delivered as if a device
+/// had raised it. Linux's apic_test_irq does exactly this during
+/// boot to confirm the LAPIC actually fires interrupts — if no
+/// IRQ arrives, the kernel disables the APIC and falls back to
+/// PIC-only delivery, undoing the entire LAPIC path we wired up.
+#[test]
+fn lapic_icr_self_ipi_delivers_vector_to_self() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel: install IDT[0x43] → handler at 0x900, LIDT, write
+    // ICR low = (1<<18) | 0x43 = 0x0004_0043 — shorthand=01 (self),
+    // delivery mode=0 (fixed), vector=0x43. STI, busy-loop until
+    // [0x900] != 0, HLT.
+    let kernel: &[u8] = &[
+        // IDT[0x43] @ idt_base + 0x43*8 = 0x1218.
+        0xC7, 0x05, 0x18, 0x12, 0x00, 0x00, 0x00, 0x09, 0x08, 0x00, //
+        0xC7, 0x05, 0x1C, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // ICR low (0xFEE0_0300) = 0x0004_0043. Single MOV dword
+        // so the high byte (at 0x303) lands last and the delivery
+        // path triggers.
+        0xC7, 0x05, 0x00, 0x03, 0xE0, 0xFE, 0x43, 0x00, 0x04, 0x00, //
+        // STI.
+        0xFB, //
+        // Loop: CMP byte [0x900], 0; JZ -7; HLT.
+        0x80, 0x3D, 0x00, 0x09, 0x00, 0x00, 0x00, //
+        0x74, 0xF7, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    vm.mem
+        .write_slice(0x0900, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(2_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert!(
+        vm.mem().read_u8(0x900) >= 1,
+        "self-IPI didn't fire (counter {})",
+        vm.mem().read_u8(0x900)
+    );
+}
+
 /// HPET periodic mode (Tn_TYPE_CNF, bit 3): the comparator
 /// auto-advances by the latched period after each match, so the
 /// timer keeps firing on a fixed cadence rather than going silent
