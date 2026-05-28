@@ -941,6 +941,59 @@ fn start_protected_mode_at_lets_kernel_read_setup_via_esi() {
     assert_eq!(vm.cpu().read_r32(0) & 0xFF, 1);
 }
 
+/// Boot-protocol §4.1 invariants the kernel reads on entry: EBP,
+/// EDI, EBX = 0, and interrupts disabled. We pre-poison the
+/// registers and EFLAGS, hand off via `start_protected_mode_at`,
+/// then assert the kernel sees the protocol-required state on the
+/// very first instruction.
+#[test]
+fn start_protected_mode_at_honors_boot_protocol_4_1_initial_state() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    // Kernel payload: just HLT — we read the register file directly.
+    bz.extend_from_slice(&[0xF4]);
+
+    let mut vm = Vm::with_ram_size(0x0020_0000);
+    // Pre-poison the registers and EFLAGS so a no-op start_protected_mode_at
+    // would fail the asserts. The test is intra-crate so it can reach
+    // into the private `cpu` field directly.
+    vm.cpu.write_r32(wwwvm_cpu::r16::BX as u8, 0xDEAD_BEEF);
+    vm.cpu.write_r32(wwwvm_cpu::r16::BP as u8, 0xCAFE_BABE);
+    vm.cpu.write_r32(wwwvm_cpu::r16::DI as u8, 0xFEED_FACE);
+    vm.cpu.flags |= wwwvm_cpu::flag::IF;
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    // Don't step yet — we want the entry state, not post-HLT.
+
+    assert_eq!(
+        vm.cpu().read_r32(wwwvm_cpu::r16::BX as u8),
+        0,
+        "EBX must be 0"
+    );
+    assert_eq!(
+        vm.cpu().read_r32(wwwvm_cpu::r16::BP as u8),
+        0,
+        "EBP must be 0"
+    );
+    assert_eq!(
+        vm.cpu().read_r32(wwwvm_cpu::r16::DI as u8),
+        0,
+        "EDI must be 0"
+    );
+    assert_eq!(
+        vm.cpu().flags & wwwvm_cpu::flag::IF,
+        0,
+        "IF must be clear (interrupts disabled)"
+    );
+    // ESI still points at the setup blob (validated by an earlier test).
+    assert_eq!(vm.cpu().read_r32(wwwvm_cpu::r16::SI as u8), 0x0009_0000);
+}
+
 /// `head_32`-shape integration: a synthetic bzImage kernel runs
 /// the full early-Linux startup chain through real instruction
 /// execution. The kernel

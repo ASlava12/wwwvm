@@ -1417,6 +1417,10 @@ impl Vm {
     /// the real-mode kernel header — that's where the kernel reads
     /// boot_params from. The setup block lives at 0x90000 (where
     /// `load_bzimage` puts it), so that's what we load into ESI.
+    /// The protocol additionally requires `%ebp = %edi = %ebx = 0`
+    /// and interrupts disabled at entry; we honor both so a kernel
+    /// that scribbles into these registers as scratch on entry
+    /// doesn't pick up garbage left over from the bootloader.
     pub fn start_protected_mode_at(&mut self, entry: u32) {
         // Flat-segments GDT: null + ring-0 code + ring-0 data, all
         // base 0 / limit 4 GiB. Placed at 0x500 (between the BIOS
@@ -1447,6 +1451,12 @@ impl Vm {
         // `load_bzimage` places the setup header at 0x90000 — the
         // historical SETUPSEG slot the boot protocol bakes in.
         self.cpu.write_r32(wwwvm_cpu::r16::SI as u8, 0x0009_0000);
+        // Protocol §4.1: EBP / EDI / EBX must be zero at entry.
+        self.cpu.write_r32(wwwvm_cpu::r16::BP as u8, 0);
+        self.cpu.write_r32(wwwvm_cpu::r16::DI as u8, 0);
+        self.cpu.write_r32(wwwvm_cpu::r16::BX as u8, 0);
+        // Protocol §4.1: interrupts must be disabled at entry.
+        self.cpu.flags &= !wwwvm_cpu::flag::IF;
         self.io.uart_mut().push_rx(&self.autorun);
         self.autorun.clear();
         self.booted = true;
