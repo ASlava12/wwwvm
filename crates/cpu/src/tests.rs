@@ -5169,6 +5169,86 @@ fn int_from_ring_3_switches_to_kernel_stack_via_tss() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8002);
 }
 
+/// User code at CPL=3 actually executes data writes, then INTs back
+/// to the kernel — the Linux syscall shape end-to-end. The
+/// previous test only asserts the frame layout the moment after
+/// the INT fires; this one runs through several CPL=3 instructions
+/// before the syscall, lands in a kernel handler, and HLTs. Pins:
+///   * CPL=3 data writes go through the user DS descriptor and
+///     reach memory,
+///   * the INT cross-ring entry actually swaps to the kernel stack
+///     (via TSS) and lands at the gate's offset,
+///   * the kernel handler runs at CPL=0 and can execute privileged
+///     instructions (HLT) cleanly.
+#[test]
+fn ring_3_writes_data_then_int_80_into_ring_0_handler() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+
+    // TSS at 0x4000 — kernel SS0:ESP0 the cross-ring entry uses.
+    mem.write_u32(0x4004, 0x3000); // ESP0
+    mem.write_u16(0x4008, 0x0010); // SS0
+
+    // IDT[0x80] = 32-bit interrupt gate, DPL=3 (user-callable),
+    // selector = kernel CS (0x08), offset = 0x9000.
+    mem.write_slice(0x6400, &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00]);
+
+    // Ring-3 user code at 0x8000:
+    //   C6 05 00 09 00 00 CC   MOV byte [0x900], 0xCC
+    //   B0 55                  MOV AL, 0x55
+    //   CD 80                  INT 0x80
+    mem.write_slice(
+        0x8000,
+        &[
+            0xC6, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCC, 0xB0, 0x55, 0xCD, 0x80,
+        ],
+    );
+
+    // Ring-0 handler at 0x9000:
+    //   B0 77   MOV AL, 0x77   ; overwrite the user-side AL
+    //   F4      HLT
+    mem.write_slice(0x9000, &[0xB0, 0x77, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem); // user code RPL=3
+    cpu.write_sreg(sreg::SS, 0x0023, &mem); // user data RPL=3
+    cpu.write_sreg(sreg::DS, 0x0023, &mem); // for the MOV byte [m], imm8
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x2000); // user stack
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "kernel handler must reach HLT");
+
+    // User wrote its sentinel from CPL=3.
+    assert_eq!(mem.read_u8(0x900), 0xCC);
+    // Kernel ran its handler — AL was 0x55 from user, kernel overwrote to 0x77.
+    assert_eq!(cpu.read_r8(0), 0x77);
+    // We landed on the kernel CS at the gate's offset.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    // The kernel stack switch happened: SS == kernel data.
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+}
+
 /// IRET to a higher-privilege CS (CPL goes from 0 to 3) pops the
 /// additional SS:ESP frame Real silicon expects, switching to the
 /// caller's user-mode stack. Same-ring IRET (the existing tests)
