@@ -2581,6 +2581,97 @@ fn translate_with_wp_set_on_readonly_pse_pde_raises_pf_on_write() {
     assert_eq!(pf.error_code & 0b11, 0b11);
 }
 
+/// CR3 reload mid-execution switches the active address space
+/// immediately — every subsequent load translates through the new
+/// page directory. This is the linchpin of Linux's context switch:
+/// `__switch_to_asm` ends with `mov %eax, %cr3` (eax = next->pgd)
+/// and the very next instruction's data accesses see the new task's
+/// memory map. Without that, every context switch silently leaks
+/// the previous task's address space.
+///
+/// We park PD-A and PD-B at distinct physical bases; both
+/// identity-map [0, 4M) (so the code keeps fetching after the
+/// switch), but their PDE[1] points at different 4-MiB frames
+/// stamped with distinct bytes. After running, BL holds the byte
+/// read through PD-A and CL the byte through PD-B.
+#[test]
+fn cr3_reload_mid_execution_switches_address_space_immediately() {
+    // 16 MiB so we can host two 4-MiB-aligned PSE frames past the
+    // identity-mapped [0, 4M) range.
+    let mut mem = Memory::new(0x0100_0000);
+
+    // GDT at 0x500 — flat CS/SS/DS with D=1/G=1.
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data
+        ],
+    );
+
+    // PD-A at 0x10_000: identity [0,4M) + linear [4M,8M) → phys 0x400000.
+    mem.write_u32(0x0001_0000, 0x0000_0083);
+    mem.write_u32(0x0001_0004, 0x0040_0083);
+    // PD-B at 0x20_000: identity [0,4M) + linear [4M,8M) → phys 0x800000.
+    // (0x800000 = next 4-MiB-aligned frame after 0x400000.)
+    mem.write_u32(0x0002_0000, 0x0000_0083);
+    mem.write_u32(0x0002_0004, 0x0080_0083);
+
+    // Stamp distinguishing bytes inside each 4 MiB frame.
+    mem.write_u8(0x0040_0000, 0xAA);
+    mem.write_u8(0x0080_0000, 0xBB);
+
+    // Kernel at phys 0x1000:
+    //   A0 00 00 40 00  MOV AL, [0x400000]    ; via PD-A → 0xAA
+    //   88 C3           MOV BL, AL            ; stash
+    //   BF 00 00 02 00  MOV EDI, 0x20000      ; PD-B base
+    //   0F 22 DF        MOV CR3, EDI          ; switch address space
+    //   A0 00 00 40 00  MOV AL, [0x400000]    ; via PD-B → 0xBB
+    //   88 C1           MOV CL, AL            ; stash
+    //   F4              HLT
+    mem.write_slice(
+        0x1000,
+        &[
+            0xA0, 0x00, 0x00, 0x40, 0x00, // MOV AL, [0x400000]
+            0x88, 0xC3, // MOV BL, AL
+            0xBF, 0x00, 0x00, 0x02, 0x00, // MOV EDI, 0x20000
+            0x0F, 0x22, 0xDF, // MOV CR3, EDI
+            0xA0, 0x00, 0x00, 0x40, 0x00, // MOV AL, [0x400000]
+            0x88, 0xC1, // MOV CL, AL
+            0xF4, // HLT
+        ],
+    );
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.cr3 = 0x0001_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE
+    cpu.ip = 0x1000;
+
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // BL captured the byte through PD-A, CL through PD-B.
+    assert_eq!(cpu.read_r8(3), 0xAA, "BL via PD-A");
+    assert_eq!(cpu.read_r8(1), 0xBB, "CL via PD-B");
+    // CR3 is now PD-B's base.
+    assert_eq!(cpu.cr3, 0x0002_0000);
+}
+
 /// Protected-mode #PF dispatch composes with paging *and* a real
 /// 32-bit IDT gate. The previous test exercises the real-mode IVT
 /// path; once the kernel is in PM with paging on, the dispatch goes
