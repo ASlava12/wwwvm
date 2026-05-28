@@ -4931,11 +4931,14 @@ impl Cpu {
                         self.write_r32(2, 0);
                     }
                     // RDMSR — 0x0F 0x32. Reads MSR named by ECX into
-                    // EDX:EAX. Unknown MSRs raise #GP(0), which is
-                    // what Linux's rdmsr_safe expects (and what real
-                    // silicon does): the kernel catches the fault and
-                    // treats the MSR as absent.
+                    // EDX:EAX. CPL=0 only — userspace RDMSR is
+                    // #GP(0). Unknown MSRs also raise #GP(0) (the
+                    // shape `rdmsr_safe` catches); the kernel
+                    // catches and treats as "MSR absent".
                     0x32 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let msr = self.read_r32(1); // ECX
                         let value: u64 = match msr {
                             0x10 => self.tsc,                  // IA32_TSC
@@ -4977,8 +4980,12 @@ impl Cpu {
                         self.write_r32(2, (value >> 32) as u32);
                     }
                     // WRMSR — 0x0F 0x30. Write MSR named by ECX from
-                    // EDX:EAX. Like RDMSR, unknown MSRs raise #GP(0).
+                    // EDX:EAX. CPL=0 only. Unknown MSRs raise #GP(0)
+                    // — `wrmsr_safe` catches and treats as absent.
                     0x30 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let msr = self.read_r32(1); // ECX
                         let lo = self.read_r32(0); // EAX
                         match msr {
@@ -5020,7 +5027,13 @@ impl Cpu {
                     }
                     // SYSEXIT — 0x0F 0x35. Return to ring 3. CS from
                     // SYSENTER_CS+16, SS from +24; EIP=EDX, ESP=ECX.
+                    // CPL=0 only — a userspace SYSEXIT would let an
+                    // attacker swap into a kernel-supplied stack/CS
+                    // at addresses the kernel doesn't expect.
                     0x35 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let cs_sel = ((self.sysenter_cs & 0xFFFC).wrapping_add(16)) as u16;
                         let ss_sel = cs_sel.wrapping_add(8);
                         self.write_sreg(sreg::CS, cs_sel, mem);

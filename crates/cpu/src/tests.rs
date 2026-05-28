@@ -5142,6 +5142,58 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// RDMSR from CPL=3 raises #GP(0). MSRs hold a mix of model-
+/// specific knobs (MTRRs, microcode, SYSENTER) — letting
+/// userspace probe them is a primitive for spying on kernel
+/// state. Linux's `rdmsr_safe` already expects #GP for unknown
+/// MSRs; the user-mode invocation falls into the same arm.
+#[test]
+fn rdmsr_in_ring_3_raises_gp() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    // User-mode RDMSR at 0x8000 (0x0F 0x32).
+    mem.write_slice(0x8000, &[0x0F, 0x32]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(1, 0x10); // ECX = IA32_TSC — would have succeeded from CPL=0
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step RDMSR");
+
+    // #GP gate dispatched — would have returned TSC value otherwise.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.ip, 0x9000);
+    // EAX/EDX untouched (CPL=0 path would have written EAX = TSC low,
+    // EDX = TSC high; the #GP path doesn't run that write).
+    assert_eq!(cpu.read_r32(0), 0);
+    assert_eq!(cpu.read_r32(2), 0);
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+}
+
 /// MOV CR3, EAX from CPL=3 raises #GP(0). A userspace process
 /// reloading CR3 would relocate the kernel's page directory —
 /// classic privilege-escalation primitive. Real silicon traps it;
