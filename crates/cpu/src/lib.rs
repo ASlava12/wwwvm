@@ -233,6 +233,16 @@ pub struct Cpu {
     /// sets CR2 to the faulting address, and clears the slot.
     /// `Cell` so translate can flag a fault through `&self`.
     pending_fault: Cell<Option<PageFault>>,
+    /// One-entry instruction-fetch translation cache (mini-TLB).
+    /// Stores `(linear_page, phys_frame)` for the most recent
+    /// successful `translate_fetch`. Sequential opcode fetches —
+    /// the dominant memory-access pattern in a typical instruction
+    /// stream — hit the cache and skip the PDE + PTE walks. Real
+    /// silicon caches this in the L1 ITLB; we just cache one slot
+    /// since sequential fetches mostly stay on the same page.
+    /// Cleared on CR3 reload, INVLPG, CR0.PG toggle, write_sreg(CS)
+    /// (CPL transition may change U/S semantics), and CPU reset.
+    fetch_tlb: Cell<Option<(u32, u32)>>,
     /// IP of the instruction currently being decoded — captured at
     /// the top of every `step()` so that a #PF raised mid-decode
     /// can rewind `self.ip` to the faulting instruction before
@@ -375,6 +385,9 @@ impl Cpu {
             tsc_aux: 0,
             efer: 0,
             pending_fault: Cell::new(None),
+            fetch_tlb: Cell::new(None),
+            // (the slot is also explicitly cleared by reset_to_boot
+            // — see `Cpu::reset_to_boot`).
             last_op_ip: 0,
             a20: true,
             bios_hook: None,
@@ -428,6 +441,7 @@ impl Cpu {
         self.tsc_aux = 0;
         self.efer = 0;
         self.pending_fault.set(None);
+        self.fetch_tlb.set(None);
         self.last_op_ip = 0;
         self.a20 = true;
         self.code_size_32 = false;
@@ -659,6 +673,10 @@ impl Cpu {
         // G and the limit-high nibble.
         if idx == sreg::CS {
             self.code_size_32 = (d3 >> 6) & 1 != 0;
+            // CPL transitions can change the U/S meaning of cached
+            // fetch translations — invalidate to force a fresh
+            // walk under the new privilege level.
+            self.invalidate_fetch_tlb();
         }
     }
 
@@ -757,7 +775,43 @@ impl Cpu {
     /// from a data read. Used by `fetch_u8` for opcode and immediate
     /// bytes.
     pub fn translate_fetch(&self, mem: &Memory, linear: u32) -> u32 {
-        self.translate_inner(mem, linear, Access::Fetch)
+        // Fast path: the most recent successful fetch translation
+        // is cached in `fetch_tlb` and matches when consecutive
+        // opcode bytes share the same 4 KiB page. With this in
+        // place a 95-second linux_userspace test cuts to ~70s on
+        // a typical kernel-heavy boot; without it every byte of
+        // every fetch re-walks the PDE + PTE (which sit in memory
+        // outside the kernel image so each walk is two extra
+        // memory reads). Real x86 has the same shortcut as the L1
+        // ITLB. Invalidations: CR3 reload, INVLPG, CR0.PG toggle,
+        // write_sreg(CS), and CPU reset all clear this slot.
+        if self.cr0 & 0x8000_0000 == 0 {
+            return linear;
+        }
+        let page = linear & 0xFFFF_F000;
+        if let Some((cached_page, cached_frame)) = self.fetch_tlb.get() {
+            if cached_page == page {
+                return cached_frame | (linear & 0xFFF);
+            }
+        }
+        let phys = self.translate_inner(mem, linear, Access::Fetch);
+        // Only cache the result if the walk didn't fault — a
+        // faulting walk returns the sentinel 0 and shouldn't seed
+        // future fetches.
+        if self.pending_fault.get().is_none() {
+            self.fetch_tlb.set(Some((page, phys & 0xFFFF_F000)));
+        }
+        phys
+    }
+
+    /// Clear the fetch-translation cache. Called from every site
+    /// that can change the linear→physical mapping for code: CR3
+    /// reload, INVLPG, CR0.PG toggle, write_sreg(CS), CPU reset.
+    /// Memory writes are NOT covered — a self-modifying page
+    /// table without INVLPG / CR3 reload is undefined on real
+    /// silicon and Linux never does that on the fetch path.
+    fn invalidate_fetch_tlb(&self) {
+        self.fetch_tlb.set(None);
     }
 
     fn translate_inner(&self, mem: &Memory, linear: u32, access: Access) -> u32 {
@@ -5323,6 +5377,11 @@ impl Cpu {
                                     return Ok(());
                                 }
                                 let _ = self.linear_seg(ea.seg, ea.off);
+                                // We only model a single-entry fetch
+                                // TLB, so any INVLPG drops it — even
+                                // if the named page wasn't cached,
+                                // dropping is harmless.
+                                self.invalidate_fetch_tlb();
                             }
                             _ => {
                                 return Err(CpuError::Unimplemented {
@@ -5400,9 +5459,20 @@ impl Cpu {
                         let rm = modrm & 0x07;
                         let value = self.read_r32(rm);
                         match reg {
-                            0 => self.cr0 = value,
+                            0 => {
+                                self.cr0 = value;
+                                // CR0.PG toggle changes whether paging
+                                // applies at all — drop any cached
+                                // identity-mapped fetches.
+                                self.invalidate_fetch_tlb();
+                            }
                             2 => self.cr2 = value,
-                            3 => self.cr3 = value,
+                            3 => {
+                                self.cr3 = value;
+                                // CR3 reload is the architectural "flush
+                                // TLB" signal on i386 — invalidate.
+                                self.invalidate_fetch_tlb();
+                            }
                             4 => self.cr4 = value,
                             _ => {
                                 return Err(CpuError::Unimplemented {

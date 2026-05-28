@@ -270,8 +270,8 @@ WWWVM_INITRD_BUILTIN=1 cargo run --release --example linux_boot
 там работает кучка per-step диагностики (EIP region tracking, IF
 transitions, stuck detection) которая интересна для отладки но
 жрёт ~5x времени. Чистый прогон без диагностики (см. integration
-test ниже) занимает **~95 секунд** на той же машине: эффективные
-≈85 MIPS, ≈8 миллиардов CPU-инструкций до момента когда /init
+test ниже) занимает **~70 секунд** на той же машине: эффективные
+≈115 MIPS, ≈8 миллиардов CPU-инструкций до момента когда /init
 успевает напечатать HELLO. В UART видна вся последовательность
 kernel boot → driver_init → do_initcalls → run_init_process →
 пользовательский `int 0x80` write → THRE IRQ → host stdout →
