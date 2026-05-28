@@ -2500,6 +2500,62 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// Richer decode medley: sum a 4-element dword array via SIB-indexed
+/// loads in a loop, then CALL a helper that doubles the accumulator.
+/// Exercises 32-bit SIB addressing (addr32), MOV r32 from memory,
+/// the loop control flow, and a near CALL/RET round-trip — the
+/// shape of a real C function indexing an array and calling a leaf.
+///
+///   xor eax, eax ; xor ecx, ecx
+/// loop:
+///   mov edx, [ecx*4 + 0x600]
+///   add eax, edx
+///   inc ecx
+///   cmp ecx, 4
+///   jne loop
+///   call double
+///   hlt
+/// double:
+///   add eax, eax
+///   ret
+#[test]
+fn decode_medley_sib_array_sum_then_call() {
+    let mut mem = Memory::new(0x10_0000);
+    // Array [10, 20, 30, 40] at 0x600.
+    for (i, v) in [10u32, 20, 30, 40].iter().enumerate() {
+        mem.write_u32(0x600 + (i as u32) * 4, *v);
+    }
+    let code: &[u8] = &[
+        0x66, 0x31, 0xC0, // xor eax, eax              (ofs 0)
+        0x66, 0x31, 0xC9, // xor ecx, ecx              (ofs 3)
+        // loop: (ofs 6)
+        0x67, 0x66, 0x8B, 0x14, 0x8D, 0x00, 0x06, 0x00,
+        0x00, // mov edx, [ecx*4 + 0x600]  (ofs 6, 9 bytes)
+        0x66, 0x01, 0xD0, // add eax, edx              (ofs 15)
+        0x66, 0x41, // inc ecx                   (ofs 18)
+        0x66, 0x83, 0xF9, 0x04, // cmp ecx, 4                (ofs 20)
+        0x75, 0xEC, // jne loop (-20: IP 26→6)   (ofs 24)
+        0xE8, 0x01, 0x00, // call double (rel16=1)     (ofs 26)
+        0xF4, // hlt                       (ofs 29)
+        // double: (ofs 30)
+        0x66, 0x01, 0xC0, // add eax, eax
+        0xC3, // ret
+    ];
+    mem.write_slice(0x7C00, code);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..200 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // (10+20+30+40) * 2 = 200.
+    assert_eq!(cpu.read_r32(0), 200);
+}
+
 /// 0x64 — FS segment-override prefix. `mov al, fs:[0x10]` reads
 /// from FS.base + 0x10, the way Linux fetches per-CPU data.
 #[test]
