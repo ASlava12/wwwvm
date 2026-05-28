@@ -1413,6 +1413,76 @@ fn lapic_timer_fires_periodic_irq_through_32_bit_gate() {
     );
 }
 
+/// HPET timer 0 fires through FSB / MSI-direct delivery. The
+/// kernel configures the timer with INT_ENB + FSB_EN, programs
+/// a comparator value the main counter will hit, and an FSB
+/// route whose data field carries the IDT vector. When the main
+/// counter increments past the comparator, the kernel's handler
+/// runs — same shape as LAPIC timer delivery but the source is
+/// HPET. This is Linux's MSI-driven HPET path on systems where
+/// HPET is preferred over LAPIC (e.g. clocksource fallback).
+#[test]
+fn hpet_timer_fsb_delivery_fires_irq_through_idt() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel at 0x100000:
+    //   - Install IDT[0x41] = 32-bit interrupt gate to phys 0x900.
+    //   - LIDT.
+    //   - Program HPET timer 0:
+    //       Config (0xFED0_0100) = (1<<2) | (1<<14) = 0x4004
+    //                              — INT_ENB + FSB_EN.
+    //       Comparator (0xFED0_0108) low = 16  — match at counter==16.
+    //       FSB Route (0xFED0_0110) low = 0x41 — MSI data = vector.
+    //   - Enable HPET via General Config (0xFED0_0010 = 1).
+    //   - STI.
+    //   - Loop until [0x900] != 0, then HLT.
+    let kernel: &[u8] = &[
+        // IDT[0x41] at idt_base + 0x41*8 = 0x1208.
+        0xC7, 0x05, 0x08, 0x12, 0x00, 0x00, 0x00, 0x09, 0x08, 0x00, //
+        0xC7, 0x05, 0x0C, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // HPET Timer 0 Config = (1<<2)|(1<<14) = 0x4004.
+        0xC7, 0x05, 0x00, 0x01, 0xD0, 0xFE, 0x04, 0x40, 0x00, 0x00, //
+        // HPET Timer 0 Comparator (low) = 16.
+        0xC7, 0x05, 0x08, 0x01, 0xD0, 0xFE, 0x10, 0x00, 0x00, 0x00, //
+        // HPET Timer 0 FSB Route low = 0x41 (vector).
+        0xC7, 0x05, 0x10, 0x01, 0xD0, 0xFE, 0x41, 0x00, 0x00, 0x00, //
+        // HPET General Configuration = 1 (ENABLE_CNF).
+        0xC7, 0x05, 0x10, 0x00, 0xD0, 0xFE, 0x01, 0x00, 0x00, 0x00, //
+        // STI.
+        0xFB, //
+        // Loop: CMP byte [0x900], 0; JZ -7; HLT.
+        0x80, 0x3D, 0x00, 0x09, 0x00, 0x00, 0x00, //
+        0x74, 0xF7, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    // Handler at 0x0900: INC byte [0x900]; IRETD.
+    vm.mem
+        .write_slice(0x0900, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(2_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert!(
+        vm.mem().read_u8(0x900) >= 1,
+        "HPET timer 0 didn't fire (counter at {})",
+        vm.mem().read_u8(0x900)
+    );
+}
+
 /// HPET Main Counter (0xFED0_00F0) ticks once per CPU step when
 /// General Configuration's ENABLE_CNF (0xFED0_0010 bit 0) is
 /// set, and freezes otherwise. Linux uses HPET as a wall-clock

@@ -228,9 +228,14 @@ impl Memory {
     /// When ENABLE_CNF is clear, the counter freezes — that's how
     /// Linux pauses HPET during recalibration / suspend.
     ///
-    /// We don't fire match-comparator interrupts yet — Linux reads
-    /// the counter directly for time-of-day, so visible ticking
-    /// is what the calibration path actually needs.
+    /// After the increment, each of the three timers is checked for
+    /// a comparator match. A matching timer with INT_ENB_CNF
+    /// (bit 2) and FSB_EN_CNF (bit 14) both set queues an IRQ at
+    /// the vector from its FSB_INT_VAL register — Linux's HPET
+    /// driver in MSI-direct delivery mode. We share the LAPIC IRQ
+    /// slot (both targets are the local APIC anyway); the kernel
+    /// can't tell whether the delivery came from LAPIC timer or
+    /// HPET except by the vector it programmed.
     pub fn tick_hpet_counter(&mut self) {
         if self.hpet[0x10] & 1 == 0 {
             return;
@@ -248,6 +253,47 @@ impl Memory {
         ]);
         let next = cur.wrapping_add(1);
         self.hpet[off..off + 8].copy_from_slice(&next.to_le_bytes());
+
+        // Three timers at 0x100, 0x120, 0x140. Per timer:
+        //   +0x00 Config / Cap   (we care about bits 2, 14)
+        //   +0x08 Comparator     (64-bit, we use the low qword)
+        //   +0x10 FSB Route       (low 32 = MSI data, high 32 = MSI addr)
+        for tn in 0..3 {
+            let base = 0x100 + tn * 0x20;
+            let cfg_lo = u32::from_le_bytes([
+                self.hpet[base],
+                self.hpet[base + 1],
+                self.hpet[base + 2],
+                self.hpet[base + 3],
+            ]);
+            if cfg_lo & ((1 << 2) | (1 << 14)) != (1 << 2) | (1 << 14) {
+                continue;
+            }
+            let cmp_off = base + 0x08;
+            let cmp = u64::from_le_bytes([
+                self.hpet[cmp_off],
+                self.hpet[cmp_off + 1],
+                self.hpet[cmp_off + 2],
+                self.hpet[cmp_off + 3],
+                self.hpet[cmp_off + 4],
+                self.hpet[cmp_off + 5],
+                self.hpet[cmp_off + 6],
+                self.hpet[cmp_off + 7],
+            ]);
+            if next != cmp {
+                continue;
+            }
+            let fsb_off = base + 0x10;
+            let fsb_val = u32::from_le_bytes([
+                self.hpet[fsb_off],
+                self.hpet[fsb_off + 1],
+                self.hpet[fsb_off + 2],
+                self.hpet[fsb_off + 3],
+            ]);
+            if self.pending_lapic_irq.is_none() {
+                self.pending_lapic_irq = Some(fsb_val as u8);
+            }
+        }
     }
 
     pub fn read_u16(&self, addr: u32) -> u16 {
