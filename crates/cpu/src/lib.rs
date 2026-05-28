@@ -900,6 +900,15 @@ impl Cpu {
             // half copies through verbatim. PSHUFD's word-level kin —
             // typical use is rearranging the bytes of a string lane
             // before a comparison.
+            // MOVQ xmm1, xmm2/m64 (F3 0F 7E) — load the low qword,
+            // zero-extending the upper 64 bits of the destination.
+            // The 66 form (MOVD r/m32, xmm) is in the main 0F dispatch
+            // and stays as-is; the F2 form is undefined.
+            0x7E if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_xmm_rm64(rm, mem) as u128;
+                self.xmm[reg as usize] = v;
+            }
             0x70 => {
                 let (_, reg, rm) = self.fetch_modrm(mem);
                 let imm = self.fetch_u8(mem);
@@ -4783,6 +4792,125 @@ impl Cpu {
                             0x67 => packuswb(a, b),
                             _ => packssdw(a, b),
                         };
+                    }
+                    // Packed unsigned-byte / signed-word min/max
+                    // (66 0F): DA PMINUB, DE PMAXUB, EA PMINSW, EE PMAXSW.
+                    0xDA | 0xDE | 0xEA | 0xEE if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let take_max = matches!(op2, 0xDE | 0xEE);
+                        let signed_word = matches!(op2, 0xEA | 0xEE);
+                        self.xmm[reg as usize] = if signed_word {
+                            packed_lanes(a, b, 16, |x, y, _| {
+                                let sx = sign_extend_lane(x, 16);
+                                let sy = sign_extend_lane(y, 16);
+                                if (take_max && sx > sy) || (!take_max && sx < sy) {
+                                    x
+                                } else {
+                                    y
+                                }
+                            })
+                        } else {
+                            packed_lanes(a, b, 8, |x, y, _| {
+                                if (take_max && x > y) || (!take_max && x < y) {
+                                    x
+                                } else {
+                                    y
+                                }
+                            })
+                        };
+                    }
+                    // PAVGB (E0) / PAVGW (E3) — packed rounded average:
+                    // (a + b + 1) / 2 per lane (byte / word). Common in
+                    // pixel blends and motion-compensation filters.
+                    0xE0 | 0xE3 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lane = if op2 == 0xE0 { 8 } else { 16 };
+                        self.xmm[reg as usize] =
+                            packed_lanes(a, b, lane, |x, y, _| (x + y + 1) >> 1);
+                    }
+                    // PMULHUW (E4) — unsigned 16×16 multiply, keep high
+                    // 16 of each product. Counterpart to PMULHW for
+                    // unsigned data (no sign extension before multiply).
+                    0xE4 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] =
+                            packed_lanes(a, b, 16, |x, y, mask| ((x * y) >> 16) & mask);
+                    }
+                    // PMULUDQ (F4) — unsigned 32×32 → 64 multiply on the
+                    // low dword of each 64-bit lane. Used for 64-bit
+                    // multi-precision arithmetic on top of SSE2.
+                    0xF4 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lo = ((a as u32) as u64) * ((b as u32) as u64);
+                        let hi = (((a >> 64) as u32) as u64) * (((b >> 64) as u32) as u64);
+                        self.xmm[reg as usize] = (lo as u128) | ((hi as u128) << 64);
+                    }
+                    // PSADBW (F6) — sum of absolute differences across
+                    // each 8-byte half; the result is a 16-bit value
+                    // in the low word of each 64-bit lane (upper bits
+                    // zero). Vectorized memcmp / decoder cost metric.
+                    0xF6 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let mut low: u128 = 0;
+                        let mut high: u128 = 0;
+                        for i in 0..8u32 {
+                            let ax = (a >> (i * 8)) & 0xFF;
+                            let bx = (b >> (i * 8)) & 0xFF;
+                            low += ax.abs_diff(bx);
+                            let ay = (a >> (64 + i * 8)) & 0xFF;
+                            let by = (b >> (64 + i * 8)) & 0xFF;
+                            high += ay.abs_diff(by);
+                        }
+                        self.xmm[reg as usize] = low | (high << 64);
+                    }
+                    // MOVQ xmm/m64, xmm1 (66 0F D6) — store low qword.
+                    // Reg-form zeroes the destination's upper 64.
+                    0xD6 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.xmm[reg as usize] as u64;
+                        match rm {
+                            Rm::Reg(i) => self.xmm[i as usize] = v as u128,
+                            Rm::Mem(ea) => {
+                                let a = self.linear_seg(ea.seg, ea.off);
+                                self.mem_write_u32(mem, a, v as u32);
+                                self.mem_write_u32(mem, a.wrapping_add(4), (v >> 32) as u32);
+                            }
+                        }
+                    }
+                    // PMOVMSKB (66 0F D7) r32, xmm — extract the high
+                    // bit of each of the 16 bytes into the low 16 bits
+                    // of a GP register; upper 16 cleared. The canonical
+                    // SIMD-to-branch primitive: pair with PCMPEQB to
+                    // hunt for a byte in a 16-byte chunk.
+                    0xD7 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = match rm {
+                            Rm::Reg(i) => self.xmm[i as usize],
+                            Rm::Mem(_) => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        let mut mask: u32 = 0;
+                        for i in 0..16u32 {
+                            if ((src >> (i * 8 + 7)) & 1) != 0 {
+                                mask |= 1 << i;
+                            }
+                        }
+                        self.write_r32(reg, mask);
                     }
                     // Packed precision converts (0F 5A):
                     //   no prefix → CVTPS2PD (2×f32 → 2×f64)

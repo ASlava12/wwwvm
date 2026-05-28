@@ -3669,6 +3669,137 @@ fn sse_pshuflw_and_pshufhw_word_shuffles() {
     }
 }
 
+/// PMOVMSKB extracts the high bit of every byte into the low 16
+/// bits of a GP register — the SIMD-to-branch primitive paired with
+/// PCMPEQB for vectorized searches. Byte positions {0,1,5,15} hold
+/// 0xFF; the others 0x00 → mask = 0x8023.
+#[test]
+fn sse_pmovmskb_extracts_top_bits_of_bytes() {
+    let mut mem = Memory::new(0x10_0000);
+    for i in 0..16u32 {
+        let v = if matches!(i, 0 | 1 | 5 | 15) {
+            0xFFu8
+        } else {
+            0x00
+        };
+        mem.write_u8(0x600 + i, v);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0xD7, 0xC0, // PMOVMSKB EAX, XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..12 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // bits {0,1,5,15} = 1 → 0x0001 | 0x0002 | 0x0020 | 0x8000 = 0x8023.
+    assert_eq!(cpu.read_r32(0), 0x0000_8023);
+}
+
+/// PSADBW (sum of absolute differences across each 8-byte half) and
+/// PMINUB (per-byte unsigned minimum) in a single program. The
+/// PSADBW result lives as a 16-bit value in the low word of each
+/// 64-bit lane, upper bits zero.
+#[test]
+fn sse_psadbw_and_pminub_byte_metrics() {
+    let mut mem = Memory::new(0x10_0000);
+    let a: [u8; 16] = [10, 20, 30, 40, 50, 60, 70, 80, 1, 2, 3, 4, 5, 6, 7, 8];
+    let b: [u8; 16] = [15, 5, 30, 100, 0, 60, 80, 0, 10, 20, 30, 40, 50, 60, 70, 80];
+    for i in 0..16u32 {
+        mem.write_u8(0x600 + i, a[i as usize]);
+        mem.write_u8(0x610 + i, b[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x6F, 0xD0, // MOVDQA XMM2, XMM0
+            0x66, 0x0F, 0xF6, 0xD1, // PSADBW  XMM2, XMM1
+            0x66, 0x0F, 0x7F, 0x16, 0x20, 0x06, // MOVDQA [0x620], XMM2
+            0x66, 0x0F, 0x6F, 0xD8, // MOVDQA XMM3, XMM0
+            0x66, 0x0F, 0xDA, 0xD9, // PMINUB  XMM3, XMM1
+            0x66, 0x0F, 0x7F, 0x1E, 0x30, 0x06, // MOVDQA [0x630], XMM3
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Low half: 5+15+0+60+50+0+10+80 = 220.
+    // High half: 9+18+27+36+45+54+63+72 = 324.
+    let lo = (mem.read_u8(0x620) as u16) | ((mem.read_u8(0x621) as u16) << 8);
+    let hi = (mem.read_u8(0x628) as u16) | ((mem.read_u8(0x629) as u16) << 8);
+    assert_eq!(lo, 220);
+    assert_eq!(hi, 324);
+    // Upper bytes of each qword must be zero.
+    for off in [0x622, 0x623, 0x624, 0x625, 0x626, 0x627, 0x62A, 0x62B] {
+        assert_eq!(mem.read_u8(off), 0, "PSADBW upper byte @ {off:#X}");
+    }
+    // PMINUB per-byte minima.
+    let want_min: [u8; 16] = [10, 5, 30, 40, 0, 60, 70, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+    for i in 0..16u32 {
+        assert_eq!(
+            mem.read_u8(0x630 + i),
+            want_min[i as usize],
+            "PMINUB byte {i}"
+        );
+    }
+}
+
+/// MOVQ load (F3 0F 7E) and MOVQ store (66 0F D6) — both zero the
+/// upper 64 bits of the destination XMM (no preservation, unlike
+/// MOVLPS). Round-trips an 8-byte pattern through both encodings
+/// and verifies the upper half is cleared.
+#[test]
+fn sse_movq_load_and_store_low_qword() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 0x5566_7788);
+    mem.write_u32(0x604, 0x1122_3344);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xF3, 0x0F, 0x7E, 0x06, 0x00, 0x06, // MOVQ XMM0, [0x600]
+            0x66, 0x0F, 0xD6, 0xC1, // MOVQ XMM1, XMM0 (reg form)
+            0x66, 0x0F, 0x7F, 0x0E, 0x20, 0x06, // MOVDQA [0x620], XMM1
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Low 8 bytes of XMM1 = the loaded pattern.
+    assert_eq!(mem.read_u32(0x620), 0x5566_7788);
+    assert_eq!(mem.read_u32(0x624), 0x1122_3344);
+    // Upper 8 bytes — zero-extended by *both* MOVQ encodings.
+    assert_eq!(mem.read_u32(0x628), 0);
+    assert_eq!(mem.read_u32(0x62C), 0);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
