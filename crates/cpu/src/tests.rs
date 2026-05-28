@@ -2393,6 +2393,41 @@ fn xchg_eax_r32_short_form_swaps_full_32_bits() {
 /// must use the pre-write translation for every byte of the access.
 /// Real x86 caches the translation in the TLB at fetch + decode
 /// time; until INVLPG (or a CR3 reload) it's stable. So
+/// Fetch + read TLB invariants. The 1-entry caches added in
+/// `24c414a` / `f423f44` skip the PDE+PTE walk when consecutive
+/// accesses stay on the same 4 KiB page; this test pins the
+/// A20-via-direct-field-write self-invalidation path so a future
+/// refactor of the cache tuple shape can't silently drop the
+/// `a20` slot. The CR3 / INVLPG / CR0.PG / CS-load invalidations
+/// fire through `invalidate_fetch_tlb` from their respective
+/// dispatch sites — covered indirectly by the existing PSE +
+/// demand-paging tests in this file, and end-to-end by the
+/// `linux_userspace_milestone` integration test.
+#[test]
+fn fetch_read_tlb_a20_tuple_self_invalidates_on_direct_field_write() {
+    let mut mem = Memory::new(0x0080_0000);
+    mem.write_u32(0x0010_0000, 0x0000_0083); // PDE[0] PSE → phys 0
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr3 = 0x0010_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE
+                           // First read walks + caches.
+    assert_eq!(cpu.translate(&mem, 0x0010_0000), 0x0010_0000);
+    // Direct field flip — port_write(0x92) is the architectural
+    // path, but unit tests do this routinely and the cache must
+    // notice via the `a20` slot in the tuple.
+    cpu.a20 = false;
+    let phys = cpu.translate(&mem, 0x0010_0000);
+    assert_eq!(
+        phys, 0x0000_0000,
+        "A20-off translation should mask bit 20 even with a stale cached entry"
+    );
+    // Flip back — both states must be reachable cleanly.
+    cpu.a20 = true;
+    assert_eq!(cpu.translate(&mem, 0x0010_0000), 0x0010_0000);
+}
+
 /// `MOV [pde], val` that clears PDE.PS in byte 0 must still write
 /// bytes 1..3 to the same physical PDE word, not re-walk through
 /// the half-written PDE and observe garbage. Linux's pgtable code
