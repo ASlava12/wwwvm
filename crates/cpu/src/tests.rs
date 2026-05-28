@@ -2500,6 +2500,46 @@ fn decode_medley_sum_of_squares_reaches_55() {
     assert_eq!(cpu.read_r32(1), 6, "loop counter ended at 6");
 }
 
+/// strlen via REPNE SCASB — the canonical libc idiom. Scan ES:EDI
+/// for the AL=0 terminator with ECX=-1, then `not ecx; dec ecx` to
+/// recover the length. Exercises the 32-bit REPNE loop (ECX/EDI
+/// driven via 0x67) plus NOT/DEC r32 in one realistic sequence.
+#[test]
+fn strlen_via_repne_scasb() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x600, b"Hello\0"); // 5 chars + NUL
+                                        // MOV EDI, 0x600        ; 66 BF 00 06 00 00
+                                        // XOR AL, AL            ; 30 C0
+                                        // MOV ECX, -1           ; 66 B9 FF FF FF FF
+                                        // REPNE SCASB           ; 67 F2 AE   (addr32 → ECX/EDI)
+                                        // NOT ECX               ; 66 F7 D1
+                                        // DEC ECX               ; 66 49
+                                        // HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBF, 0x00, 0x06, 0x00, 0x00, // MOV EDI, 0x600
+            0x30, 0xC0, // XOR AL, AL
+            0x66, 0xB9, 0xFF, 0xFF, 0xFF, 0xFF, // MOV ECX, -1
+            0x67, 0xF2, 0xAE, // REPNE SCASB
+            0x66, 0xF7, 0xD1, // NOT ECX
+            0x66, 0x49, // DEC ECX
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(1), 5, "strlen(\"Hello\") = 5");
+}
+
 /// INT 0x80 legacy-syscall round-trip — the Linux i386 syscall ABI
 /// shape. User code loads argument registers, INT 0x80 vectors to a
 /// handler that computes a result into EAX, and IRET returns to the
