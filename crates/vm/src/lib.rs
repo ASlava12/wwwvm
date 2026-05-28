@@ -49,6 +49,9 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///   * INT 0x10 AH=0x02 — set cursor position (BH page, DH row, DL col)
 ///   * INT 0x10 AH=0x03 — read cursor position (returns row/col in
 ///     DH/DL plus a canned cursor shape in CH/CL)
+///   * INT 0x10 AH=0x06 — scroll window up. CH/CL = upper-left,
+///     DH/DL = lower-right, AL = lines (0 = clear), BH = fill attr.
+///   * INT 0x10 AH=0x07 — scroll window down (mirror of 0x06).
 ///   * INT 0x10 AH=0x09 — write char + attribute at the current
 ///     cursor, CX times. Does NOT advance the cursor (matches BIOS).
 ///   * INT 0x10 AH=0x0E — TTY teletype output. Writes AL to the VGA
@@ -78,6 +81,41 @@ fn bios_int12(cpu: &mut Cpu) -> bool {
     cpu.regs[wwwvm_cpu::r16::AX] = 640;
     cpu.flags &= !wwwvm_cpu::flag::CF;
     true
+}
+
+/// Fill a rectangular region of the VGA text buffer with `ch` +
+/// `attr`. Coordinates are inclusive on both ends.
+fn fill_rect(
+    mem: &mut Memory,
+    top: usize,
+    left: usize,
+    bot: usize,
+    right: usize,
+    ch: u8,
+    attr: u8,
+) {
+    for r in top..=bot {
+        for c in left..=right {
+            let off = ((r * VGA_TEXT_COLS) + c) * 2;
+            mem.write_u8(VGA_TEXT_BASE + off as u32, ch);
+            mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, attr);
+        }
+    }
+}
+
+/// Copy a single-row span `[left..=right]` from `src_row` to
+/// `dst_row` in the VGA buffer. Caller arranges read/write ordering
+/// when src and dst overlap (scroll handlers iterate forwards or
+/// reverse depending on direction).
+fn copy_row_range(mem: &mut Memory, src_row: usize, dst_row: usize, left: usize, right: usize) {
+    for c in left..=right {
+        let src_off = ((src_row * VGA_TEXT_COLS) + c) * 2;
+        let dst_off = ((dst_row * VGA_TEXT_COLS) + c) * 2;
+        let ch = mem.read_u8(VGA_TEXT_BASE + src_off as u32);
+        let at = mem.read_u8(VGA_TEXT_BASE + src_off as u32 + 1);
+        mem.write_u8(VGA_TEXT_BASE + dst_off as u32, ch);
+        mem.write_u8(VGA_TEXT_BASE + dst_off as u32 + 1, at);
+    }
 }
 
 fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
@@ -117,6 +155,52 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
             cpu.write_r8(2, col); // DL
             cpu.write_r8(5, 0x0E); // CH (start scan line)
             cpu.write_r8(1, 0x0F); // CL (end scan line)
+            true
+        }
+        // Scroll a window up (AH=0x06) or down (AH=0x07). CH/CL =
+        // upper-left row/col, DH/DL = lower-right row/col, AL =
+        // number of lines to scroll, BH = attribute for the new
+        // blank lines. AL=0 — or AL >= window height — clears the
+        // whole window. Used for clearing panels and the bottom
+        // status row in kernel banners.
+        0x06 | 0x07 => {
+            let scroll_up = ah == 0x06;
+            let lines = cpu.read_r8(0) as usize; // AL
+            let attr = cpu.read_r8(7); // BH
+            let top = cpu.read_r8(5) as usize; // CH
+            let left = cpu.read_r8(1) as usize; // CL
+            let bot = cpu.read_r8(6) as usize; // DH
+            let right = cpu.read_r8(2) as usize; // DL
+                                                 // Reject obviously-bogus coordinates; real BIOS silently
+                                                 // ignores out-of-range rectangles too.
+            if top >= VGA_TEXT_ROWS
+                || bot >= VGA_TEXT_ROWS
+                || left >= VGA_TEXT_COLS
+                || right >= VGA_TEXT_COLS
+                || top > bot
+                || left > right
+            {
+                return true;
+            }
+            let window_rows = bot - top + 1;
+            if lines == 0 || lines >= window_rows {
+                // Whole-window clear.
+                fill_rect(mem, top, left, bot, right, b' ', attr);
+            } else if scroll_up {
+                // Copy rows [top+lines..=bot] up by `lines`, then
+                // clear the bottom `lines` rows.
+                for r in top..=(bot - lines) {
+                    copy_row_range(mem, r + lines, r, left, right);
+                }
+                fill_rect(mem, bot + 1 - lines, left, bot, right, b' ', attr);
+            } else {
+                // Scroll down: walk top-down in reverse so we don't
+                // clobber source rows before reading them.
+                for r in ((top + lines)..=bot).rev() {
+                    copy_row_range(mem, r - lines, r, left, right);
+                }
+                fill_rect(mem, top, left, top + lines - 1, right, b' ', attr);
+            }
             true
         }
         // Write char + attribute at current cursor, CX times. AL =

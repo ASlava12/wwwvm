@@ -74,6 +74,100 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
 #[test]
+fn bios_int10_scroll_up_with_zero_lines_clears_window() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Paint the whole screen with 'X' on attr 0x70 so we can see
+    // exactly which cells the call touches.
+    for i in 0..(80 * 25) as u32 {
+        let off = i * 2;
+        vm.mem.write_u8(VGA_TEXT_BASE + off, b'X');
+        vm.mem.write_u8(VGA_TEXT_BASE + off + 1, 0x70);
+    }
+    // Clear the rectangle (rows 5..=8, cols 10..=15) with attr 0x4F.
+    //   AH=0x06 AL=0 (clear) BH=0x4F CH=5 CL=10 DH=8 DL=15
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x06, // MOV AH, 0x06
+            0xB0, 0x00, // MOV AL, 0     (clear-whole-window)
+            0xB7, 0x4F, // MOV BH, 0x4F  (fill attribute)
+            0xB5, 0x05, // MOV CH, 5
+            0xB1, 0x0A, // MOV CL, 10
+            0xB6, 0x08, // MOV DH, 8
+            0xB2, 0x0F, // MOV DL, 15
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    // Inside the rectangle: ' ' with attr 0x4F.
+    for r in 5..=8usize {
+        for c in 10..=15usize {
+            let off = ((r * 80) + c) * 2;
+            assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), b' ');
+            assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), 0x4F);
+        }
+    }
+    // Cells just outside the rectangle still hold the prefill.
+    let outside = [(4, 12), (9, 12), (6, 9), (6, 16)];
+    for (r, c) in outside {
+        let off = ((r * 80) + c) * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), b'X');
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), 0x70);
+    }
+}
+
+#[test]
+fn bios_int10_scroll_up_by_one_line_shifts_rows_and_fills_bottom() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Paint rows 5..=8 with row-distinct labels (A/B/C/D), full width.
+    for (row, ch) in [(5, b'A'), (6, b'B'), (7, b'C'), (8, b'D')] {
+        for c in 0..80u32 {
+            let off = ((row * 80) + c as usize) * 2;
+            vm.mem.write_u8(VGA_TEXT_BASE + off as u32, ch);
+            vm.mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, 0x07);
+        }
+    }
+    // Scroll the rows 5..=8 window up by 1 line, fill attr 0x1E.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x06, // MOV AH, 0x06
+            0xB0, 0x01, // MOV AL, 1     (one line)
+            0xB7, 0x1E, // MOV BH, 0x1E
+            0xB5, 0x05, // MOV CH, 5
+            0xB1, 0x00, // MOV CL, 0
+            0xB6, 0x08, // MOV DH, 8
+            0xB2, 0x4F, // MOV DL, 79
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    // Rows shift: 5←B, 6←C, 7←D, 8 ← blanks(0x1E).
+    let want = [(5, b'B'), (6, b'C'), (7, b'D')];
+    for (row, ch) in want {
+        for c in 0..80usize {
+            let off = ((row * 80) + c) * 2;
+            assert_eq!(
+                vm.mem().read_u8(VGA_TEXT_BASE + off as u32),
+                ch,
+                "row {row} col {c}"
+            );
+        }
+    }
+    for c in 0..80usize {
+        let off = ((8 * 80) + c) * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), b' ');
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), 0x1E);
+    }
+}
+
+#[test]
 fn bios_int10_set_video_mode_clears_screen_and_resets_cursor() {
     let mut vm = Vm::new();
     vm.install_bios();
