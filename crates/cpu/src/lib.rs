@@ -896,8 +896,10 @@ impl Cpu {
         }
         // Diagnostic watchpoint: print every write within a
         // configurable physical range, including the EIP of the
-        // executing instruction. Used to find what kernel code
-        // path stores a particular value to a particular addr.
+        // executing instruction and a short call-stack of return
+        // addresses pulled from [ESP] / [ESP+4] / [ESP+8] via
+        // paging. Used to find what kernel code path stores a
+        // particular value to a particular addr.
         if let Ok(spec) = std::env::var("WWWVM_WATCH_WRITE") {
             if let Some((lo, hi)) = spec.split_once(':') {
                 if let (Ok(lo), Ok(hi)) = (
@@ -905,9 +907,19 @@ impl Cpu {
                     u32::from_str_radix(hi.trim_start_matches("0x"), 16),
                 ) {
                     if phys >= lo && phys < hi {
+                        let esp = self.read_r32(r16::SP as u8);
+                        let read = |va: u32| -> u32 {
+                            let pa = self.translate(m, va);
+                            m.read_u32(pa)
+                        };
                         eprintln!(
-                            "[W] phys[{:08X}] <- {:02X}  EIP={:08X}",
-                            phys, value, self.last_op_ip
+                            "[W] phys[{:08X}] <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
+                            phys,
+                            value,
+                            self.last_op_ip,
+                            read(esp),
+                            read(esp.wrapping_add(4)),
+                            read(esp.wrapping_add(8))
                         );
                     }
                 }
@@ -6907,6 +6919,16 @@ impl Cpu {
                             if sub == 3 {
                                 let _ = self.fpu_pop();
                             }
+                        }
+                        // DD /7 FNSTSW m16 — store FPU status word to
+                        // memory. Linux's fpu init test sequence
+                        // (fninit; fnstsw m; fnstcw m; check) uses
+                        // this; without it the test "succeeds" only
+                        // because we silently failed and Linux then
+                        // clears X86_FEATURE_FPU.
+                        7 => {
+                            let sw = self.fpu_sw;
+                            self.mem_write_u16(mem, addr, sw);
                         }
                         _ => {
                             return Err(CpuError::Unimplemented {
