@@ -1439,6 +1439,45 @@ impl Vm {
         self.load_image(d::PRINT_DEC_ADDR, d::PRINT_DEC);
     }
 
+    /// Load the bundled protected-mode kernel demo: a synthetic
+    /// bzImage whose payload runs in 32-bit CS.D=1 mode, prints
+    /// "Hello from PM!\n" via COM1 (port 0x3F8) and HLTs. Composes
+    /// the full bzImage → PM handoff path for JS demos and
+    /// integration tests that want a stock PM guest without
+    /// hand-rolling the bzImage bytes.
+    pub fn load_pm_demo(&mut self) -> Result<(), bzimage::BzImageError> {
+        // Synthetic v2.10 bzImage: setup_sects=1, boot_flag=AA55,
+        // HdrS magic, code32_start = 1 MiB. 1024-byte setup blob
+        // followed by the 32-bit kernel payload.
+        let mut bz = vec![0u8; 1024];
+        bz[0x1F1] = 1;
+        bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        bz[0x202..0x206].copy_from_slice(b"HdrS");
+        bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+        bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        // Kernel payload (CS.D=1 32-bit):
+        //   BA F8 03 00 00      MOV EDX, 0x3F8       (COM1 THR)
+        //   B0 <c> EE  …  per char of "Hello from PM!\n"
+        //   F4                  HLT
+        bz.extend_from_slice(&[0xBA, 0xF8, 0x03, 0x00, 0x00]);
+        for ch in b"Hello from PM!\n" {
+            bz.extend_from_slice(&[0xB0, *ch, 0xEE]);
+        }
+        bz.push(0xF4);
+
+        // The default 1 MiB RAM can't fit code32_start (1 MiB) —
+        // resize up to 2 MiB so the payload lands inside RAM. This
+        // mirrors the JS-callable best practice for any real
+        // bzImage (use new_with_ram_size for ≥2 MiB).
+        if self.mem.size() < 0x0020_0000 {
+            self.mem.resize(0x0020_0000);
+        }
+
+        let parsed = self.load_bzimage(&bz)?;
+        self.start_protected_mode_at(parsed.code32_start);
+        Ok(())
+    }
+
     /// Queue commands to be delivered to the guest the moment it boots.
     /// Each command is terminated with `\n` and they are concatenated in
     /// order — `["ls", "cat /etc/os-release"]` becomes `"ls\ncat …\n"`.

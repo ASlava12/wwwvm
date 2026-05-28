@@ -84,6 +84,18 @@ impl Memory {
         self.bytes.len()
     }
 
+    /// Grow the physical RAM region in place. Existing contents
+    /// stay at their original addresses; new bytes are zero-filled.
+    /// LAPIC and HPET MMIO windows are unaffected — they live in
+    /// their own scratch buffers, not in `bytes`. Used when a VM
+    /// host needs to expand RAM mid-life (e.g. loading a bzImage
+    /// whose code32_start sits past the default 1 MiB).
+    pub fn resize(&mut self, new_size: usize) {
+        if new_size > self.bytes.len() {
+            self.bytes.resize(new_size, 0);
+        }
+    }
+
     /// True if `addr` falls inside the LAPIC's MMIO window.
     #[inline]
     fn is_lapic(addr: u32) -> bool {

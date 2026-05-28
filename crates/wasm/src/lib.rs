@@ -69,6 +69,18 @@ impl WwwVm {
         self.inner.load_calculator_demo();
     }
 
+    /// Load the bundled PM-kernel demo: synthetic bzImage with a
+    /// 32-bit kernel that prints "Hello from PM!\n" via COM1 and
+    /// HLTs. Demonstrates the full bzImage → start_protected_mode_at
+    /// → run → read_output chain through the JS surface. RAM is
+    /// auto-resized to 2 MiB if currently smaller (code32_start is
+    /// at 1 MiB).
+    pub fn load_pm_demo(&mut self) -> Result<(), JsError> {
+        self.inner
+            .load_pm_demo()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Load arbitrary bytes (e.g. a future kernel/initrd) at `addr`.
     pub fn load_image(&mut self, addr: u32, bytes: &[u8]) {
         self.inner.load_image(addr, bytes);
@@ -512,6 +524,24 @@ mod tests {
         // Single 32-bit read — would need four read_mem_u8 calls
         // and bit-shifting on the JS side without this wrapper.
         assert_eq!(vm.read_mem_u32(0x900), 0xCAFE_BABE);
+    }
+
+    /// The bundled PM-kernel demo: one call sets up the bzImage,
+    /// hands off to PM, runs the kernel, and the host drains the
+    /// UART tx buffer to read what the kernel printed. This is
+    /// the smallest JS-callable shape for "boot a PM kernel and
+    /// see its output" — useful for the web demo's PM option.
+    #[test]
+    fn js_facing_load_pm_demo_prints_hello_from_pm() {
+        let mut vm = WwwVm::new();
+        vm.load_pm_demo().expect("load_pm_demo");
+        vm.run(128);
+        assert!(vm.is_halted());
+        assert!(vm.last_error().is_none());
+        assert_eq!(vm.read_output(), "Hello from PM!\n");
+        // The handoff also set up PE in CR0 and ESI = 0x90000.
+        assert_eq!(vm.read_control_register(0) & 1, 1);
+        assert_eq!(vm.read_register_u32(6), 0x0009_0000);
     }
 
     /// Register accessors expose the kernel's post-execution state

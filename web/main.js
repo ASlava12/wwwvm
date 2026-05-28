@@ -88,6 +88,19 @@ $("boot").addEventListener("click", () => {
     vm.load_interactive_demo();
   } else if (guestKind === "calculator") {
     vm.load_calculator_demo();
+  } else if (guestKind === "pm") {
+    // PM-kernel demo doesn't go through reset_to_boot — load_pm_demo
+    // calls start_protected_mode_at, which sets booted=true itself.
+    // Skip vm.boot() so we don't undo it.
+    try {
+      vm.load_pm_demo();
+    } catch (e) {
+      setStatus(`load_pm_demo: ${e}`, "error");
+      return;
+    }
+    setStatus("running", "running");
+    pump();
+    return;
   } else {
     vm.load_default_guest();
   }
