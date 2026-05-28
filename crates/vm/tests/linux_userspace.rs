@@ -7,7 +7,7 @@
 //!
 //! The test is `#[ignore]` because it depends on a vmlinuz file
 //! we don't ship (Tinycore Core ISO `boot/vmlinuz`, 5.85 MB). One
-//! run is ~55 seconds wall-clock — the test bails the moment
+//! run is ~52 seconds wall-clock — the test bails the moment
 //! HELLO shows up, vs. the linux_boot example which intentionally
 //! runs the full 16 B-step budget for diagnostics and clocks
 //! ~10 min. Even at 55 seconds, this isn't something to put in
@@ -169,7 +169,7 @@ fn run_until_marker(
 /// but pins the *full* documented end-to-end chain from the README
 /// instead of trusting that "if HELLO works, exit must too."
 #[test]
-#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~80s wall-clock"]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
 fn linux_userspace_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());

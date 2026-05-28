@@ -2428,6 +2428,36 @@ fn fetch_read_tlb_a20_tuple_self_invalidates_on_direct_field_write() {
     assert_eq!(cpu.translate(&mem, 0x0010_0000), 0x0010_0000);
 }
 
+/// Write-side TLB regression. Same shape as the read-side test
+/// above but on `translate_write`. The slot was added in `e87cd63`
+/// for a ~4% Linux-boot win; this test pins the a20-tuple
+/// self-invalidation invariant on the write path so the slot can't
+/// silently regress to "honors a stale a20 frame" the way the
+/// read-side cache would have without `f423f44`.
+#[test]
+fn write_tlb_a20_tuple_self_invalidates_on_direct_field_write() {
+    let mut mem = Memory::new(0x0080_0000);
+    mem.write_u32(0x0010_0000, 0x0000_0083); // PDE[0] PSE, R/W → phys 0
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr3 = 0x0010_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE — CR0.WP=0 so kernel writes bypass
+                           // First translate_write walks + caches.
+    assert_eq!(cpu.translate_write(&mem, 0x0010_0000), 0x0010_0000);
+    // Direct a20 flip — the cached tuple records the pre-flip
+    // a20 state, so the lookup misses and re-walks.
+    cpu.a20 = false;
+    let phys = cpu.translate_write(&mem, 0x0010_0000);
+    assert_eq!(
+        phys, 0x0000_0000,
+        "A20-off translate_write should mask bit 20 even with a stale cached entry"
+    );
+    // Flip back — both states reachable cleanly through the write path.
+    cpu.a20 = true;
+    assert_eq!(cpu.translate_write(&mem, 0x0010_0000), 0x0010_0000);
+}
+
 /// `MOV [pde], val` that clears PDE.PS in byte 0 must still write
 /// bytes 1..3 to the same physical PDE word, not re-walk through
 /// the half-written PDE and observe garbage. Linux's pgtable code
