@@ -199,6 +199,14 @@ impl IoBus {
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
+        // Port 0x61 (NMI Status & Control) lives in the keyboard's
+        // claimed range but is logically a PIT/PPI register —
+        // Linux's TSC-via-PIT calibration polls bit 5 (channel-2
+        // OUT) here. Dispatch it explicitly before the keyboard
+        // catches the read and returns 0.
+        if port == 0x61 {
+            return self.pit.read_port_61();
+        }
         let (lo, hi) = self.uart.port_range();
         if port >= lo && port <= hi {
             return self.uart.read(port);
@@ -248,6 +256,11 @@ impl IoBus {
     }
 
     pub fn write(&mut self, port: u16, value: u8) {
+        // See `read` — port 0x61 is logically a PIT/PPI register.
+        if port == 0x61 {
+            self.pit.write_port_61(value);
+            return;
+        }
         let (lo, hi) = self.uart.port_range();
         if port >= lo && port <= hi {
             self.uart.write(port, value);

@@ -1,20 +1,27 @@
-//! 8254 Programmable Interval Timer — minimal channel-0 subset.
+//! 8254 Programmable Interval Timer — channels 0 and 2 subset.
 //!
 //! What we model:
 //!   * Channel 0 with reload register, current counter, and modes 0
 //!     (one-shot) and 2/3 (periodic — both reload on terminal count
 //!     and behave identically for IRQ generation purposes).
-//!   * Control-word writes to 0x43 with SC=0 and access pattern
-//!     RW=3 (LSB then MSB). Other RW patterns are accepted but the
-//!     reload-value writes will silently not latch.
-//!   * Counter Latch Command (CW = 0x00..0x3F with RW=0): snapshots
-//!     the live counter into a hold register so two-byte reads see
-//!     a consistent value even if the counter ticks between them.
-//!     Linux's PIT clocksource readback uses this every tick.
-//!   * `tick(n)` decrements the counter by n; on terminal count it
-//!     latches a pending edge for IRQ 0 and (mode 2/3) reloads.
+//!   * Channel 2 minimal: mode 0 (one-shot) only, gated by port 0x61
+//!     bit 0. Linux uses this for TSC-via-PIT calibration: it
+//!     programs ch2 with a known countdown and polls port 0x61 bit
+//!     5 (TIMER_2_OUTPUT) until the OUT line goes high. Without ch2
+//!     the calibration polls forever and start_kernel never
+//!     advances past tsc_init.
+//!   * Port 0x61 (NMI Status & Control Register) — bits 0 (timer 2
+//!     gate enable) and 1 (speaker data) are writable; bit 5
+//!     reflects channel 2's OUT line. Other bits read back as 0
+//!     and writes to them are dropped.
+//!   * Control-word writes to 0x43 with SC=0 or SC=2 and access
+//!     pattern RW=3 (LSB then MSB). Counter Latch Command (CW with
+//!     RW=0) snapshots channel 0 only.
+//!   * `tick(n)` decrements channel 0 unconditionally and channel 2
+//!     only while its gate is high.
 //!
-//! Channels 1 and 2 accept writes silently and don't generate IRQs.
+//! Channel 1 (DRAM refresh) accepts writes silently. Mode > 0 on
+//! channel 2 isn't modeled — Linux only uses mode 0 for calibration.
 
 use crate::IoDevice;
 
@@ -38,6 +45,24 @@ pub struct Pit {
     /// Next byte to return when `ch0_latch` is Some: 0 = LSB, 1 = MSB.
     /// Also tracks the LSB/MSB phase for unlatched RW=3 reads.
     read_state: u8,
+    // ----- Channel 2 (Linux TSC-via-PIT calibration) -----
+    pub ch2_reload: u16,
+    pub ch2_counter: u32,
+    pub ch2_running: bool,
+    /// Channel 2 OUT line. In mode 0 (the only mode we model for
+    /// ch2) OUT is 0 while counting and flips to 1 on terminal
+    /// count, where it latches until the next control-word write or
+    /// reload. Port 0x61 bit 5 reads from here.
+    pub ch2_out: bool,
+    ch2_write_state: u8,
+    ch2_pending_lsb: u8,
+    /// Port 0x61 bit 0 — gate for channel 2. When clear the counter
+    /// is frozen (matches the 8254 behavior of holding the count on
+    /// gate-low in mode 0). Linux sets this before programming ch2.
+    pub gate2: bool,
+    /// Port 0x61 bit 1 — speaker data. Stored for round-trip but
+    /// otherwise unused; nothing in the model produces audio.
+    pub speaker2: bool,
 }
 
 impl Pit {
@@ -55,6 +80,14 @@ impl Pit {
             pending_lsb: 0,
             ch0_latch: None,
             read_state: 0,
+            ch2_reload: 0,
+            ch2_counter: 0,
+            ch2_running: false,
+            ch2_out: false,
+            ch2_write_state: 0,
+            ch2_pending_lsb: 0,
+            gate2: false,
+            speaker2: false,
         }
     }
 
@@ -68,37 +101,79 @@ impl Pit {
     /// count latches a single pending edge that the IoBus will
     /// translate into an IRQ.
     pub fn tick(&mut self, n: u32) {
-        if !self.ch0_running || n == 0 {
+        if n == 0 {
             return;
         }
-        let mut remaining = n;
-        loop {
-            if self.ch0_counter == 0 {
-                match self.ch0_mode {
-                    0 => {
-                        self.ch0_running = false;
-                        return;
-                    }
-                    _ => {
-                        let reload = if self.ch0_reload == 0 {
-                            0x10000
-                        } else {
-                            self.ch0_reload as u32
-                        };
-                        self.ch0_counter = reload;
+        // Channel 0 — IRQ source on terminal count.
+        if self.ch0_running {
+            let mut remaining = n;
+            loop {
+                if self.ch0_counter == 0 {
+                    match self.ch0_mode {
+                        0 => {
+                            self.ch0_running = false;
+                            break;
+                        }
+                        _ => {
+                            let reload = if self.ch0_reload == 0 {
+                                0x10000
+                            } else {
+                                self.ch0_reload as u32
+                            };
+                            self.ch0_counter = reload;
+                        }
                     }
                 }
-            }
-            let take = remaining.min(self.ch0_counter);
-            self.ch0_counter -= take;
-            remaining -= take;
-            if self.ch0_counter == 0 {
-                self.ch0_pending_edge = true;
-            }
-            if remaining == 0 {
-                return;
+                let take = remaining.min(self.ch0_counter);
+                self.ch0_counter -= take;
+                remaining -= take;
+                if self.ch0_counter == 0 {
+                    self.ch0_pending_edge = true;
+                }
+                if remaining == 0 {
+                    break;
+                }
             }
         }
+        // Channel 2 — mode 0 only; gated by port 0x61 bit 0. We
+        // don't reload on terminal count (mode 0 holds OUT high
+        // until the counter is reprogrammed), so a single saturating
+        // sub is enough.
+        if self.ch2_running && self.gate2 {
+            let take = n.min(self.ch2_counter);
+            self.ch2_counter -= take;
+            if self.ch2_counter == 0 {
+                self.ch2_out = true;
+                self.ch2_running = false;
+            }
+        }
+    }
+
+    /// Read NMI Status & Control register (port 0x61). Bit 5
+    /// reflects channel 2's OUT line, which Linux's TSC-via-PIT
+    /// calibration polls to detect when its programmed countdown
+    /// has elapsed. Other bits round-trip the last write.
+    pub fn read_port_61(&self) -> u8 {
+        let mut v = 0u8;
+        if self.gate2 {
+            v |= 0x01;
+        }
+        if self.speaker2 {
+            v |= 0x02;
+        }
+        if self.ch2_out {
+            v |= 0x20;
+        }
+        v
+    }
+
+    /// Write NMI Status & Control register (port 0x61). Only bits 0
+    /// (channel 2 gate) and 1 (speaker data) are stored; everything
+    /// else is dropped. Lowering the gate freezes channel 2 in
+    /// place; raising it resumes counting from where we left off.
+    pub fn write_port_61(&mut self, value: u8) {
+        self.gate2 = value & 0x01 != 0;
+        self.speaker2 = value & 0x02 != 0;
     }
 
     /// Consume the channel-0 edge, if any. IoBus calls this each
@@ -218,6 +293,17 @@ impl IoDevice for Pit {
                     self.ch0_latch = None;
                     self.ch0_pending_edge = false;
                     self.ch0_running = false;
+                } else if sc == 2 && rw == 3 {
+                    // Channel 2 init: reset write phase, drop OUT
+                    // back to 0 so the kernel's poll sees a clean
+                    // starting edge, and arm for the LSB+MSB pair
+                    // that follows. Mode bits are not stored because
+                    // we only model mode 0 — Linux's calibration
+                    // never asks for anything else.
+                    let _ = mode;
+                    self.ch2_write_state = 0;
+                    self.ch2_out = false;
+                    self.ch2_running = false;
                 }
             }
             0 => {
@@ -232,6 +318,22 @@ impl IoDevice for Pit {
                     self.write_state = 0;
                 }
             }
+            2 => {
+                // Channel 2 data port — LSB then MSB. The second
+                // byte arms the counter; the gate (port 0x61 bit 0)
+                // then controls whether it actually decrements.
+                if self.ch2_write_state == 0 {
+                    self.ch2_pending_lsb = value;
+                    self.ch2_write_state = 1;
+                } else {
+                    let reload = (self.ch2_pending_lsb as u16) | ((value as u16) << 8);
+                    self.ch2_reload = reload;
+                    self.ch2_counter = if reload == 0 { 0x10000 } else { reload as u32 };
+                    self.ch2_running = true;
+                    self.ch2_out = false;
+                    self.ch2_write_state = 0;
+                }
+            }
             _ => {}
         }
     }
@@ -240,6 +342,59 @@ impl IoDevice for Pit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Channel 2 + port 0x61 model the loop Linux uses to derive the
+    /// TSC frequency from the PIT's known crystal rate:
+    ///   1. write port 0x61 to gate timer 2 on, speaker off
+    ///   2. write 0x43 with SC=2 RW=3 mode 0 (= 0xB0)
+    ///   3. write 0x42 LSB and 0x42 MSB to load the countdown
+    ///   4. poll port 0x61 bit 5 — clear while counting, set on
+    ///      terminal count
+    ///
+    /// Without this, the calibration loop in start_kernel spins
+    /// forever and the kernel never advances past tsc_init.
+    #[test]
+    fn pit_ch2_terminal_count_flips_port61_bit5() {
+        let mut pit = Pit::standard();
+        // Enable gate, speaker off.
+        pit.write_port_61(0x01);
+        // Control word: SC=2 (channel 2), RW=3 (LSB then MSB),
+        // mode=0 (interrupt on terminal count), BCD=0 → 0xB0.
+        pit.write(0x43, 0xB0);
+        // Counter = 5 ticks.
+        pit.write(0x42, 5);
+        pit.write(0x42, 0);
+        // Pre-terminal: OUT=0, port 0x61 bit 5 reads back as 0.
+        assert_eq!(pit.read_port_61() & 0x20, 0);
+        // 4 ticks — still counting.
+        pit.tick(4);
+        assert_eq!(pit.read_port_61() & 0x20, 0);
+        // 5th tick reaches zero → OUT high, bit 5 latches set.
+        pit.tick(1);
+        assert_eq!(pit.read_port_61() & 0x20, 0x20);
+        // OUT stays high after additional ticks (mode 0 holds).
+        pit.tick(100);
+        assert_eq!(pit.read_port_61() & 0x20, 0x20);
+    }
+
+    /// Gating ch2 off via port 0x61 bit 0 freezes the counter — the
+    /// 8254 spec for mode 0 says the count holds while GATE is low.
+    /// Linux relies on this to set up the channel before letting it
+    /// run.
+    #[test]
+    fn pit_ch2_gate_low_freezes_counter() {
+        let mut pit = Pit::standard();
+        pit.write(0x43, 0xB0);
+        pit.write(0x42, 0x10);
+        pit.write(0x42, 0x00);
+        // Gate is still 0 (default) — ticks must not decrement.
+        pit.tick(100);
+        assert_eq!(pit.read_port_61() & 0x20, 0, "gate=0 must keep OUT low");
+        // Raise gate; counter now decrements.
+        pit.write_port_61(0x01);
+        pit.tick(0x10);
+        assert_eq!(pit.read_port_61() & 0x20, 0x20);
+    }
 
     #[test]
     fn mode2_fires_periodic_edge_every_reload_ticks() {
