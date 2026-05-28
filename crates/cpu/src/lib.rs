@@ -4083,6 +4083,25 @@ impl Cpu {
                         }
                     }
 
+                    // PUSH FS / POP FS / PUSH GS / POP GS. Linux uses
+                    // FS (and GS on x86-64) for per-CPU / TLS bases, so
+                    // these show up in entry/exit paths constantly.
+                    0xA0 => {
+                        let v = self.sregs[sreg::FS];
+                        self.push16(mem, v);
+                    }
+                    0xA1 => {
+                        let v = self.pop16(mem);
+                        self.write_sreg(sreg::FS, v, mem);
+                    }
+                    0xA8 => {
+                        let v = self.sregs[sreg::GS];
+                        self.push16(mem, v);
+                    }
+                    0xA9 => {
+                        let v = self.pop16(mem);
+                        self.write_sreg(sreg::GS, v, mem);
+                    }
                     // SHLD r/m16/32, r16/32, imm8 — 0x0F 0xA4.
                     // Shifts the destination left by `count`, filling
                     // the low end with bits shifted out of the source's

@@ -2466,6 +2466,43 @@ fn enter_leave_round_trip_32_bit_frame() {
     );
 }
 
+/// 0x0F 0xA0/0xA1 — PUSH FS / POP FS round-trip. (FS holds the
+/// per-CPU / TLS base in Linux.)
+#[test]
+fn push_pop_fs_round_trip() {
+    let mut mem = Memory::new(0x10_0000);
+    // Real-mode: load FS via a far-pointer-free path. We use the
+    // MOV-to-sreg-from-r16 (0x8E /4) form: MOV FS, AX.
+    //   MOV AX, 0x1234   ; B8 34 12
+    //   MOV FS, AX       ; 8E E0  (modrm 11 100 000 → sreg=4=FS, rm=AX)
+    //   PUSH FS          ; 0F A0
+    //   MOV AX, 0        ; B8 00 00
+    //   MOV FS, AX       ; 8E E0  (clobber FS)
+    //   POP FS           ; 0F A1
+    //   HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xB8, 0x34, 0x12, 0x8E, 0xE0, 0x0F, 0xA0, 0xB8, 0x00, 0x00, 0x8E, 0xE0, 0x0F, 0xA1,
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    // SS:SP must point at usable RAM for the push/pop.
+    cpu.regs[r16::SP] = 0x2000;
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // FS clobbered to 0 then restored from the stack.
+    assert_eq!(cpu.sregs[sreg::FS], 0x1234);
+}
+
 /// 0x66 0x69 — three-operand IMUL r32, r/m32, imm32.
 #[test]
 fn imul_three_operand_imm32() {
