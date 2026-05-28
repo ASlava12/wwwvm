@@ -67,7 +67,7 @@ fn main() {
     // a soft hang in calibrate_delay_converge. Setting lpj declares
     // a pre-computed value and skips calibration entirely.
     vm.set_kernel_cmdline(
-        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 initcall_debug",
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 debug loglevel=8 initcall_debug ignore_loglevel",
     );
 
     // Optional initramfs — without one Linux 6.12 mounts an empty
