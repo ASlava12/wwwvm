@@ -48,6 +48,20 @@ impl Disk {
         }
         to_write
     }
+
+    /// Write `data.len()` bytes starting at sector `lba`. The image
+    /// grows on demand — writes past the current end extend the
+    /// backing store with zero-filled bytes up to `start + data.len()`
+    /// so a kernel can format a fresh disk by writing to sectors that
+    /// were never part of the initial image.
+    pub fn write_sectors(&mut self, lba: u32, data: &[u8]) {
+        let start = (lba as usize) * SECTOR_SIZE;
+        let end = start + data.len();
+        if self.bytes.len() < end {
+            self.bytes.resize(end, 0);
+        }
+        self.bytes[start..end].copy_from_slice(data);
+    }
 }
 
 #[cfg(test)]
@@ -64,6 +78,26 @@ mod tests {
         assert_eq!(buf[0], 0xAA);
         assert_eq!(buf[255], 0xAA);
         assert_eq!(buf[256], 0x00, "zero-padded past image end");
+    }
+
+    #[test]
+    fn write_sectors_grows_image_and_round_trips() {
+        let mut d = Disk::new();
+        // Start with a one-sector image of 0x11s.
+        d.load(&[0x11; SECTOR_SIZE]);
+        assert_eq!(d.size(), SECTOR_SIZE);
+        // Write 0x22s into sector 2 — the image must grow to cover
+        // sectors 0..2 with the in-between sector zero-filled.
+        d.write_sectors(2, &[0x22; SECTOR_SIZE]);
+        assert_eq!(d.size(), 3 * SECTOR_SIZE);
+        let mut buf = [0xFFu8; 3 * SECTOR_SIZE];
+        d.read_sectors(0, 3, &mut buf);
+        assert!(buf[..SECTOR_SIZE].iter().all(|&b| b == 0x11));
+        assert!(
+            buf[SECTOR_SIZE..2 * SECTOR_SIZE].iter().all(|&b| b == 0x00),
+            "gap sector zero-filled"
+        );
+        assert!(buf[2 * SECTOR_SIZE..].iter().all(|&b| b == 0x22));
     }
 
     #[test]

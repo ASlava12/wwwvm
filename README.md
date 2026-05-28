@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**368 тестов** зелёные (mem 6 + devices 34 + cpu 264 + vm 56 +
+**371 тест** зелёный (mem 6 + devices 37 + cpu 264 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -180,9 +180,10 @@ spinlock через LOCK CMPXCHG + PAUSE):
   MOVNTDQ/MOVNTPS/MOVNTI, MASKMOVDQU, фенсы LFENCE/SFENCE/MFENCE.
 - **BIOS-shim**: INT 0x10 (TTY), 0x12, 0x13 (disk read), 0x15
   (E820 + AH=88), 0x16 (keyboard).
-- **IDE/ATA primary канал** (порты 0x1F0..0x1F7): IDENTIFY DEVICE
-  и READ SECTORS (LBA28). 16-битная передача данных приходит как
-  два байтовых чтения подряд — оба продвигают буфер.
+- **IDE/ATA primary канал** (порты 0x1F0..0x1F7): IDENTIFY DEVICE,
+  READ SECTORS и WRITE SECTORS (LBA28). 16-битная передача данных
+  приходит как пара байтовых обращений подряд — оба продвигают
+  буфер, в обе стороны (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
   header parser + loader. Снапшот v9 round-trip'ит всё состояние.
 
@@ -199,7 +200,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
 | Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #GP уже raised из RDMSR/WRMSR на неизвестных MSR (rdmsr_safe работает); остаётся раздавать из segment-load helper'ов и привилегий |
-| IDE/ATA secondary channel + WRITE SECTORS + DMA / virtio-blk | средний | Primary канал (read-only, IDENTIFY+READ) уже работает; для модерн дистров нужно ещё пишущий путь и желательно DMA |
+| IDE/ATA secondary channel + DMA / virtio-blk | средний | Primary канал read+write через PIO уже работает; для модерн дистров нужно ещё DMA и желательно второй канал для CD-ROM |
 | APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
 | VGA graphics, framebuffer | средний | fbcon, графические гости |
@@ -216,7 +217,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 368 пройденных тестов на текущий момент. CI
+Должно вывести 371 пройденный тест на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
