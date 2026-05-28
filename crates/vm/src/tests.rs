@@ -74,6 +74,108 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
 #[test]
+fn bios_int10_set_then_read_cursor_round_trips_row_and_col() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // MOV AH, 0x02 ; MOV BH, 0 ; MOV DH, 12 ; MOV DL, 40 ; INT 0x10
+    //   (set cursor to row 12, col 40)
+    // MOV AH, 0x03 ; MOV BH, 0 ; INT 0x10
+    //   (read it back into DH/DL and a canned shape into CH/CL)
+    // HLT
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x02, // MOV AH, 0x02
+            0xB7, 0x00, // MOV BH, 0
+            0xB6, 0x0C, // MOV DH, 12
+            0xB2, 0x28, // MOV DL, 40
+            0xCD, 0x10, // INT 0x10
+            0xB4, 0x03, // MOV AH, 0x03
+            0xB7, 0x00, // MOV BH, 0
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(6), 12, "DH = row");
+    assert_eq!(cpu.read_r8(2), 40, "DL = col");
+    assert_eq!(cpu.read_r8(5), 0x0E, "CH = canned cursor start");
+    assert_eq!(cpu.read_r8(1), 0x0F, "CL = canned cursor end");
+}
+
+/// INT 0x10 AH=0x09 writes a character + attribute CX times at the
+/// current cursor, without advancing it. Used by setup.bin and
+/// kernel banners to paint colored panels.
+#[test]
+fn bios_int10_write_char_attribute_fills_n_cells_without_advancing() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Position cursor at row 5 col 10, then write '#' with attr 0x4F
+    // (white on red) five times.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x02, // MOV AH, 0x02
+            0xB6, 0x05, // MOV DH, 5
+            0xB2, 0x0A, // MOV DL, 10
+            0xCD, 0x10, // INT 0x10
+            0xB4, 0x09, // MOV AH, 0x09
+            0xB0, b'#', // MOV AL, '#'
+            0xB3, 0x4F, // MOV BL, 0x4F
+            0xB9, 0x05, 0x00, // MOV CX, 5
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    // Five '#' cells at row 5, columns 10..14.
+    for i in 0..5u32 {
+        let off = ((5 * 80) + 10 + i) * 2;
+        assert_eq!(
+            vm.mem().read_u8(VGA_TEXT_BASE + off),
+            b'#',
+            "char at col {}",
+            10 + i
+        );
+        assert_eq!(
+            vm.mem().read_u8(VGA_TEXT_BASE + off + 1),
+            0x4F,
+            "attr at col {}",
+            10 + i
+        );
+    }
+    // Cursor was NOT advanced — still at col 10.
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_COL), 10);
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_ROW), 5);
+}
+
+/// INT 0x10 AH=0x0F reports the active video mode. We always return
+/// mode 3 (80×25 16-colour text), 80 columns, page 0 — close enough
+/// to satisfy kernel probes that check before any mode-switching.
+#[test]
+fn bios_int10_get_video_mode_reports_mode_3_with_80_cols() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x0F, // MOV AH, 0x0F
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(0), 3, "AL = mode 3");
+    assert_eq!(cpu.read_r8(4), 80, "AH = columns");
+    assert_eq!(cpu.read_r8(7), 0, "BH = page");
+}
+
+#[test]
 fn bios_int12_returns_640_kib_conventional_memory() {
     let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
     vm.install_bios();

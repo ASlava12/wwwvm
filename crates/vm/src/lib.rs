@@ -43,10 +43,16 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 /// guest installed at the IVT entry.
 ///
 /// Currently implemented:
+///   * INT 0x10 AH=0x02 — set cursor position (BH page, DH row, DL col)
+///   * INT 0x10 AH=0x03 — read cursor position (returns row/col in
+///     DH/DL plus a canned cursor shape in CH/CL)
+///   * INT 0x10 AH=0x09 — write char + attribute at the current
+///     cursor, CX times. Does NOT advance the cursor (matches BIOS).
 ///   * INT 0x10 AH=0x0E — TTY teletype output. Writes AL to the VGA
 ///     text buffer at the BDA cursor (page 0), advances the cursor,
 ///     wraps at column 80 and clamps at row 24. CR/LF/BS are honored;
 ///     BEL is silently dropped.
+///   * INT 0x10 AH=0x0F — get video mode (returns mode 3 / 80 cols)
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
     match vector {
         0x10 => bios_int10(cpu, mem),
@@ -72,6 +78,48 @@ fn bios_int12(cpu: &mut Cpu) -> bool {
 fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
     let ah = cpu.read_r8(4); // AH lives in the high half of AX
     match ah {
+        // Set cursor position. BH = page (ignored — page 0 only),
+        // DH = row, DL = column. Clamps each to the 80×25 grid.
+        0x02 => {
+            let row = cpu.read_r8(6).min(VGA_TEXT_ROWS as u8 - 1);
+            let col = cpu.read_r8(2).min(VGA_TEXT_COLS as u8 - 1);
+            mem.write_u8(BDA_CURSOR_ROW, row);
+            mem.write_u8(BDA_CURSOR_COL, col);
+            true
+        }
+        // Read cursor position. Returns DH=row, DL=col, and a
+        // plausible cursor shape (start/end scan line) in CH/CL —
+        // we don't model the cursor shape so just report the
+        // standard underline-style block (lines 14..15).
+        0x03 => {
+            let row = mem.read_u8(BDA_CURSOR_ROW);
+            let col = mem.read_u8(BDA_CURSOR_COL);
+            cpu.write_r8(6, row); // DH
+            cpu.write_r8(2, col); // DL
+            cpu.write_r8(5, 0x0E); // CH (start scan line)
+            cpu.write_r8(1, 0x0F); // CL (end scan line)
+            true
+        }
+        // Write char + attribute at current cursor, CX times. AL =
+        // char, BL = attribute, CX = repeat count. The cursor is
+        // NOT advanced — that's the real BIOS contract, distinct
+        // from AH=0x0E's teletype behavior.
+        0x09 => {
+            let ch = cpu.read_r8(0); // AL
+            let attr = cpu.read_r8(3); // BL
+            let count = cpu.read_r16(1) as usize; // CX
+            let col = mem.read_u8(BDA_CURSOR_COL) as usize;
+            let row = mem.read_u8(BDA_CURSOR_ROW) as usize;
+            for i in 0..count {
+                if col + i >= VGA_TEXT_COLS {
+                    break;
+                }
+                let off = ((row * VGA_TEXT_COLS) + col + i) * 2;
+                mem.write_u8(VGA_TEXT_BASE + off as u32, ch);
+                mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, attr);
+            }
+            true
+        }
         0x0E => {
             let al = cpu.read_r8(0);
             let mut col = mem.read_u8(BDA_CURSOR_COL) as usize;
@@ -101,6 +149,15 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
             }
             mem.write_u8(BDA_CURSOR_COL, col as u8);
             mem.write_u8(BDA_CURSOR_ROW, row as u8);
+            true
+        }
+        // Get video mode. AL = active mode, AH = columns, BH = page.
+        // We don't model multiple modes — always report 80×25
+        // text (mode 3) with the active page = 0.
+        0x0F => {
+            cpu.write_r8(0, 3); // AL = mode 3
+            cpu.write_r8(4, VGA_TEXT_COLS as u8); // AH = columns
+            cpu.write_r8(7, 0); // BH = page
             true
         }
         _ => false,
