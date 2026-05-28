@@ -211,6 +211,33 @@ impl WwwVm {
         cpu.sregs[idx as usize]
     }
 
+    /// GDTR base — the linear address the kernel's GDT lives at,
+    /// loaded via LGDT. JS callers walking descriptors do
+    /// `read_mem_u32(gdtr_base + idx * 8)` to fetch each entry.
+    pub fn get_gdtr_base(&self) -> u32 {
+        self.inner.cpu().gdtr.base
+    }
+
+    /// GDTR limit — last valid byte offset into the GDT. A
+    /// selector with index << 3 > limit raises #GP(selector).
+    pub fn get_gdtr_limit(&self) -> u16 {
+        self.inner.cpu().gdtr.limit
+    }
+
+    /// IDTR base — the linear address of the IDT. JS debuggers
+    /// fetch gate entries via `read_mem_u32(idtr_base + vec * 8)`
+    /// (32-bit interrupt/trap gates are 8 bytes).
+    pub fn get_idtr_base(&self) -> u32 {
+        self.inner.cpu().idtr.base
+    }
+
+    /// IDTR limit — last valid byte offset into the IDT. A vector
+    /// beyond limit is undefined behavior on real silicon; in
+    /// practice Linux sets limit = 0x7FF (256 gates × 8 bytes - 1).
+    pub fn get_idtr_limit(&self) -> u16 {
+        self.inner.cpu().idtr.limit
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -543,6 +570,13 @@ mod tests {
         assert_eq!(vm.read_segment_selector(5), 0x10, "GS");
         // Out-of-range index returns 0 (no panic).
         assert_eq!(vm.read_segment_selector(42), 0);
+        // GDTR points at the flat-segments GDT start_protected_mode_at
+        // builds at 0x500 (null + ring-0 code + ring-0 data → 0x17).
+        assert_eq!(vm.get_gdtr_base(), 0x0500);
+        assert_eq!(vm.get_gdtr_limit(), 0x0017);
+        // IDTR was never loaded — base/limit are at construction defaults.
+        assert_eq!(vm.get_idtr_base(), 0);
+        assert_eq!(vm.get_idtr_limit(), 0);
     }
 
     #[test]
