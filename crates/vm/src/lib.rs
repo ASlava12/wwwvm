@@ -344,6 +344,28 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
             }
             true
         }
+        // AH=0x12 — video subsystem configuration. Linux's
+        // arch/x86/boot/video-vga.c calls this with BL=0x10 to
+        // discover the EGA/VGA adapter; if BL comes back unchanged
+        // the function is treated as unsupported. We model the
+        // BL=0x10 sub-function and return "VGA color, 256K of video
+        // memory" — which is what's effectively true here (the VGA
+        // text buffer at 0xB8000 covers more than enough). Other BL
+        // values return CF=1 (unsupported).
+        0x12 => {
+            let bl = cpu.read_r8(3); // BL
+            if bl == 0x10 {
+                cpu.write_r8(6, 0); // BH = 0 (color)
+                cpu.write_r8(3, 3); // BL = 3 (256K video memory)
+                cpu.write_r8(5, 0); // CH = 0 (feature bits)
+                cpu.write_r8(1, 0); // CL = 0 (switches)
+                cpu.flags &= !wwwvm_cpu::flag::CF;
+                true
+            } else {
+                cpu.flags |= wwwvm_cpu::flag::CF;
+                true
+            }
+        }
         _ => false,
     }
 }

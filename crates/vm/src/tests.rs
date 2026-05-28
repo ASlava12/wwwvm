@@ -656,6 +656,59 @@ fn bios_int10_get_video_mode_reports_mode_3_with_80_cols() {
     assert_eq!(cpu.read_r8(7), 0, "BH = page");
 }
 
+/// INT 0x10 / AH=0x12 / BL=0x10 — get EGA/VGA adapter info.
+/// Linux's arch/x86/boot/video-vga.c probes this on every boot
+/// to discover the adapter type. If BL comes back unchanged
+/// the function is treated as unsupported (and the kernel
+/// falls back to MDA assumptions). We report "color VGA, 256K"
+/// so Linux takes its VGA branch.
+#[test]
+fn bios_int10_get_ega_info_reports_color_vga_256k() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x12, // MOV AH, 0x12
+            0xB3, 0x10, // MOV BL, 0x10
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    let cpu = vm.cpu();
+    assert_eq!(cpu.read_r8(6), 0, "BH = 0 (color)");
+    assert_eq!(cpu.read_r8(3), 3, "BL = 3 (256K video memory)");
+    assert_eq!(cpu.read_r8(5), 0, "CH = 0 (feature bits)");
+    assert_eq!(cpu.read_r8(1), 0, "CL = 0 (switches)");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0);
+}
+
+/// INT 0x10 / AH=0x12 / BL=anything-else — unsupported. Returns
+/// CF=1 so the caller knows the sub-function isn't modelled.
+#[test]
+fn bios_int10_video_subsystem_other_bl_signals_unsupported() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x12, // MOV AH, 0x12
+            0xB3, 0x20, // MOV BL, 0x20 (some other sub-function)
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(16);
+    assert_ne!(
+        vm.cpu().flags & wwwvm_cpu::flag::CF,
+        0,
+        "CF set on unsupported BL"
+    );
+}
+
 #[test]
 fn bios_int12_returns_640_kib_conventional_memory() {
     let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
