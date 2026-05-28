@@ -258,6 +258,36 @@ impl WwwVm {
         self.inner.cpu().tr
     }
 
+    /// LAPIC timer Current Count (MMIO 0xFEE0_0390). Counts down
+    /// once per CPU step when LVT_TIMER is configured; the kernel
+    /// programs Initial Count and watches this register against
+    /// TSC for calibration. Returns the live u32 value.
+    pub fn get_lapic_current_count(&self) -> u32 {
+        self.inner.mem().read_u32(0xFEE0_0390)
+    }
+
+    /// LAPIC LVT_TIMER (MMIO 0xFEE0_0320). Vector in bits 7:0,
+    /// mask in bit 16, mode in bits 18:17. JS debuggers display
+    /// this alongside Current Count so the operator can see what
+    /// the kernel programmed.
+    pub fn get_lapic_lvt_timer(&self) -> u32 {
+        self.inner.mem().read_u32(0xFEE0_0320)
+    }
+
+    /// HPET Main Counter low 32 bits (MMIO 0xFED0_00F0). Advances
+    /// once per CPU step when General Configuration's ENABLE_CNF
+    /// (0xFED0_0010 bit 0) is set. Pair with `get_hpet_counter_high`
+    /// for the full 64-bit value.
+    pub fn get_hpet_counter_low(&self) -> u32 {
+        self.inner.mem().read_u32(0xFED0_00F0)
+    }
+
+    /// HPET Main Counter high 32 bits. Usually zero unless the VM
+    /// has been running for ~4 billion CPU steps with HPET enabled.
+    pub fn get_hpet_counter_high(&self) -> u32 {
+        self.inner.mem().read_u32(0xFED0_00F4)
+    }
+
     /// LDT Register selector. LLDT writes this. We don't yet walk
     /// the LDT for descriptor lookups (every test pulls from GDT),
     /// so this is mostly informational — JS debuggers display it
@@ -574,6 +604,13 @@ mod tests {
         // The handoff also set up PE in CR0 and ESI = 0x90000.
         assert_eq!(vm.read_control_register(0) & 1, 1);
         assert_eq!(vm.read_register_u32(6), 0x0009_0000);
+        // The timer accessors round-trip: the demo kernel doesn't
+        // touch LAPIC or HPET, so both stay at construction defaults
+        // (zero current count, zero LVT, zero counter).
+        assert_eq!(vm.get_lapic_current_count(), 0);
+        assert_eq!(vm.get_lapic_lvt_timer(), 0);
+        assert_eq!(vm.get_hpet_counter_low(), 0);
+        assert_eq!(vm.get_hpet_counter_high(), 0);
     }
 
     /// Register accessors expose the kernel's post-execution state
