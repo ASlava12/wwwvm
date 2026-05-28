@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**394 теста** зелёные (mem 6 + devices 38 + cpu 266 + vm 76 +
+**398 тестов** зелёные (mem 6 + devices 41 + cpu 267 + vm 76 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -197,6 +197,10 @@ spinlock через LOCK CMPXCHG + PAUSE):
   (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
   header parser + loader. Снапшот v9 round-trip'ит всё состояние.
+- **PCI** (порты 0xCF8/0xCFC, Mechanism #1): пустая шина — все
+  чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
+  Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются
+  в четыре байтовых обращения подряд.
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
@@ -228,7 +232,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 394 пройденных теста на текущий момент. CI
+Должно вывести 398 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

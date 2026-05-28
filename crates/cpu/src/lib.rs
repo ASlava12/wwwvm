@@ -3946,11 +3946,18 @@ impl Cpu {
                 self.write_r8(0, v);
             }
             0xE5 => {
-                // IN AX, imm8 — two byte reads from consecutive ports
+                // IN AX/EAX, imm8 — two/four byte reads from
+                // consecutive ports. The 0x66 prefix widens to EAX
+                // (four bytes from port..port+3).
                 let port = self.fetch_u8(mem) as u16;
-                let lo = self.port_read(io, port) as u16;
-                let hi = self.port_read(io, port.wrapping_add(1)) as u16;
-                self.regs[r16::AX] = lo | (hi << 8);
+                if self.op_size_32 {
+                    let v = port_read_u32(self, io, port);
+                    self.write_r32(0, v);
+                } else {
+                    let lo = self.port_read(io, port) as u16;
+                    let hi = self.port_read(io, port.wrapping_add(1)) as u16;
+                    self.regs[r16::AX] = lo | (hi << 8);
+                }
             }
             0xE6 => {
                 // OUT imm8, AL
@@ -3959,25 +3966,41 @@ impl Cpu {
                 self.port_write(io, port, v);
             }
             0xE7 => {
-                // OUT imm8, AX — two byte writes to consecutive ports
+                // OUT imm8, AX/EAX — two/four byte writes to
+                // consecutive ports (0x66 → 32-bit form).
                 let port = self.fetch_u8(mem) as u16;
-                let ax = self.regs[r16::AX];
-                self.port_write(io, port, ax as u8);
-                self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
+                if self.op_size_32 {
+                    let v = self.read_r32(0);
+                    port_write_u32(self, io, port, v);
+                } else {
+                    let ax = self.regs[r16::AX];
+                    self.port_write(io, port, ax as u8);
+                    self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
+                }
             }
             0xED => {
-                // IN AX, DX — 16-bit port read via DX
+                // IN AX/EAX, DX
                 let port = self.regs[r16::DX];
-                let lo = self.port_read(io, port) as u16;
-                let hi = self.port_read(io, port.wrapping_add(1)) as u16;
-                self.regs[r16::AX] = lo | (hi << 8);
+                if self.op_size_32 {
+                    let v = port_read_u32(self, io, port);
+                    self.write_r32(0, v);
+                } else {
+                    let lo = self.port_read(io, port) as u16;
+                    let hi = self.port_read(io, port.wrapping_add(1)) as u16;
+                    self.regs[r16::AX] = lo | (hi << 8);
+                }
             }
             0xEF => {
-                // OUT DX, AX — 16-bit port write via DX
+                // OUT DX, AX/EAX
                 let port = self.regs[r16::DX];
-                let ax = self.regs[r16::AX];
-                self.port_write(io, port, ax as u8);
-                self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
+                if self.op_size_32 {
+                    let v = self.read_r32(0);
+                    port_write_u32(self, io, port, v);
+                } else {
+                    let ax = self.regs[r16::AX];
+                    self.port_write(io, port, ax as u8);
+                    self.port_write(io, port.wrapping_add(1), (ax >> 8) as u8);
+                }
             }
 
             // XLAT — AL = mem[DS:BX+AL] (with seg-override if present).
@@ -6337,6 +6360,24 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             cpu.write_r32(1, 0);
         }
     }
+}
+
+/// 32-bit port read decomposed into four byte reads at port..port+3,
+/// the same shape PCI configuration's data port (0xCFC) expects.
+fn port_read_u32(cpu: &mut Cpu, io: &mut IoBus, port: u16) -> u32 {
+    let b0 = cpu.port_read(io, port) as u32;
+    let b1 = cpu.port_read(io, port.wrapping_add(1)) as u32;
+    let b2 = cpu.port_read(io, port.wrapping_add(2)) as u32;
+    let b3 = cpu.port_read(io, port.wrapping_add(3)) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+/// 32-bit port write decomposed into four byte writes at port..port+3.
+fn port_write_u32(cpu: &mut Cpu, io: &mut IoBus, port: u16, value: u32) {
+    cpu.port_write(io, port, value as u8);
+    cpu.port_write(io, port.wrapping_add(1), (value >> 8) as u8);
+    cpu.port_write(io, port.wrapping_add(2), (value >> 16) as u8);
+    cpu.port_write(io, port.wrapping_add(3), (value >> 24) as u8);
 }
 
 fn comis_flags(ord: Option<std::cmp::Ordering>) -> (bool, bool, bool) {

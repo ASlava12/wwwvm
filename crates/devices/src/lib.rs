@@ -26,6 +26,7 @@ mod ata;
 mod cmos;
 mod disk;
 mod keyboard;
+mod pci;
 mod pic;
 mod pit;
 mod uart;
@@ -34,6 +35,7 @@ pub use ata::{Ata, PRIMARY_PORT_BASE, SECONDARY_PORT_BASE};
 pub use cmos::{reg as cmos_reg, Cmos};
 pub use disk::{Disk, SECTOR_SIZE as DISK_SECTOR_SIZE};
 pub use keyboard::Keyboard;
+pub use pci::Pci;
 pub use pic::Pic;
 pub use pit::Pit;
 pub use uart::Uart;
@@ -61,6 +63,11 @@ pub struct IoBus {
     /// type, different port base — the standard PC two-channel
     /// layout, useful for a CD-ROM target or a second hard drive.
     pub ata2: Ata,
+    /// PCI configuration space (ports 0xCF8..0xCFF). No devices
+    /// behind the bus yet — every read at the data window returns
+    /// the 0xFFFFFFFF "no device" sentinel, which is what Linux
+    /// expects to see when it walks an empty bus.
+    pub pci: Pci,
 }
 
 impl IoBus {
@@ -89,6 +96,7 @@ impl IoBus {
             cmos: Cmos::new(),
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
+            pci: Pci::new(),
         }
     }
 
@@ -104,6 +112,7 @@ impl IoBus {
             cmos: Cmos::new(),
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
+            pci: Pci::new(),
         }
     }
 
@@ -222,6 +231,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.ata2.read(port);
         }
+        let (lo, hi) = self.pci.port_range();
+        if port >= lo && port <= hi {
+            return self.pci.read(port);
+        }
         0xFF
     }
 
@@ -264,6 +277,11 @@ impl IoBus {
         let (lo, hi) = self.ata2.port_range();
         if port >= lo && port <= hi {
             self.ata2.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.pci.port_range();
+        if port >= lo && port <= hi {
+            self.pci.write(port, value);
         }
     }
 }

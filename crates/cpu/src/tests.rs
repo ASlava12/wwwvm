@@ -4114,6 +4114,40 @@ fn ata_identify_via_in_out_returns_signature_word() {
     assert_eq!(cpu.regs[r16::AX], 0x0040);
 }
 
+/// End-to-end PCI Mechanism #1 probe via 32-bit OUT/IN under 0x66.
+/// Selects bus 0 / device 0 / register 0 with enable=1, then reads
+/// the 32-bit data window — the canonical "scan PCI for a device"
+/// idiom Linux uses. An empty bus returns 0xFFFFFFFF (vendor ID =
+/// 0xFFFF), and that's what we verify here.
+#[test]
+fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x7C00,
+        &[
+            // EAX = 0x80000000 (enable bit + bus 0 / dev 0 / reg 0).
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x80, // MOV EAX, 0x80000000
+            0xBA, 0xF8, 0x0C, // MOV DX, 0x0CF8
+            0x66, 0xEF, // OUT DX, EAX  (32-bit; uses op_size_32 path)
+            0xBA, 0xFC, 0x0C, // MOV DX, 0x0CFC
+            0x66, 0xED, // IN  EAX, DX
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Empty PCI bus → vendor/device ID = 0xFFFFFFFF.
+    assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
