@@ -913,8 +913,9 @@ impl Cpu {
                             m.read_u32(pa)
                         };
                         eprintln!(
-                            "[W] phys[{:08X}] <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
+                            "[W] phys[{:08X}] (VA={:08X}) <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
                             phys,
+                            linear,
                             value,
                             self.last_op_ip,
                             read(esp),
@@ -938,8 +939,7 @@ impl Cpu {
     }
 
     pub fn mem_write_u16(&self, m: &mut Memory, linear: u32, value: u16) {
-        self.mem_write_u8(m, linear, value as u8);
-        self.mem_write_u8(m, linear.wrapping_add(1), (value >> 8) as u8);
+        self.mem_write_aligned(m, linear, &value.to_le_bytes());
     }
 
     pub fn mem_read_u32(&self, m: &Memory, linear: u32) -> u32 {
@@ -949,8 +949,77 @@ impl Cpu {
     }
 
     pub fn mem_write_u32(&self, m: &mut Memory, linear: u32, value: u32) {
-        self.mem_write_u16(m, linear, value as u16);
-        self.mem_write_u16(m, linear.wrapping_add(2), (value >> 16) as u16);
+        self.mem_write_aligned(m, linear, &value.to_le_bytes());
+    }
+
+    /// Write `bytes` to consecutive linear addresses starting at
+    /// `linear`. When the whole span fits in a single 4 KiB page we
+    /// translate only the base address and use the resulting phys
+    /// frame for every byte — this matches real x86 TLB semantics
+    /// for an in-flight instruction, where a write to a page-table
+    /// entry doesn't retroactively change the translation of the
+    /// rest of the same access. Without it, Linux's `MOV [pde], val`
+    /// that clears PDE.PS observes the cleared-PS state for byte 1
+    /// onwards and walks through the half-written PT — which on a
+    /// kernel pgdir update means a fault on an entry that's still
+    /// being written.
+    ///
+    /// If the access crosses a page boundary we fall back to the
+    /// per-byte path, which costs the second walk but only matters
+    /// for the rare unaligned span. The diagnostic watchpoint
+    /// (WWWVM_WATCH_WRITE) fires for every byte regardless of which
+    /// path we take.
+    fn mem_write_aligned(&self, m: &mut Memory, linear: u32, bytes: &[u8]) {
+        let len = bytes.len() as u32;
+        let page_off = linear & 0xFFF;
+        if page_off + len <= 0x1000 {
+            // Same-page fast path: translate once, write many.
+            let had_fault = self.pending_fault.get().is_some();
+            let phys_base = self.translate_write(m, linear);
+            if had_fault || self.pending_fault.get().is_some() {
+                return;
+            }
+            for (i, b) in bytes.iter().enumerate() {
+                let phys = phys_base.wrapping_add(i as u32);
+                self.watch_write(m, linear.wrapping_add(i as u32), phys, *b);
+                m.write_u8(phys, *b);
+            }
+        } else {
+            // Page-crossing slow path: per-byte translate (each may
+            // fault independently if the second page isn't mapped).
+            for (i, b) in bytes.iter().enumerate() {
+                self.mem_write_u8(m, linear.wrapping_add(i as u32), *b);
+            }
+        }
+    }
+
+    fn watch_write(&self, m: &Memory, linear: u32, phys: u32, value: u8) {
+        if let Ok(spec) = std::env::var("WWWVM_WATCH_WRITE") {
+            if let Some((lo, hi)) = spec.split_once(':') {
+                if let (Ok(lo), Ok(hi)) = (
+                    u32::from_str_radix(lo.trim_start_matches("0x"), 16),
+                    u32::from_str_radix(hi.trim_start_matches("0x"), 16),
+                ) {
+                    if phys >= lo && phys < hi {
+                        let esp = self.read_r32(r16::SP as u8);
+                        let read = |va: u32| -> u32 {
+                            let pa = self.translate(m, va);
+                            m.read_u32(pa)
+                        };
+                        eprintln!(
+                            "[W] phys[{:08X}] (VA={:08X}) <- {:02X}  EIP={:08X} ret={:08X},{:08X},{:08X}",
+                            phys,
+                            linear,
+                            value,
+                            self.last_op_ip,
+                            read(esp),
+                            read(esp.wrapping_add(4)),
+                            read(esp.wrapping_add(8))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Read an SSE r/m operand: an XMM register (mod=11) or a 128-bit
@@ -1667,8 +1736,11 @@ impl Cpu {
             Rm::Reg(i) => self.write_r32(i, value),
             Rm::Mem(ea) => {
                 let base = self.linear_seg(ea.seg, ea.off);
-                self.mem_write_u16(mem, base, value as u16);
-                self.mem_write_u16(mem, base.wrapping_add(2), (value >> 16) as u16);
+                // Single mem_write_u32 (which uses the per-write
+                // mini-TLB) so a 4-byte store that *targets* a PTE
+                // doesn't see its own first-byte effect on the
+                // remaining three bytes — see mem_write_aligned.
+                self.mem_write_u32(mem, base, value);
             }
         }
     }

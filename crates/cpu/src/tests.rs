@@ -2366,6 +2366,88 @@ fn translate_with_pse_pde_uses_4mib_page_directly() {
     assert_eq!(phys_w, 0x0040_0000 + 0x0000_0FFF);
 }
 
+/// A multi-byte write whose target is *itself* the PDE that maps it
+/// must use the pre-write translation for every byte of the access.
+/// Real x86 caches the translation in the TLB at fetch + decode
+/// time; until INVLPG (or a CR3 reload) it's stable. So
+/// `MOV [pde], val` that clears PDE.PS in byte 0 must still write
+/// bytes 1..3 to the same physical PDE word, not re-walk through
+/// the half-written PDE and observe garbage. Linux's pgtable code
+/// hits this when it converts a 4 MiB super-page mapping into a 4
+/// KiB-PT mapping with one `MOV` of the new PDE value.
+#[test]
+fn write_through_pde_uses_pre_write_translation() {
+    let mut mem = Memory::new(0x0080_0000); // 8 MiB
+                                            // GDT at 0x500: null + ring-0 code (D=1/G=1) + ring-0 data.
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data
+        ],
+    );
+    // Page directory at phys 0x10_0000. PDE[0] identity-maps [0,4M)
+    // with PSE 4 MiB page — this is the entry we deliberately
+    // overwrite during the test. PDE[1] identity-maps [4M,8M) and
+    // we put the boot code there so instruction fetches DON'T
+    // depend on the PDE we're modifying. (Otherwise the next fetch
+    // after clearing PDE[0].PS would walk an invalid PT and our
+    // test would self-corrupt for unrelated reasons.)
+    mem.write_u32(0x0010_0000, 0x0000_0083); // PDE[0] PSE → phys 0
+    mem.write_u32(0x0010_0004, 0x0040_0083); // PDE[1] PSE → phys 0x400000
+                                             // Boot stub at phys 0x400000 (= VA 0x400000 through PDE[1]):
+                                             //   B8 00 00 10 00     MOV EAX, 0x00100000  (= PDE base)
+                                             //   8B 18              MOV EBX, [EAX]       (= PDE[0] = 0x83)
+                                             //   C7 00 03 00 00 00  MOV [EAX], 0x00000003 (clear PS, keep P+RW)
+                                             //   F4                 HLT
+                                             // The MOV [EAX], imm32 access writes 4 bytes to phys 0x00100000.
+                                             // Pre-write: PDE[0].PS=1 (super-page maps VA 0 → phys 0). The
+                                             // first byte write (0x03) clears PS. Without our fix, byte 1
+                                             // walks PDE[0] (now PS=0, PT base = 0) and reads PTE[0] from
+                                             // phys 0 (= zero RAM here), which is P=0 → #PF and only the
+                                             // first byte of the write actually lands. With our fix, all 4
+                                             // bytes write to the same translated phys, and PDE[0] = 3.
+    mem.write_slice(
+        0x0040_0000,
+        &[
+            0xB8, 0x00, 0x00, 0x10, 0x00, // MOV EAX, 0x100000
+            0x8B, 0x18, // MOV EBX, [EAX]
+            0xC7, 0x00, 0x03, 0x00, 0x00, 0x00, // MOV [EAX], 3
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.cr3 = 0x0010_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE
+    cpu.ip = 0x0040_0000;
+    let mut io = IoBus::new();
+    for _ in 0..32 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "did not HLT — final IP={:08X}", cpu.ip);
+    // PDE[0] should now be exactly the 4 bytes we wrote: 0x00000003.
+    // Pre-fix, only byte 0 made it (the rest faulted on the
+    // partially-cleared PDE walk).
+    assert_eq!(
+        mem.read_u32(0x0010_0000),
+        0x0000_0003,
+        "all 4 bytes of MOV [EAX],imm32 must land at the PDE's phys, even though byte 0 clears PS",
+    );
+    assert_eq!(cpu.read_r32(3), 0x83); // pre-write read of PDE[0] into EBX
+}
+
 /// End-to-end: paging + PSE work for *instruction fetch*, not just
 /// for `translate()` of data operands. We set up a flat 32-bit CS,
 /// build a 4 MiB-page directory with PDE[0] identity-mapping [0,4M)

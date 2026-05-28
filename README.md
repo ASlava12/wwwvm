@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**504 тестов** зелёные (mem 11 + devices 56 + cpu 308 + vm 115 +
+**505 тестов** зелёные (mem 11 + devices 56 + cpu 309 + vm 115 +
 tutorial-anchor 2 + wasm 7 + proxy 5). Снапшот v13.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -277,7 +277,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 504 пройденных тестов на текущий момент. CI
+Должно вывести 505 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
