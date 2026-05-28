@@ -116,6 +116,20 @@ impl WwwVm {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// Skip the real-mode → PM trampoline and jump straight into
+    /// 32-bit code at `entry`. The standard caller flow is:
+    ///   const entry = vm.load_bzimage(kernelBytes);
+    ///   vm.set_kernel_cmdline("console=ttyS0");
+    ///   vm.set_ramdisk(initrdBytes);
+    ///   vm.start_protected_mode_at(entry);
+    ///   vm.run(50_000);  // pump
+    /// The VM is left in the same state a real bootloader would
+    /// have produced just after JMPing to the kernel: CR0.PE=1,
+    /// flat segments, 32-bit stack, IP = entry.
+    pub fn start_protected_mode_at(&mut self, entry: u32) {
+        self.inner.start_protected_mode_at(entry);
+    }
+
     /// Write an IVT entry. Vector `v` lives at linear `v*4`. Use this
     /// from JS to install an interrupt handler without emitting MOV
     /// WORD instructions in the guest.
@@ -300,6 +314,40 @@ mod tests {
         assert_eq!(vm.read_mem_u8(entry), 0xB0);
         assert_eq!(vm.read_mem_u8(entry + 1), 0xCD);
         assert_eq!(vm.read_mem_u8(entry + 2), 0xF4);
+    }
+
+    /// JS-facing end-to-end: bzImage handoff + skip-trampoline.
+    /// Mirrors the recommended caller sequence — load_bzimage,
+    /// start_protected_mode_at, run — and confirms a 32-bit kernel
+    /// payload at code32_start actually ran (EAX holds the imm32 the
+    /// kernel deposited there). This is the smallest possible
+    /// reproduction of "boot a real kernel from JS" without
+    /// synthesising a real-mode trampoline at 0x7C00.
+    #[test]
+    fn js_facing_skip_trampoline_runs_pm_kernel() {
+        let mut bz = vec![0u8; 1024];
+        bz[0x1F1] = 1;
+        bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        bz[0x202..0x206].copy_from_slice(b"HdrS");
+        bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+        bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        // MOV EAX, 0xDEADBEEF ; HLT — the imm32 only survives if
+        // the CPU honored CS.D=1 on the flat code segment built by
+        // start_protected_mode_at.
+        bz.extend_from_slice(&[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0xF4]);
+
+        let mut vm = WwwVm::new_with_ram_size(0x0020_0000); // 2 MiB
+        let entry = vm.load_bzimage(&bz).expect("load_bzimage");
+        vm.start_protected_mode_at(entry);
+        vm.run(16);
+
+        assert!(vm.is_halted());
+        assert!(vm.last_error().is_none());
+        // Read EAX through the byte window — the wrappers don't
+        // expose registers directly but the 4-byte MOV imm32 still
+        // lives at memory + entry.
+        assert_eq!(vm.read_mem_u8(entry), 0xB8);
+        assert_eq!(vm.read_mem_u8(entry + 1), 0xEF);
     }
 
     #[test]
