@@ -740,11 +740,15 @@ pub mod snapshot {
     /// * v10 — appends the LAPIC MMIO scratch buffer (4 KiB)
     ///   between the RAM section and the device blob. Lets a
     ///   guest's kernel writes to SIV/TPR/etc. survive snapshot.
-    pub const VERSION: u8 = 10;
+    /// * v11 — appends the HPET MMIO scratch buffer (1 KiB) right
+    ///   after the LAPIC section.
+    pub const VERSION: u8 = 11;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
     pub const LAPIC_LEN: usize = 4096;
+    /// Bytes the v11 HPET section adds past the LAPIC region.
+    pub const HPET_LEN: usize = 1024;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -987,6 +991,9 @@ impl Vm {
         // since the size is fixed by snapshot::LAPIC_LEN.
         buf.extend_from_slice(self.mem.lapic_bytes());
 
+        // v11 HPET scratch window (1 KiB) follows the LAPIC.
+        buf.extend_from_slice(self.mem.hpet_bytes());
+
         // Devices (v2-style length-prefixed records — see IoBus::snapshot).
         let dev = self.io.snapshot();
         let dev_len = dev.len() as u32;
@@ -1012,13 +1019,14 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=10) {
+        if !matches!(version, 1..=11) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            // v10 doesn't extend the CPU image — only appends a
-            // LAPIC section between RAM and the device blob.
-            10 | 9 => snapshot::CPU_V9_LEN,
+            // v10/v11 don't extend the CPU image — they append MMIO
+            // sections (LAPIC, then HPET) between RAM and the device
+            // blob.
+            9..=11 => snapshot::CPU_V9_LEN,
             8 => snapshot::CPU_V8_LEN,
             7 => snapshot::CPU_V7_LEN,
             6 => snapshot::CPU_V6_LEN,
@@ -1220,9 +1228,29 @@ impl Vm {
         } else {
             mem_start + ram_size
         };
+        // v11 HPET scratch sits right after the LAPIC. Pre-v11
+        // snapshots leave the HPET at construction defaults (Caps
+        // register pre-populated).
+        let mmio_end = if version >= 11 {
+            if bytes.len() < lapic_end + snapshot::HPET_LEN {
+                return Err(SnapshotError::TooSmall {
+                    got: bytes.len(),
+                    need: lapic_end + snapshot::HPET_LEN,
+                });
+            }
+            self.mem
+                .restore_hpet(&bytes[lapic_end..lapic_end + snapshot::HPET_LEN])
+                .map_err(|expected| SnapshotError::MemorySizeMismatch {
+                    expected,
+                    actual: snapshot::HPET_LEN,
+                })?;
+            lapic_end + snapshot::HPET_LEN
+        } else {
+            lapic_end
+        };
         // Device section (v2 and v3). v1 snapshots have nothing here.
         if version >= 2 {
-            let dev_off = lapic_end;
+            let dev_off = mmio_end;
             if bytes.len() < dev_off + 4 {
                 return Err(SnapshotError::TooSmall {
                     got: bytes.len(),

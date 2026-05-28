@@ -127,8 +127,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**409 тестов** зелёные (mem 9 + devices 45 + cpu 267 + vm 80 +
-tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v10.
+**412 тестов** зелёные (mem 11 + devices 45 + cpu 267 + vm 81 +
+tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v11.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
@@ -198,8 +198,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   байтовых обращений подряд — оба продвигают буфер, в обе стороны
   (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
-  header parser + loader. Снапшот v10 round-trip'ит всё состояние,
-  включая LAPIC scratch buffer.
+  header parser + loader. Снапшот v11 round-trip'ит всё состояние,
+  включая LAPIC и HPET scratch buffers.
 - **PCI** (порты 0xCF8/0xCFC, Mechanism #1): пустая шина — все
   чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
   Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются
@@ -209,6 +209,11 @@ spinlock через LOCK CMPXCHG + PAUSE):
   4 KiB scratch buffer для round-trip записей (SIV, TPR). IA32_APIC_BASE
   MSR не выставляет enable-bit, так что Linux падает на legacy PIC
   для реальной доставки прерываний.
+- **HPET MMIO** (0xFED0_0000 + 1 KiB): тоже стаб. General Caps на
+  offset 0x000 = 0x05F5_E100_8086_A201 (3 таймера, 64-битный
+  counter, vendor 0x8086, 100 ns период); остальное — scratch buffer.
+  Без доставки прерываний — ядро видит, что HPET присутствует, но
+  фактический таймер по-прежнему идёт через PIT.
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
@@ -240,7 +245,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 409 пройденных тестов на текущий момент. CI
+Должно вывести 412 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

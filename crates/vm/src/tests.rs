@@ -2106,6 +2106,30 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.cmos.read(0x71), 26);
 }
 
+/// v11 adds an HPET section right after the LAPIC. Same shape as
+/// the v10 LAPIC test: a kernel write to a writable HPET register
+/// must survive the round-trip, and the construction-default
+/// General Caps register must come back intact too.
+#[test]
+fn snapshot_v11_preserves_hpet_writes_to_main_counter() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // HPET main counter at 0xFED0_00F0 — kernel writes calibration
+    // values here on init.
+    vm.cpu.mem_write_u32(&mut vm.mem, 0xFED0_00F0, 0x1234_5678);
+    assert_eq!(vm.cpu.mem_read_u32(&vm.mem, 0xFED0_00F0), 0x1234_5678);
+
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v11 restore");
+    // Counter write survived.
+    assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFED0_00F0), 0x1234_5678);
+    // Caps register (set at construction) also intact.
+    assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFED0_0000), 0x8086_A201);
+    assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFED0_0004), 0x05F5_E100);
+}
+
 /// v10 adds a LAPIC section between RAM and the device blob. A
 /// kernel that writes to the SIV at 0xFEE0_00F0 (the canonical
 /// "enable + spurious vector" probe) must see its write survive

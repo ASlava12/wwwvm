@@ -21,6 +21,14 @@ pub const LAPIC_BASE: u32 = 0xFEE0_0000;
 /// Size of the LAPIC window. Real silicon exposes a full 4 KiB page.
 pub const LAPIC_SIZE: u32 = 0x1000;
 
+/// Base of the HPET (High Precision Event Timer) MMIO window. The
+/// ACPI HPET table normally tells the kernel this address; we pin
+/// it at the canonical Intel default so the kernel's hard-coded
+/// fallback probe finds the device.
+pub const HPET_BASE: u32 = 0xFED0_0000;
+/// HPET window size — 1 KiB is the spec minimum.
+pub const HPET_SIZE: u32 = 0x0400;
+
 pub struct Memory {
     bytes: Vec<u8>,
     /// Backing store for the LAPIC MMIO window. Most bytes are 0 by
@@ -28,6 +36,11 @@ pub struct Memory {
     /// canonical register values (Version, ID) the kernel checks
     /// during APIC presence probing.
     lapic: [u8; LAPIC_SIZE as usize],
+    /// Backing store for the HPET MMIO window. Initialised with a
+    /// realistic General Capabilities register at offset 0x000 so
+    /// the kernel's presence probe sees 3 timers, a 64-bit counter,
+    /// vendor ID 0x8086, and a 100 ns counter period.
+    hpet: [u8; HPET_SIZE as usize],
 }
 
 impl Memory {
@@ -41,9 +54,29 @@ impl Memory {
         lapic[0x32] = 0x06;
         // ID register at 0x020 already reads zero — that's the
         // canonical BSP APIC ID for our single-CPU model.
+
+        let mut hpet = [0u8; HPET_SIZE as usize];
+        // General Capabilities register at offset 0x000 (64-bit).
+        // Low dword (0x8086_A201):
+        //   bits 0..7   REV_ID          = 0x01
+        //   bits 8..12  NUM_TIM_CAP     = 2 (means 3 timers)
+        //   bit 13      COUNT_SIZE_CAP  = 1 (64-bit counter)
+        //   bit 15      LEG_RT_CAP      = 1 (legacy replacement OK)
+        //   bits 16..31 VENDOR_ID       = 0x8086 (Intel)
+        // High dword: COUNTER_CLK_PERIOD in femtoseconds. 0x05F5_E100
+        // = 100_000_000 fs = 100 ns period (10 MHz tick rate).
+        hpet[0x00] = 0x01;
+        hpet[0x01] = 0xA2;
+        hpet[0x02] = 0x86;
+        hpet[0x03] = 0x80;
+        hpet[0x04] = 0x00;
+        hpet[0x05] = 0xE1;
+        hpet[0x06] = 0xF5;
+        hpet[0x07] = 0x05;
         Self {
             bytes: vec![0; size],
             lapic,
+            hpet,
         }
     }
 
@@ -57,9 +90,18 @@ impl Memory {
         addr.wrapping_sub(LAPIC_BASE) < LAPIC_SIZE
     }
 
+    /// True if `addr` falls inside the HPET's MMIO window.
+    #[inline]
+    fn is_hpet(addr: u32) -> bool {
+        addr.wrapping_sub(HPET_BASE) < HPET_SIZE
+    }
+
     pub fn read_u8(&self, addr: u32) -> u8 {
         if Self::is_lapic(addr) {
             return self.lapic[(addr - LAPIC_BASE) as usize];
+        }
+        if Self::is_hpet(addr) {
+            return self.hpet[(addr - HPET_BASE) as usize];
         }
         let a = addr as usize;
         if a < self.bytes.len() {
@@ -72,6 +114,10 @@ impl Memory {
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         if Self::is_lapic(addr) {
             self.lapic[(addr - LAPIC_BASE) as usize] = value;
+            return;
+        }
+        if Self::is_hpet(addr) {
+            self.hpet[(addr - HPET_BASE) as usize] = value;
             return;
         }
         let a = addr as usize;
@@ -143,6 +189,20 @@ impl Memory {
         self.lapic.copy_from_slice(data);
         Ok(())
     }
+
+    /// Borrow the 1 KiB HPET scratch window — same role as
+    /// `lapic_bytes` for the timer's MMIO state.
+    pub fn hpet_bytes(&self) -> &[u8] {
+        &self.hpet
+    }
+
+    pub fn restore_hpet(&mut self, data: &[u8]) -> Result<(), usize> {
+        if data.len() != self.hpet.len() {
+            return Err(self.hpet.len());
+        }
+        self.hpet.copy_from_slice(data);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +269,24 @@ mod tests {
         let mut m = Memory::new(64);
         m.write_u32(LAPIC_BASE + 0xF0, 0x0000_010F); // enable + vector 0x0F
         assert_eq!(m.read_u32(LAPIC_BASE + 0xF0), 0x0000_010F);
+    }
+
+    #[test]
+    fn hpet_general_caps_register_reads_as_canonical_value() {
+        let m = Memory::new(64);
+        // Low dword: 0x8086_A201 — REV_ID 1, 3 timers, 64-bit
+        // counter, LEG_RT supported, vendor 0x8086.
+        assert_eq!(m.read_u32(HPET_BASE), 0x8086_A201);
+        // High dword: 100 ns counter period in femtoseconds.
+        assert_eq!(m.read_u32(HPET_BASE + 0x04), 0x05F5_E100);
+    }
+
+    #[test]
+    fn hpet_writes_round_trip_through_scratch() {
+        let mut m = Memory::new(64);
+        // Main counter at offset 0x0F0 (writable when timer is off).
+        m.write_u32(HPET_BASE + 0xF0, 0xDEAD_BEEF);
+        assert_eq!(m.read_u32(HPET_BASE + 0xF0), 0xDEAD_BEEF);
     }
 
     #[test]
