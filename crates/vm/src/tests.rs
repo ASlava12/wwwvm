@@ -874,6 +874,39 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 ///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
 ///      asserts AL = 0xCD after the run.
 ///
+/// `start_protected_mode_at` is the host-side "skip the
+/// trampoline" entry point: a JS caller (or Rust test) can load a
+/// bzImage and jump straight into 32-bit code without supplying
+/// the LGDT/CR0/JMP-FAR boot stub. The CPU lands in PM with flat
+/// segments and IP = entry, ready to execute the kernel.
+#[test]
+fn start_protected_mode_at_jumps_into_pm_kernel() {
+    // Synthetic v2.10 bzImage with a 32-bit kernel payload:
+    //   MOV EAX, 0xCAFEBABE ; HLT
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    bz.extend_from_slice(&[0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]);
+
+    let mut vm = Vm::with_ram_size(0x0020_0000); // 2 MiB
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(16);
+
+    assert!(vm.is_halted());
+    // Confirms the kernel ran in 32-bit mode (the MOV imm32 took
+    // its data immediately after the opcode, no 0x66 prefix).
+    assert_eq!(vm.cpu().read_r32(0), 0xCAFE_BABE);
+    // CR0.PE = 1, CS RPL = 0 (ring 0 kernel).
+    assert_eq!(vm.cpu().cr0 & 1, 1);
+    assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::CS] & 3, 0);
+    assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::CS], 0x08);
+    assert_eq!(vm.cpu().sregs[wwwvm_cpu::sreg::SS], 0x10);
+}
+
 /// The three bzImage handoff functions compose: loading a bzImage,
 /// setting a cmdline, and placing an initrd all write into the
 /// setup header at 0x90000. The risk is that a later call might

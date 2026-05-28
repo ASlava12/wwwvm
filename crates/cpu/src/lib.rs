@@ -114,6 +114,14 @@ pub struct Cpu {
     /// 16-bit stack used in real mode and early PM). Public so an
     /// OS-bootstrap test can flip it after building an SS descriptor.
     pub stack_size_32: bool,
+    /// Default operand/address size for code fetched through the
+    /// current CS. Set from the CS descriptor's D bit at PM segment
+    /// load time. With `code_size_32 = true` every fetch defaults to
+    /// 32-bit operand/address sizes, and the 0x66 / 0x67 prefixes
+    /// flip them back to 16-bit (rather than the other way round in
+    /// real mode). This is how a 32-bit kernel runs without
+    /// 0x66-stuffing every immediate.
+    pub(crate) code_size_32: bool,
     /// Control Register 0. On real x86 it's 32 bits; we store the
     /// full width but only bit 0 (PE — Protection Enable) and bit 31
     /// (PG — Paging) will gain semantic meaning once those modes
@@ -285,6 +293,7 @@ impl Cpu {
             op_size_32: false,
             addr_size_32: false,
             stack_size_32: false,
+            code_size_32: false,
             cr0: 0,
             gdtr: DescriptorTable::default(),
             idtr: DescriptorTable::default(),
@@ -352,6 +361,8 @@ impl Cpu {
         self.sysenter_eip = 0;
         self.pending_fault.set(None);
         self.a20 = true;
+        self.code_size_32 = false;
+        self.stack_size_32 = false;
         // Real-mode default: every cache mirrors `sregs[i] << 4`.
         // Since sregs reset to 0, base is 0 for everything.
         self.seg_cache = [SegmentCache {
@@ -551,6 +562,15 @@ impl Cpu {
             limit,
             access,
         };
+        // CS load: latch the D bit (descriptor byte 6 bit 6 = 0x40)
+        // into `code_size_32`. Without this a 32-bit kernel running
+        // in a flat code segment would still decode instructions as
+        // 16-bit by default — the very condition the D bit exists
+        // to flip. The D bit lives in the granularity byte alongside
+        // G and the limit-high nibble.
+        if idx == sreg::CS {
+            self.code_size_32 = (d3 >> 6) & 1 != 0;
+        }
     }
 
     /// PE-aware linear-address translation. In real mode the cache
@@ -2495,8 +2515,13 @@ impl Cpu {
             }
         }
         self.seg_override = None;
-        self.op_size_32 = false;
-        self.addr_size_32 = false;
+        // Default operand / address sizes come from the active CS
+        // descriptor's D bit (latched in `code_size_32`). 0x66 / 0x67
+        // prefixes invert them for this one instruction; real-mode
+        // and 16-bit-PM CS leave `code_size_32 = false`, matching
+        // the historical "everything is 16-bit unless prefixed".
+        self.op_size_32 = self.code_size_32;
+        self.addr_size_32 = self.code_size_32;
         let op_cs = self.sregs[sreg::CS];
         let op_ip = self.ip;
         let opcode = loop {
@@ -2512,10 +2537,10 @@ impl Cpu {
                 0x65 => self.seg_override = Some(sreg::GS),
                 // 0x66 — operand-size override. Flips default
                 // operand width from 16 to 32 for this instruction.
-                0x66 => self.op_size_32 = true,
+                0x66 => self.op_size_32 = !self.code_size_32,
                 // 0x67 — address-size override. Flips the ModR/M
                 // address decode from 16-bit to 32-bit (and SIB).
-                0x67 => self.addr_size_32 = true,
+                0x67 => self.addr_size_32 = !self.code_size_32,
                 _ => break b,
             }
         };
@@ -2692,8 +2717,8 @@ impl Cpu {
                         0x3E => self.seg_override = Some(sreg::DS),
                         0x64 => self.seg_override = Some(sreg::FS),
                         0x65 => self.seg_override = Some(sreg::GS),
-                        0x66 => self.op_size_32 = true,
-                        0x67 => self.addr_size_32 = true,
+                        0x66 => self.op_size_32 = !self.code_size_32,
+                        0x67 => self.addr_size_32 = !self.code_size_32,
                         _ => break b,
                     }
                 };

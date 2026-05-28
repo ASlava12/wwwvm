@@ -1390,6 +1390,50 @@ impl Vm {
         self.booted = true;
     }
 
+    /// Skip the real-mode → PM transition dance and jump straight
+    /// into 32-bit protected-mode execution at `entry`. The standard
+    /// real-bootloader trampoline at 0x7C00 (LGDT + CR0|=1 + far
+    /// JMP) becomes unnecessary because we mutate the CPU state
+    /// directly: write a minimal flat-segments GDT at 0x500, set
+    /// CR0.PE, load CS/SS/DS/ES/FS/GS from GDT, and point IP at
+    /// `entry`.
+    ///
+    /// Pair with [`load_bzimage`]: pass `bz.code32_start` as the
+    /// entry. The resulting flow is exactly what a real GRUB
+    /// hand-off would have produced, minus the trampoline bytes.
+    /// `autorun` bytes still arrive via the UART for guests that
+    /// read input there.
+    pub fn start_protected_mode_at(&mut self, entry: u32) {
+        // Flat-segments GDT: null + ring-0 code + ring-0 data, all
+        // base 0 / limit 4 GiB. Placed at 0x500 (between the BIOS
+        // data area and the boot-sector load address, where it
+        // doesn't collide with the bzImage setup blob at 0x90000).
+        const GDT: [u8; 24] = [
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data
+        ];
+        self.mem.write_slice(0x500, &GDT);
+        self.cpu.cr0 |= 1;
+        self.cpu.gdtr = wwwvm_cpu::DescriptorTable {
+            base: 0x500,
+            limit: 0x17,
+        };
+        // Load each segment register through write_sreg so the
+        // descriptor cache reflects the flat-4-GiB layout.
+        self.cpu.write_sreg(wwwvm_cpu::sreg::CS, 0x08, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::DS, 0x10, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::ES, 0x10, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::FS, 0x10, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::GS, 0x10, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::SS, 0x10, &self.mem);
+        self.cpu.stack_size_32 = true;
+        self.cpu.ip = entry;
+        self.io.uart_mut().push_rx(&self.autorun);
+        self.autorun.clear();
+        self.booted = true;
+    }
+
     /// Wire the host-side BIOS shim into the CPU. After this, `INT 0x10`
     /// (and future BIOS vectors) gets dispatched to the Rust functions
     /// in [`bios_hook`] instead of the IVT entry — so a freshly booted

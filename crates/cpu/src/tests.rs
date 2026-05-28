@@ -4474,14 +4474,19 @@ fn iret_to_higher_ring_pops_extra_ss_esp_and_switches_stack() {
     ];
     mem.write_slice(0x500, &gdt);
 
-    // IRET frame at 0x6000 (low → high, popped in this order):
-    //   IP = 0x0000, CS = 0x001B, FLAGS = 0x0202,
-    //   SP = 0x4000, SS = 0x0023.
-    mem.write_u16(0x6000, 0x0000);
-    mem.write_u16(0x6002, 0x001B);
-    mem.write_u16(0x6004, 0x0202);
-    mem.write_u16(0x6006, 0x4000);
-    mem.write_u16(0x6008, 0x0023);
+    // IRET frame at 0x6000 (dword pushes — the GDT descriptors
+    // above set CS.D=1 via the 0xCF granularity byte, so the
+    // CPU's IRET defaults to IRETD on this code segment):
+    //   EIP = 0x0000_0000
+    //   CS  = 0x0000_001B (zero-extended)
+    //   EFLAGS = 0x0000_0202
+    //   ESP = 0x0000_4000
+    //   SS  = 0x0000_0023
+    mem.write_u32(0x6000, 0x0000_0000);
+    mem.write_u32(0x6004, 0x0000_001B);
+    mem.write_u32(0x6008, 0x0000_0202);
+    mem.write_u32(0x600C, 0x0000_4000);
+    mem.write_u32(0x6010, 0x0000_0023);
 
     // IRET (0xCF) at linear 0x7C00 — that's where reset_to_boot
     // points CS:IP (CS=0 / IP=0x7C00). We later swap CS to ring-0
@@ -6247,8 +6252,9 @@ fn pm_interrupt_through_32_bit_gate_and_iretd() {
     //   offset_lo = 0x0900, selector = 0x0008, type = 0x8E,
     //   offset_hi = 0x0000.
     mem.write_slice(0x4108, &[0x00, 0x09, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00]);
-    // Handler at linear 0x0900: MOV BL,0x55; 66 CF (IRETD); HLT
-    mem.write_slice(0x0900, &[0xB3, 0x55, 0x66, 0xCF, 0xF4]);
+    // Handler at linear 0x0900: MOV BL,0x55; CF (IRETD — default
+    // 32-bit because the CS descriptor has D=1); HLT.
+    mem.write_slice(0x0900, &[0xB3, 0x55, 0xCF, 0xF4]);
 
     // Boot stub at 0x7C00:
     //   INT 0x21 (CD 21)
