@@ -2496,6 +2496,91 @@ fn page_fault_dispatches_int14_and_latches_cr2() {
     );
 }
 
+/// CR0.WP (bit 16) — Write Protect. A supervisor write to a
+/// 4-KiB page whose effective R/W bit is 0 raises #PF with both
+/// P=1 (page is present) and W=1 (write triggered the fault).
+/// Linux's COW path depends on this: fork() marks shared pages
+/// R/W=0; the first write from either child takes a #PF, and the
+/// handler clones the page. Without WP enforcement, the write
+/// would land silently and corrupt the shared backing.
+#[test]
+fn translate_with_wp_set_on_readonly_pte_raises_pf_on_write() {
+    let mut mem = Memory::new(0x10_0000);
+    // PDE[0] -> PT at 0x2000, P=1 RW=1.
+    mem.write_u32(0x1000, 0x0000_2000 | 0x03);
+    // PTE[0] = present (P=1) but R/W=0 (read-only).
+    mem.write_u32(0x2000, 0x0000_3000 | 0x01);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8001_0000; // PG | WP
+    cpu.cr3 = 0x0000_1000;
+
+    // Read succeeds — WP only gates writes.
+    let phys = cpu.translate(&mem, 0x0000_0123);
+    assert!(
+        cpu.pending_fault().is_none(),
+        "read through R/W=0 page is fine"
+    );
+    assert_eq!(phys, 0x0000_3123);
+
+    // Write must #PF with P=1 (present) | W=1 (write).
+    let _ = cpu.translate_write(&mem, 0x0000_0234);
+    let pf = cpu.pending_fault().expect("WP write must raise #PF");
+    assert_eq!(pf.addr, 0x0000_0234);
+    assert_eq!(pf.error_code & 0b11, 0b11, "P=1 (present) | W=1 (write)");
+}
+
+/// Same write-to-R/W=0 page, but with CR0.WP cleared. The
+/// supervisor write is allowed through — Linux relies on this
+/// during early init before COW is wired up.
+#[test]
+fn translate_without_wp_lets_supervisor_write_a_readonly_page() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x1000, 0x0000_2000 | 0x03);
+    mem.write_u32(0x2000, 0x0000_3000 | 0x01); // P=1, R/W=0
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // PG, WP off
+    cpu.cr3 = 0x0000_1000;
+
+    let phys = cpu.translate_write(&mem, 0x0000_0567);
+    assert!(
+        cpu.pending_fault().is_none(),
+        "no WP -> no protection fault"
+    );
+    assert_eq!(phys, 0x0000_3567);
+}
+
+/// CR0.WP also gates the 4 MiB (PSE) path: PDE with PS=1 and
+/// R/W=0 raises #PF on a write. The check has to happen at the
+/// PDE level here because PSE collapses the PTE walk.
+#[test]
+fn translate_with_wp_set_on_readonly_pse_pde_raises_pf_on_write() {
+    let mut mem = Memory::new(0x0080_0000);
+    // PSE 4 MiB at phys 0x0040_0000, P=1, PS=1, R/W=0.
+    //   PS=0x80, P=0x01  →  0x81. (Note: R/W bit 1 NOT set.)
+    mem.write_u32(0x1004, 0x0040_0000 | 0x81);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8001_0000; // PG | WP
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr3 = 0x0000_1000;
+
+    // Read works.
+    let phys = cpu.translate(&mem, 0x0040_0010);
+    assert!(cpu.pending_fault().is_none());
+    assert_eq!(phys, 0x0040_0010);
+
+    // Write must #PF.
+    let _ = cpu.translate_write(&mem, 0x0040_0020);
+    let pf = cpu.pending_fault().expect("WP+PSE write must #PF");
+    assert_eq!(pf.addr, 0x0040_0020);
+    assert_eq!(pf.error_code & 0b11, 0b11);
+}
+
 /// Protected-mode #PF dispatch composes with paging *and* a real
 /// 32-bit IDT gate. The previous test exercises the real-mode IVT
 /// path; once the kernel is in PM with paging on, the dispatch goes

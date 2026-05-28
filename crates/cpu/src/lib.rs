@@ -624,11 +624,14 @@ impl Cpu {
     ///   linear[11: 0] -> page offset
     /// ```
     ///
-    /// Not yet modelled: the R/W bit on the descriptor itself
-    /// (protection violations vs. plain not-present), User/Supervisor
-    /// (since we always run ring 0), and a TLB cache. 4 MiB pages
-    /// (CR4.PSE + PDE.PS) collapse the second walk and are honored
-    /// here — Linux's `head_32.S` maps the kernel that way.
+    /// Not yet modelled: User/Supervisor (since we always run ring
+    /// 0) and a TLB cache. CR0.WP (bit 16) is honored: a supervisor
+    /// write to a present page whose effective R/W bit is 0 raises
+    /// #PF with P=1 (page is present) and W=1. Linux's COW path
+    /// depends on this — without it `fork()`'d children silently
+    /// overwrite the parent's shared pages. 4 MiB pages (CR4.PSE +
+    /// PDE.PS) collapse the second walk and are honored here too —
+    /// Linux's `head_32.S` maps the kernel that way.
     ///
     /// Defaults to a read access; writes go through `translate_write`
     /// so the W bit in the #PF error code reflects the access type.
@@ -670,7 +673,13 @@ impl Cpu {
             // get a phantom fault.
             if self.cr4 & 0x10 != 0 && pde & 0x80 != 0 {
                 // 4 MiB pages: PDE[31:22] is the frame, linear[21:0]
-                // is the offset within it.
+                // is the offset within it. With CR0.WP (bit 16) and
+                // a write to a page whose R/W bit is clear, raise
+                // #PF with P=1 (page IS present) | W=1.
+                if write && self.cr0 & 0x0001_0000 != 0 && pde & 0b10 == 0 {
+                    self.raise_fault(linear, w_bit | 1);
+                    return 0;
+                }
                 let frame = pde & 0xFFC0_0000;
                 let offset = linear & 0x003F_FFFF;
                 frame | offset
@@ -679,6 +688,16 @@ impl Cpu {
                 let pte = mem.read_u32(pt_base.wrapping_add(pt_index * 4));
                 if pte & 1 == 0 {
                     self.raise_fault(linear, w_bit);
+                    return 0;
+                }
+                // CR0.WP: a supervisor write to a present page whose
+                // effective R/W is 0 (= AND of PDE.RW and PTE.RW) is
+                // a #PF with P=1 | W=1. This is what Linux's COW
+                // path needs — without WP, fork() children's writes
+                // would silently land in the parent's pages.
+                let effective_rw = (pde & 0b10) & (pte & 0b10);
+                if write && self.cr0 & 0x0001_0000 != 0 && effective_rw == 0 {
+                    self.raise_fault(linear, w_bit | 1);
                     return 0;
                 }
                 let frame = pte & 0xFFFF_F000;
