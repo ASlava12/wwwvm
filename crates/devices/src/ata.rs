@@ -109,6 +109,63 @@ impl Ata {
     /// there's nothing to clear mid-operation. Silently accept.
     pub fn write_device_control(&mut self, _value: u8) {}
 
+    /// Serialize the controller's register state and transfer
+    /// buffer. `port_base` and `disk` are not part of the blob: the
+    /// former is fixed at construction (matched to the channel),
+    /// and the disk image is reloaded separately via the host-side
+    /// `load_disk_image` API.
+    ///
+    /// Layout (little-endian):
+    ///   1 byte   sector_count
+    ///   1 byte   lba_low
+    ///   1 byte   lba_mid
+    ///   1 byte   lba_high
+    ///   1 byte   drive_head
+    ///   1 byte   error
+    ///   1 byte   status
+    ///   1 byte   writing flag (0/1)
+    ///   4 bytes  write_lba (u32 LE)
+    ///   4 bytes  buf_pos (u32 LE)
+    ///   4 bytes  buf_len (u32 LE)
+    ///   N bytes  buf contents
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.push(self.sector_count);
+        out.push(self.lba_low);
+        out.push(self.lba_mid);
+        out.push(self.lba_high);
+        out.push(self.drive_head);
+        out.push(self.error);
+        out.push(self.status);
+        out.push(self.writing as u8);
+        out.extend_from_slice(&self.write_lba.to_le_bytes());
+        out.extend_from_slice(&(self.pos as u32).to_le_bytes());
+        out.extend_from_slice(&(self.buf.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.buf);
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 8 + 4 + 4 + 4 {
+            return Err("ata: truncated header");
+        }
+        self.sector_count = bytes[0];
+        self.lba_low = bytes[1];
+        self.lba_mid = bytes[2];
+        self.lba_high = bytes[3];
+        self.drive_head = bytes[4];
+        self.error = bytes[5];
+        self.status = bytes[6];
+        self.writing = bytes[7] != 0;
+        self.write_lba = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        self.pos = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        let buf_len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let header = 20;
+        if bytes.len() < header + buf_len {
+            return Err("ata: truncated buf");
+        }
+        self.buf = bytes[header..header + buf_len].to_vec();
+        Ok(header + buf_len)
+    }
+
     /// Build a controller listening on a specific command-block
     /// base. Use [`SECONDARY_PORT_BASE`] for the second channel.
     pub fn with_port_base(port_base: u16) -> Self {

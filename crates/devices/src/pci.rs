@@ -46,6 +46,20 @@ impl Pci {
         let _ = self.addr;
         0xFFFF_FFFF
     }
+
+    /// Serialize the latched address register (4 bytes). The bus
+    /// has no devices, so there's nothing else to preserve.
+    pub fn snapshot_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.addr.to_le_bytes());
+    }
+
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        if bytes.len() < 4 {
+            return Err("pci: truncated");
+        }
+        self.addr = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(4)
+    }
 }
 
 impl Default for Pci {
