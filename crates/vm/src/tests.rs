@@ -941,6 +941,105 @@ fn start_protected_mode_at_lets_kernel_read_setup_via_esi() {
     assert_eq!(vm.cpu().read_r32(0) & 0xFF, 1);
 }
 
+/// `head_32`-shape integration: a synthetic bzImage kernel runs
+/// the full early-Linux startup chain through real instruction
+/// execution. The kernel
+///   1. reads `boot_params->setup_sects` via `[esi+0x1F1]`
+///      (proves ESI is wired to 0x90000),
+///   2. builds a PSE page directory with PDE[0] identity-mapping
+///      [0,4M) and PDE[1] aliasing [4M,8M) onto phys [0,4M),
+///   3. loads CR3, sets CR4.PSE, sets CR0.PG,
+///   4. far-jumps through `EA off32 sel16` into the alias virtual
+///      range,
+///   5. lands at the same kernel bytes via the alias and writes a
+///      sentinel into low RAM,
+///   6. HLTs.
+///
+/// Touches: load_bzimage layout, start_protected_mode_at handoff,
+/// CS.D=1 default operand size, MOV CR3/CR4/CR0, OR imm32, JMP
+/// FAR ptr16:32 in 32-bit mode, PSE walker, paged instruction
+/// fetch. If any of those silently regress, the sentinel write
+/// goes to the wrong physical address (or doesn't happen) and the
+/// assertion fires.
+#[test]
+fn head_32_shape_runs_through_paging_handoff() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    // code32_start = 0x0010_0000 (1 MiB) — the canonical bzImage
+    // landing zone, and well outside our PSE 4 MiB frame for the
+    // alias trick to actually mean something.
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel image bytes — every instruction assumes CS.D=1.
+    //
+    //  8A 86 F1 01 00 00          MOV AL, [ESI+0x1F1]       (6)
+    //  C7 05 00 00 01 00 83 00 00 00   MOV DWORD [0x10000], 0x83   (10)
+    //  C7 05 04 00 01 00 83 00 00 00   MOV DWORD [0x10004], 0x83   (10)
+    //  B8 00 00 01 00             MOV EAX, 0x00010000        (5)
+    //  0F 22 D8                   MOV CR3, EAX               (3)
+    //  0F 20 E0                   MOV EAX, CR4               (3)
+    //  83 C8 10                   OR EAX, 0x10               (3)
+    //  0F 22 E0                   MOV CR4, EAX               (3)
+    //  0F 20 C0                   MOV EAX, CR0               (3)
+    //  0D 00 00 00 80             OR EAX, 0x80000000         (5)
+    //  0F 22 C0                   MOV CR0, EAX               (3)
+    //  EA off32 sel16             JMP FAR ptr16:32           (7)
+    //  C7 05 00 09 00 00 EF BE AD DE  MOV DWORD [0x900], 0xDEADBEEF (10)
+    //  F4                         HLT                        (1)
+    //
+    // Pre-JMP bytes: 6+10+10+5+3+3+3+3+3+5+3 = 54
+    // JMP is 7 bytes at offsets 54..61.
+    // Post-JMP starts at kernel offset 61.
+    // code32_start = 0x100000, so post-JMP physical = 0x10003D.
+    // PDE[1] aliases [4M,8M) → [0,4M), so the alias of phys
+    // 0x10003D is linear 0x40_0000 + 0x10_003D = 0x50_003D.
+    let mut kernel = Vec::<u8>::new();
+    kernel.extend_from_slice(&[0x8A, 0x86, 0xF1, 0x01, 0x00, 0x00]);
+    kernel.extend_from_slice(&[0xC7, 0x05, 0x00, 0x00, 0x01, 0x00, 0x83, 0x00, 0x00, 0x00]);
+    kernel.extend_from_slice(&[0xC7, 0x05, 0x04, 0x00, 0x01, 0x00, 0x83, 0x00, 0x00, 0x00]);
+    kernel.extend_from_slice(&[0xB8, 0x00, 0x00, 0x01, 0x00]);
+    kernel.extend_from_slice(&[0x0F, 0x22, 0xD8]);
+    kernel.extend_from_slice(&[0x0F, 0x20, 0xE0]);
+    kernel.extend_from_slice(&[0x83, 0xC8, 0x10]);
+    kernel.extend_from_slice(&[0x0F, 0x22, 0xE0]);
+    kernel.extend_from_slice(&[0x0F, 0x20, 0xC0]);
+    kernel.extend_from_slice(&[0x0D, 0x00, 0x00, 0x00, 0x80]);
+    kernel.extend_from_slice(&[0x0F, 0x22, 0xC0]);
+    assert_eq!(kernel.len(), 54, "pre-JMP byte count drifted");
+    let post_jmp_alias_linear: u32 = 0x0050_003D;
+    kernel.push(0xEA);
+    kernel.extend_from_slice(&post_jmp_alias_linear.to_le_bytes());
+    kernel.extend_from_slice(&0x0008u16.to_le_bytes());
+    assert_eq!(kernel.len(), 61, "JMP offset drifted");
+    kernel.extend_from_slice(&[0xC7, 0x05, 0x00, 0x09, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE]);
+    kernel.push(0xF4);
+    bz.extend_from_slice(&kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000); // 8 MiB
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(64);
+
+    assert!(vm.is_halted(), "kernel never reached HLT");
+    // Sentinel landed at the right physical address — the post-JMP
+    // code ran from the alias virtual range with paging on.
+    assert_eq!(
+        vm.mem().read_u32(0x900),
+        0xDEAD_BEEF,
+        "sentinel write didn't land at phys 0x900"
+    );
+    // Paging is on, PSE is on.
+    assert_eq!(vm.cpu().cr0 & 0x8000_0001, 0x8000_0001);
+    assert_eq!(vm.cpu().cr4 & 0x10, 0x10);
+    assert_eq!(vm.cpu().cr3, 0x0001_0000);
+    // The kernel-side AL byte still holds setup_sects (= 1) from
+    // the initial [esi+0x1F1] read.
+    assert_eq!(vm.cpu().read_r32(0) & 0xFF, 1);
+}
+
 /// The three bzImage handoff functions compose: loading a bzImage,
 /// setting a cmdline, and placing an initrd all write into the
 /// setup header at 0x90000. The risk is that a later call might
