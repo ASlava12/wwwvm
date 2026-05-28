@@ -894,6 +894,25 @@ impl Cpu {
         if had_fault || self.pending_fault.get().is_some() {
             return;
         }
+        // Diagnostic watchpoint: print every write within a
+        // configurable physical range, including the EIP of the
+        // executing instruction. Used to find what kernel code
+        // path stores a particular value to a particular addr.
+        if let Ok(spec) = std::env::var("WWWVM_WATCH_WRITE") {
+            if let Some((lo, hi)) = spec.split_once(':') {
+                if let (Ok(lo), Ok(hi)) = (
+                    u32::from_str_radix(lo.trim_start_matches("0x"), 16),
+                    u32::from_str_radix(hi.trim_start_matches("0x"), 16),
+                ) {
+                    if phys >= lo && phys < hi {
+                        eprintln!(
+                            "[W] phys[{:08X}] <- {:02X}  EIP={:08X}",
+                            phys, value, self.last_op_ip
+                        );
+                    }
+                }
+            }
+        }
         m.write_u8(phys, value);
     }
 
@@ -7297,10 +7316,28 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             cpu.write_r32(1, u32::from_le_bytes(*b"ntel")); // ECX = chars 8..11
         }
         1 => {
-            // Family 6, model 6, stepping 4 — a generic Pentium-Pro
-            // class shape. Family-6 keeps the kernel on its modern
-            // probe paths rather than the antique-i386 branches.
-            cpu.write_r32(0, 0x0000_0664); // EAX = family/model/stepping
+            // Skylake-class shape: family 6, extended model = 5,
+            // base model = E (= model 0x5E = 94), stepping 3.
+            //   bits 31:28  reserved
+            //   bits 27:20  extended family (0)
+            //   bits 19:16  extended model (5)
+            //   bits 15:14  reserved
+            //   bits 13:12  processor type (00 = original OEM)
+            //   bits 11: 8  family (6)
+            //   bits  7: 4  model (E)
+            //   bits  3: 0  stepping (3)
+            // Why not Pentium-Pro (family 6, model 6) like before?
+            // Linux's init_intel applies an avalanche of cpu-cap-
+            // clear quirks for the older Intel models — the
+            // Pentium-Pro PSE errata, TSC unreliability bits, the
+            // F00F-bug-friendly FPU clears, etc — and the net
+            // effect was that boot_cpu_data.x86_capability[0]
+            // ended up with FPU and most other bits CLEARED before
+            // fpu init read it. Reporting Skylake skips all those
+            // model-gated quirks. Family-6 keeps the kernel on its
+            // modern probe paths rather than the antique-i386
+            // branches.
+            cpu.write_r32(0, 0x0005_06E3);
             cpu.write_r32(3, CPUID_LEAF1_EBX); // EBX = brand idx / cflush / max-logical / APIC ID
             cpu.write_r32(1, 0); // ECX (SSE3+) — we advertise none
             cpu.write_r32(2, CPUID_LEAF1_EDX); // EDX = FPU/PSE/TSC/MSR/CX8/APIC/SEP/CMOV/CLFLUSH/FXSR/SSE/SSE2 etc.

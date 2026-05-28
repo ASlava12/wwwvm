@@ -8219,8 +8219,9 @@ fn cpuid_leaf_2_returns_one_iteration_and_no_descriptors() {
 #[test]
 fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
     let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
-    // Family 6, model 6, stepping 4.
-    assert_eq!(cpu.read_r32(0), 0x0000_0664);
+    // Family 6, model 0x5E (Skylake-class), stepping 3 — chosen
+    // to skip Linux's older-Intel cap-clear quirks.
+    assert_eq!(cpu.read_r32(0), 0x0005_06E3);
     // Register index 2 = EDX (we use the r32 register encoding
     // 0=EAX, 1=ECX, 2=EDX, 3=EBX throughout the CPU).
     let edx = cpu.read_r32(2);
