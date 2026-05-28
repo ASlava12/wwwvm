@@ -4614,6 +4614,59 @@ impl Cpu {
                         };
                         self.xmm[target] = r;
                     }
+                    // Variable-count packed-int shifts (66 0F):
+                    //   D1/D2/D3  PSRLW / PSRLD / PSRLQ
+                    //   E1/E2     PSRAW / PSRAD            (no PSRAQ)
+                    //   F1/F2/F3  PSLLW / PSLLD / PSLLQ
+                    // The count is the *full* low qword of the source
+                    // operand — but values larger than the lane width
+                    // are handled identically to the imm form (logical
+                    // shifts clear, arithmetic clamps to width-1), so
+                    // we just cap into u32 and reuse the helpers.
+                    0xD1..=0xD3 | 0xE1 | 0xE2 | 0xF1..=0xF3 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        let count_full = src as u64;
+                        let count = if count_full > u32::MAX as u64 {
+                            u32::MAX
+                        } else {
+                            count_full as u32
+                        };
+                        let lane = match op2 {
+                            0xD1 | 0xE1 | 0xF1 => 16,
+                            0xD2 | 0xE2 | 0xF2 => 32,
+                            _ => 64,
+                        };
+                        let v = self.xmm[reg as usize];
+                        let r = match op2 {
+                            0xD1..=0xD3 => packed_shift_logical_right(v, lane, count),
+                            0xE1 | 0xE2 => packed_shift_arithmetic_right(v, lane, count),
+                            _ => packed_shift_left(v, lane, count),
+                        };
+                        self.xmm[reg as usize] = r;
+                    }
+                    // Packed-int multiplies (66 0F):
+                    //   D5  PMULLW   — low 16 of each 16×16 product
+                    //   E5  PMULHW   — high 16 of signed 16×16 product
+                    //   F5  PMADDWD  — signed 16×16 + pair-sum → dword
+                    0xD5 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = pmullw(a, b);
+                    }
+                    0xE5 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = pmulhw(a, b);
+                    }
+                    0xF5 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = pmaddwd(a, b);
+                    }
                     // Packed float arithmetic. The 0x66 prefix
                     // (op_size_32) selects double-precision (PD, 2×f64)
                     // over single (PS, 4×f32); the opcode low bits pick
@@ -5597,6 +5650,40 @@ fn packed_shift_arithmetic_right(a: u128, lane_bits: u32, count: u32) -> u128 {
         let signed = if x & sb != 0 { x | !mask } else { x };
         ((signed as i128) >> count) as u128 & mask
     })
+}
+
+/// PMULLW — packed 16×16 multiply, keep low 16 of each product.
+/// The low half is sign-agnostic so a plain wrapping_mul suffices.
+fn pmullw(a: u128, b: u128) -> u128 {
+    packed_lanes(a, b, 16, |x, y, mask| x.wrapping_mul(y) & mask)
+}
+
+/// PMULHW — packed signed 16×16 multiply, keep the high 16 of each
+/// product. Sign-extending both operands to i32 before the multiply
+/// avoids the i16×i16 → i32 ambiguity.
+fn pmulhw(a: u128, b: u128) -> u128 {
+    packed_lanes(a, b, 16, |x, y, mask| {
+        let sx = x as u16 as i16 as i32;
+        let sy = y as u16 as i16 as i32;
+        ((sx * sy) >> 16) as u128 & mask
+    })
+}
+
+/// PMADDWD — multiply adjacent signed 16-bit pairs and sum each pair
+/// into a 32-bit lane. Sum wraps modulo 2^32 per the Intel SDM.
+fn pmaddwd(a: u128, b: u128) -> u128 {
+    let mut out: u128 = 0;
+    for i in 0..4u32 {
+        let lo_off = i * 32;
+        let hi_off = i * 32 + 16;
+        let a_lo = ((a >> lo_off) & 0xFFFF) as u16 as i16 as i32;
+        let a_hi = ((a >> hi_off) & 0xFFFF) as u16 as i16 as i32;
+        let b_lo = ((b >> lo_off) & 0xFFFF) as u16 as i16 as i32;
+        let b_hi = ((b >> hi_off) & 0xFFFF) as u16 as i16 as i32;
+        let sum = (a_lo as i64) * (b_lo as i64) + (a_hi as i64) * (b_hi as i64);
+        out |= ((sum as u32) as u128) << (i * 32);
+    }
+    out
 }
 
 /// PSLLDQ — byte-granular left shift of the whole 128-bit register

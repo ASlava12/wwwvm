@@ -3278,6 +3278,116 @@ fn sse_immediate_shifts_psllw_psrad_pslldq() {
     }
 }
 
+/// Variable-count packed shift: PSLLD with the count coming from
+/// the low qword of a second XMM register. Confirms the variable
+/// form shares the imm-shift semantics (and helpers) cleanly.
+#[test]
+fn sse_variable_pslld_count_from_xmm() {
+    let mut mem = Memory::new(0x10_0000);
+    // XMM0: four copies of 0x1234_5678.
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, 0x1234_5678);
+    }
+    // XMM1 low qword = 4 (shift count); upper bits zero.
+    mem.write_u32(0x610, 4);
+    mem.write_u32(0x614, 0);
+    mem.write_u32(0x618, 0);
+    mem.write_u32(0x61C, 0);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0xF2, 0xC1, // PSLLD XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    for i in 0..4u32 {
+        // Each lane: 0x1234_5678 << 4 (mod 2^32) = 0x2345_6780.
+        assert_eq!(mem.read_u32(0x620 + i * 4), 0x2345_6780, "lane {i}");
+    }
+}
+
+/// PMULLW (low 16 of word product), PMULHW (high 16 of signed word
+/// product), and PMADDWD (signed word pairs → dword sums) over the
+/// same two source vectors. The 0xFFFF lane (-1 signed) gives the
+/// best diagnostic: PMULLW(-1, 2) = 0xFFFE, PMULHW(-1, 2) = 0xFFFF.
+#[test]
+fn sse_packed_int_multiplies_pmullw_pmulhw_pmaddwd() {
+    let mut mem = Memory::new(0x10_0000);
+    // Lane | a       | b       | low(a*b)  high(signed) | madd pair
+    //   0  | 0x1000  | 0x0003  | 0x3000    0x0000       | a0*b0 + a1*b1
+    //   1  | 0x0100  | 0x0005  | 0x0500    0x0000       |  = 0x3500
+    //   2  | 0xFFFF  | 0x0002  | 0xFFFE    0xFFFF       | a2*b2 + a3*b3
+    //   3  | 0x0080  | 0x0040  | 0x2000    0x0000       |  = 0x1FFE
+    let a_words: [u16; 8] = [0x1000, 0x0100, 0xFFFF, 0x0080, 0, 0, 0, 0];
+    let b_words: [u16; 8] = [0x0003, 0x0005, 0x0002, 0x0040, 0, 0, 0, 0];
+    for i in 0..8u32 {
+        mem.write_u8(0x600 + i * 2, (a_words[i as usize] & 0xFF) as u8);
+        mem.write_u8(0x600 + i * 2 + 1, (a_words[i as usize] >> 8) as u8);
+        mem.write_u8(0x610 + i * 2, (b_words[i as usize] & 0xFF) as u8);
+        mem.write_u8(0x610 + i * 2 + 1, (b_words[i as usize] >> 8) as u8);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x6F, 0xD0, // MOVDQA XMM2, XMM0
+            0x66, 0x0F, 0xD5, 0xD1, // PMULLW XMM2, XMM1
+            0x66, 0x0F, 0x7F, 0x16, 0x20, 0x06, // MOVDQA [0x620], XMM2
+            0x66, 0x0F, 0x6F, 0xD8, // MOVDQA XMM3, XMM0
+            0x66, 0x0F, 0xE5, 0xD9, // PMULHW XMM3, XMM1
+            0x66, 0x0F, 0x7F, 0x1E, 0x30, 0x06, // MOVDQA [0x630], XMM3
+            0x66, 0x0F, 0x6F, 0xE0, // MOVDQA XMM4, XMM0
+            0x66, 0x0F, 0xF5, 0xE1, // PMADDWD XMM4, XMM1
+            0x66, 0x0F, 0x7F, 0x26, 0x40, 0x06, // MOVDQA [0x640], XMM4
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..40 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // PMULLW (low 16 of each product) — word-by-word check.
+    let expect_low: [u16; 8] = [0x3000, 0x0500, 0xFFFE, 0x2000, 0, 0, 0, 0];
+    for i in 0..8u32 {
+        let got =
+            (mem.read_u8(0x620 + i * 2) as u16) | ((mem.read_u8(0x620 + i * 2 + 1) as u16) << 8);
+        assert_eq!(got, expect_low[i as usize], "PMULLW lane {i}");
+    }
+    // PMULHW (signed high 16) — lane 2 (0xFFFF, signed -1) is the
+    // diagnostic; -1*2 = -2 = 0xFFFFFFFE → high 16 = 0xFFFF.
+    let expect_high: [u16; 8] = [0x0000, 0x0000, 0xFFFF, 0x0000, 0, 0, 0, 0];
+    for i in 0..8u32 {
+        let got =
+            (mem.read_u8(0x630 + i * 2) as u16) | ((mem.read_u8(0x630 + i * 2 + 1) as u16) << 8);
+        assert_eq!(got, expect_high[i as usize], "PMULHW lane {i}");
+    }
+    // PMADDWD — 8 word lanes → 4 dword sums.
+    assert_eq!(mem.read_u32(0x640), 0x0000_3500);
+    assert_eq!(mem.read_u32(0x644), 0x0000_1FFE);
+    assert_eq!(mem.read_u32(0x648), 0);
+    assert_eq!(mem.read_u32(0x64C), 0);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
