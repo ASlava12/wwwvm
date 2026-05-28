@@ -1550,11 +1550,11 @@ impl Cpu {
     ///   byte 6-7: offset 31:16 (0 for 16-bit gates)
     /// ```
     ///
-    /// IF is always cleared for the moment (we don't yet distinguish
-    /// trap gates from interrupt gates — both end here). No privilege
-    /// level change is modelled: a ring transition would require
-    /// pushing the caller's SS/SP, which we'll add when ring 3 user
-    /// code shows up.
+    /// Interrupt gates (type 0x6 / 0xE) clear IF on entry so the
+    /// handler can't be re-entered by another IRQ before it's done.
+    /// Trap gates (type 0x7 / 0xF) leave IF as-is — Linux uses them
+    /// for #DB and #BP so a debugger probe doesn't silently disable
+    /// the IRQ tick while you're stepping through.
     fn do_interrupt(&mut self, n: u8, mem: &mut Memory) {
         self.do_interrupt_with_error(n, None, mem);
     }
@@ -1568,15 +1568,20 @@ impl Cpu {
     /// handler path will widen to a 32-bit push.
     fn do_interrupt_with_error(&mut self, n: u8, error_code: Option<u32>, mem: &mut Memory) {
         // In PE, the gate's type bits (low nibble of the access byte
-        // at descriptor offset 5) pick the frame width:
+        // at descriptor offset 5) pick the frame width and whether
+        // IF gets cleared:
         //   0x6 / 0x7 → 16-bit interrupt / trap gate
         //   0xE / 0xF → 32-bit interrupt / trap gate
-        // Real-mode (PE=0) IVT is always the 16-bit 4-byte form.
-        let (new_cs, new_ip, gate_is_32) = if self.cr0 & 1 == 0 {
+        //   bit 0 set → trap gate (keep IF)  ; bit 0 clear → interrupt
+        //   bit 3 set → 32-bit frame
+        // Real-mode (PE=0) IVT is always the 16-bit 4-byte form, and
+        // INT in real mode clears IF (matches real-silicon real mode).
+        let (new_cs, new_ip, gate_is_32, is_trap) = if self.cr0 & 1 == 0 {
             let ivt_addr = (n as u32) * 4;
             (
                 self.mem_read_u16(mem, ivt_addr + 2),
                 self.mem_read_u16(mem, ivt_addr) as u32,
+                false,
                 false,
             )
         } else {
@@ -1586,12 +1591,13 @@ impl Cpu {
             let access = self.mem_read_u8(mem, gate_addr.wrapping_add(5));
             let off_hi = self.mem_read_u16(mem, gate_addr.wrapping_add(6)) as u32;
             let is_32 = (access & 0x0F) >= 0x0E;
+            let is_trap = (access & 0x01) != 0;
             let off = if is_32 {
                 off_lo | (off_hi << 16)
             } else {
                 off_lo
             };
-            (selector, off, is_32)
+            (selector, off, is_32, is_trap)
         };
         let flags = self.flags;
         let cs = self.sregs[sreg::CS];
@@ -1644,7 +1650,13 @@ impl Cpu {
                 self.push16(mem, ec as u16);
             }
         }
-        self.set_flag(flag::IF, false);
+        // Interrupt gates clear IF so the handler runs with IRQs
+        // off; trap gates leave IF as-is so debugger probes don't
+        // silently disable IRQs while the handler runs. Real-mode
+        // INT clears IF unconditionally (is_trap = false above).
+        if !is_trap {
+            self.set_flag(flag::IF, false);
+        }
         // TF is not modeled yet — when it is, this is also where it
         // gets cleared.
         self.write_sreg(sreg::CS, new_cs, mem);

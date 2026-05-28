@@ -2775,6 +2775,85 @@ fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// Interrupt gates clear IF on entry; trap gates leave IF as-is.
+/// Linux uses trap gates for #DB and #BP so a debugger probe
+/// doesn't silently disable IRQs while the handler runs.
+///
+/// Two adjacent vectors, same code segment, same handler shape,
+/// but distinct gate types (0xE vs 0xF). Both handlers capture
+/// the EFLAGS-on-entry to memory; afterwards we compare the IF
+/// bit in each capture.
+#[test]
+fn interrupt_gate_clears_if_trap_gate_keeps_it() {
+    let mut mem = Memory::new(0x0080_0000);
+
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+
+    // IDT at 0x1000:
+    //   vector 0x20: 32-bit interrupt gate (type 0xE) → handler A at 0x800
+    //   vector 0x21: 32-bit trap gate     (type 0xF) → handler B at 0x900
+    mem.write_slice(
+        0x1000 + 0x20 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+    mem.write_slice(
+        0x1000 + 0x21 * 8,
+        &[0x00, 0x09, 0x08, 0x00, 0x00, 0x8F, 0x00, 0x00],
+    );
+
+    // Handler A: PUSHFD; POP EAX; MOV [0x600], EAX; IRETD.
+    mem.write_slice(0x0800, &[0x9C, 0x58, 0xA3, 0x00, 0x06, 0x00, 0x00, 0xCF]);
+    // Handler B: same shape, store at 0x604.
+    mem.write_slice(0x0900, &[0x9C, 0x58, 0xA3, 0x04, 0x06, 0x00, 0x00, 0xCF]);
+
+    // Kernel: STI; INT 0x20; INT 0x21; HLT.
+    mem.write_slice(0x0010_0000, &[0xFB, 0xCD, 0x20, 0xCD, 0x21, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+
+    // EFLAGS captured by handler A (interrupt gate): IF clear.
+    let captured_a = mem.read_u32(0x600);
+    assert_eq!(
+        captured_a & flag::IF as u32,
+        0,
+        "interrupt gate must clear IF on entry"
+    );
+    // EFLAGS captured by handler B (trap gate): IF still set.
+    let captured_b = mem.read_u32(0x604);
+    assert_ne!(
+        captured_b & flag::IF as u32,
+        0,
+        "trap gate must leave IF set on entry"
+    );
+}
+
 /// U/S bit (bit 2) of the #PF error code is set iff the faulting
 /// access came from CPL=3. Linux's `do_page_fault` branches on
 /// this — userspace faults get a SIGSEGV path, kernel faults get
