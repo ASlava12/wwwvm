@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**371 тест** зелёный (mem 6 + devices 37 + cpu 264 + vm 56 +
+**373 теста** зелёные (mem 6 + devices 37 + cpu 266 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -154,7 +154,9 @@ spinlock через LOCK CMPXCHG + PAUSE):
   BSF/BSR/BSWAP, XADD/CMPXCHG, SHLD/SHRD, far/near jumps + Jcc rel32,
   ENTER/LEAVE, PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
 - **Системное**: CR2/CR3/CR4, RDMSR/WRMSR (TSC/APIC/SYSENTER),
-  RDTSC, CPUID, SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
+  RDTSC, CPUID (leaf 0/1 + ext 0x80000000..4 brand string,
+  EDX-флаги отражают реальный ISA: FPU/TSC/MSR/SEP/CMOV/FXSR/SSE/SSE2),
+  SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
   CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
   RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe),
   MOV/POP sreg и LES/LDS на селекторе вне GDT.limit раздают
@@ -217,7 +219,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 371 пройденный тест на текущий момент. CI
+Должно вывести 373 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

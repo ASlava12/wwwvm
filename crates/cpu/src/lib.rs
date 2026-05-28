@@ -5398,47 +5398,22 @@ impl Cpu {
                     }
 
                     // CPUID — 0x0F 0xA2. Inputs in EAX/ECX, results in
-                    // EAX/EBX/ECX/EDX. We respond to the two leaves
-                    // Linux setup looks at first:
-                    //   leaf 0: max-leaf in EAX, vendor string in EBX|EDX|ECX.
-                    //           We report leaf 1 supported and pose as
-                    //           "WWWVMxRust  " — close enough to satisfy
-                    //           any "is this Intel/AMD" sniffing without
-                    //           accidentally triggering vendor-specific
-                    //           workarounds. (12 ASCII bytes.)
-                    //   leaf 1: family/model/stepping in EAX, feature
-                    //           flags in EDX/ECX. We report a bare i386
-                    //           with FPU=0, PSE=0, PAE=0, no SSE — the
-                    //           kernel may refuse if features look too
-                    //           lean, but at least it'll know what it's
-                    //           dealing with.
-                    // Anything else returns zeros.
-                    0xA2 => {
-                        let leaf = self.read_r32(0); // EAX
-                        match leaf {
-                            0 => {
-                                self.write_r32(0, 1); // max basic leaf = 1
-                                                      // "WWWVMxRust  " = 12 bytes in EBX, EDX, ECX
-                                self.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX
-                                self.write_r32(2, u32::from_le_bytes(*b"st  ")); // ECX
-                                self.write_r32(1, u32::from_le_bytes(*b"MxRu"));
-                                // EDX
-                            }
-                            1 => {
-                                // Family 3 (i386), no model, stepping 0.
-                                self.write_r32(0, 0x0000_0300);
-                                self.write_r32(3, 0); // EBX
-                                self.write_r32(2, 0); // ECX (SSE3+)
-                                self.write_r32(1, 0); // EDX (FPU/PSE/etc all 0)
-                            }
-                            _ => {
-                                self.write_r32(0, 0);
-                                self.write_r32(3, 0);
-                                self.write_r32(2, 0);
-                                self.write_r32(1, 0);
-                            }
-                        }
-                    }
+                    // EAX/EBX/ECX/EDX. We answer the leaves a Linux
+                    // boot path consults during cpu-feature probing,
+                    // advertising the subset of ISA we actually
+                    // implement (so the kernel takes the fast paths
+                    // instead of the i386-fallback ones).
+                    //
+                    //   leaf 0      max-basic-leaf in EAX, 12-byte
+                    //               vendor string in EBX|EDX|ECX
+                    //   leaf 1      family/model/stepping in EAX,
+                    //               feature flags in EDX/ECX
+                    //   0x80000000  max-extended-leaf in EAX
+                    //   0x80000002..4   48-byte brand string
+                    //
+                    // Anything else returns zeros (the "absent leaf"
+                    // contract Linux expects).
+                    0xA2 => cpuid_dispatch(self),
 
                     // IMUL r16/32, r/m16/32 — 0x0F 0xAF. Two-operand
                     // signed multiply: reg *= r/m, truncated to the
@@ -6301,6 +6276,91 @@ fn packed_f64(a: u128, b: u128, f: impl Fn(f64, f64) -> f64) -> u128 {
 /// [U]COMISS/[U]COMISD instructions write. `None` (a NaN operand) is
 /// the "unordered" case and sets all three. OF/SF are cleared by the
 /// caller; AF we don't model.
+/// 48-byte brand string returned across CPUID 0x80000002..4.
+/// Linux reads this verbatim into `/proc/cpuinfo`'s `model name`.
+const CPUID_BRAND: &[u8; 48] = b"wwwvm Rust software-only x86 CPU                ";
+
+/// Feature-flag bitmap for CPUID leaf 1 EDX. We turn on the bits
+/// that correspond to ISA we actually implement so the kernel takes
+/// the fast paths (FXSAVE, SSE2 memcpy, SYSENTER, CMOV, etc.)
+/// instead of i386 fallbacks.
+const CPUID_LEAF1_EDX: u32 = (1 << 0)        // FPU
+        | (1 << 4)                                   // TSC
+        | (1 << 5)                                   // MSR
+        | (1 << 11)                                  // SEP (SYSENTER)
+        | (1 << 15)                                  // CMOV
+        | (1 << 24)                                  // FXSR
+        | (1 << 25)                                  // SSE
+        | (1 << 26); // SSE2
+
+/// Write a 4-byte chunk of the brand string into a u32 register,
+/// little-endian (the order Linux reconstructs the string in).
+fn brand_dword(offset: usize) -> u32 {
+    u32::from_le_bytes([
+        CPUID_BRAND[offset],
+        CPUID_BRAND[offset + 1],
+        CPUID_BRAND[offset + 2],
+        CPUID_BRAND[offset + 3],
+    ])
+}
+
+/// CPUID dispatcher — small enough to keep here as a free fn so the
+/// step() arm stays a single line. Inputs in EAX (leaf) — we don't
+/// yet read ECX (sub-leaf) because every leaf we answer is
+/// sub-leaf-independent.
+fn cpuid_dispatch(cpu: &mut Cpu) {
+    let leaf = cpu.read_r32(0);
+    match leaf {
+        // Standard leaves.
+        0 => {
+            cpu.write_r32(0, 1); // max basic leaf = 1
+                                 // Vendor string "WWWVMxRust  " in EBX, EDX, ECX.
+            cpu.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX
+            cpu.write_r32(1, u32::from_le_bytes(*b"MxRu")); // EDX
+            cpu.write_r32(2, u32::from_le_bytes(*b"st  ")); // ECX
+        }
+        1 => {
+            // Family 6, model 6, stepping 4 — a generic Pentium-Pro
+            // class shape. Family-6 keeps the kernel on its modern
+            // probe paths rather than the antique-i386 branches.
+            cpu.write_r32(0, 0x0000_0664);
+            cpu.write_r32(3, 0); // EBX (brand index / cflush / APIC ID)
+            cpu.write_r32(2, 0); // ECX (SSE3+)
+            cpu.write_r32(1, CPUID_LEAF1_EDX); // EDX
+        }
+        // Extended leaves.
+        0x8000_0000 => {
+            // Max extended leaf supported = 0x80000004 (brand string).
+            cpu.write_r32(0, 0x8000_0004);
+            cpu.write_r32(3, 0);
+            cpu.write_r32(2, 0);
+            cpu.write_r32(1, 0);
+        }
+        0x8000_0001 => {
+            // Extended feature flags — long-mode and 3DNow! both off.
+            cpu.write_r32(0, 0);
+            cpu.write_r32(3, 0);
+            cpu.write_r32(2, 0);
+            cpu.write_r32(1, 0);
+        }
+        // Brand string: 48 bytes split across three leaves of four
+        // dwords each (EAX/EBX/ECX/EDX = positions 0/4/8/12).
+        0x8000_0002..=0x8000_0004 => {
+            let base = ((leaf - 0x8000_0002) as usize) * 16;
+            cpu.write_r32(0, brand_dword(base));
+            cpu.write_r32(3, brand_dword(base + 4));
+            cpu.write_r32(2, brand_dword(base + 8));
+            cpu.write_r32(1, brand_dword(base + 12));
+        }
+        _ => {
+            cpu.write_r32(0, 0);
+            cpu.write_r32(3, 0);
+            cpu.write_r32(2, 0);
+            cpu.write_r32(1, 0);
+        }
+    }
+}
+
 fn comis_flags(ord: Option<std::cmp::Ordering>) -> (bool, bool, bool) {
     use std::cmp::Ordering::*;
     match ord {

@@ -6230,6 +6230,67 @@ fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {
     assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"st  "));
 }
 
+/// CPUID leaf 1 must advertise the ISA we actually implement: FPU,
+/// TSC, MSR, SYSENTER, CMOV, FXSR, SSE, SSE2. The kernel reads EDX
+/// to decide between fast modern paths and i386 fallbacks; honest
+/// flags keep it on the fast paths.
+#[test]
+fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
+    // Family 6, model 6, stepping 4.
+    assert_eq!(cpu.read_r32(0), 0x0000_0664);
+    let edx = cpu.read_r32(1);
+    assert_ne!(edx & (1 << 0), 0, "FPU");
+    assert_ne!(edx & (1 << 4), 0, "TSC");
+    assert_ne!(edx & (1 << 5), 0, "MSR");
+    assert_ne!(edx & (1 << 11), 0, "SEP");
+    assert_ne!(edx & (1 << 15), 0, "CMOV");
+    assert_ne!(edx & (1 << 24), 0, "FXSR");
+    assert_ne!(edx & (1 << 25), 0, "SSE");
+    assert_ne!(edx & (1 << 26), 0, "SSE2");
+    // Things we don't implement must NOT be set.
+    assert_eq!(edx & (1 << 6), 0, "PAE absent");
+    assert_eq!(edx & (1 << 8), 0, "CX8 absent");
+    assert_eq!(edx & (1 << 23), 0, "MMX absent");
+}
+
+/// CPUID extended leaves 0x80000002..4 return a 48-byte brand
+/// string. Linux reads this verbatim into /proc/cpuinfo. The leaf
+/// 0x80000000 reports the max extended leaf supported.
+#[test]
+fn cpuid_extended_leaves_return_brand_string() {
+    // First: max extended leaf reported by 0x80000000 must be at
+    // least 0x80000004.
+    let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x00, 0x00, 0x00, 0x80, 0x0F, 0xA2, 0xF4], 12);
+    assert!(cpu.read_r32(0) >= 0x8000_0004);
+
+    // Now read all three brand-string leaves into a buffer in the
+    // EAX/EBX/ECX/EDX order each leaf delivers.
+    let mut s = Vec::with_capacity(48);
+    for leaf in 0x8000_0002u32..=0x8000_0004 {
+        let prog = [
+            0x66,
+            0xB8,
+            leaf as u8,
+            (leaf >> 8) as u8,
+            (leaf >> 16) as u8,
+            (leaf >> 24) as u8,
+            0x0F,
+            0xA2,
+            0xF4,
+        ];
+        let (c, _, _) = run_payload(&prog, 12);
+        s.extend_from_slice(&c.read_r32(0).to_le_bytes()); // EAX
+        s.extend_from_slice(&c.read_r32(3).to_le_bytes()); // EBX
+        s.extend_from_slice(&c.read_r32(2).to_le_bytes()); // ECX
+        s.extend_from_slice(&c.read_r32(1).to_le_bytes()); // EDX
+    }
+    assert_eq!(s.len(), 48);
+    let text = String::from_utf8(s).expect("ascii");
+    assert!(text.starts_with("wwwvm Rust"), "got {:?}", text);
+    assert!(text.contains("x86 CPU"));
+}
+
 /// 0x0F 0xB6 — MOVZX r16, r/m8. Zero-extends a byte to 16 bits.
 #[test]
 fn movzx_r16_rm8_zero_extends() {
