@@ -4058,14 +4058,36 @@ impl Cpu {
                     self.push16(mem, self.flags);
                 }
             }
-            // POPF / POPFD — pop FLAGS / EFLAGS.
+            // POPF / POPFD — pop FLAGS / EFLAGS. In PM, real silicon
+            // strips bits the current CPL isn't allowed to change:
+            //   * CPL > 0   → IOPL field (bits 12-13) stays pinned —
+            //     otherwise userspace would self-promote to ring 0
+            //     for the purpose of CLI/STI/IN/OUT.
+            //   * CPL > IOPL → IF (bit 9) stays pinned — so an
+            //     untrusted task can't disable interrupts.
+            // Real-mode POPF (PE=0) writes through unmasked. We don't
+            // model VM/RF/NT here — those fields stay at their
+            // current value implicitly via the mask.
             0x9D => {
-                if self.op_size_32 {
-                    let eflags = self.pop32(mem);
-                    self.flags = eflags as u16;
+                let popped = if self.op_size_32 {
+                    self.pop32(mem) as u16
                 } else {
-                    self.flags = self.pop16(mem);
-                }
+                    self.pop16(mem)
+                };
+                self.flags = if self.cr0 & 1 != 0 {
+                    let cpl = self.sregs[sreg::CS] & 3;
+                    let iopl = (self.flags >> 12) & 3;
+                    let mut mask: u16 = 0xFFFF;
+                    if cpl > 0 {
+                        mask &= !0x3000; // preserve IOPL
+                    }
+                    if cpl > iopl {
+                        mask &= !flag::IF; // preserve IF
+                    }
+                    (popped & mask) | (self.flags & !mask)
+                } else {
+                    popped
+                };
             }
 
             // CBW — sign-extend AL into AX. AH = AL & 0x80 ? 0xFF : 0x00.

@@ -5142,6 +5142,51 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// POPF at CPL > IOPL must not change the IF bit — otherwise an
+/// untrusted process could disable interrupts. Setup: PM, CPL=3,
+/// IOPL=0, IF=1. User pushes EFLAGS with IF=0 then POPFs. After
+/// POPF, IF stays 1 (kernel's IF survives) and IOPL stays 0.
+#[test]
+fn popf_at_cpl_above_iopl_preserves_if_and_iopl() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 40] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+
+    // User stack at 0x2000 holds a 32-bit EFLAGS image with IF=0
+    // and IOPL=3 — both values the user would like to apply. The
+    // kernel's IF=1 / IOPL=0 must survive POPF.
+    let pushed_eflags: u32 = 0x0000_3002; // bit 1 set (reserved), IOPL=3, IF=0
+    mem.write_u32(0x2000 - 4, pushed_eflags);
+
+    // User code at 0x8000: 0x66 0x9D (POPFD); HLT.
+    mem.write_slice(0x8000, &[0x66, 0x9D, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x27;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x2000 - 4);
+    cpu.ip = 0x8000;
+    // Kernel-set EFLAGS: IF=1, IOPL=0.
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step POPFD");
+
+    // IF stayed 1 — user couldn't disable interrupts.
+    assert_ne!(cpu.flags & flag::IF, 0, "IF must stay set at CPL>IOPL");
+    // IOPL stayed 0 — user couldn't grant itself I/O privilege.
+    assert_eq!((cpu.flags >> 12) & 3, 0, "IOPL must stay 0 at CPL>0");
+}
+
 /// RDPMC from CPL=3 with CR4.PCE clear raises #GP(0). Real
 /// silicon gates the userspace-perf path on CR4.PCE (bit 8);
 /// Linux toggles it on/off as `perf_event_open` instances come
