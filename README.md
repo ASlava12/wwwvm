@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**481 тестов** зелёные (mem 11 + devices 45 + cpu 303 + vm 108 +
+**482 тестов** зелёные (mem 11 + devices 45 + cpu 303 + vm 109 +
 tutorial-anchor 2 + wasm 7 + proxy 5). Снапшот v12.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -225,16 +225,20 @@ spinlock через LOCK CMPXCHG + PAUSE):
   чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
   Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются
   в четыре байтовых обращения подряд.
-- **LAPIC MMIO** (0xFEE0_0000 + 4 KiB): минимальный стаб. Version
-  reg на 0x030 даёт 0x0006_0014, ID на 0x020 = 0; всё прочее —
-  4 KiB scratch buffer для round-trip записей (SIV, TPR). IA32_APIC_BASE
-  MSR не выставляет enable-bit, так что Linux падает на legacy PIC
-  для реальной доставки прерываний.
-- **HPET MMIO** (0xFED0_0000 + 1 KiB): тоже стаб. General Caps на
+- **LAPIC MMIO** (0xFEE0_0000 + 4 KiB): Version reg на 0x030 =
+  0x0006_0014, ID на 0x020 = 0. Таймер: write в Initial Count
+  (0x380) защёлкивает Current Count (0x390); каждый cpu.step
+  декрементирует Current Count, на zero-crossing — если
+  LVT_TIMER (0x320) не masked — диспетчится вектор из LVT_TIMER.
+  Поддержаны periodic (бит 17=01) и one-shot (00) режимы.
+  Доставка идёт впереди legacy-PIC очереди в step(). EOI-запись
+  в 0x0B0 — no-op (scratch). IA32_APIC_BASE MSR не выставляет
+  enable-bit; Linux всё ещё видит и LAPIC, и legacy PIC.
+- **HPET MMIO** (0xFED0_0000 + 1 KiB): пока стаб. General Caps на
   offset 0x000 = 0x05F5_E100_8086_A201 (3 таймера, 64-битный
   counter, vendor 0x8086, 100 ns период); остальное — scratch buffer.
   Без доставки прерываний — ядро видит, что HPET присутствует, но
-  фактический таймер по-прежнему идёт через PIT.
+  фактический таймер идёт через PIT или LAPIC.
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
@@ -247,10 +251,10 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | MMX-стек (mm0..mm7, EMMS, packed-int MMX-only), помарки в SSE3+ (HADDPS/HADDPD, MOVDDUP, LDDQU) | средний | SSE2 готов в практическом смысле; Alpine ≥3.x линкуется именно с ним. MMX совершенно отдельный регистровый стек — линукс почти не пользуется в современном коде |
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
-| Ring 3 + полноценный TSS + privilege transitions | малый | Обе половины ring-3 round-trip работают: вход через TSS.SS0:ESP0 и возврат через попап SS:ESP. HLT/CLI/STI/IN/OUT из CPL>IOPL раздают #GP(0). Software-INT с CPL>gate.DPL раздаёт #GP с правильным IDT error-кодом. Остаётся: per-port IO permission bitmap в TSS, SYSENTER-side TSS lookup |
-| Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #DE, #UD, #PF и существенный кусок #GP уже доезжают; остался #GP из ring transitions и #DF/#NP/#SS |
+| Ring 3 + полноценный TSS + privilege transitions | малый | Cross-ring INT/IRET, syscall round-trip (IRETD→user→INT→handler), cross-ring #PF — всё работает. CPL=0 guards стоят на HLT/CLI/STI/IN/OUT (IOPL), LLDT/LTR/LGDT/LIDT/LMSW/INVLPG, INVD/WBINVD, MOV CR/DR, RDMSR/WRMSR/SYSEXIT, CLTS, RDPMC (через CR4.PCE). Остаётся: per-port IO permission bitmap в TSS |
+| Полный #DF / #NP / #SS | средний | #DE, #UD, #PF и весь основной #GP набор уже доезжают; #DF/#NP/#SS — ещё нет |
 | IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
-| APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
+| HPET таймер-IRQ / реалистичный PIT-тайминг | малый | LAPIC периодический таймер уже доставляет; HPET — только probe-stub без доставки. Linux в большинстве конфигов берёт LAPIC, так что HPET-доставка — second-tier. |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
 | VGA graphics, framebuffer | средний | fbcon, графические гости |
 
@@ -266,7 +270,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 481 пройденных тестов на текущий момент. CI
+Должно вывести 482 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

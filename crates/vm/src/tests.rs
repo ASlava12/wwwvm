@@ -1336,6 +1336,60 @@ fn lapic_timer_fires_periodic_irq_through_32_bit_gate() {
     );
 }
 
+/// LAPIC mask bit (LVT_TIMER bit 16): when set, no IRQ fires on
+/// zero-crossings even though Current Count still decrements.
+/// Linux flips this bit to disable the timer during S3 / power
+/// transitions; if our model ignored the mask, the kernel would
+/// keep receiving spurious ticks while it tries to suspend.
+#[test]
+fn lapic_timer_masked_does_not_fire_irq() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel programs LVT_TIMER = 0x00030040 — vector 0x40, mode
+    // periodic (0b01 << 17), mask = 1 (1 << 16). Same Initial
+    // Count (32) as the one-shot test. Then STI + busy loop ~8K
+    // cycles + HLT. Without the mask the periodic timer would
+    // fire ~250 times in that window.
+    let kernel: &[u8] = &[
+        // IDT[0x40] @ idt_base + 0x40*8 = 0x1200.
+        0xC7, 0x05, 0x00, 0x12, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, //
+        0xC7, 0x05, 0x04, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // LVT_TIMER = 0x00030040: vector=0x40, mask=1, periodic.
+        0xC7, 0x05, 0x20, 0x03, 0xE0, 0xFE, 0x40, 0x00, 0x03, 0x00, //
+        // Initial Count = 32.
+        0xC7, 0x05, 0x80, 0x03, 0xE0, 0xFE, 0x20, 0x00, 0x00, 0x00, //
+        // STI.
+        0xFB, //
+        // Busy loop: MOV ECX, 0x1000; DEC ECX; JNZ -3; HLT.
+        0xB9, 0x00, 0x10, 0x00, 0x00, 0x49, 0x75, 0xFD, 0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    vm.mem
+        .write_slice(0x0800, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(20_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT");
+    assert_eq!(
+        vm.mem().read_u8(0x900),
+        0,
+        "masked timer must not fire (got {})",
+        vm.mem().read_u8(0x900)
+    );
+}
+
 /// LAPIC one-shot mode (LVT_TIMER bits 18:17 = 0b00): the timer
 /// fires exactly once on the first zero crossing. Current Count
 /// stays at zero afterwards — no reload from Initial Count. If
