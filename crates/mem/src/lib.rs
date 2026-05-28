@@ -125,7 +125,17 @@ impl Memory {
 
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         if Self::is_lapic(addr) {
-            self.lapic[(addr - LAPIC_BASE) as usize] = value;
+            let off = (addr - LAPIC_BASE) as usize;
+            self.lapic[off] = value;
+            // A write to LAPIC Initial Count (0x380..0x384) also
+            // resets the matching byte of Current Count (0x390+).
+            // Real silicon snaps current = initial atomically; we
+            // mirror byte-wise, which converges to the same value
+            // after the kernel finishes its u32 write (Linux writes
+            // initial count as a single MOV).
+            if (0x380..0x384).contains(&off) {
+                self.lapic[0x390 + (off - 0x380)] = value;
+            }
             return;
         }
         if Self::is_hpet(addr) {
@@ -135,6 +145,27 @@ impl Memory {
         let a = addr as usize;
         if a < self.bytes.len() {
             self.bytes[a] = value;
+        }
+    }
+
+    /// Tick the LAPIC timer once. Decrements the Current Count
+    /// (LAPIC offset 0x390) by 1, saturating to 0. The CPU calls
+    /// this once per step; Linux's LAPIC calibration measures the
+    /// delta against TSC to learn the bus-clock ratio. We don't
+    /// model the divide-config register (every step counts as one
+    /// LAPIC tick) — Linux's calibration computes whatever ratio
+    /// it observes; the *delta* is what matters.
+    pub fn tick_lapic_timer(&mut self) {
+        let off = 0x390;
+        let cur = u32::from_le_bytes([
+            self.lapic[off],
+            self.lapic[off + 1],
+            self.lapic[off + 2],
+            self.lapic[off + 3],
+        ]);
+        if cur > 0 {
+            let next = cur - 1;
+            self.lapic[off..off + 4].copy_from_slice(&next.to_le_bytes());
         }
     }
 

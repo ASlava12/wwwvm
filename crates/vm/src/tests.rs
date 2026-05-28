@@ -2925,6 +2925,35 @@ fn snapshot_v11_preserves_hpet_writes_to_main_counter() {
     assert_eq!(vm2.cpu().mem_read_u32(vm2.mem(), 0xFED0_0004), 0x05F5_E100);
 }
 
+/// LAPIC timer Current Count (offset 0x390) ticks down once per
+/// CPU step. Writing Initial Count (0x380) snaps Current to the
+/// same value (real silicon snaps atomically; we snap byte-wise).
+/// Linux's LAPIC calibration measures the delta against TSC to
+/// derive the bus-clock ratio — we don't fire timer interrupts
+/// yet (Linux falls back to PIC), but the kernel sees a live
+/// counter.
+#[test]
+fn lapic_current_count_ticks_down_after_initial_count_write() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // Write Initial Count = 0x1000 to the LAPIC MMIO. Current Count
+    // should snap to the same value.
+    vm.cpu.mem_write_u32(&mut vm.mem, 0xFEE0_0380, 0x0000_1000);
+    assert_eq!(
+        vm.cpu.mem_read_u32(&vm.mem, 0xFEE0_0390),
+        0x0000_1000,
+        "Current Count snaps to Initial Count on write"
+    );
+    // Step the CPU a handful of times. Each step decrements current.
+    vm.run_steps(8);
+    let cur = vm.cpu().mem_read_u32(vm.mem(), 0xFEE0_0390);
+    // 8 steps × 1 tick each = 8 decrements; default guest may take
+    // a few steps to reach steady state, but cur must be < 0x1000.
+    assert!(cur < 0x1000, "current count ticked down (got {cur:#x})");
+    assert!(cur >= 0x1000 - 16, "didn't tick too fast (got {cur:#x})");
+}
+
 /// v10 adds a LAPIC section between RAM and the device blob. A
 /// kernel that writes to the SIV at 0xFEE0_00F0 (the canonical
 /// "enable + spurious vector" probe) must see its write survive
