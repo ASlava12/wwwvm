@@ -4148,6 +4148,89 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
     assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
 }
 
+/// Cross-ring entry: an INT from CPL=3 lands on the kernel stack
+/// via TSS.SS0:ESP0 and pushes the full five-dword frame (SS_user,
+/// ESP_user, FLAGS, CS_user, IP_user). This is the kernel-entry
+/// half of the user-mode round trip; the IRET-side test above is
+/// the matching kernel→user return.
+#[test]
+fn int_from_ring_3_switches_to_kernel_stack_via_tss() {
+    let mut mem = Memory::new(0x10_0000);
+    // GDT at 0x500. Six entries (limit = 47 = 0x2F):
+    //   0x00 null
+    //   0x08 ring-0 code
+    //   0x10 ring-0 data
+    //   0x18 ring-3 code  (selector 0x1B with RPL=3)
+    //   0x20 ring-3 data  (selector 0x23 with RPL=3)
+    //   0x28 TSS descriptor — base 0x4000, limit 0x67, type 0x89
+    //                          (available 32-bit TSS, DPL=0).
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+
+    // TSS at 0x4000. ESP0 at +4, SS0 at +8.
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+
+    // IDT at 0x6000. Vector 0x80 lives at 0x6000 + 0x80*8 = 0x6400.
+    // 32-bit interrupt gate, DPL=3 (callable from ring 3),
+    // selector = ring-0 code (0x08), offset = 0x9000.
+    mem.write_slice(
+        0x6400,
+        &[
+            0x00, 0x90, // offset 15:0
+            0x08, 0x00, // selector
+            0x00, // reserved
+            0xEE, // P=1 DPL=3 32-bit interrupt gate
+            0x00, 0x00, // offset 31:16
+        ],
+    );
+
+    // Ring-3 code at 0x8000: a single INT 0x80.
+    mem.write_slice(0x8000, &[0xCD, 0x80]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28; // active TSS selector (index 5)
+
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202; // distinctive value so we can verify the push
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step INT 0x80");
+
+    // Landed on kernel CS via the IDT gate.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.ip, 0x9000);
+    // Stack switched via TSS.
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+    // ESP = TSS.ESP0 - 20 (five 32-bit pushes, no error code).
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x3000 - 20);
+    // Frame layout, walking down from TSS.ESP0:
+    //   [0x3000 - 4]  = SS_user  (0x23 zero-extended)
+    //   [0x3000 - 8]  = ESP_user (0x2000)
+    //   [0x3000 - 12] = FLAGS    (with IF cleared by the gate)
+    //   [0x3000 - 16] = CS_user  (0x1B)
+    //   [0x3000 - 20] = IP_user  (0x8002 = address after INT 0x80,
+    //                             since INT pushes the IP of the
+    //                             following instruction)
+    assert_eq!(mem.read_u32(0x3000 - 4), 0x23);
+    assert_eq!(mem.read_u32(0x3000 - 8), 0x2000);
+    assert_eq!(mem.read_u32(0x3000 - 16), 0x1B);
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8002);
+}
+
 /// IRET to a higher-privilege CS (CPL goes from 0 to 3) pops the
 /// additional SS:ESP frame Real silicon expects, switching to the
 /// caller's user-mode stack. Same-ring IRET (the existing tests)

@@ -1392,10 +1392,40 @@ impl Cpu {
         };
         let flags = self.flags;
         let cs = self.sregs[sreg::CS];
+        // Cross-ring entry: when a PE-mode interrupt fires from
+        // CPL > 0 (user space) into a handler at a lower CPL, real
+        // silicon loads SS0:ESP0 from the active TSS *before*
+        // pushing the IRET frame, then also pushes the user's
+        // SS:ESP atop the frame. The matching IRET path (with the
+        // popped CS RPL > current CPL) walks all five (or six,
+        // with error code) words back. We only switch when the
+        // gate is 32-bit — 16-bit cross-ring entries are
+        // vanishingly rare in real kernels, and supporting both
+        // would just double the frame-layout code path.
+        let cpl_before = if self.cr0 & 1 != 0 { (cs & 3) as u8 } else { 0 };
+        let cross_ring = gate_is_32 && cpl_before > 0;
+        let (old_ss, old_esp) = if cross_ring {
+            let old_ss = self.sregs[sreg::SS];
+            let old_esp = self.read_r32(r16::SP as u8);
+            // Read ESP0 / SS0 from the 32-bit-TSS layout. Base
+            // comes from the descriptor that LTR latched into TR.
+            let tss_base = self.tss_base(mem);
+            let new_esp = self.mem_read_u32(mem, tss_base.wrapping_add(4));
+            let new_ss = self.mem_read_u16(mem, tss_base.wrapping_add(8));
+            // Switch to the kernel stack before pushing any frame.
+            self.write_sreg(sreg::SS, new_ss, mem);
+            self.write_r32(r16::SP as u8, new_esp);
+            (Some(old_ss), Some(old_esp))
+        } else {
+            (None, None)
+        };
         if gate_is_32 {
-            // 32-bit frame: push EFLAGS, CS (zero-extended to dword),
-            // and the full 32-bit EIP. The error code (when present)
-            // gets a dword push too.
+            // Push the caller's SS:ESP first when we switched stacks,
+            // so an IRET back to ring 3 walks them last.
+            if let (Some(ss), Some(esp)) = (old_ss, old_esp) {
+                self.push32(mem, ss as u32);
+                self.push32(mem, esp);
+            }
             self.push32(mem, flags as u32);
             self.push32(mem, cs as u32);
             self.push32(mem, self.ip);
@@ -1416,6 +1446,20 @@ impl Cpu {
         // gets cleared.
         self.write_sreg(sreg::CS, new_cs, mem);
         self.ip = new_ip;
+    }
+
+    /// Look up the linear base of the currently-active TSS by
+    /// decoding the descriptor that TR points at in the GDT. The
+    /// 32-bit-TSS layout (the one Linux uses) starts with the
+    /// previous-task link at offset 0 and has ESP0 at offset 4,
+    /// SS0 at offset 8 — that's what `do_interrupt_with_error`
+    /// reads on a cross-ring entry.
+    fn tss_base(&self, mem: &Memory) -> u32 {
+        let desc_addr = self.gdtr.base.wrapping_add((self.tr & 0xFFF8) as u32);
+        let d1 = self.mem_read_u16(mem, desc_addr.wrapping_add(2)) as u32;
+        let d2 = self.mem_read_u16(mem, desc_addr.wrapping_add(4)) as u32;
+        let d3 = self.mem_read_u16(mem, desc_addr.wrapping_add(6)) as u32;
+        d1 | ((d2 & 0x00FF) << 16) | ((d3 & 0xFF00) << 16)
     }
 
     /// Read the stack pointer at its current width. Returns the
