@@ -358,6 +358,49 @@ mod tests {
         assert_eq!(vm.read_mem_u8(entry + 1), 0xEF);
     }
 
+    /// JS-facing smallest console demo: a PM kernel handed off via
+    /// `start_protected_mode_at` writes "Hi!\n" to COM1 (port 0x3F8)
+    /// and HLTs. The host drains the UART buffer through
+    /// `read_output` and sees the string. This pins the full
+    /// chain JS callers actually use to display kernel output:
+    /// load_bzimage → start_protected_mode_at → run → read_output.
+    #[test]
+    fn js_facing_pm_kernel_prints_through_uart() {
+        let mut bz = vec![0u8; 1024];
+        bz[0x1F1] = 1;
+        bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        bz[0x202..0x206].copy_from_slice(b"HdrS");
+        bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+        bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+        // Kernel: MOV EDX, 0x3F8 (COM1 THR); for each byte of "Hi!\n"
+        // MOV AL, byte then OUT DX, AL; HLT. CS.D=1 makes BA take a
+        // 32-bit immediate by default.
+        //   BA F8 03 00 00   MOV EDX, 0x3F8        (5)
+        //   B0 'H' EE        MOV AL,'H'; OUT DX,AL (3)
+        //   B0 'i' EE                              (3)
+        //   B0 '!' EE                              (3)
+        //   B0 0A  EE                              (3)
+        //   F4                HLT                  (1)
+        let mut payload = Vec::<u8>::new();
+        payload.extend_from_slice(&[0xBA, 0xF8, 0x03, 0x00, 0x00]);
+        for ch in b"Hi!\n" {
+            payload.extend_from_slice(&[0xB0, *ch, 0xEE]);
+        }
+        payload.push(0xF4);
+        bz.extend_from_slice(&payload);
+
+        let mut vm = WwwVm::new_with_ram_size(0x0020_0000);
+        let entry = vm.load_bzimage(&bz).expect("load_bzimage");
+        vm.start_protected_mode_at(entry);
+        vm.run(64);
+
+        assert!(vm.is_halted());
+        assert!(vm.last_error().is_none());
+        // The string lands in the UART tx buffer; read_output drains it.
+        assert_eq!(vm.read_output(), "Hi!\n");
+    }
+
     /// `read_mem_u32` lets JS check a 32-bit sentinel in one call.
     /// A freshly-handed-off kernel that does `MOV [0x900],
     /// 0xCAFEBABE; HLT` should leave the dword readable through

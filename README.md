@@ -127,8 +127,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**448 тестов** зелёные (mem 11 + devices 45 + cpu 288 + vm 93 +
-tutorial-anchor 2 + wasm 4 + proxy 5). Снапшот v11.
+**449 тестов** зелёные (mem 11 + devices 45 + cpu 288 + vm 93 +
+tutorial-anchor 2 + wasm 5 + proxy 5). Снапшот v11.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
@@ -245,7 +245,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 448 пройденных тестов на текущий момент. CI
+Должно вывести 449 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
