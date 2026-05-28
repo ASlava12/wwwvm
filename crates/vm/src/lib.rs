@@ -43,6 +43,9 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 /// guest installed at the IVT entry.
 ///
 /// Currently implemented:
+///   * INT 0x10 AH=0x00 — set video mode. Clears the 80×25 text
+///     buffer and resets the cursor to (0, 0). The mode number is
+///     accepted but ignored (we only model mode 3).
 ///   * INT 0x10 AH=0x02 — set cursor position (BH page, DH row, DL col)
 ///   * INT 0x10 AH=0x03 — read cursor position (returns row/col in
 ///     DH/DL plus a canned cursor shape in CH/CL)
@@ -53,6 +56,8 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///     wraps at column 80 and clamps at row 24. CR/LF/BS are honored;
 ///     BEL is silently dropped.
 ///   * INT 0x10 AH=0x0F — get video mode (returns mode 3 / 80 cols)
+///   * INT 0x16 AH=0x02 — get keyboard shift-flags. We don't model
+///     modifier-key state, so always report 0 (no modifiers held).
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
     match vector {
         0x10 => bios_int10(cpu, mem),
@@ -78,6 +83,20 @@ fn bios_int12(cpu: &mut Cpu) -> bool {
 fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
     let ah = cpu.read_r8(4); // AH lives in the high half of AX
     match ah {
+        // Set video mode. AL = mode number — we only model mode 3
+        // (80×25 16-colour text) so the value is accepted but
+        // ignored; the contract observers actually care about is
+        // that the screen clears and the cursor resets to (0, 0).
+        0x00 => {
+            for i in 0..(VGA_TEXT_ROWS * VGA_TEXT_COLS) as u32 {
+                let off = i * 2;
+                mem.write_u8(VGA_TEXT_BASE + off, b' ');
+                mem.write_u8(VGA_TEXT_BASE + off + 1, 0x07);
+            }
+            mem.write_u8(BDA_CURSOR_COL, 0);
+            mem.write_u8(BDA_CURSOR_ROW, 0);
+            true
+        }
         // Set cursor position. BH = page (ignored — page 0 only),
         // DH = row, DL = column. Clamps each to the 80×25 grid.
         0x02 => {
@@ -327,6 +346,15 @@ fn bios_int16(cpu: &mut Cpu, io: &mut IoBus) -> bool {
             } else {
                 cpu.flags |= wwwvm_cpu::flag::ZF;
             }
+            true
+        }
+        // Get keyboard shift-flags. We don't track modifier-key
+        // state (shift, ctrl, alt, capslock, etc.) so always report
+        // "nothing held". setup.bin reads this to decide between
+        // graphical and serial console; with AL=0 it falls back to
+        // its default behaviour, which is what we want.
+        0x02 => {
+            cpu.write_r8(0, 0);
             true
         }
         _ => false,

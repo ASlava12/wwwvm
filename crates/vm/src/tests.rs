@@ -74,6 +74,59 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
 #[test]
+fn bios_int10_set_video_mode_clears_screen_and_resets_cursor() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Dirty up the screen and move the cursor away from (0, 0) so
+    // we can prove AH=0x00 actually clears + resets.
+    vm.mem.write_u8(VGA_TEXT_BASE, b'X');
+    vm.mem.write_u8(VGA_TEXT_BASE + 1, 0x4F);
+    vm.mem.write_u8(BDA_CURSOR_COL, 25);
+    vm.mem.write_u8(BDA_CURSOR_ROW, 7);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x00, // MOV AH, 0x00
+            0xB0, 0x03, // MOV AL, 0x03  (mode 3; value is accepted but ignored)
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    // Cell (0, 0) is now a space with the default attribute.
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE), b' ');
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + 1), 0x07);
+    // A sampled later cell is also cleared.
+    let off = ((10 * 80) + 40) * 2;
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off), b' ');
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off + 1), 0x07);
+    // Cursor is back at the origin.
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_COL), 0);
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_ROW), 0);
+}
+
+#[test]
+fn bios_int16_get_shift_flags_reports_no_modifiers_held() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB0, 0xFF, // MOV AL, 0xFF  (poison — handler must overwrite)
+            0xB4, 0x02, // MOV AH, 0x02
+            0xCD, 0x16, // INT 0x16
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    // AL = 0 means no modifier keys held; AH is unspecified by
+    // most BIOSes and we leave it alone.
+    assert_eq!(vm.cpu().read_r8(0), 0);
+}
+
+#[test]
 fn bios_int10_set_then_read_cursor_round_trips_row_and_col() {
     let mut vm = Vm::new();
     vm.install_bios();
