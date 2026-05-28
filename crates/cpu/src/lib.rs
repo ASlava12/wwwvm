@@ -4724,8 +4724,12 @@ impl Cpu {
                     // through the full 32-bit GPR (write_r32) so the
                     // upper half of each control register survives.
                     // The #PF handler reads CR2 here to learn which
-                    // linear address it must page in.
+                    // linear address it must page in. CPL=0 only —
+                    // userspace MOV r,CR is #GP(0).
                     0x20 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
@@ -4744,22 +4748,28 @@ impl Cpu {
                         };
                         self.write_r32(rm, value);
                     }
-                    // MOV r32, DRn — 0x0F 0x21 /reg. Debug registers
-                    // are stub-only: reads return whatever was last
-                    // written. Linux's context switcher does
-                    // `mov %dr6, %eax` early to sample status, then
-                    // clears them — so a faulting #UD here would
-                    // crash the kernel before it even prints. DR4/DR5
-                    // are independent slots here; real hardware
-                    // aliases them to DR6/DR7.
+                    // MOV r32, DRn — 0x0F 0x21 /reg. CPL=0 only.
+                    // Debug registers are stub-only: reads return
+                    // whatever was last written. Linux's context
+                    // switcher does `mov %dr6, %eax` early to sample
+                    // status, then clears them — so a faulting #UD
+                    // here would crash the kernel before it even
+                    // prints. DR4/DR5 are independent slots here;
+                    // real hardware aliases them to DR6/DR7.
                     0x21 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
                         self.write_r32(rm, self.dr[reg as usize]);
                     }
-                    // MOV CRn, r32 — 0x0F 0x22 /reg.
+                    // MOV CRn, r32 — 0x0F 0x22 /reg. CPL=0 only.
                     0x22 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;
@@ -4780,7 +4790,11 @@ impl Cpu {
                     }
                     // MOV DRn, r32 — 0x0F 0x23 /reg. Counterpart to
                     // 0x21. Stub: store the value, no semantic action.
+                    // CPL=0 only.
                     0x23 => {
+                        if self.raise_gp_if_user(op_ip, mem) {
+                            return Ok(());
+                        }
                         let modrm = self.fetch_u8(mem);
                         let reg = (modrm >> 3) & 0x07;
                         let rm = modrm & 0x07;

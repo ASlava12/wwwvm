@@ -5142,6 +5142,58 @@ fn lgdt_in_ring_3_raises_gp() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
+/// MOV CR3, EAX from CPL=3 raises #GP(0). A userspace process
+/// reloading CR3 would relocate the kernel's page directory —
+/// classic privilege-escalation primitive. Real silicon traps it;
+/// we used to silently succeed.
+#[test]
+fn mov_cr3_in_ring_3_raises_gp() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    // User-mode `MOV CR3, EAX` at 0x8000:
+    //   0F 22 D8  — modrm = 11 011 000 (reg=3=CR3, rm=0=EAX).
+    mem.write_slice(0x8000, &[0x0F, 0x22, 0xD8]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.cr3 = 0xAAAA_0000; // distinctive original CR3
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(0, 0xDEAD_BEEF); // would-be new CR3
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step MOV CR3");
+
+    // #GP gate dispatched.
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.ip, 0x9000);
+    // CR3 untouched — the userspace write didn't land.
+    assert_eq!(cpu.cr3, 0xAAAA_0000);
+    // Saved IP = start of MOV (fault, not trap).
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+}
+
 /// WBINVD from CPL=3 raises #GP(0), just like HLT. The kernel
 /// is the only legitimate caller (cache hygiene during context
 /// switches, MTRR updates, etc.); userspace WBINVD must fault.
