@@ -1292,6 +1292,14 @@ impl Vm {
         self.io.disk_mut().load(bytes);
     }
 
+    /// Replace the secondary-channel disk image (the one a guest
+    /// reaches via ATA at 0x170..0x177 / 0x376). Useful for handing
+    /// the kernel a second drive — a CD-ROM mock, a swap target,
+    /// or a separate rootfs. Doesn't touch the BIOS boot drive.
+    pub fn load_secondary_disk_image(&mut self, bytes: &[u8]) {
+        self.io.ata2.disk.load(bytes);
+    }
+
     /// Parse an ELF32 image and copy its PT_LOAD segments into guest
     /// memory. After this returns, the caller should call [`boot`]
     /// (which resets the CPU) and then position CS:IP at the entry

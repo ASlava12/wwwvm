@@ -153,10 +153,54 @@ fn bios_int16_read_blocks_until_key_arrives() {
     assert_eq!(vm.cpu().read_r8(0), b'Z');
 }
 
-/// INT 0x12 — Returns AX = conventional memory KiB below 1 MiB.
-/// Always 640 regardless of actual VM size (the historical PC
-/// reservation for VGA/ROM above 0xA0000 holds even if the VM has
-/// more RAM than that).
+/// `Vm::load_secondary_disk_image` populates the 0x170-channel
+/// drive without touching the boot disk. A boot stub then drives a
+/// READ SECTORS through the secondary's port block (0x170..0x177),
+/// drains 16 bytes from the data port via a byte-at-a-time IN
+/// loop, and verifies the bytes match what the host loaded.
+#[test]
+fn secondary_ata_channel_round_trips_host_loaded_image() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // 1 KiB of distinctive payload on the secondary; primary stays
+    // empty so a mis-routed read would land on 0 / 0xAA boot-pattern.
+    vm.load_secondary_disk_image(&[0x42; 1024]);
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            // Sector count = 1 → secondary 0x172.
+            0xB0, 0x01, // MOV AL, 1
+            0xBA, 0x72, 0x01, // MOV DX, 0x0172
+            0xEE, // OUT DX, AL
+            // Drive/head register: bit 6 set marks LBA mode.
+            0xB0, 0x40, // MOV AL, 0x40
+            0xBA, 0x76, 0x01, // MOV DX, 0x0176
+            0xEE, // OUT DX, AL
+            // READ SECTORS command (0x20) → 0x177.
+            0xB0, 0x20, // MOV AL, 0x20
+            0xBA, 0x77, 0x01, // MOV DX, 0x0177
+            0xEE, // OUT DX, AL
+            // Drain 16 bytes from 0x170 into DS:[DI=0x9000..0x9010].
+            0xBF, 0x00, 0x90, // MOV DI, 0x9000
+            0xBA, 0x70, 0x01, // MOV DX, 0x0170
+            0xB9, 0x10, 0x00, // MOV CX, 16
+            // .L:
+            0xEC, // IN AL, DX
+            0x88, 0x05, // MOV [DI], AL
+            0x47, // INC DI
+            0xE2, 0xFA, // LOOP .L  (rel8 = -6)
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(200);
+    assert!(vm.is_halted());
+    // The 16-byte drain mirrored the secondary's sector-0 contents.
+    for i in 0..16u32 {
+        assert_eq!(vm.mem().read_u8(0x9000 + i), 0x42, "byte {i}");
+    }
+}
+
 /// End-to-end BIOS surface check: a setup.bin-shaped stub that
 /// clears the screen, prints a banner with write-string, reads a
 /// sector from disk into a scratch buffer, then positions the
