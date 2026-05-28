@@ -185,11 +185,15 @@ impl Pit {
         p
     }
 
-    /// Snapshot layout, 12 bytes: reload (u16), counter (u32), mode
-    /// (u8), flags (u8 — bit0=running, bit1=pending_edge,
-    /// bit2=latched, bit3=read_state), write_state (u8), pending_lsb
-    /// (u8), latch_value (u16). Older 10-byte snapshots (no latch
-    /// fields) restore cleanly with latch=None and read_state=0.
+    /// Snapshot layout grew from 10 → 12 → 26 bytes:
+    /// * v1 (10 bytes) — channel-0 only, no counter-latch fields
+    /// * v2 (12 bytes) — adds ch0 counter-latch hold register
+    /// * v3 (26 bytes) — adds channel 2: reload (u16) + counter
+    ///   (u32) + flags (u8 — bit0=running, bit1=out, bit2=gate2,
+    ///   bit3=speaker2) + write_state (u8) + pending_lsb (u8) +
+    ///   trailing reserved (u32, 0). The trailing reserved slot
+    ///   is for a future pit_div_counter promote-up; for now it
+    ///   restores as 0 and the prescaler resets to a fresh cycle.
     pub fn snapshot_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.ch0_reload.to_le_bytes());
         out.extend_from_slice(&self.ch0_counter.to_le_bytes());
@@ -202,6 +206,17 @@ impl Pit {
         out.push(self.write_state);
         out.push(self.pending_lsb);
         out.extend_from_slice(&self.ch0_latch.unwrap_or(0).to_le_bytes());
+        // v3 trailer — channel 2 + port 0x61 state.
+        out.extend_from_slice(&self.ch2_reload.to_le_bytes());
+        out.extend_from_slice(&self.ch2_counter.to_le_bytes());
+        let ch2_flags = (self.ch2_running as u8)
+            | ((self.ch2_out as u8) << 1)
+            | ((self.gate2 as u8) << 2)
+            | ((self.speaker2 as u8) << 3);
+        out.push(ch2_flags);
+        out.push(self.ch2_write_state);
+        out.push(self.ch2_pending_lsb);
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
@@ -216,18 +231,45 @@ impl Pit {
         self.ch0_pending_edge = flags & 2 != 0;
         self.write_state = bytes[8];
         self.pending_lsb = bytes[9];
-        // Latch fields are optional — old 10-byte snapshots predate
-        // counter-latch support and restore with latch cleared.
-        if bytes.len() >= 12 {
+        // v2 latch fields (optional — old 10-byte snapshots predate
+        // counter-latch support and restore with latch cleared).
+        let consumed_v2 = if bytes.len() >= 12 {
             let latched = flags & (1 << 2) != 0;
             self.read_state = (flags >> 3) & 1;
             let val = u16::from_le_bytes([bytes[10], bytes[11]]);
             self.ch0_latch = if latched { Some(val) } else { None };
-            Ok(12)
+            12
         } else {
             self.ch0_latch = None;
             self.read_state = 0;
-            Ok(10)
+            10
+        };
+        // v3 channel-2 trailer (optional — pre-v3 snapshots restore
+        // with ch2 idle and port 0x61 = 0). Trailer = 2+4+1+1+1+4 = 13 bytes.
+        if bytes.len() >= consumed_v2 + 13 {
+            let p = consumed_v2;
+            self.ch2_reload = u16::from_le_bytes([bytes[p], bytes[p + 1]]);
+            self.ch2_counter =
+                u32::from_le_bytes([bytes[p + 2], bytes[p + 3], bytes[p + 4], bytes[p + 5]]);
+            let ch2_flags = bytes[p + 6];
+            self.ch2_running = ch2_flags & 1 != 0;
+            self.ch2_out = ch2_flags & 2 != 0;
+            self.gate2 = ch2_flags & 4 != 0;
+            self.speaker2 = ch2_flags & 8 != 0;
+            self.ch2_write_state = bytes[p + 7];
+            self.ch2_pending_lsb = bytes[p + 8];
+            // Skip the 4-byte reserved trailer.
+            Ok(consumed_v2 + 13)
+        } else {
+            self.ch2_reload = 0;
+            self.ch2_counter = 0;
+            self.ch2_running = false;
+            self.ch2_out = false;
+            self.gate2 = false;
+            self.speaker2 = false;
+            self.ch2_write_state = 0;
+            self.ch2_pending_lsb = 0;
+            Ok(consumed_v2)
         }
     }
 }
@@ -483,15 +525,37 @@ mod tests {
         let _ = pit.read(0x40); // consume LSB, read_state=1
         let mut buf = Vec::new();
         pit.snapshot_into(&mut buf);
-        assert_eq!(buf.len(), 12);
+        // Format v3: 12 bytes ch0 (incl. latch) + 13 bytes ch2 trailer.
+        assert_eq!(buf.len(), 25);
 
         let mut pit2 = Pit::standard();
         let consumed = pit2.restore(&buf).unwrap();
-        assert_eq!(consumed, 12);
+        assert_eq!(consumed, 25);
         // The remaining read should still return the latched MSB.
         assert_eq!(pit2.read(0x40), 0x12);
         // And after that the latch is cleared.
         assert!(pit2.ch0_latch.is_none());
+    }
+
+    /// v3 trailer round-trips ch2 state too — port-0x61 gate + the
+    /// half-loaded counter the kernel left mid-init survive
+    /// snapshot/restore.
+    #[test]
+    fn snapshot_roundtrip_preserves_ch2_state() {
+        let mut pit = Pit::standard();
+        pit.write_port_61(0x01); // gate2 on
+        pit.write(0x43, 0xB0); // SC=2 RW=3 mode=0
+        pit.write(0x42, 0xCD);
+        pit.write(0x42, 0xAB); // ch2 reload = 0xABCD
+        let mut buf = Vec::new();
+        pit.snapshot_into(&mut buf);
+        let mut pit2 = Pit::standard();
+        pit2.restore(&buf).unwrap();
+        assert!(pit2.gate2);
+        assert!(!pit2.speaker2);
+        assert!(pit2.ch2_running);
+        assert!(!pit2.ch2_out);
+        assert_eq!(pit2.ch2_counter, 0xABCD);
     }
 
     /// Old 10-byte snapshots (pre-latch) restore as latch=None and

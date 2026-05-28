@@ -829,7 +829,13 @@ pub mod snapshot {
     ///   a snapshot still auto-advances on restore; pre-v13
     ///   snapshots resume with periods=0 (one-shot until the kernel
     ///   re-arms the comparator).
-    pub const VERSION: u8 = 13;
+    /// * v14 — extends the inner PIT record with channel-2 state
+    ///   (reload + counter + flags + write_state + pending_lsb,
+    ///   plus 4 reserved bytes) so the kernel's TSC-via-PIT
+    ///   calibration setup at port 0x42 + the port-0x61 gate/
+    ///   speaker bits round-trip. Pre-v14 snapshots leave ch2
+    ///   idle on restore; the kernel re-arms it next calibration.
+    pub const VERSION: u8 = 14;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
@@ -1141,13 +1147,14 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=13) {
+        if !matches!(version, 1..=14) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            // v13 doesn't extend the CPU image — it appends HPET
-            // period state past the v11 HPET MMIO buffer.
-            12..=13 => snapshot::CPU_V12_LEN,
+            // v13 / v14 don't extend the CPU image — they extend
+            // device-side blobs (HPET periods in v13, PIT ch2 in
+            // v14).
+            12..=14 => snapshot::CPU_V12_LEN,
             // v10/v11 don't extend the CPU image — they append MMIO
             // sections (LAPIC, then HPET) between RAM and the device
             // blob.
