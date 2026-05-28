@@ -4540,6 +4540,80 @@ impl Cpu {
                         };
                         self.xmm[reg as usize] = packed_sub(a, b, lane);
                     }
+                    // PCMPEQB/W/D (66 0F 74/75/76) — per-lane equality;
+                    // result lane is all-ones on equal, all-zeros
+                    // otherwise. The classic SIMD primitive for
+                    // strchr / memcmp / vectorized branching.
+                    0x74..=0x76 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lane = match op2 {
+                            0x74 => 8,
+                            0x75 => 16,
+                            _ => 32,
+                        };
+                        self.xmm[reg as usize] = pcmpeq(a, b, lane);
+                    }
+                    // PCMPGTB/W/D (66 0F 64/65/66) — signed greater-than;
+                    // result lane all-ones if (signed) a > b. Pairs
+                    // with PCMPEQ to derive {<, ≤, ≥, ≠} via masks.
+                    0x64..=0x66 if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let lane = match op2 {
+                            0x64 => 8,
+                            0x65 => 16,
+                            _ => 32,
+                        };
+                        self.xmm[reg as usize] = pcmpgt(a, b, lane);
+                    }
+                    // Group 12/13/14 immediate-count shifts:
+                    //   66 0F 71 /2,4,6 ib  PSRLW / PSRAW / PSLLW  (16)
+                    //   66 0F 72 /2,4,6 ib  PSRLD / PSRAD / PSLLD  (32)
+                    //   66 0F 73 /2,6   ib  PSRLQ /         PSLLQ  (64)
+                    //   66 0F 73 /3,7   ib  PSRLDQ / PSLLDQ        (byte
+                    //                                  shifts of whole 128)
+                    // The ModR/M reg field is the opcode extension;
+                    // rm.is_reg() encodes the target XMM (no memory).
+                    // Compilers emit `psrad xmm, 31` constantly for
+                    // sign-extension across a vector.
+                    0x71..=0x73 if self.op_size_32 => {
+                        let (_, ext, rm) = self.fetch_modrm(mem);
+                        let count = self.fetch_u8(mem) as u32;
+                        let target = match rm {
+                            Rm::Reg(i) => i as usize,
+                            Rm::Mem(_) => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        let v = self.xmm[target];
+                        let lane = match op2 {
+                            0x71 => 16,
+                            0x72 => 32,
+                            _ => 64,
+                        };
+                        let r = match (op2, ext) {
+                            (_, 2) => packed_shift_logical_right(v, lane, count),
+                            (0x71, 4) | (0x72, 4) => packed_shift_arithmetic_right(v, lane, count),
+                            (_, 6) => packed_shift_left(v, lane, count),
+                            (0x73, 3) => byte_shift_right_128(v, count),
+                            (0x73, 7) => byte_shift_left_128(v, count),
+                            _ => {
+                                return Err(CpuError::Unimplemented {
+                                    opcode: op2,
+                                    cs: op_cs,
+                                    ip: op_ip,
+                                });
+                            }
+                        };
+                        self.xmm[target] = r;
+                    }
                     // Packed float arithmetic. The 0x66 prefix
                     // (op_size_32) selects double-precision (PD, 2×f64)
                     // over single (PS, 4×f32); the opcode low bits pick
@@ -5467,6 +5541,81 @@ fn packed_add(a: u128, b: u128, lane_bits: u32) -> u128 {
 /// Packed per-lane subtract — PSUBB/PSUBW/PSUBD/PSUBQ.
 fn packed_sub(a: u128, b: u128, lane_bits: u32) -> u128 {
     packed_lanes(a, b, lane_bits, |x, y, mask| x.wrapping_sub(y) & mask)
+}
+
+/// Packed per-lane equality — PCMPEQB/W/D. Each lane is all-ones if
+/// the two source lanes are equal, all-zeros otherwise.
+fn pcmpeq(a: u128, b: u128, lane_bits: u32) -> u128 {
+    packed_lanes(a, b, lane_bits, |x, y, mask| if x == y { mask } else { 0 })
+}
+
+/// Packed per-lane signed-greater-than — PCMPGTB/W/D. Lanes are
+/// sign-extended from their narrow width before the compare.
+fn pcmpgt(a: u128, b: u128, lane_bits: u32) -> u128 {
+    let signed = |v: u128| -> i64 {
+        match lane_bits {
+            8 => v as u8 as i8 as i64,
+            16 => v as u16 as i16 as i64,
+            32 => v as u32 as i32 as i64,
+            _ => v as i64,
+        }
+    };
+    packed_lanes(a, b, lane_bits, |x, y, mask| {
+        if signed(x) > signed(y) {
+            mask
+        } else {
+            0
+        }
+    })
+}
+
+/// Packed left shift by `count` — PSLLW/D/Q. Counts ≥ lane width
+/// clear the lane (matching x86's saturating-zero semantics).
+fn packed_shift_left(a: u128, lane_bits: u32, count: u32) -> u128 {
+    if count >= lane_bits {
+        return 0;
+    }
+    packed_lanes(a, 0, lane_bits, |x, _, mask| (x << count) & mask)
+}
+
+/// Packed logical right shift — PSRLW/D/Q. Counts ≥ lane width
+/// clear the lane.
+fn packed_shift_logical_right(a: u128, lane_bits: u32, count: u32) -> u128 {
+    if count >= lane_bits {
+        return 0;
+    }
+    packed_lanes(a, 0, lane_bits, |x, _, _| x >> count)
+}
+
+/// Packed arithmetic right shift — PSRAW/D (no PSRAQ in SSE2).
+/// Counts ≥ lane width clamp to `lane_bits-1`, replicating the sign
+/// bit across the lane.
+fn packed_shift_arithmetic_right(a: u128, lane_bits: u32, count: u32) -> u128 {
+    let count = count.min(lane_bits - 1);
+    packed_lanes(a, 0, lane_bits, |x, _, mask| {
+        let sb = 1u128 << (lane_bits - 1);
+        let signed = if x & sb != 0 { x | !mask } else { x };
+        ((signed as i128) >> count) as u128 & mask
+    })
+}
+
+/// PSLLDQ — byte-granular left shift of the whole 128-bit register
+/// (not per-lane). Counts ≥ 16 clear the register.
+fn byte_shift_left_128(v: u128, count: u32) -> u128 {
+    if count >= 16 {
+        0
+    } else {
+        v << (count * 8)
+    }
+}
+
+/// PSRLDQ — byte-granular right shift of the whole 128-bit register.
+fn byte_shift_right_128(v: u128, count: u32) -> u128 {
+    if count >= 16 {
+        0
+    } else {
+        v >> (count * 8)
+    }
 }
 
 /// Apply `f` to each `lane_bits`-wide lane of `a` and `b`. `f`

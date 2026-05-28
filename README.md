@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**344 теста** зелёные (mem 6 + devices 31 + cpu 243 + vm 56 +
+**347 тестов** зелёные (mem 6 + devices 31 + cpu 246 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -165,7 +165,9 @@ spinlock через LOCK CMPXCHG + PAUSE):
   CVTSI2SS/SD + CVT(T)SS/SD2SI, [U]COMISS/[U]COMISD (флаги),
   MIN/MAX/SQRT (packed PS/PD + скалярные SS/SD), битовые
   ANDPS/ANDNPS/ORPS/XORPS, UNPCKL/UNPCKH PS/PD, SHUFPS/SHUFPD,
-  PSHUFD, MOVHLPS/MOVLHPS + MOVLPS/MOVHPS m64-load+store.
+  PSHUFD, MOVHLPS/MOVLHPS + MOVLPS/MOVHPS m64-load+store,
+  PCMPEQB/W/D + PCMPGTB/W/D (signed), Group 12/13/14 imm-shifts
+  (PSLLW/D/Q + PSRLW/D/Q + PSRAW/D + PSLLDQ/PSRLDQ).
 - **BIOS-shim**: INT 0x10 (TTY), 0x12, 0x13 (disk read), 0x15
   (E820 + AH=88), 0x16 (keyboard).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
@@ -179,7 +181,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Блокер | Объём | Зачем |
 |--------|-------|-------|
 | x87 расширения (трансцендентные FSIN/FCOS/FPTAN/F2XM1, 80-бит m80, FPU-исключения) | средний | База (стек + арифметика + сравнения) уже есть; glibc местами зовёт трансцендентные |
-| MMX + остаток SSE/SSE2 (PSHUFHW/PSHUFLW, packed-int shifts PSLLD/PSRLD, packed-int compares PCMPEQ/GT, конверты PS↔PD/DQ, ~130 опкодов) | очень большой | Есть подмножество (movdqa/scalar/packed-arith/converts/compares/min-max-sqrt/bitwise/unpacks/shuffles/lane-moves); Alpine ≥3.x линкуется с полным SSE2 |
+| MMX + остаток SSE/SSE2 (PSHUFHW/PSHUFLW, переменные shift-по-XMM, MULHW/PMULLW/PMADDWD, конверты PS↔PD/DQ, ~110 опкодов) | очень большой | Есть подмножество (movdqa/scalar/packed-arith/converts/compares/min-max-sqrt/bitwise/unpacks/shuffles/lane-moves/imm-shifts/int-compares); Alpine ≥3.x линкуется с полным SSE2 |
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
@@ -201,7 +203,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 344 пройденных теста на текущий момент. CI
+Должно вывести 347 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

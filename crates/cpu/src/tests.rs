@@ -3120,6 +3120,164 @@ fn sse_movhlps_reg_form_overwrites_low_preserves_high() {
     assert_eq!(mem.read_u32(0x62C), 0x6666_6666);
 }
 
+/// PCMPEQD writes an all-ones lane on equal, all-zeros on unequal.
+/// Mixes matching and non-matching dwords to exercise both outcomes.
+#[test]
+fn sse_pcmpeqd_per_lane_equality() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [1u32, 2, 3, 4];
+    let b = [1u32, 9, 3, 9]; // lanes 0,2 match; 1,3 don't
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize]);
+        mem.write_u32(0x610 + i * 4, b[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x76, 0xC1, // PCMPEQD XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x620), 0xFFFF_FFFF);
+    assert_eq!(mem.read_u32(0x624), 0x0000_0000);
+    assert_eq!(mem.read_u32(0x628), 0xFFFF_FFFF);
+    assert_eq!(mem.read_u32(0x62C), 0x0000_0000);
+}
+
+/// PCMPGTB is signed — a high-bit-set byte (e.g. 0x80) must compare
+/// less than a small positive byte. Mixes four explicit byte pairs
+/// covering greater/equal/less/positive-vs-negative.
+#[test]
+fn sse_pcmpgtb_uses_signed_byte_compare() {
+    let mut mem = Memory::new(0x10_0000);
+    // Bytes 0..3 are the interesting cases; rest are zero (0 > 0 → 0).
+    let a = [0x10u8, 0x80, 0x01, 0x7F];
+    let b = [0x05u8, 0x10, 0x05, 0x05];
+    for i in 0..4 {
+        mem.write_u8(0x600 + i, a[i as usize]);
+        mem.write_u8(0x610 + i, b[i as usize]);
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x64, 0xC1, // PCMPGTB XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u8(0x620), 0xFF); //  16  > 5
+    assert_eq!(mem.read_u8(0x621), 0x00); // -128 > 16  (false, negative)
+    assert_eq!(mem.read_u8(0x622), 0x00); //  1   > 5
+    assert_eq!(mem.read_u8(0x623), 0xFF); // 127  > 5
+                                          // High bytes: both zero everywhere → 0 > 0 false → all zero.
+    assert_eq!(mem.read_u8(0x62F), 0x00);
+}
+
+/// Immediate-count shifts via Group 12/13/14 — exercises PSLLW,
+/// PSRAD (with sign-fill), and PSLLDQ (whole-register byte shift)
+/// in one program.
+#[test]
+fn sse_immediate_shifts_psllw_psrad_pslldq() {
+    let mut mem = Memory::new(0x10_0000);
+    // PSLLW input: words. Pick a small left-shift that fits.
+    let psllw_in: [u16; 8] = [
+        0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x0001, 0xFFFF, 0x0010, 0x0080,
+    ];
+    for i in 0..8u32 {
+        mem.write_u8(0x600 + i * 2, (psllw_in[i as usize] & 0xFF) as u8);
+        mem.write_u8(
+            0x600 + i * 2 + 1,
+            ((psllw_in[i as usize] >> 8) & 0xFF) as u8,
+        );
+    }
+    // PSRAD input: dwords mixing positive, negative, all-ones, zero.
+    let psrad_in: [u32; 4] = [0x8000_0000, 0x4000_0000, 0xFFFF_FFFE, 0x0000_0000];
+    for i in 0..4u32 {
+        mem.write_u32(0x610 + i * 4, psrad_in[i as usize]);
+    }
+    // PSLLDQ input: a recognizable bit pattern, byte-shifted left
+    // by 1 should slide every byte up one position.
+    for i in 0..16u32 {
+        mem.write_u8(0x620 + i, (i + 1) as u8); // [01,02,...,10]
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            // PSLLW XMM0, 4
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x71, 0xF0, 0x04, // PSLLW XMM0, 4 (/6)
+            0x66, 0x0F, 0x7F, 0x06, 0x40, 0x06, // MOVDQA [0x640], XMM0
+            // PSRAD XMM1, 4 — arithmetic; sign bit replicates.
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x72, 0xE1, 0x04, // PSRAD XMM1, 4 (/4)
+            0x66, 0x0F, 0x7F, 0x0E, 0x50, 0x06, // MOVDQA [0x650], XMM1
+            // PSLLDQ XMM2, 1 — whole-register byte shift left.
+            0x66, 0x0F, 0x6F, 0x16, 0x20, 0x06, // MOVDQA XMM2, [0x620]
+            0x66, 0x0F, 0x73, 0xFA, 0x01, // PSLLDQ XMM2, 1 (/7)
+            0x66, 0x0F, 0x7F, 0x16, 0x60, 0x06, // MOVDQA [0x660], XMM2
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..40 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // PSLLW results: each word shifted left 4, masked to 16 bits.
+    for i in 0..8u32 {
+        let lo = mem.read_u8(0x640 + i * 2) as u16;
+        let hi = mem.read_u8(0x640 + i * 2 + 1) as u16;
+        let got = lo | (hi << 8);
+        let want = psllw_in[i as usize].wrapping_shl(4);
+        assert_eq!(got, want, "PSLLW lane {i}");
+    }
+    // PSRAD results:
+    //   0x8000_0000 >> 4 (arith) = 0xF800_0000  (sign-fill)
+    //   0x4000_0000 >> 4 (arith) = 0x0400_0000
+    //   0xFFFF_FFFE >> 4 (arith) = 0xFFFF_FFFF  (-2 / 16 toward -inf = -1)
+    //   0          >> 4         = 0
+    assert_eq!(mem.read_u32(0x650), 0xF800_0000);
+    assert_eq!(mem.read_u32(0x654), 0x0400_0000);
+    assert_eq!(mem.read_u32(0x658), 0xFFFF_FFFF);
+    assert_eq!(mem.read_u32(0x65C), 0x0000_0000);
+    // PSLLDQ shifts every byte up by one position; byte 0 becomes
+    // 0, bytes 1..15 hold the originals [01,02,...,0F].
+    assert_eq!(mem.read_u8(0x660), 0x00);
+    for i in 1..16u32 {
+        assert_eq!(mem.read_u8(0x660 + i), i as u8, "PSLLDQ byte {i}");
+    }
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {
