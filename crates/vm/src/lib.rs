@@ -1493,6 +1493,40 @@ impl Vm {
             .write_u32(0x9_0000 + bzimage::OFF_CMD_LINE_PTR as u32, CMD_LINE_ADDR);
     }
 
+    /// Place an initial RAM disk at the top of physical memory,
+    /// page-aligned downward, and write its address/size into the
+    /// bzImage setup header (ramdisk_image at 0x90218,
+    /// ramdisk_size at 0x9021C). The kernel reads those fields
+    /// during boot to find and unpack the initrd.
+    ///
+    /// "Top-aligned" placement is what real bootloaders do — keeps
+    /// the kernel's expand-from-low-memory layout undisturbed.
+    /// If the image is larger than available RAM (rounded up to a
+    /// 4 KiB boundary) we return `BzImageError::NotEnoughRam`
+    /// rather than silently truncating; a half-loaded initrd would
+    /// corrupt the root filesystem the kernel tries to mount.
+    ///
+    /// Call after [`load_bzimage`] so the setup-header writes land
+    /// in the bzImage's actual header copy.
+    pub fn set_ramdisk(&mut self, bytes: &[u8]) -> Result<(), BzImageError> {
+        let len = bytes.len();
+        let aligned = (len + 0xFFF) & !0xFFF;
+        let ram_size = self.mem.size();
+        if aligned > ram_size {
+            return Err(BzImageError::NotEnoughRam {
+                need: aligned as u64,
+                have: ram_size as u64,
+            });
+        }
+        let start = (ram_size - aligned) as u32;
+        self.mem.write_slice(start, bytes);
+        self.mem
+            .write_u32(0x9_0000 + bzimage::OFF_RAMDISK_IMAGE as u32, start);
+        self.mem
+            .write_u32(0x9_0000 + bzimage::OFF_RAMDISK_SIZE as u32, len as u32);
+        Ok(())
+    }
+
     /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
     /// disk image to linear `0x7C00` (the standard boot-sector load
     /// address), then continue with the same autorun/UART setup as

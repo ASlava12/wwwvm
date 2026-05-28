@@ -874,6 +874,41 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 ///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
 ///      asserts AL = 0xCD after the run.
 ///
+/// `set_ramdisk` places the initrd at the top of physical memory
+/// (page-aligned downward) and writes both ramdisk_image and
+/// ramdisk_size into the setup header so the kernel can find it.
+#[test]
+fn set_ramdisk_places_image_at_top_of_ram_and_updates_header() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    let initrd = vec![0x77u8; 1024]; // 1 KiB
+    vm.set_ramdisk(&initrd).expect("fits in 16 MiB");
+    // 1 KiB rounds up to one 4 KiB page; placed at top minus 4 KiB.
+    let expected_start: u32 = 0x0100_0000 - 0x1000;
+    // First byte and last-of-payload byte both at the right places.
+    assert_eq!(vm.mem().read_u8(expected_start), 0x77);
+    assert_eq!(vm.mem().read_u8(expected_start + 1023), 0x77);
+    // Setup-header fields point at it with the *unrounded* length.
+    assert_eq!(vm.mem().read_u32(0x9_0218), expected_start);
+    assert_eq!(vm.mem().read_u32(0x9_021C), 1024);
+}
+
+#[test]
+fn set_ramdisk_rejects_oversize_image_with_notenoughram() {
+    let mut vm = Vm::with_ram_size(0x0100_0000); // 16 MiB
+    let huge = vec![0u8; 0x0200_0000]; // 32 MiB
+    let err = vm.set_ramdisk(&huge).unwrap_err();
+    match err {
+        BzImageError::NotEnoughRam { need, have } => {
+            assert_eq!(need, 0x0200_0000); // already 4 KiB-aligned
+            assert_eq!(have, 0x0100_0000);
+        }
+        other => panic!("expected NotEnoughRam, got {other:?}"),
+    }
+    // Header fields untouched (still 0 from fresh VM construction).
+    assert_eq!(vm.mem().read_u32(0x9_0218), 0);
+    assert_eq!(vm.mem().read_u32(0x9_021C), 0);
+}
+
 /// `set_kernel_cmdline` writes the string at the conventional
 /// 0x90800 and updates `cmd_line_ptr` in the setup header at
 /// 0x90228. After this the kernel's setup.bin can read its

@@ -21,8 +21,11 @@ const OFF_BOOT_FLAG: usize = 0x1FE; // boot_flag (u16) = 0xAA55
 const OFF_HEADER: usize = 0x202; // "HdrS" magic (4 bytes)
 const OFF_VERSION: usize = 0x206; // protocol version (u16)
 const OFF_CODE32_START: usize = 0x214; // 32-bit kernel entry (u32)
-const OFF_RAMDISK_IMAGE: usize = 0x218; // ramdisk address (u32)
-const OFF_RAMDISK_SIZE: usize = 0x21C; // ramdisk size (u32)
+/// Linear address of the initial ramdisk — the bootloader writes
+/// the load address here so the kernel knows where to find it.
+pub const OFF_RAMDISK_IMAGE: usize = 0x218;
+/// Length of the initial ramdisk in bytes.
+pub const OFF_RAMDISK_SIZE: usize = 0x21C;
 /// Offset within the setup header where the bootloader writes the
 /// linear address of the kernel command-line string. The kernel
 /// reads its `boot_command_line` from here on startup. Protocol
