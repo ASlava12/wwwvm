@@ -2366,6 +2366,78 @@ fn translate_with_pse_pde_uses_4mib_page_directly() {
     assert_eq!(phys_w, 0x0040_0000 + 0x0000_0FFF);
 }
 
+/// End-to-end: paging + PSE work for *instruction fetch*, not just
+/// for `translate()` of data operands. We set up a flat 32-bit CS,
+/// build a 4 MiB-page directory with PDE[0] identity-mapping [0,4M)
+/// and PDE[1] aliasing [4M,8M) → [0,4M), enable PG+PSE, then start
+/// EIP up in the alias range. The first fetch must walk the PSE PDE,
+/// land on the same physical bytes the identity map sees, and run.
+/// This is the shape `head_32.S` produces when it jumps to the kernel's
+/// high virtual address right after flipping CR0.PG.
+#[test]
+fn paging_with_pse_steps_real_instruction_through_aliased_virtual() {
+    let mut mem = Memory::new(0x0080_0000); // 8 MiB
+
+    // GDT at 0x500: null + ring-0 code (D=1/G=1) + ring-0 data.
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data
+        ],
+    );
+
+    // Page directory at 0x10_0000 (above the 1 MiB line so it doesn't
+    // collide with the kernel payload). PDE[0] identity-maps [0, 4M),
+    // PDE[1] aliases [4M, 8M) onto phys [0, 4M). Both PSE, P=1, RW=1.
+    mem.write_u32(0x0010_0000, 0x0000_0083);
+    mem.write_u32(0x0010_0004, 0x0000_0083);
+
+    // Kernel payload at physical 0x0020_0000 (2 MiB in, well inside
+    // the 4 MiB frame). With CS.D=1 the MOV imm32 is real 32-bit.
+    //   B8 BE BA FE CA       MOV EAX, 0xCAFEBABE
+    //   F4                   HLT
+    mem.write_slice(0x0020_0000, &[0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+
+    // Enable paging *after* the descriptors are loaded — flipping
+    // PG with a stale CS would have the CPU fetch the next byte
+    // through translate() against an empty PDE.
+    cpu.cr3 = 0x0010_0000;
+    cpu.cr4 = 0x10; // PSE
+    cpu.cr0 = 0x8000_0001; // PG | PE
+
+    // Enter through the *alias* — linear 0x0040_0000 + 0x0020_0000
+    // (= 0x0060_0000) walks PDE[1] to physical 0x0020_0000, where
+    // the payload sits. If the fetch were taken without paging
+    // we'd read whatever was at linear 0x0060_0000 in raw memory
+    // (zeros — RAM is unwritten there) and immediately ADD to a
+    // zero-prefix string of opcodes, not run the MOV.
+    cpu.ip = 0x0060_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(0), 0xCAFE_BABE);
+    // Sanity: paging is still on, the descriptor base is still 0.
+    assert_eq!(cpu.cr0 & 0x8000_0001, 0x8000_0001);
+    assert_eq!(cpu.seg_cache[sreg::CS].base, 0);
+}
+
 /// End-to-end: a load that touches an unmapped page must vector
 /// through INT 14 with CR2 set. We identity-map the first 4 MiB so
 /// the boot code, the IVT, and the #PF handler are all reachable,
