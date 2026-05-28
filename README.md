@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**361 тест** зелёный (mem 6 + devices 31 + cpu 260 + vm 56 +
+**362 теста** зелёные (mem 6 + devices 31 + cpu 261 + vm 56 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -155,7 +155,8 @@ spinlock через LOCK CMPXCHG + PAUSE):
   ENTER/LEAVE, PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
 - **Системное**: CR2/CR3/CR4, RDMSR/WRMSR (TSC/APIC/SYSENTER),
   RDTSC, CPUID, SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
-  CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6).
+  CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
+  RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe).
 - **x87 FPU**: 8×f64 register-stack с TOP, FLD/FST/FSTP (m32/m64),
   FILD/FISTP, FADD/FMUL/FSUB(R)/FDIV(R) + ...P-формы, FCHS/FABS/
   FSQRT/FRNDINT, константы (FLD1/FLDPI/...), FCOM/FTST + FNSTSW.
@@ -192,7 +193,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
-| Исключения #GP/#DF/#NP/#SS (UD2/#UD уже есть, #PF тоже) — нужно вектoрить из проверок прав сегментов, ring transitions, fault-on-fault | средний | Ядро ставит обработчики на весь IDT; пока только #UD и #PF доезжают |
+| Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #GP уже raised из RDMSR/WRMSR на неизвестных MSR (rdmsr_safe работает); остаётся раздавать из segment-load helper'ов и привилегий |
 | IDE/ATA (порты 0x1F0) или virtio-blk | средний | Чтение rootfs напрямую (мимо BIOS-shim) |
 | APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
@@ -210,7 +211,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 361 пройденный тест на текущий момент. CI
+Должно вывести 362 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

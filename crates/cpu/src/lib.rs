@@ -4362,9 +4362,10 @@ impl Cpu {
                         self.write_r32(2, (self.tsc >> 32) as u32);
                     }
                     // RDMSR — 0x0F 0x32. Reads MSR named by ECX into
-                    // EDX:EAX. We return 0 for everything; Linux setup
-                    // treats this as "feature disabled" rather than
-                    // probing further, which is what we want.
+                    // EDX:EAX. Unknown MSRs raise #GP(0), which is
+                    // what Linux's rdmsr_safe expects (and what real
+                    // silicon does): the kernel catches the fault and
+                    // treats the MSR as absent.
                     0x32 => {
                         let msr = self.read_r32(1); // ECX
                         let value: u64 = match msr {
@@ -4373,15 +4374,17 @@ impl Cpu {
                             0x174 => self.sysenter_cs as u64,  // IA32_SYSENTER_CS
                             0x175 => self.sysenter_esp as u64, // IA32_SYSENTER_ESP
                             0x176 => self.sysenter_eip as u64, // IA32_SYSENTER_EIP
-                            _ => 0,
+                            _ => {
+                                self.ip = op_ip;
+                                self.do_interrupt_with_error(13, Some(0), mem);
+                                return Ok(());
+                            }
                         };
                         self.write_r32(0, value as u32);
                         self.write_r32(2, (value >> 32) as u32);
                     }
                     // WRMSR — 0x0F 0x30. Write MSR named by ECX from
-                    // EDX:EAX. We persist the SYSENTER MSRs (the only
-                    // ones with read-back semantics SYSENTER relies on);
-                    // all others are dropped.
+                    // EDX:EAX. Like RDMSR, unknown MSRs raise #GP(0).
                     0x30 => {
                         let msr = self.read_r32(1); // ECX
                         let lo = self.read_r32(0); // EAX
@@ -4389,7 +4392,11 @@ impl Cpu {
                             0x174 => self.sysenter_cs = lo,
                             0x175 => self.sysenter_esp = lo,
                             0x176 => self.sysenter_eip = lo,
-                            _ => {}
+                            _ => {
+                                self.ip = op_ip;
+                                self.do_interrupt_with_error(13, Some(0), mem);
+                                return Ok(());
+                            }
                         }
                     }
                     // SYSENTER — 0x0F 0x34. Fast ring-0 entry. Loads

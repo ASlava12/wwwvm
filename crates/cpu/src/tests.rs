@@ -5256,22 +5256,98 @@ fn mov_cr4_round_trip_carries_feature_bits() {
     assert_eq!(cpu.regs[r16::BX], 0x20);
 }
 
-/// 0x0F 0x32 — RDMSR returns zeros for unknown MSRs.
+/// RDMSR on an unrecognized MSR raises #GP(0) — matching real
+/// silicon and the rdmsr_safe pattern Linux uses for cpu-feature
+/// probes. Vectors through IVT[13] to a handler that captures a
+/// sentinel; we also check that the pushed IP names the start of
+/// the RDMSR instruction and the pushed error code is 0.
 #[test]
-fn rdmsr_returns_zero_for_unknown_msr() {
-    // Pick an MSR we have no special case for (0xDEAD).
-    let (cpu, _, _) = run_payload(
+fn rdmsr_unknown_msr_raises_gp_via_ivt() {
+    let mut mem = Memory::new(0x10_0000);
+    // IVT[13] = 0:0x7C30 (handler).
+    mem.write_u8(13 * 4, 0x30);
+    mem.write_u8(13 * 4 + 1, 0x7C);
+    mem.write_u8(13 * 4 + 2, 0);
+    mem.write_u8(13 * 4 + 3, 0);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xB9, 0xAD, 0xDE, 0x00, 0x00, // MOV ECX, 0xDEAD (unknown MSR)
+            0x0F, 0x32, // RDMSR  ← should #GP at this IP (0x7C06)
+            0xF4, // HLT — must never run
+        ],
+    );
+    mem.write_slice(
+        0x7C30,
+        &[
+            0xB8, 0x0D, 0x00, // MOV AX, 0x000D (vector 13 sentinel)
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..20 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.regs[r16::AX], 0x000D);
+    // Initial SP = 0x7C00. Four 16-bit pushes (error code + IP + CS +
+    // FLAGS) move SP to 0x7BF8. mem[0x7BF8] = error code = 0,
+    // mem[0x7BFA] = saved IP = 0x7C06 (start of RDMSR).
+    assert_eq!(mem.read_u16(0x7BF8), 0, "error code");
+    assert_eq!(mem.read_u16(0x7BFA), 0x7C06, "saved IP = start of RDMSR");
+}
+
+/// The kernel-style rdmsr_safe pattern: a #GP handler discards the
+/// error code, advances the saved IP past the faulting RDMSR,
+/// zeros EAX/EDX (signalling "MSR absent"), and IRETs. After IRET
+/// execution continues at the instruction immediately following
+/// RDMSR — the whole point of catchable #GP for cpu-feature probes.
+#[test]
+fn gp_handler_irets_past_unknown_rdmsr_clearing_eax_edx() {
+    let mut mem = Memory::new(0x10_0000);
+    // IVT[13] = 0:0x7C30.
+    mem.write_u8(13 * 4, 0x30);
+    mem.write_u8(13 * 4 + 1, 0x7C);
+    mem.write_u8(13 * 4 + 2, 0);
+    mem.write_u8(13 * 4 + 3, 0);
+    mem.write_slice(
+        0x7C00,
         &[
             0x66, 0xB9, 0xAD, 0xDE, 0x00, 0x00, // MOV ECX, 0xDEAD
-            0x66, 0xB8, 0xAD, 0xDE, 0x00, 0x00, // MOV EAX, 0xDEAD (poison)
-            0x66, 0xBA, 0xEF, 0xBE, 0x00, 0x00, // MOV EDX, 0xBEEF (poison)
-            0x0F, 0x32, // RDMSR
-            0xF4,
+            0x0F, 0x32, // RDMSR → #GP
+            0xBB, 0xFE, 0xCA, // MOV BX, 0xCAFE  (resumes here after IRET)
+            0xF4, // HLT
         ],
-        16,
     );
-    assert_eq!(cpu.read_r32(0), 0, "unknown MSR → EAX = 0");
-    assert_eq!(cpu.read_r32(2), 0, "unknown MSR → EDX = 0");
+    mem.write_slice(
+        0x7C30,
+        &[
+            0x58, // POP AX           (discard error code; AX clobbered)
+            0x89, 0xE5, // MOV BP, SP      (BP now points at saved IP)
+            0x83, 0x46, 0x00, 0x02, // ADD WORD PTR [BP], 2  (skip 2-byte RDMSR)
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // MOV EAX, 0
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x00, // MOV EDX, 0
+            0xCF, // IRET — returns to RDMSR+2 with EAX/EDX cleared
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..40 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r32(0), 0, "EAX cleared by handler");
+    assert_eq!(cpu.read_r32(2), 0, "EDX cleared by handler");
+    assert_eq!(cpu.regs[r16::BX], 0xCAFE, "post-IRET code ran");
 }
 
 /// 0x66 0xFF /0 — INC r/m32.
