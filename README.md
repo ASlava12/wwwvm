@@ -9,8 +9,14 @@
 через IDT, snapshot/restore, доступ из JS через wasm-bindgen, отдельный
 Rust-прокси для сетевых соединений. Три встроенных гостя для первого
 запуска, тутор по hand-assembly в [docs/HAND_ASSEMBLY.md](docs/HAND_ASSEMBLY.md).
-Загрузка реальных ОС (Linux/FreeBSD) — большая отдельная порция,
-дороадмап ниже.
+
+**Linux 6.12 i386 загружается до userspace.** `WWWVM_INITRD_BUILTIN=1
+cargo run --release --example linux_boot` собирает минимальный initramfs
+(136-байтный ELF /init + /dev/console) inline, бутает tinycore vmlinuz из
+`/tmp/wwwvm-linux/vmlinuz` и печатает `HELLO FROM USERSPACE` через полный
+путь syscall: user `int 0x80` → kernel cross-ring → `sys_write` →
+`tty_write` → `serial8250` THRE IRQ → наш UART → host stdout.
+Архитектурный обзор покрытия — раздел "Что уже работает (i386-ядро)".
 
 ```
 ┌──────────────────────────┐         ┌──────────────────────────┐
@@ -247,10 +253,36 @@ spinlock через LOCK CMPXCHG + PAUSE):
   FSB_INT_VAL (Linux'овский MSI-driver HPET). LAPIC и HPET делят
   слот pending_lapic_irq (обе цели — local APIC).
 
+## Загрузка Linux 6.12 (tinycore vmlinuz)
+
+Полный путь от ROM-handoff до userspace проверен на tinycore
+vmlinuz (5.85 MB сжатого ядра, ~12 MB после распаковки). Recipe —
+одна команда:
+
+```
+WWWVM_INITRD_BUILTIN=1 cargo run --release --example linux_boot
+```
+
+Минимальный initramfs (136-байтный ELF /init + /dev/console)
+собирается inline в [crates/vm/examples/linux_boot.rs](crates/vm/examples/linux_boot.rs);
+для своих init-ELF'ов передавайте `WWWVM_INITRD=path/to/cpio`.
+Прогон занимает ~10 минут wall-clock (≈17 MIPS на одном ядре,
+≈11 миллиардов CPU-инструкций до panic'а на `init exit`). В UART
+видна вся последовательность kernel boot → driver_init →
+do_initcalls → run_init_process → пользовательский `int 0x80`
+write → THRE IRQ → host stdout → пользовательский exit → kernel
+panic с `exitcode=0x00002a00` (= exit(42) << 8). Подробности
+end-to-end syscall-цепочки — в commit `milestone: Linux 6.12
+boots to userspace`.
+
+Что нужно vmlinuz: положите его в `/tmp/wwwvm-linux/vmlinuz` или
+укажите путь через `WWWVM_KERNEL=...`. Tinycore Core ISO извлекает
+vmlinuz прямо из `boot/vmlinuz`.
+
 ## Что НЕ работает (дорожная карта к Alpine)
 
-Между «исполняет обычный 32-битный код» и «грузит Alpine» —
-большая дистанция. Крупные оставшиеся блокеры, по приоритету:
+Между «грузит userspace из minimal initramfs» и «грузит Alpine» —
+ещё дистанция. Крупные оставшиеся блокеры, по приоритету:
 
 | Блокер | Объём | Зачем |
 |--------|-------|-------|
