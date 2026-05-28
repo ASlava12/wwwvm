@@ -2496,6 +2496,106 @@ fn page_fault_dispatches_int14_and_latches_cr2() {
     );
 }
 
+/// Protected-mode #PF dispatch composes with paging *and* a real
+/// 32-bit IDT gate. The previous test exercises the real-mode IVT
+/// path; once the kernel is in PM with paging on, the dispatch goes
+/// through an 8-byte gate descriptor instead, and the error-code
+/// push happens on the kernel stack — exactly Linux's
+/// `do_page_fault` entry. None of the existing tests cover the
+/// composition of: PM CS.D=1, paged instruction fetch, #PF in PM,
+/// 32-bit IDT gate, error-code push, CR2 latched.
+#[test]
+fn pm_page_fault_dispatches_through_32_bit_gate_with_cr2_set() {
+    let mut mem = Memory::new(0x0080_0000); // 8 MiB
+
+    // GDT at 0x500: null + ring-0 code (D=1/G=1) + ring-0 data.
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data
+        ],
+    );
+
+    // IDT at 0x1000. 14 * 8 = 0x70 → 32-bit interrupt gate for #PF:
+    //   offset_lo=0x0800, selector=0x0008, type=0x8E, offset_hi=0
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+
+    // Page directory at 0x2000 — PDE[0] = PSE identity for [0,4M);
+    // PDE[1] = 0 → linear [4M,8M) all not-present.
+    mem.write_u32(0x2000, 0x0000_0083);
+    // PDE[1] stays zero.
+
+    // #PF handler at physical 0x0800 (= linear 0x0800 with identity
+    // map; PSE PDE[0] covers it). Reads CR2 into EBX, then HLTs.
+    //   0F 20 D3   MOV EBX, CR2 (reg=2=CR2, rm=3=EBX)
+    //   F4         HLT
+    mem.write_slice(0x0800, &[0x0F, 0x20, 0xD3, 0xF4]);
+
+    // Kernel boot stub at physical 0x10_0000, inside the identity-
+    // mapped 4 MiB. Enables PG+PSE, then deliberately loads from an
+    // unmapped linear address (0x40_0000 = PDE[1]).
+    //   B8 00 20 00 00     MOV EAX, 0x2000        (5)
+    //   0F 22 D8           MOV CR3, EAX            (3)
+    //   0F 20 E0           MOV EAX, CR4            (3)
+    //   83 C8 10           OR EAX, 0x10            (3)
+    //   0F 22 E0           MOV CR4, EAX            (3)
+    //   0F 20 C0           MOV EAX, CR0            (3)
+    //   0D 00 00 00 80     OR EAX, 0x80000000      (5)
+    //   0F 22 C0           MOV CR0, EAX            (3)
+    //   A1 00 00 40 00     MOV EAX, [0x400000]    (5)   ← faults
+    //   F4                 HLT (never reached)
+    mem.write_slice(
+        0x0010_0000,
+        &[
+            0xB8, 0x00, 0x20, 0x00, 0x00, // MOV EAX, 0x2000
+            0x0F, 0x22, 0xD8, // MOV CR3, EAX
+            0x0F, 0x20, 0xE0, // MOV EAX, CR4
+            0x83, 0xC8, 0x10, // OR EAX, 0x10
+            0x0F, 0x22, 0xE0, // MOV CR4, EAX
+            0x0F, 0x20, 0xC0, // MOV EAX, CR0
+            0x0D, 0x00, 0x00, 0x00, 0x80, // OR EAX, 0x80000000
+            0x0F, 0x22, 0xC0, // MOV CR0, EAX
+            0xA1, 0x00, 0x00, 0x40, 0x00, // MOV EAX, [0x400000]
+            0xF4, // HLT
+        ],
+    );
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.write_sreg(sreg::ES, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000); // stack at 0x80000
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "handler must reach HLT");
+    // CR2 holds the faulting linear address (0x40_0000).
+    assert_eq!(cpu.cr2, 0x0040_0000);
+    // The handler captured CR2 into EBX before the HLT.
+    let ebx = cpu.regs[r16::BX] as u32 | ((cpu.regs_high[r16::BX] as u32) << 16);
+    assert_eq!(ebx, 0x0040_0000);
+    assert!(cpu.pending_fault().is_none());
+}
+
 /// CPU comes up with the A20 line enabled (matching post-BIOS state)
 /// and reads port 0x92 with bit 1 set to expose this.
 #[test]
