@@ -994,6 +994,34 @@ fn start_protected_mode_at_honors_boot_protocol_4_1_initial_state() {
     assert_eq!(vm.cpu().read_r32(wwwvm_cpu::r16::SI as u8), 0x0009_0000);
 }
 
+/// `start_protected_mode_at` must leave ESP at a safe address so
+/// a kernel that takes any kind of fault (or interrupt) before
+/// it sets its own stack can push the IRET frame without
+/// wrapping the stack pointer through 0 and into unmapped memory.
+/// Default-constructed `Cpu` has ESP = 0; without an init here,
+/// the *first* push goes to 0xFFFFFFFC and the gate dispatch
+/// fault-loops forever.
+#[test]
+fn start_protected_mode_at_seeds_esp_to_safe_address() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    bz.extend_from_slice(&[0xF4]);
+
+    let mut vm = Vm::with_ram_size(0x0020_0000);
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    // ESP must point at a real address inside the low conventional
+    // RAM, not 0. The exact value is "doesn't matter per the boot
+    // protocol", but it must be addressable.
+    let esp = vm.cpu().read_r32(wwwvm_cpu::r16::SP as u8);
+    assert!(esp > 0, "ESP must be non-zero");
+    assert!((esp as usize) < vm.mem().size(), "ESP must point into RAM");
+}
+
 /// `head_32`-shape integration: a synthetic bzImage kernel runs
 /// the full early-Linux startup chain through real instruction
 /// execution. The kernel

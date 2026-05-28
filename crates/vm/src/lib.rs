@@ -1421,6 +1421,15 @@ impl Vm {
     /// and interrupts disabled at entry; we honor both so a kernel
     /// that scribbles into these registers as scratch on entry
     /// doesn't pick up garbage left over from the bootloader.
+    ///
+    /// ESP is "don't care" per the protocol — Linux's `startup_32`
+    /// sets its own stack via `lss BP_kernel_alignment(%esi), %esp`
+    /// almost immediately — but a fresh-from-`new()` Cpu has ESP=0,
+    /// and any fault that fires before the kernel sets its own
+    /// stack would wrap the stack pointer through 0 into unmapped
+    /// memory. We seed it to 0x7C00 (the historic bootloader
+    /// scratch address, below the bzImage setup block at 0x90000
+    /// and well above anything the kernel writes).
     pub fn start_protected_mode_at(&mut self, entry: u32) {
         // Flat-segments GDT: null + ring-0 code + ring-0 data, all
         // base 0 / limit 4 GiB. Placed at 0x500 (between the BIOS
@@ -1455,6 +1464,8 @@ impl Vm {
         self.cpu.write_r32(wwwvm_cpu::r16::BP as u8, 0);
         self.cpu.write_r32(wwwvm_cpu::r16::DI as u8, 0);
         self.cpu.write_r32(wwwvm_cpu::r16::BX as u8, 0);
+        // ESP defaults — see doc on this fn for the rationale.
+        self.cpu.write_r32(wwwvm_cpu::r16::SP as u8, 0x0000_7C00);
         // Protocol §4.1: interrupts must be disabled at entry.
         self.cpu.flags &= !wwwvm_cpu::flag::IF;
         self.io.uart_mut().push_rx(&self.autorun);
