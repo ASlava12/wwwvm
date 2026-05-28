@@ -150,10 +150,21 @@ pub struct Cpu {
     /// will be added when a guest needs it.
     pub cr2: u32,
     /// Control Register 4 — feature-enable bits added past i486 (VME,
-    /// PSE, PAE, PGE, OSFXSR, etc.). We don't act on any of them yet;
-    /// the value is just stored so a kernel can read/write it via
-    /// `MOV CR4, r32` / `MOV r32, CR4` without faulting.
+    /// PSE, PAE, PGE, OSFXSR, etc.). Only CR4.PSE (bit 4) has semantic
+    /// meaning here; the rest are stored so a kernel can read/write
+    /// them via `MOV CR4, r32` / `MOV r32, CR4` without faulting.
     pub cr4: u32,
+    /// Debug registers DR0..DR7. DR0..3 are linear breakpoint
+    /// addresses, DR6 latches debug-event status, DR7 controls
+    /// per-breakpoint enable/type/length. Linux clears DR6+DR7 on
+    /// every context switch and reads them on `ptrace(PTRACE_PEEKUSR)`.
+    /// We don't actually trigger #DB on hits — these are stub-only
+    /// state so MOV r,DRn and MOV DRn,r round-trip cleanly instead of
+    /// faulting #UD. DR4/DR5 are RAZ/WI aliases of DR6/DR7 on real
+    /// CPUs; we expose them as independent slots and leave the
+    /// aliasing for a future tick if anything needs it. Not snapshotted —
+    /// a restore acts like a context switch (kernel reclears them).
+    pub dr: [u32; 8],
     /// Time-stamp counter. Incremented once per `step()`. Read via
     /// RDTSC (0x0F 0x31). Linux uses TSC for delay calibration —
     /// returning a monotonically advancing counter is what matters,
@@ -300,6 +311,7 @@ impl Cpu {
             cr3: 0,
             cr2: 0,
             cr4: 0,
+            dr: [0; 8],
             tsc: 0,
             ldtr: 0,
             tr: 0,
@@ -348,6 +360,7 @@ impl Cpu {
         self.cr3 = 0;
         self.cr2 = 0;
         self.cr4 = 0;
+        self.dr = [0; 8];
         self.tsc = 0;
         self.ldtr = 0;
         self.tr = 0;
@@ -4536,6 +4549,20 @@ impl Cpu {
                         };
                         self.write_r32(rm, value);
                     }
+                    // MOV r32, DRn — 0x0F 0x21 /reg. Debug registers
+                    // are stub-only: reads return whatever was last
+                    // written. Linux's context switcher does
+                    // `mov %dr6, %eax` early to sample status, then
+                    // clears them — so a faulting #UD here would
+                    // crash the kernel before it even prints. DR4/DR5
+                    // are independent slots here; real hardware
+                    // aliases them to DR6/DR7.
+                    0x21 => {
+                        let modrm = self.fetch_u8(mem);
+                        let reg = (modrm >> 3) & 0x07;
+                        let rm = modrm & 0x07;
+                        self.write_r32(rm, self.dr[reg as usize]);
+                    }
                     // MOV CRn, r32 — 0x0F 0x22 /reg.
                     0x22 => {
                         let modrm = self.fetch_u8(mem);
@@ -4555,6 +4582,14 @@ impl Cpu {
                                 });
                             }
                         }
+                    }
+                    // MOV DRn, r32 — 0x0F 0x23 /reg. Counterpart to
+                    // 0x21. Stub: store the value, no semantic action.
+                    0x23 => {
+                        let modrm = self.fetch_u8(mem);
+                        let reg = (modrm >> 3) & 0x07;
+                        let rm = modrm & 0x07;
+                        self.dr[reg as usize] = self.read_r32(rm);
                     }
                     // 0x0F 0xAE — group with FXSAVE/FXRSTOR (when
                     // mod != 11) and the fences/CLFLUSH (when

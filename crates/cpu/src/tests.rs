@@ -7129,6 +7129,38 @@ fn mov_cr3_round_trip_preserves_32_bit_page_directory_base() {
     assert_eq!(cpu.regs_high[r16::BX], 0xCAFE);
 }
 
+/// `MOV r32, DRn` / `MOV DRn, r32` round-trip cleanly across all
+/// 8 debug registers. Stubs only — we never raise #DB — but the
+/// kernel's context switch path writes DR6/DR7 unconditionally
+/// at every preemption, so a #UD here would crash schedule().
+#[test]
+fn mov_drn_round_trips_through_eax() {
+    // For each DR index 0..7:
+    //   MOV EAX, 0xDEC0_DE00 | i   ; 66 B8 imm32
+    //   MOV DRi, EAX                ; 0F 23 (11 i 000)
+    //   MOV EBX, DRi                ; 0F 21 (11 i 011)
+    //   ... continue accumulating EBX into EDI via OR ...
+    // We just verify the simplest pattern for one DR per run, but
+    // walk all 8 indices in a loop so a typo in one ModR/M encoding
+    // surfaces.
+    for dr_idx in 0..8u8 {
+        let modrm_w = 0b1100_0000 | (dr_idx << 3); // reg=dr_idx, rm=0(EAX)
+        let modrm_r = 0b1100_0011 | (dr_idx << 3); // reg=dr_idx, rm=3(EBX)
+        let value = 0xDEC0_DE00u32 | (dr_idx as u32);
+        let imm = value.to_le_bytes();
+        let prog = vec![
+            0x66, 0xB8, imm[0], imm[1], imm[2], imm[3], // MOV EAX, value
+            0x0F, 0x23, modrm_w, // MOV DRi, EAX
+            0x0F, 0x21, modrm_r, // MOV EBX, DRi
+            0xF4,    // HLT
+        ];
+        let (cpu, _, _) = run_payload(&prog, 16);
+        assert_eq!(cpu.dr[dr_idx as usize], value, "DR{dr_idx} write");
+        let ebx = cpu.regs[r16::BX] as u32 | ((cpu.regs_high[r16::BX] as u32) << 16);
+        assert_eq!(ebx, value, "DR{dr_idx} read-back");
+    }
+}
+
 /// translate() is identity whenever CR0.PG=0 — both real mode and
 /// "PE but not yet paged" boot stages must keep using linear addresses
 /// unchanged.
