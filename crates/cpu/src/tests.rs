@@ -7276,6 +7276,52 @@ fn lldt_sldt_round_trip_via_register() {
     assert_eq!(cpu.regs[r16::BX], 0x28);
 }
 
+/// 0x0F 0x00 /5 — VERW: ZF=1 iff the selector names a writable
+/// data segment from the current CPL. Linux issues VERW on a
+/// dummy data selector to flush CPU buffers as part of the
+/// MDS / RETBleed mitigations; without this opcode the kernel
+/// dies with Unimplemented mid-mitigation. We model just the
+/// architectural ZF result (no microarchitectural buffer flush).
+///
+/// We drive `selector_accessible` directly through the unit-test
+/// boundary rather than running a 32-bit PM stub, because the
+/// surrounding test scaffolding is already heavy and the helper
+/// has no surprising state (just GDTR + memory).
+#[test]
+fn verw_sets_zf_per_descriptor_writability() {
+    let mut mem = Memory::new(0x10_0000);
+    // Build a tiny GDT at phys 0x500: null, code (D=1, R), data
+    // (D=1, W). Access bytes: code=0x9A (P=1 DPL=0 S=1 type=code-R),
+    // data=0x92 (P=1 DPL=0 S=1 type=data-W).
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // code @ 0x08
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // data @ 0x10
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE on
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x17;
+    // Data selector (0x10) is writable; code selector (0x08) is not.
+    assert!(cpu.selector_accessible(&mem, 0x10, true));
+    assert!(!cpu.selector_accessible(&mem, 0x08, true));
+    // Both are readable (data always, code because R bit set in 0x9A).
+    assert!(cpu.selector_accessible(&mem, 0x10, false));
+    assert!(cpu.selector_accessible(&mem, 0x08, false));
+    // Null selector is neither.
+    assert!(!cpu.selector_accessible(&mem, 0, true));
+    assert!(!cpu.selector_accessible(&mem, 0, false));
+    // System descriptor (S=0) is also rejected: poke an LDT-type
+    // access byte (0x82) into the data slot and re-check.
+    mem.write_u8(0x0500 + 16 + 5, 0x82);
+    assert!(!cpu.selector_accessible(&mem, 0x10, true));
+    assert!(!cpu.selector_accessible(&mem, 0x10, false));
+}
+
 /// 0x0F 0x01 /0 — SGDT stores the 6-byte GDTR pseudo-descriptor.
 #[test]
 fn sgdt_stores_pseudo_descriptor_to_memory() {

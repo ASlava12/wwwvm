@@ -165,7 +165,7 @@ fn main() {
         // instruction that retired into the transition.
         let pre_eip = vm.cpu().ip;
         let _ = pre_eip;
-        let (s, st) = vm.run_steps(chunk);
+        let (s, st) = vm.run_steps_idle_aware(chunk);
         steps += s as u64;
         if trace_esp_align && pg_on {
             let esp = vm.cpu().read_r32(4);

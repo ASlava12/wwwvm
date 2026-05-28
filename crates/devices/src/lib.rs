@@ -48,6 +48,10 @@ pub struct IoBus {
     pub uart: Uart,
     /// Master PIC, 0x20/0x21, vector base 0x08 — IRQs 0..7.
     pub pic: Pic,
+    /// PIT-tick prescaler counter — see `PIT_TICK_DIVIDER` for the
+    /// rationale. `refresh_irqs` advances it; PIT gets a real tick
+    /// only when it overflows the divider.
+    pit_div_counter: u32,
     /// Slave PIC, 0xA0/0xA1, vector base 0x70 — IRQs 8..15. Cascaded
     /// through master IRQ 2 (the standard PC wiring).
     pub slave_pic: Pic,
@@ -97,6 +101,7 @@ impl IoBus {
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
+            pit_div_counter: 0,
         }
     }
 
@@ -113,6 +118,7 @@ impl IoBus {
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
+            pit_div_counter: 0,
         }
     }
 
@@ -146,14 +152,30 @@ impl IoBus {
         } else {
             self.pic.irr &= !irq1_bit;
         }
-        // PIT — one tick per CPU step. Each terminal count gets
-        // translated into a one-shot IRR set on IRQ 0. The PIC keeps
-        // the bit until ack, so even if multiple ticks fire between
-        // refresh calls (we only do one per step) the handler still
-        // runs once per pulse — periodic timers work as expected.
-        self.pit.tick(1);
-        if self.pit.take_ch0_pending() {
-            self.pic.irr |= 1u8 << 0;
+        // PIT — prescaler-divided tick. One CPU step ≠ one PIT
+        // cycle: at our ~17 MIPS effective throughput, ticking PIT
+        // once per step gives Linux a HZ=250 latch (~4773 PIT
+        // cycles) every ~4 800 CPU steps. The scheduler-tick
+        // handler then takes most of those steps doing 64-bit
+        // ktime conversion, leaving almost no budget for the
+        // kernel_init thread between ticks — and PID 1 never
+        // gets enough CPU to reach run_init_process. Divide the
+        // tick rate by `PIT_TICK_DIVIDER` so PIT IRQs fire roughly
+        // every (divider × latch) steps. With divider=16 and HZ=
+        // 250, that's ~76 K CPU steps per IRQ — the handler still
+        // runs every tick but is well under 50 % of the budget,
+        // so kernel_init makes forward progress. Linux doesn't
+        // care about the absolute PIT rate (TSC calibration is
+        // already overridden by `lpj=1000000`); it only needs the
+        // edge to fire so jiffies advance.
+        const PIT_TICK_DIVIDER: u32 = 16;
+        self.pit_div_counter += 1;
+        if self.pit_div_counter >= PIT_TICK_DIVIDER {
+            self.pit_div_counter = 0;
+            self.pit.tick(1);
+            if self.pit.take_ch0_pending() {
+                self.pic.irr |= 1u8 << 0;
+            }
         }
         // Cascade — slave-pending state controls master IRR bit 2.
         // Level-triggered so master deasserts as soon as the slave has
@@ -656,12 +678,46 @@ mod tests {
 
     #[test]
     fn refresh_translates_pit_edge_into_pic_irr() {
+        // `refresh_irqs` prescales the PIT (one real tick per 16
+        // calls — see `PIT_TICK_DIVIDER`) so PIT IRQ rate stays
+        // sane relative to our CPU throughput. We need (divider +
+        // reload) calls before the edge actually fires.
         let mut bus = IoBus::new();
         bus.write(0x43, 0x34);
         bus.write(0x40, 0x01);
         bus.write(0x40, 0x00);
         bus.pic.imr = 0xFE;
-        bus.refresh_irqs();
+        for _ in 0..16 {
+            bus.refresh_irqs();
+        }
         assert_eq!(bus.pic.pending_vector(), Some(0x08));
+    }
+
+    /// Prescaler must not drop edges: when the kernel programs a
+    /// short PIT latch we still want one edge per `divider × latch`
+    /// refresh_irqs calls. Drive 200 refresh ticks against a
+    /// reload of 2 and count how many IRR pulses appear — we expect
+    /// 200 / (16 * 2) ≈ 6 pulses.
+    #[test]
+    fn pit_prescaler_preserves_edge_count() {
+        let mut bus = IoBus::new();
+        bus.write(0x43, 0x34); // mode 2, ch0
+        bus.write(0x40, 0x02);
+        bus.write(0x40, 0x00);
+        bus.pic.imr = 0xFE;
+        let mut edges = 0;
+        for _ in 0..200 {
+            bus.pic.irr &= !1u8; // ack pending IRQ 0 each iter
+            bus.refresh_irqs();
+            if bus.pic.irr & 1 != 0 {
+                edges += 1;
+            }
+        }
+        // 200 / 32 = 6 (with remainder); accept 5..=7 to be robust
+        // against off-by-one in counter init.
+        assert!(
+            (5..=7).contains(&edges),
+            "expected ~6 PIT edges, got {edges}"
+        );
     }
 }

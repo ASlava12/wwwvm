@@ -13,7 +13,7 @@ pub mod elf;
 
 pub use bzimage::{parse as parse_bzimage, BzImage, BzImageError};
 pub use elf::{load_elf, ElfError};
-use wwwvm_cpu::{Cpu, CpuError};
+use wwwvm_cpu::{flag, Cpu, CpuError};
 use wwwvm_devices::IoBus;
 use wwwvm_mem::Memory;
 
@@ -1917,6 +1917,12 @@ impl Vm {
     }
 
     /// Step the CPU up to `max` times. Returns (steps_executed, reason).
+    /// HLT is treated as a *terminal* stop here — for the guests in
+    /// our test fleet (HELLO_GUEST, the calculator demo, etc.) the
+    /// program is done once it halts and a tight loop downstream
+    /// would just spin. For kernel-idle-aware stepping (where HLT
+    /// with IF=1 is a wait-for-IRQ rather than a terminal stop), use
+    /// `run_steps_idle_aware`.
     pub fn run_steps(&mut self, max: u32) -> (u32, Stop) {
         if !self.booted {
             self.boot();
@@ -1924,6 +1930,31 @@ impl Vm {
         let mut executed = 0;
         for _ in 0..max {
             if self.cpu.halted {
+                return (executed, Stop::Halted);
+            }
+            if let Err(e) = self.cpu.step(&mut self.mem, &mut self.io) {
+                return (executed, Stop::CpuError(e));
+            }
+            executed += 1;
+        }
+        (executed, Stop::StepBudget)
+    }
+
+    /// Same as `run_steps`, but a HLT with EFLAGS.IF=1 is treated as
+    /// an idle wait — `cpu.step` itself keeps ticking the timer
+    /// sources and will dispatch the next IRQ that fires, so the
+    /// kernel's `STI; HLT` idle pattern eventually resumes. A HLT
+    /// with IF=0 is still terminal: nothing can wake the CPU. Use
+    /// this for the Linux boot probe; existing test fleets call
+    /// `run_steps` directly so their fast Halted return path is
+    /// preserved.
+    pub fn run_steps_idle_aware(&mut self, max: u32) -> (u32, Stop) {
+        if !self.booted {
+            self.boot();
+        }
+        let mut executed = 0;
+        for _ in 0..max {
+            if self.cpu.halted && self.cpu.flags & flag::IF == 0 {
                 return (executed, Stop::Halted);
             }
             if let Err(e) = self.cpu.step(&mut self.mem, &mut self.io) {

@@ -671,6 +671,51 @@ impl Cpu {
         self.seg_cache[seg_idx].base.wrapping_add(off)
     }
 
+    /// VERR/VERW backing: is the segment named by `selector` either
+    /// readable (`for_write=false`) or writable (`for_write=true`)
+    /// from the current CPL? Returns `false` for the null selector,
+    /// for any selector that walks off the GDT, and for descriptors
+    /// whose access byte forbids the requested operation. In real
+    /// mode every selector is treated as accessible — VERR/VERW
+    /// without PE is undefined on real silicon but Linux only
+    /// issues them under CR0.PE=1.
+    fn selector_accessible(&self, mem: &Memory, selector: u16, for_write: bool) -> bool {
+        if self.cr0 & 1 == 0 {
+            return true;
+        }
+        // Null selector → always inaccessible.
+        if selector & 0xFFFC == 0 {
+            return false;
+        }
+        // TI=1 (LDT) not modeled — Linux never asks VERW on an LDT
+        // selector in its mitigation paths.
+        let table_base = self.gdtr.base;
+        let addr = table_base.wrapping_add((selector & 0xFFF8) as u32);
+        // Bail if the descriptor would walk past the GDT limit.
+        if (selector & 0xFFF8) as u32 + 7 > self.gdtr.limit as u32 {
+            return false;
+        }
+        // Access byte lives at offset 5 of an 8-byte descriptor.
+        // bit 4 = S (1 = code/data, 0 = system); we only ever
+        // VERR/VERW code or data, so a system descriptor returns
+        // false. Among code/data, bits 3:1 encode (E, R/C, W/R, A);
+        // readable: data is always readable; code is readable iff R
+        // (bit 1) is 1. writable: code is never writable; data is
+        // writable iff W (bit 1) is 1.
+        let access = self.mem_read_u8(mem, addr.wrapping_add(5));
+        let s = (access >> 4) & 1;
+        if s == 0 {
+            return false;
+        }
+        let executable = (access >> 3) & 1 != 0;
+        let rw_bit = (access >> 1) & 1 != 0;
+        if for_write {
+            !executable && rw_bit
+        } else {
+            !executable || rw_bit
+        }
+    }
+
     /// Translate a linear address to a physical address. When
     /// `CR0.PG = 0` this is identity (real mode and unpaged PM).
     /// When `CR0.PG = 1` it walks the 2-level i386 page tables
@@ -2676,6 +2721,97 @@ impl Cpu {
         true
     }
 
+    /// Port-string ops (INS / OUTS, opcodes 0x6C..=0x6F). Each does
+    /// one transfer between port `DX` and `ES:[EDI]` (INS) or
+    /// `DS:[ESI]` (OUTS) and bumps the pointer by the operand size.
+    /// REP-prefixed forms loop in the outer dispatcher. The byte
+    /// variants (0x6C, 0x6E) are always 8-bit; the word/dword
+    /// variants (0x6D, 0x6F) follow `op_size_32`.
+    fn step_string_io(&mut self, inner: u8, mem: &mut Memory, io: &mut IoBus) {
+        let port = self.regs[r16::DX];
+        let step_size: u32 = match inner {
+            0x6C | 0x6E => 1,
+            _ if self.op_size_32 => 4,
+            _ => 2,
+        };
+        let delta: u32 = if self.has(flag::DF) {
+            (step_size as i32).wrapping_neg() as u32
+        } else {
+            step_size
+        };
+        let edi_idx = r16::DI as u8;
+        let esi_idx = r16::SI as u8;
+        match inner {
+            // INSB / INSW / INSD — port DX → ES:[EDI]
+            0x6C | 0x6D => {
+                let dst = if self.addr_size_32 {
+                    self.read_r32(edi_idx)
+                } else {
+                    self.regs[r16::DI] as u32
+                };
+                let linear = self.linear_seg(sreg::ES, dst);
+                match step_size {
+                    1 => {
+                        let v = self.port_read(io, port);
+                        self.mem_write_u8(mem, linear, v);
+                    }
+                    2 => {
+                        let lo = self.port_read(io, port) as u16;
+                        let hi = self.port_read(io, port.wrapping_add(1)) as u16;
+                        self.mem_write_u16(mem, linear, lo | (hi << 8));
+                    }
+                    _ => {
+                        let mut v = 0u32;
+                        for i in 0..4 {
+                            v |= (self.port_read(io, port.wrapping_add(i)) as u32) << (8 * i);
+                        }
+                        self.mem_write_u32(mem, linear, v);
+                    }
+                }
+                if self.addr_size_32 {
+                    let new = self.read_r32(edi_idx).wrapping_add(delta);
+                    self.write_r32(edi_idx, new);
+                } else {
+                    self.regs[r16::DI] = self.regs[r16::DI].wrapping_add(delta as u16);
+                }
+            }
+            // OUTSB / OUTSW / OUTSD — DS:[ESI] → port DX
+            0x6E | 0x6F => {
+                let src_seg = self.seg_override.unwrap_or(sreg::DS);
+                let src = if self.addr_size_32 {
+                    self.read_r32(esi_idx)
+                } else {
+                    self.regs[r16::SI] as u32
+                };
+                let linear = self.linear_seg(src_seg, src);
+                match step_size {
+                    1 => {
+                        let v = self.mem_read_u8(mem, linear);
+                        self.port_write(io, port, v);
+                    }
+                    2 => {
+                        let v = self.mem_read_u16(mem, linear);
+                        self.port_write(io, port, v as u8);
+                        self.port_write(io, port.wrapping_add(1), (v >> 8) as u8);
+                    }
+                    _ => {
+                        let v = self.mem_read_u32(mem, linear);
+                        for i in 0..4 {
+                            self.port_write(io, port.wrapping_add(i), (v >> (8 * i)) as u8);
+                        }
+                    }
+                }
+                if self.addr_size_32 {
+                    let new = self.read_r32(esi_idx).wrapping_add(delta);
+                    self.write_r32(esi_idx, new);
+                } else {
+                    self.regs[r16::SI] = self.regs[r16::SI].wrapping_add(delta as u16);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn alu_apply16(&mut self, op: u8, a: u16, b: u16) -> (u16, bool) {
         let cin: u16 = if (op == 2 || op == 3) && self.has(flag::CF) {
             1
@@ -2908,6 +3044,38 @@ impl Cpu {
     /// the override first.
     pub fn step(&mut self, mem: &mut Memory, io: &mut IoBus) -> Result<(), CpuError> {
         if self.halted {
+            // Real x86 wakes from HLT on the next external interrupt
+            // (and NMI/SMI/INIT/RESET, which we don't model). The
+            // refresh path below still needs to run so devices that
+            // emit interrupts based on a counter (PIT, LAPIC timer,
+            // HPET) get ticked — without that, the kernel's HLT in
+            // its idle loop would deadlock when the only event it's
+            // waiting for is a timer pulse.
+            mem.tick_lapic_timer();
+            mem.tick_hpet_counter();
+            io.refresh_irqs();
+            // Sleeping ticks still advance TSC — Linux measures
+            // idle time against TSC and expects monotonic forward
+            // motion even when no instruction retires.
+            self.tsc = self.tsc.wrapping_add(1);
+            // Any pending IRQ delivered now also wakes the CPU. The
+            // ordering matches the architectural "HLT exits, IRQ is
+            // taken at the next instruction boundary" sequence.
+            if self.has(flag::IF) {
+                if let Some(vec) = mem.take_pending_lapic_irq() {
+                    self.halted = false;
+                    self.trace_irq(vec, "LAPIC");
+                    self.do_interrupt(vec, mem);
+                    return Ok(());
+                }
+                if let Some(vec) = io.pending_irq_vector() {
+                    self.halted = false;
+                    io.ack_irq();
+                    self.trace_irq(vec, "PIC");
+                    self.do_interrupt(vec, mem);
+                    return Ok(());
+                }
+            }
             return Ok(());
         }
         self.tsc = self.tsc.wrapping_add(1);
@@ -3158,6 +3326,15 @@ impl Cpu {
                 self.step_string(opcode, mem);
             }
 
+            // INSB / INSW / INSD / OUTSB / OUTSW / OUTSD — port-to-
+            // memory and memory-to-port string moves. Linux's
+            // serial8250 driver init uses these; without them the
+            // kernel oopses with Unimplemented mid-initcall and
+            // never reaches `Run /init`.
+            0x6C..=0x6F => {
+                self.step_string_io(opcode, mem, io);
+            }
+
             // Group 2: shift/rotate r/m by 1, CL, or imm8.
             //   0xD0: r/m8 by 1
             //   0xD1: r/m16 by 1
@@ -3233,6 +3410,7 @@ impl Cpu {
                     // 0x90).
                 } else {
                     let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
+                    let is_io = matches!(inner, 0x6C..=0x6F);
                     loop {
                         let counter_done = if self.addr_size_32 {
                             self.read_r32(r16::CX as u8) == 0
@@ -3242,7 +3420,9 @@ impl Cpu {
                         if counter_done {
                             break;
                         }
-                        if !self.step_string(inner, mem) {
+                        if is_io {
+                            self.step_string_io(inner, mem, io);
+                        } else if !self.step_string(inner, mem) {
                             return Err(CpuError::Unimplemented {
                                 opcode: inner,
                                 cs: op_cs,
@@ -4987,9 +5167,9 @@ impl Cpu {
             0x0F => {
                 let op2 = self.fetch_u8(mem);
                 match op2 {
-                    // Group 6 — SLDT (/0) STR (/1) LLDT (/2) LTR (/3).
-                    // Each operates on a 16-bit selector in r/m16.
-                    // VERR/VERW (/4/5) are not implemented yet.
+                    // Group 6 — SLDT (/0) STR (/1) LLDT (/2) LTR (/3)
+                    // VERR (/4) VERW (/5). Each operates on a 16-bit
+                    // selector in r/m16.
                     0x00 => {
                         let (_, sub, rm) = self.fetch_modrm(mem);
                         match sub {
@@ -5016,6 +5196,32 @@ impl Cpu {
                                     return Ok(());
                                 }
                                 self.tr = self.read_rm16(rm, mem);
+                            }
+                            // VERR — set ZF=1 iff the segment selected
+                            // by the low 16 bits of r/m is readable
+                            // from the current CPL. Linux uses this
+                            // sparingly; we don't see it on the boot
+                            // path, but symmetry with VERW is cheap.
+                            4 => {
+                                let sel = self.read_rm16(rm, mem);
+                                let ok = self.selector_accessible(mem, sel, false);
+                                self.set_flag(flag::ZF, ok);
+                            }
+                            // VERW — set ZF=1 iff the segment is
+                            // writable from the current CPL. Linux's
+                            // MDS / RETBleed / MMIO-stale-data
+                            // mitigations issue `verw $perf_event_ds`
+                            // for the *side effect* (CPU-buffer
+                            // clear on real silicon), not the ZF
+                            // result — but if we don't implement
+                            // the opcode at all the kernel oopses
+                            // mid-mitigation. ZF must still be
+                            // architecturally well-defined, so we
+                            // honor the access-bit check.
+                            5 => {
+                                let sel = self.read_rm16(rm, mem);
+                                let ok = self.selector_accessible(mem, sel, true);
+                                self.set_flag(flag::ZF, ok);
                             }
                             _ => {
                                 return Err(CpuError::Unimplemented {
