@@ -96,6 +96,8 @@ fn main() {
     let mut last_esp_align = true;
     let mut last_eip = 0u32;
     let mut transitions = 0u32;
+    let mut last_if = false;
+    let mut if_transitions = 0u32;
     while steps < STEP_BUDGET {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
         let chunk = if stop_at_first_pf && pg_on {
@@ -258,6 +260,24 @@ fn main() {
                 last_eip_region.unwrap_or(0)
             );
             last_eip_region = Some(region);
+        }
+        // IF (EFLAGS bit 9) — if it never flips to 1 after PG=1,
+        // the kernel ran with interrupts disabled for the whole
+        // post-paging life, which deadlocks any "wait for jiffies"
+        // loop. Log every transition so we see when (if ever)
+        // the kernel STIs.
+        let if_set = (vm.cpu().flags & wwwvm_cpu::flag::IF) != 0;
+        if if_set != last_if {
+            if_transitions += 1;
+            if if_transitions <= 10 {
+                println!(
+                    "[{:>10}] IF -> {} at EIP={:08X}  (transition #{if_transitions})",
+                    steps,
+                    if_set,
+                    vm.cpu().ip
+                );
+            }
+            last_if = if_set;
         }
         // CR2 only updates on a #PF — every transition here is a
         // new page-fault address. Spammy if the handler keeps
