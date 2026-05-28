@@ -176,6 +176,10 @@ pub struct Cpu {
     pub fpu_st: [f64; 8],
     /// x87 stack-top index (the architectural TOP field, 0..7).
     pub fpu_top: u8,
+    /// SSE register file: XMM0..XMM7, each 128 bits. Modelled as u128
+    /// so data-movement (MOVD/MOVQ/MOVDQA) is exact; packed-arith ops
+    /// reinterpret the lanes as needed.
+    pub xmm: [u128; 8],
     /// SYSENTER MSRs (IA32_SYSENTER_CS/ESP/EIP = 0x174/0x175/0x176).
     /// SYSENTER loads CS:EIP and SS:ESP from these; SYSEXIT derives
     /// the return selectors from `sysenter_cs`. Written via WRMSR.
@@ -300,6 +304,7 @@ impl Cpu {
             fpu_cw: 0x037F,
             fpu_st: [0.0; 8],
             fpu_top: 0,
+            xmm: [0; 8],
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
@@ -347,6 +352,7 @@ impl Cpu {
         self.fpu_cw = 0x037F;
         self.fpu_st = [0.0; 8];
         self.fpu_top = 0;
+        self.xmm = [0; 8];
         self.sysenter_cs = 0;
         self.sysenter_esp = 0;
         self.sysenter_eip = 0;
@@ -613,6 +619,43 @@ impl Cpu {
     pub fn mem_write_u32(&self, m: &mut Memory, linear: u32, value: u32) {
         self.mem_write_u16(m, linear, value as u16);
         self.mem_write_u16(m, linear.wrapping_add(2), (value >> 16) as u16);
+    }
+
+    /// Read an SSE r/m operand: an XMM register (mod=11) or a 128-bit
+    /// memory location.
+    fn read_xmm_rm(&self, rm: Rm, mem: &Memory) -> u128 {
+        match rm {
+            Rm::Reg(i) => self.xmm[i as usize],
+            Rm::Mem(ea) => self.mem_read_u128(mem, self.linear_seg(ea.seg, ea.off)),
+        }
+    }
+
+    /// Write an SSE r/m operand (XMM register or 128-bit memory).
+    fn write_xmm_rm(&mut self, rm: Rm, mem: &mut Memory, value: u128) {
+        match rm {
+            Rm::Reg(i) => self.xmm[i as usize] = value,
+            Rm::Mem(ea) => {
+                let addr = self.linear_seg(ea.seg, ea.off);
+                self.mem_write_u128(mem, addr, value);
+            }
+        }
+    }
+
+    /// Read a 128-bit value (an XMM operand) as four little-endian
+    /// dwords. Used by the SSE move/arith instructions.
+    pub fn mem_read_u128(&self, m: &Memory, linear: u32) -> u128 {
+        let mut v: u128 = 0;
+        for i in 0..4u32 {
+            let d = self.mem_read_u32(m, linear.wrapping_add(i * 4)) as u128;
+            v |= d << (i * 32);
+        }
+        v
+    }
+
+    pub fn mem_write_u128(&self, m: &mut Memory, linear: u32, value: u128) {
+        for i in 0..4u32 {
+            self.mem_write_u32(m, linear.wrapping_add(i * 4), (value >> (i * 32)) as u32);
+        }
     }
 
     fn fetch_u8(&mut self, mem: &Memory) -> u8 {
@@ -4174,6 +4217,49 @@ impl Cpu {
                                 self.write_rm16(rm, mem, new);
                             }
                         }
+                    }
+
+                    // SSE MOVAPS/MOVUPS xmm, xmm/m128 (0F 28/10) and
+                    // the store direction (0F 29/11). Aligned vs
+                    // unaligned is the same here — we don't enforce
+                    // alignment faults. Under 0x66 these become
+                    // MOVAPD/MOVUPD (same bits, double semantics —
+                    // irrelevant for a pure 128-bit copy).
+                    0x28 | 0x10 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = v;
+                    }
+                    0x29 | 0x11 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.xmm[reg as usize];
+                        self.write_xmm_rm(rm, mem, v);
+                    }
+                    // MOVD/MOVQ and MOVDQA. The 0x66 prefix (op_size_32)
+                    // selects the integer-SSE forms:
+                    //   66 0F 6E  MOVD xmm, r/m32   (GP/mem → low dword)
+                    //   66 0F 7E  MOVD r/m32, xmm   (low dword → GP/mem)
+                    //   66 0F 6F  MOVDQA xmm, xmm/m128
+                    //   66 0F 7F  MOVDQA xmm/m128, xmm
+                    0x6E if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_rm32(rm, mem) as u128;
+                        self.xmm[reg as usize] = v; // zero-extends upper 96 bits
+                    }
+                    0x7E if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.xmm[reg as usize] as u32;
+                        self.write_rm32(rm, mem, v);
+                    }
+                    0x6F if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = v;
+                    }
+                    0x7F if self.op_size_32 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.xmm[reg as usize];
+                        self.write_xmm_rm(rm, mem, v);
                     }
 
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.

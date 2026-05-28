@@ -2546,6 +2546,64 @@ fn spinlock_acquire_via_lock_cmpxchg() {
     assert_eq!(mem.read_u32(0x600), 1, "lock taken (set to 1)");
 }
 
+/// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
+/// Round-trips a dword through the XMM register file.
+#[test]
+fn sse_movd_movdqa_register_round_trip() {
+    // MOV EAX, 0xDEADBEEF ; MOVD XMM0, EAX ; MOVDQA XMM1, XMM0 ;
+    // MOVD EBX, XMM1 ; HLT
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0xEF, 0xBE, 0xAD, 0xDE, // MOV EAX, 0xDEADBEEF
+            0x66, 0x0F, 0x6E, 0xC0, // MOVD XMM0, EAX
+            0x66, 0x0F, 0x6F, 0xC8, // MOVDQA XMM1, XMM0
+            0x66, 0x0F, 0x7E, 0xCB, // MOVD EBX, XMM1
+            0xF4,
+        ],
+        16,
+    );
+    assert_eq!(cpu.read_r32(3), 0xDEAD_BEEF, "dword survived GP→XMM→XMM→GP");
+    // MOVD zero-extends the upper 96 bits of XMM0.
+    assert_eq!(cpu.xmm[0], 0xDEAD_BEEF_u128);
+}
+
+/// SSE 128-bit memory move: MOVDQA m128 → XMM → m128 copies all
+/// 16 bytes intact.
+#[test]
+fn sse_movdqa_memory_round_trip() {
+    let mut mem = Memory::new(0x10_0000);
+    // Source 128-bit pattern at 0x600.
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, 0x1111_1111 * (i + 1));
+    }
+    // MOVDQA XMM0, [0x600] ; MOVDQA [0x610], XMM0 ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x7F, 0x06, 0x10, 0x06, // MOVDQA [0x610], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..12 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    for i in 0..4u32 {
+        assert_eq!(
+            mem.read_u32(0x610 + i * 4),
+            0x1111_1111 * (i + 1),
+            "dword {i} copied via XMM"
+        );
+    }
+}
+
 /// Unary x87 ops: FSQRT, FCHS, FABS. sqrt(16)=4, negate → -4,
 /// abs → 4.
 #[test]
