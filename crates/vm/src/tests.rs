@@ -874,6 +874,46 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 ///   3. A 3-byte "kernel" payload: `MOV AL, 0xCD; HLT`. The host
 ///      asserts AL = 0xCD after the run.
 ///
+/// `set_kernel_cmdline` writes the string at the conventional
+/// 0x90800 and updates `cmd_line_ptr` in the setup header at
+/// 0x90228. After this the kernel's setup.bin can read its
+/// command line via `*(u32*)0x90228 -> "..."` exactly as a real
+/// bootloader would have arranged.
+#[test]
+fn set_kernel_cmdline_writes_string_and_updates_ptr() {
+    let mut vm = Vm::new();
+    vm.set_kernel_cmdline("root=/dev/sda1 ro console=ttyS0");
+    // Bytes land at 0x90800; null terminator follows.
+    let want = b"root=/dev/sda1 ro console=ttyS0";
+    for (i, &b) in want.iter().enumerate() {
+        assert_eq!(vm.mem().read_u8(0x9_0800 + i as u32), b, "byte {i}");
+    }
+    assert_eq!(
+        vm.mem().read_u8(0x9_0800 + want.len() as u32),
+        0,
+        "null terminator"
+    );
+    // cmd_line_ptr at 0x90228 points at our cmdline.
+    assert_eq!(vm.mem().read_u32(0x9_0228), 0x9_0800);
+}
+
+/// A cmdline longer than the 2 KiB slot is truncated rather than
+/// overflowing into adjacent setup-header / kernel territory.
+#[test]
+fn set_kernel_cmdline_truncates_overlong_input() {
+    let mut vm = Vm::new();
+    let long = "x".repeat(3000);
+    vm.set_kernel_cmdline(&long);
+    // First 2047 bytes match; byte 2047 is the null; byte 2048 was
+    // never written (still the original zero of the fresh VM).
+    assert_eq!(vm.mem().read_u8(0x9_0800), b'x');
+    assert_eq!(vm.mem().read_u8(0x9_0800 + 2046), b'x');
+    assert_eq!(vm.mem().read_u8(0x9_0800 + 2047), 0, "null at cap");
+    // The space immediately past the cap is *not* an 'x' — the
+    // truncation actually stopped there.
+    assert_eq!(vm.mem().read_u8(0x9_0800 + 2048), 0);
+}
+
 /// A v2.10 bzImage that declares `init_size` larger than the VM
 /// gets rejected up front rather than being half-loaded and then
 /// faulting mid-decompression. Real silicon doesn't enforce this

@@ -1468,6 +1468,31 @@ impl Vm {
         Ok(bz)
     }
 
+    /// Place a kernel command-line string in memory and point the
+    /// loaded bzImage's `cmd_line_ptr` (setup header offset 0x228)
+    /// at it. The conventional bootloader layout puts the string
+    /// at linear `0x90800` (2 KiB past the setup blob at 0x90000),
+    /// where the kernel's setup.bin already expects to find it.
+    ///
+    /// `cmdline` is truncated to 2047 bytes — the practical cap our
+    /// 2 KiB slot can hold with room for a null terminator. Most
+    /// modern kernels advertise `cmdline_size = 4096` or more, but
+    /// the 2 KiB convention works back to early protocol versions.
+    /// Call *after* [`load_bzimage`] — this only updates two
+    /// regions of memory and doesn't validate that a bzImage is
+    /// actually loaded.
+    pub fn set_kernel_cmdline(&mut self, cmdline: &str) {
+        const CMD_LINE_ADDR: u32 = 0x9_0800;
+        const MAX_LEN: usize = 2047;
+        let bytes = cmdline.as_bytes();
+        let len = bytes.len().min(MAX_LEN);
+        self.mem.write_slice(CMD_LINE_ADDR, &bytes[..len]);
+        self.mem.write_u8(CMD_LINE_ADDR + len as u32, 0); // null terminator
+                                                          // cmd_line_ptr in the setup header lives at 0x90000 + 0x228.
+        self.mem
+            .write_u32(0x9_0000 + bzimage::OFF_CMD_LINE_PTR as u32, CMD_LINE_ADDR);
+    }
+
     /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
     /// disk image to linear `0x7C00` (the standard boot-sector load
     /// address), then continue with the same autorun/UART setup as

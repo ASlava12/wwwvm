@@ -23,6 +23,12 @@ const OFF_VERSION: usize = 0x206; // protocol version (u16)
 const OFF_CODE32_START: usize = 0x214; // 32-bit kernel entry (u32)
 const OFF_RAMDISK_IMAGE: usize = 0x218; // ramdisk address (u32)
 const OFF_RAMDISK_SIZE: usize = 0x21C; // ramdisk size (u32)
+/// Offset within the setup header where the bootloader writes the
+/// linear address of the kernel command-line string. The kernel
+/// reads its `boot_command_line` from here on startup. Protocol
+/// v2.02+ field; pre-2.02 kernels found the cmdline via a fixed
+/// magic-number convention we don't support.
+pub const OFF_CMD_LINE_PTR: usize = 0x228;
 const OFF_RELOCATABLE_KERNEL: usize = 0x234; // u8 — non-zero = can move
 const OFF_CMDLINE_SIZE: usize = 0x238; // u32 — max command-line length
 const OFF_PAYLOAD_OFFSET: usize = 0x248; // u32 — compressed payload offset
