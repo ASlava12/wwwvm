@@ -602,6 +602,48 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0xF0), 0xDEAD_BEEF);
     }
 
+    /// The SVR software-enable gate must keep the LAPIC timer
+    /// silent across a zero-crossing tick. Real LAPIC: SVR bit 8
+    /// gates *all* interrupt delivery — masking LVT alone isn't
+    /// enough, and the kernel relies on SVR=0 (the architectural
+    /// reset state) keeping things quiet until apic_init runs.
+    /// Our default flips bit 8 on so test kernels don't need an
+    /// SVR write boilerplate, but a guest that clears bit 8 must
+    /// see the gate immediately take effect.
+    #[test]
+    fn tick_lapic_timer_at_zero_crossing_does_not_queue_irq_when_svr_disabled() {
+        let mut m = Memory::new(64);
+        // Disable SVR (clear bit 8 of the 0xF0 register, i.e. bit 0
+        // of byte 0xF1). LVT Timer left unmasked at vector 0x40 —
+        // so the ONLY reason no IRQ should fire is the SVR gate.
+        m.write_u32(LAPIC_BASE + 0xF0, 0x0000_0000);
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0040);
+        // Current Count = 1; the next tick decrements to 0 and
+        // would normally queue an IRQ.
+        m.write_u32(LAPIC_BASE + 0x390, 1);
+        m.tick_lapic_timer();
+        assert_eq!(m.read_u32(LAPIC_BASE + 0x390), 0, "counter still ticks");
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "SVR=disabled must suppress LAPIC timer IRQ even at zero-crossing"
+        );
+    }
+
+    /// Positive companion to the SVR-disabled test above: with SVR
+    /// enabled (the default), the same zero-crossing setup *does*
+    /// queue an IRQ at the LVT vector. Together the two tests pin
+    /// the gate as both necessary and sufficient.
+    #[test]
+    fn tick_lapic_timer_at_zero_crossing_queues_irq_when_svr_enabled() {
+        let mut m = Memory::new(64);
+        // SVR=enabled is the construction default; assert and proceed.
+        assert_eq!(m.read_u32(LAPIC_BASE + 0xF0), 0x0000_0100);
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0040);
+        m.write_u32(LAPIC_BASE + 0x390, 1);
+        m.tick_lapic_timer();
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x40));
+    }
+
     #[test]
     fn lapic_window_does_not_steal_from_low_dram() {
         // Confirm a normal RAM write at 0x1000 still goes to DRAM
