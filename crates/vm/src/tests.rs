@@ -2581,6 +2581,55 @@ fn guest_writes_vga_buffer_and_host_snapshots_it() {
     );
 }
 
+/// PM kernel writes directly to the VGA text buffer at 0xB8000
+/// — the host's `vga_text_snapshot` picks up the characters. The
+/// real-mode VGA test above uses ES:offset with the segment-base
+/// trick (ES=0xB800); a PM kernel addresses linear 0xB8000
+/// directly because all segments have base=0. This pins that the
+/// path through translate (no paging here, just CR0.PE) reaches
+/// the same physical bytes vga_text_snapshot reads.
+#[test]
+fn bzimage_pm_kernel_writes_vga_buffer() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel payload (CS.D=1): write "PM!" to the VGA text buffer
+    // one char at a time via MOV BYTE [m32], imm8.
+    //   C6 05 00 80 0B 00 'P'   MOV BYTE [0xB8000], 'P'
+    //   C6 05 02 80 0B 00 'M'   MOV BYTE [0xB8002], 'M'
+    //   C6 05 04 80 0B 00 '!'   MOV BYTE [0xB8004], '!'
+    //   F4                      HLT
+    let mut kernel: Vec<u8> = Vec::new();
+    for (i, &ch) in b"PM!".iter().enumerate() {
+        let off = 0xB8000_u32 + (i as u32) * 2;
+        kernel.extend_from_slice(&[
+            0xC6,
+            0x05,
+            off as u8,
+            (off >> 8) as u8,
+            (off >> 16) as u8,
+            (off >> 24) as u8,
+            ch,
+        ]);
+    }
+    kernel.push(0xF4);
+    bz.extend_from_slice(&kernel);
+
+    let mut vm = Vm::with_ram_size(0x0020_0000);
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(64);
+
+    assert!(vm.is_halted());
+    let snap = vm.vga_text_snapshot();
+    let first_line = snap.lines().next().unwrap();
+    assert!(first_line.starts_with("PM!"), "first line: {first_line:?}");
+}
+
 /// End-to-end cascade IRQ delivery: host raises an IRQ on the
 /// slave PIC, the master sees IRQ 2 from the cascade, the CPU
 /// gets the *slave's* vector. Handler EOIs both PICs (the
