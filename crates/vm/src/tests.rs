@@ -74,6 +74,76 @@ fn bios_int16_read_blocks_until_key_arrives() {
 /// reservation for VGA/ROM above 0xA0000 holds even if the VM has
 /// more RAM than that).
 #[test]
+fn bios_int10_write_string_mode1_uses_bl_attribute_and_advances_cursor() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Stash "OK" at ES:BP = 0:0x9000.
+    vm.mem.write_u8(0x9000, b'O');
+    vm.mem.write_u8(0x9001, b'K');
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xBD, 0x00, 0x90, // MOV BP, 0x9000
+            0xB9, 0x02, 0x00, // MOV CX, 2
+            0xBB, 0x4F, 0x00, // MOV BX, 0x004F  (BL = 0x4F)
+            0xB6, 0x00, // MOV DH, 0
+            0xB2, 0x00, // MOV DL, 0
+            0xB8, 0x01, 0x13, // MOV AX, 0x1301  (AH=0x13, AL=0x01 = mode 1)
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(24);
+    // Both cells hold the BL=0x4F attribute.
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE), b'O');
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + 1), 0x4F);
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + 2), b'K');
+    assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + 3), 0x4F);
+    // Mode 1 advances the cursor. Two writes from (0,0) → (0,2).
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_COL), 2);
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_ROW), 0);
+}
+
+#[test]
+fn bios_int10_write_string_mode3_picks_attributes_from_interleaved_bytes() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Interleaved (char, attr) at ES:BP = 0:0x9000.
+    let payload = [b'A', 0x12, b'B', 0x34, b'C', 0x56];
+    for (i, b) in payload.iter().enumerate() {
+        vm.mem.write_u8(0x9000 + i as u32, *b);
+    }
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xBD, 0x00, 0x90, // MOV BP, 0x9000
+            0xB9, 0x03, 0x00, // MOV CX, 3
+            0xB7, 0x00, // MOV BH, 0
+            0xB6, 0x02, // MOV DH, 2   (row 2)
+            0xB2, 0x05, // MOV DL, 5   (col 5)
+            0xB8, 0x03, 0x13, // MOV AX, 0x1303  (AH=0x13, AL=0x03 = mode 3)
+            0xCD, 0x10, // INT 0x10
+            0xF4, // HLT
+        ],
+    );
+    vm.boot();
+    vm.run_steps(24);
+    // Each cell at row 2, columns 5/6/7 holds its own attribute.
+    for (i, (ch, attr)) in [(b'A', 0x12), (b'B', 0x34), (b'C', 0x56)]
+        .iter()
+        .enumerate()
+    {
+        let off = ((2 * 80) + 5 + i) * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), *ch);
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), *attr);
+    }
+    // Mode 3 also advances the cursor.
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_ROW), 2);
+    assert_eq!(vm.mem().read_u8(BDA_CURSOR_COL), 8);
+}
+
+#[test]
 fn bios_int10_set_cursor_shape_is_silent_accept() {
     let mut vm = Vm::new();
     vm.install_bios();

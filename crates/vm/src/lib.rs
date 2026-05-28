@@ -63,6 +63,10 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///     wraps at column 80 and clamps at row 24. CR/LF/BS are honored;
 ///     BEL is silently dropped.
 ///   * INT 0x10 AH=0x0F — get video mode (returns mode 3 / 80 cols)
+///   * INT 0x10 AH=0x13 — write string at ES:BP. AL bits select
+///     cursor-advance and attribute-interleaved modes (the four
+///     modes 0..3 from the original BIOS spec). Used by setup.bin
+///     banners and kernel panic messages.
 ///   * INT 0x16 AH=0x02 — get keyboard shift-flags. We don't model
 ///     modifier-key state, so always report 0 (no modifiers held).
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
@@ -281,6 +285,56 @@ fn bios_int10(cpu: &mut Cpu, mem: &mut Memory) -> bool {
             cpu.write_r8(0, 3); // AL = mode 3
             cpu.write_r8(4, VGA_TEXT_COLS as u8); // AH = columns
             cpu.write_r8(7, 0); // BH = page
+            true
+        }
+        // Write string. AL = mode (bit 0 = update cursor, bit 1 =
+        // string includes attribute bytes after each char). CX =
+        // length in chars, BH = page, BL = attribute (used for
+        // mode 0/1), DH/DL = starting row/col, ES:BP = string.
+        // Setup.bin's banner uses this; kernel panic output too.
+        0x13 => {
+            let mode = cpu.read_r8(0); // AL
+            let count = cpu.read_r16(1) as usize; // CX
+            let attr_default = cpu.read_r8(3); // BL
+            let row = cpu.read_r8(6) as usize; // DH
+            let col_start = cpu.read_r8(2) as usize; // DL
+            let bp = cpu.read_r16(5); // BP
+            let src_base = cpu.linear_seg(wwwvm_cpu::sreg::ES, bp as u32);
+            let has_attr_in_str = mode & 0x02 != 0;
+            let advance_cursor = mode & 0x01 != 0;
+            let mut col = col_start;
+            let mut cur_row = row;
+            // Stride between chars in the source: 2 if interleaved
+            // attrs are present, 1 otherwise.
+            let stride = if has_attr_in_str { 2u32 } else { 1u32 };
+            for i in 0..count {
+                if cur_row >= VGA_TEXT_ROWS {
+                    break;
+                }
+                let off_src = src_base.wrapping_add((i as u32) * stride);
+                let ch = mem.read_u8(off_src);
+                let attr = if has_attr_in_str {
+                    mem.read_u8(off_src.wrapping_add(1))
+                } else {
+                    attr_default
+                };
+                // CR/LF aren't part of the write-string contract,
+                // but BIOSes typically still honor them for the
+                // teletype-style modes (1, 3). Keep it simple: just
+                // place the char at (cur_row, col), then wrap.
+                let off = ((cur_row * VGA_TEXT_COLS) + col) * 2;
+                mem.write_u8(VGA_TEXT_BASE + off as u32, ch);
+                mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, attr);
+                col += 1;
+                if col >= VGA_TEXT_COLS {
+                    col = 0;
+                    cur_row += 1;
+                }
+            }
+            if advance_cursor {
+                mem.write_u8(BDA_CURSOR_ROW, cur_row.min(VGA_TEXT_ROWS - 1) as u8);
+                mem.write_u8(BDA_CURSOR_COL, col.min(VGA_TEXT_COLS - 1) as u8);
+            }
             true
         }
         _ => false,
