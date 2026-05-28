@@ -654,6 +654,50 @@ mod tests {
         assert_eq!(m.read_u32(0x1000), 0xDEAD_BEEF);
     }
 
+    /// HPET timer 0 in periodic mode: at comparator match, the
+    /// stored period must auto-advance the comparator for the
+    /// next match. v13 added the period bytes to the snapshot for
+    /// exactly this reason — without auto-advance, the kernel's
+    /// 1 ms tick degrades to a one-shot post-restore. This test
+    /// pins the in-memory periodic-advance path directly.
+    #[test]
+    fn tick_hpet_periodic_mode_auto_advances_comparator_by_period() {
+        let mut m = Memory::new(64);
+        // Enable HPET main counter (General Config ENABLE_CNF).
+        m.write_u32(HPET_BASE + 0x10, 1);
+        // Timer 0 config: bit 2 (INT_ENB) + bit 3 (TYPE = periodic)
+        // + bit 14 (FSB_EN_CNF) all set.
+        m.write_u32(HPET_BASE + 0x100, (1 << 2) | (1 << 3) | (1 << 14));
+        // Comparator low at offset 0x108 = 10 (match value).
+        m.write_u32(HPET_BASE + 0x108, 10);
+        m.write_u32(HPET_BASE + 0x10C, 0);
+        // FSB Route low at 0x110 = vector 0x42.
+        m.write_u32(HPET_BASE + 0x110, 0x0000_0042);
+        // Seed the period array (the kernel writes this via the
+        // VAL_SET MMIO path which our model collapses; the
+        // snapshot helper round-trips it). Period = 5.
+        m.restore_hpet_period(&[5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .expect("seed period");
+
+        // Tick to counter=10 — should fire and auto-advance.
+        for _ in 0..10 {
+            m.tick_hpet_counter();
+        }
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x42), "match fires");
+        assert_eq!(
+            m.read_u32(HPET_BASE + 0x108),
+            15,
+            "comparator advanced by period"
+        );
+
+        // Tick another 5 ticks (counter 11..15) — fires again at 15.
+        for _ in 0..5 {
+            m.tick_hpet_counter();
+        }
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x42), "next match fires");
+        assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
+    }
+
     #[test]
     fn restore_full_rejects_size_mismatch() {
         let mut m = Memory::new(16);
