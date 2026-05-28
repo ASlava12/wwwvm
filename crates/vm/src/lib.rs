@@ -76,7 +76,7 @@ pub const BDA_CURSOR_ROW: u32 = 0x0451;
 ///     returned values are BCD-encoded (BIOS convention), regardless
 ///     of the CMOS binary/BCD mode.
 pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) -> bool {
-    match vector {
+    let handled = match vector {
         0x10 => bios_int10(cpu, mem),
         0x12 => bios_int12(cpu),
         0x13 => bios_int13(cpu, mem, io),
@@ -84,7 +84,20 @@ pub fn bios_hook(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus, vector: u8) ->
         0x16 => bios_int16(cpu, io),
         0x1A => bios_int1a(cpu, mem, io),
         _ => false,
+    };
+    if !handled && matches!(vector, 0x10 | 0x13 | 0x15) {
+        // For the vectors a real BIOS always serves, surface an
+        // "unsupported sub-function" reply (CF=1, AH=0x86) instead
+        // of falling through to the IVT — where an uninitialized
+        // entry would land the CPU at linear 0 and crash. Linux's
+        // setup code checks CF and moves on. The 0x16 (keyboard) /
+        // 0x1A (clock) / 0x12 (low-mem) sub-functions are simple
+        // enough that we handle every realistic call.
+        cpu.write_r8(4, 0x86);
+        cpu.flags |= wwwvm_cpu::flag::CF;
+        return true;
     }
+    handled
 }
 
 /// INT 0x12 — Get Conventional Memory Size. Returns AX = number of

@@ -720,6 +720,38 @@ fn bios_int12_returns_640_kib_conventional_memory() {
     assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0);
 }
 
+/// Unhandled BIOS sub-functions on INT 0x10 / 0x13 / 0x15 should
+/// return CF=1, AH=0x86 ("function not supported") — Linux's
+/// setup checks CF and moves on. Until now they fell through to
+/// the IVT, which on a stock setup is zero and would land the
+/// CPU at linear 0 and crash. We pin the safe behavior on
+/// INT 0x15 / AH=0xC1 (Get EBDA address — not implemented).
+#[test]
+fn bios_unsupported_subfunction_signals_cf_with_ah_86() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0xC1, // MOV AH, 0xC1
+            0xCD, 0x15, // INT 0x15
+            0xF4,
+        ],
+    );
+    vm.boot();
+    vm.run_steps(8);
+    assert_ne!(
+        vm.cpu().flags & wwwvm_cpu::flag::CF,
+        0,
+        "CF=1 on unsupported BIOS sub-function"
+    );
+    assert_eq!(
+        vm.cpu().read_r8(4),
+        0x86,
+        "AH=0x86 (function not supported)"
+    );
+}
+
 /// INT 0x15 / AH=0x24 — A20 gate control. Linux's a20.c tries
 /// BIOS first; if the BIOS doesn't support it, fall back to KBC
 /// and port 0x92. We model all four sub-functions.
