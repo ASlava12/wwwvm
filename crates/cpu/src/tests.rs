@@ -2775,6 +2775,91 @@ fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// Demand paging on *instruction fetch*. A kernel JMP target
+/// that lives in an unmapped page must fault, vector through the
+/// #PF handler, get fixed up, and resume — same loop as the
+/// data-side demand-paging test but the fault originates in
+/// `fetch_u8`, not in an operand read. This is Linux's path for
+/// mmap'd binaries: the kernel exec()s a file, the code pages
+/// aren't loaded until the first instruction in each page is
+/// fetched, and `do_page_fault` reads them from disk.
+#[test]
+fn pm_demand_paging_on_instruction_fetch_resumes_at_target() {
+    let mut mem = Memory::new(0x0080_0000);
+
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+    mem.write_u32(0x0001_0000, 0x0000_0083); // PDE[0] PSE identity
+                                             // PDE[1] left zero — instruction fetch in [4M, 8M) faults.
+
+    // Kernel at phys 0x100000 (identity-mapped):
+    //   B8 00 00 40 00   MOV EAX, 0x400000
+    //   FF E0            JMP EAX             ; lands in unmapped page
+    mem.write_slice(0x0010_0000, &[0xB8, 0x00, 0x00, 0x40, 0x00, 0xFF, 0xE0]);
+
+    // #PF handler at phys 0x800:
+    //   58                              POP EAX (discard error code)
+    //   0F 20 D3                        MOV EBX, CR2
+    //   C7 05 04 00 01 00 83 00 40 00   MOV DWORD [0x10004], 0x00400083
+    //   CF                              IRETD
+    mem.write_slice(
+        0x0800,
+        &[
+            0x58, 0x0F, 0x20, 0xD3, 0xC7, 0x05, 0x04, 0x00, 0x01, 0x00, 0x83, 0x00, 0x40, 0x00,
+            0xCF,
+        ],
+    );
+
+    // Once PDE[1] is patched, linear 0x400000 maps to phys 0x400000.
+    // Lay the "real" target code there:
+    //   B8 BE BA FE CA   MOV EAX, 0xCAFEBABE
+    //   F4               HLT
+    mem.write_slice(0x0040_0000, &[0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.write_sreg(sreg::ES, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.cr3 = 0x0001_0000;
+    cpu.cr4 = 0x10;
+    cpu.cr0 = 0x8000_0001; // PG | PE
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // Handler captured the faulting linear (the JMP target).
+    let ebx = cpu.regs[r16::BX] as u32 | ((cpu.regs_high[r16::BX] as u32) << 16);
+    assert_eq!(ebx, 0x0040_0000, "fetch fault at the JMP target");
+    // After the IRETD landed back on 0x400000 the kernel executed
+    // MOV EAX, 0xCAFEBABE → HLT.
+    assert_eq!(cpu.read_r32(0), 0xCAFE_BABE);
+    assert_eq!(mem.read_u32(0x0001_0004), 0x0040_0083);
+}
+
 /// Protected-mode #PF dispatch composes with paging *and* a real
 /// 32-bit IDT gate. The previous test exercises the real-mode IVT
 /// path; once the kernel is in PM with paging on, the dispatch goes
