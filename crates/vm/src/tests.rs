@@ -1413,6 +1413,46 @@ fn lapic_timer_fires_periodic_irq_through_32_bit_gate() {
     );
 }
 
+/// HPET Main Counter (0xFED0_00F0) ticks once per CPU step when
+/// General Configuration's ENABLE_CNF (0xFED0_0010 bit 0) is
+/// set, and freezes otherwise. Linux uses HPET as a wall-clock
+/// time source — reading the counter at known intervals tells
+/// the kernel how fast the CPU runs.
+#[test]
+fn hpet_main_counter_advances_when_enabled_and_freezes_when_disabled() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+
+    // Initially ENABLE_CNF=0 → counter frozen.
+    let before = vm.cpu().mem_read_u32(vm.mem(), 0xFED0_00F0);
+    vm.run_steps(32);
+    assert_eq!(
+        vm.cpu().mem_read_u32(vm.mem(), 0xFED0_00F0),
+        before,
+        "counter must freeze while ENABLE_CNF=0"
+    );
+
+    // Enable the counter via the General Configuration register.
+    vm.cpu
+        .mem_write_u32(&mut vm.mem, 0xFED0_0010, 0x0000_0001);
+
+    let baseline = vm.cpu().mem_read_u32(vm.mem(), 0xFED0_00F0);
+    vm.run_steps(32);
+    let after = vm.cpu().mem_read_u32(vm.mem(), 0xFED0_00F0);
+    // The kernel's reads add their own steps, so the delta is at
+    // least the number of steps we explicitly ran.
+    assert!(
+        after > baseline,
+        "counter must advance while ENABLE_CNF=1 (baseline={baseline:#x} after={after:#x})"
+    );
+    assert!(
+        after - baseline >= 30,
+        "advanced too few steps (got {})",
+        after - baseline
+    );
+}
+
 /// LAPIC mask bit (LVT_TIMER bit 16): when set, no IRQ fires on
 /// zero-crossings even though Current Count still decrements.
 /// Linux flips this bit to disable the timer during S3 / power

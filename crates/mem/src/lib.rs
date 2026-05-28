@@ -222,6 +222,34 @@ impl Memory {
         self.pending_lapic_irq.take()
     }
 
+    /// Tick the HPET main counter once. When the General
+    /// Configuration register's ENABLE_CNF bit (offset 0x010 bit 0)
+    /// is set, the 64-bit Main Counter at 0x0F0 increments by 1.
+    /// When ENABLE_CNF is clear, the counter freezes — that's how
+    /// Linux pauses HPET during recalibration / suspend.
+    ///
+    /// We don't fire match-comparator interrupts yet — Linux reads
+    /// the counter directly for time-of-day, so visible ticking
+    /// is what the calibration path actually needs.
+    pub fn tick_hpet_counter(&mut self) {
+        if self.hpet[0x10] & 1 == 0 {
+            return;
+        }
+        let off = 0xF0;
+        let cur = u64::from_le_bytes([
+            self.hpet[off],
+            self.hpet[off + 1],
+            self.hpet[off + 2],
+            self.hpet[off + 3],
+            self.hpet[off + 4],
+            self.hpet[off + 5],
+            self.hpet[off + 6],
+            self.hpet[off + 7],
+        ]);
+        let next = cur.wrapping_add(1);
+        self.hpet[off..off + 8].copy_from_slice(&next.to_le_bytes());
+    }
+
     pub fn read_u16(&self, addr: u32) -> u16 {
         let lo = self.read_u8(addr) as u16;
         let hi = self.read_u8(addr.wrapping_add(1)) as u16;

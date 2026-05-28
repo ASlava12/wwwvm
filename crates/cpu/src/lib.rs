@@ -2679,6 +2679,11 @@ impl Cpu {
         // against TSC to derive the bus ratio; periodic mode keeps
         // the kernel's scheduler tick alive.
         mem.tick_lapic_timer();
+        // HPET main counter advances once per step too — Linux uses
+        // it as a time-of-day source via direct MMIO reads. The
+        // counter freezes when General Configuration ENABLE_CNF is
+        // clear, so software-paused HPET still works.
+        mem.tick_hpet_counter();
         io.refresh_irqs();
         if self.has(flag::IF) {
             // LAPIC IRQs win over legacy PIC — they're the higher-
