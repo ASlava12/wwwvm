@@ -3553,6 +3553,42 @@ fn snapshot_v12_preserves_code_size_misc_enable_tsc_aux_dr() {
     }
 }
 
+/// v14 added a 13-byte PIT trailer covering channel 2 (the path
+/// Linux's `pit_calibrate_tsc` uses on the boot CPU). The Pit-
+/// level unit test in `crates/devices/src/pit.rs` covers the
+/// PIT module's own snapshot helper; this test pins the
+/// integration: a Vm snapshot taken with ch2 mid-countdown
+/// restores ch2 with the same reload, counter, gate, and OUT
+/// line. Without v14 the trailer would be missing from the blob
+/// the Vm wrote and the restored PIT would land with ch2 idle —
+/// silent divergence at TSC-calibration time.
+#[test]
+fn snapshot_v14_preserves_pit_ch2_state_through_vm_round_trip() {
+    let mut vm = Vm::new();
+    vm.load_default_guest();
+    vm.boot();
+    // Park ch2 in the middle of a mode-0 countdown: gate on,
+    // reload 0xABCD, counter advanced to 0x1234 (i.e. some ticks
+    // have already fired but terminal count hasn't been reached).
+    vm.io.pit.gate2 = true;
+    vm.io.pit.speaker2 = true;
+    vm.io.pit.ch2_reload = 0xABCD;
+    vm.io.pit.ch2_counter = 0x1234;
+    vm.io.pit.ch2_running = true;
+    vm.io.pit.ch2_out = false;
+
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&snap).expect("v14 restore");
+
+    assert!(vm2.io.pit.gate2, "gate2 should round-trip");
+    assert!(vm2.io.pit.speaker2, "speaker2 should round-trip");
+    assert_eq!(vm2.io.pit.ch2_reload, 0xABCD);
+    assert_eq!(vm2.io.pit.ch2_counter, 0x1234);
+    assert!(vm2.io.pit.ch2_running);
+    assert!(!vm2.io.pit.ch2_out);
+}
+
 /// v9 snapshot must round-trip the full architectural i386 state:
 /// CR0/2/3/4, GDTR, IDTR, full 32-bit IP, TSC, LDTR, TR, A20,
 /// stack_size_32, FPU control/status, SYSENTER MSRs, x87 stack,
