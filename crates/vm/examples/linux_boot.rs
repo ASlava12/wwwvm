@@ -60,7 +60,13 @@ fn main() {
     // Minimal earlyprintk cmdline — without console=ttyS0 the kernel
     // queues output instead of pushing to UART. With it we should see
     // log lines as soon as the kernel's console driver initializes.
-    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10");
+    //
+    // lpj=1000000 skips calibrate_delay's busy-wait loop. That loop
+    // requires timer IRQs to update jiffies, which requires IF=1,
+    // which our kernel hasn't reached yet — so without lpj we hit
+    // a soft hang in calibrate_delay_converge. Setting lpj declares
+    // a pre-computed value and skips calibration entirely.
+    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000");
 
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);
