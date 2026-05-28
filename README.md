@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**378 тестов** зелёные (mem 6 + devices 37 + cpu 266 + vm 61 +
+**379 тестов** зелёные (mem 6 + devices 38 + cpu 266 + vm 61 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v9.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -184,10 +184,11 @@ spinlock через LOCK CMPXCHG + PAUSE):
   0x03 get cursor / 0x09 char+attr / 0x0E TTY / 0x0F get mode),
   0x12, 0x13 (disk read), 0x15 (E820 + AH=88), 0x16
   (AH=0x00 read / 0x01 peek / 0x02 shift flags).
-- **IDE/ATA primary канал** (порты 0x1F0..0x1F7): IDENTIFY DEVICE,
-  READ SECTORS и WRITE SECTORS (LBA28). 16-битная передача данных
-  приходит как пара байтовых обращений подряд — оба продвигают
-  буфер, в обе стороны (read drain и write fill).
+- **IDE/ATA два канала** (primary 0x1F0..0x1F7, secondary
+  0x170..0x177): IDENTIFY DEVICE, READ SECTORS и WRITE SECTORS
+  (LBA28). 16-битная передача данных приходит как пара байтовых
+  обращений подряд — оба продвигают буфер, в обе стороны
+  (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
   header parser + loader. Снапшот v9 round-trip'ит всё состояние.
 
@@ -204,7 +205,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
 | Ring 3 + полноценный TSS + privilege transitions | большой | User-space; сейчас всё ring 0 |
 | Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #GP уже raised из RDMSR/WRMSR на неизвестных MSR (rdmsr_safe работает); остаётся раздавать из segment-load helper'ов и привилегий |
-| IDE/ATA secondary channel + DMA / virtio-blk | средний | Primary канал read+write через PIO уже работает; для модерн дистров нужно ещё DMA и желательно второй канал для CD-ROM |
+| IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
 | APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
 | VGA graphics, framebuffer | средний | fbcon, графические гости |
@@ -221,7 +222,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 378 пройденных тестов на текущий момент. CI
+Должно вывести 379 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 

@@ -30,7 +30,7 @@ mod pic;
 mod pit;
 mod uart;
 
-pub use ata::Ata;
+pub use ata::{Ata, PRIMARY_PORT_BASE, SECONDARY_PORT_BASE};
 pub use cmos::{reg as cmos_reg, Cmos};
 pub use disk::{Disk, SECTOR_SIZE as DISK_SECTOR_SIZE};
 pub use keyboard::Keyboard;
@@ -57,6 +57,10 @@ pub struct IoBus {
     /// reach for `io.disk` directly now go through `io.disk()` /
     /// `io.disk_mut()` accessors. Not snapshotted yet.
     pub ata: Ata,
+    /// Secondary IDE channel (ports 0x170..0x177). Same controller
+    /// type, different port base — the standard PC two-channel
+    /// layout, useful for a CD-ROM target or a second hard drive.
+    pub ata2: Ata,
 }
 
 impl IoBus {
@@ -84,6 +88,7 @@ impl IoBus {
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
             ata: Ata::new(),
+            ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
         }
     }
 
@@ -98,6 +103,7 @@ impl IoBus {
             kbd: Keyboard::new(),
             cmos: Cmos::new(),
             ata: Ata::new(),
+            ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
         }
     }
 
@@ -212,6 +218,10 @@ impl IoBus {
         if port >= lo && port <= hi {
             return self.ata.read(port);
         }
+        let (lo, hi) = self.ata2.port_range();
+        if port >= lo && port <= hi {
+            return self.ata2.read(port);
+        }
         0xFF
     }
 
@@ -249,6 +259,11 @@ impl IoBus {
         let (lo, hi) = self.ata.port_range();
         if port >= lo && port <= hi {
             self.ata.write(port, value);
+            return;
+        }
+        let (lo, hi) = self.ata2.port_range();
+        if port >= lo && port <= hi {
+            self.ata2.write(port, value);
         }
     }
 }
@@ -344,6 +359,30 @@ impl IoBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_and_secondary_ata_channels_route_independently() {
+        let mut bus = IoBus::new();
+        // Load distinct images so each side has a recognisable
+        // payload.
+        bus.ata.disk.load(&[0xAAu8; 512]); // primary
+        bus.ata2.disk.load(&[0x55u8; 512]); // secondary
+                                            // Issue READ SECTORS at LBA 0, sector count 1, on each.
+                                            // Each command-block read should drain that channel's own
+                                            // buffer; if dispatch leaked between them the secondary
+                                            // would echo 0xAA or vice versa.
+        for (base, expect) in [(0x1F0u16, 0xAAu8), (0x170u16, 0x55u8)] {
+            bus.write(base + 2, 1); // sector count
+            bus.write(base + 3, 0); // LBA low
+            bus.write(base + 4, 0);
+            bus.write(base + 5, 0);
+            bus.write(base + 6, 0x40); // LBA mode
+            bus.write(base + 7, 0x20); // READ SECTORS
+            for _ in 0..4 {
+                assert_eq!(bus.read(base), expect);
+            }
+        }
+    }
 
     #[test]
     fn routes_to_uart() {

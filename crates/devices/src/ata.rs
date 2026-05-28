@@ -1,7 +1,8 @@
-//! Minimal IDE/ATA (primary channel) controller — what a Linux
-//! kernel pokes at when it bypasses BIOS and talks to the disk
-//! directly. We own a single `Disk` and present the legacy port
-//! interface at 0x1F0..0x1F7 plus the control port at 0x3F6.
+//! Minimal IDE/ATA controller — what a Linux kernel pokes at when
+//! it bypasses BIOS and talks to the disk directly. We own a
+//! single `Disk` and present the legacy port interface at a
+//! configurable base (0x1F0 for the primary channel, 0x170 for
+//! the secondary).
 //!
 //! The two commands we actually service:
 //!   * 0xEC — IDENTIFY DEVICE (drive metadata block)
@@ -23,9 +24,10 @@
 use crate::disk::{Disk, SECTOR_SIZE};
 use crate::IoDevice;
 
-/// I/O port range covered by the primary IDE channel's command block.
-const PORT_BASE: u16 = 0x1F0;
-const PORT_LAST: u16 = 0x1F7;
+/// Standard primary-channel command-block base (also the BIOS
+/// boot drive). The secondary channel lives at 0x170.
+pub const PRIMARY_PORT_BASE: u16 = 0x1F0;
+pub const SECONDARY_PORT_BASE: u16 = 0x170;
 
 /// Status-register bits we drive. (STATUS_ERR is not used yet —
 /// we never raise a command error.)
@@ -40,19 +42,19 @@ const CMD_IDENTIFY: u8 = 0xEC;
 
 pub struct Ata {
     pub disk: Disk,
-    /// Sector-count register (0x1F2). 0 means 256 sectors.
+    /// Sector-count register (base+2). 0 means 256 sectors.
     sector_count: u8,
-    /// LBA byte registers (0x1F3..0x1F5) — low/mid/high.
+    /// LBA byte registers (base+3..base+5) — low/mid/high.
     lba_low: u8,
     lba_mid: u8,
     lba_high: u8,
-    /// Drive / head register (0x1F6). Bits 0..3 = LBA[27:24], bit 4
-    /// = drive number (we only emulate drive 0), bit 6 set marks
+    /// Drive / head register (base+6). Bits 0..3 = LBA[27:24], bit
+    /// 4 = drive number (we only emulate drive 0), bit 6 set marks
     /// LBA mode (vs CHS, which we don't model).
     drive_head: u8,
-    /// Error register (read back at 0x1F1).
+    /// Error register (read back at base+1).
     error: u8,
-    /// Last status (read back at 0x1F7).
+    /// Last status (read back at base+7).
     status: u8,
     /// Pending data-transfer buffer. Filled when DRQ goes high; the
     /// guest drains it via reads on the data port for READ commands,
@@ -67,10 +69,20 @@ pub struct Ata {
     /// LBA latched at WRITE SECTORS time, so it survives the guest
     /// scribbling on the LBA registers while still mid-transfer.
     write_lba: u32,
+    /// Command-block port base — 0x1F0 (primary) or 0x170 (secondary).
+    port_base: u16,
 }
 
 impl Ata {
+    /// Build a controller listening on the primary command block
+    /// (0x1F0..0x1F7). This is what the existing IoBus uses.
     pub fn new() -> Self {
+        Self::with_port_base(PRIMARY_PORT_BASE)
+    }
+
+    /// Build a controller listening on a specific command-block
+    /// base. Use [`SECONDARY_PORT_BASE`] for the second channel.
+    pub fn with_port_base(port_base: u16) -> Self {
         Self {
             disk: Disk::new(),
             sector_count: 0,
@@ -84,6 +96,7 @@ impl Ata {
             pos: 0,
             writing: false,
             write_lba: 0,
+            port_base,
         }
     }
 
@@ -190,21 +203,25 @@ impl Default for Ata {
 
 impl IoDevice for Ata {
     fn port_range(&self) -> (u16, u16) {
-        (PORT_BASE, PORT_LAST)
+        (self.port_base, self.port_base + 7)
     }
 
     fn read(&mut self, port: u16) -> u8 {
-        match port {
-            0x1F0 if self.drq() && !self.writing => self.pop_buf_byte(),
-            0x1F0 => 0xFF,
-            0x1F1 if self.drq() && !self.writing => self.pop_buf_byte(),
-            0x1F1 => self.error,
-            0x1F2 => self.sector_count,
-            0x1F3 => self.lba_low,
-            0x1F4 => self.lba_mid,
-            0x1F5 => self.lba_high,
-            0x1F6 => self.drive_head,
-            0x1F7 => {
+        // Register layout is the same shape on both channels — the
+        // controller just shifts by `port_base`. Negative offsets
+        // (impossible here because IoBus filters by port_range)
+        // would underflow, but `wrapping_sub` keeps the math safe.
+        match port.wrapping_sub(self.port_base) {
+            0 if self.drq() && !self.writing => self.pop_buf_byte(),
+            0 => 0xFF,
+            1 if self.drq() && !self.writing => self.pop_buf_byte(),
+            1 => self.error,
+            2 => self.sector_count,
+            3 => self.lba_low,
+            4 => self.lba_mid,
+            5 => self.lba_high,
+            6 => self.drive_head,
+            7 => {
                 // Reading status would normally clear the interrupt
                 // pending state; we don't generate interrupts so it
                 // is a plain read.
@@ -215,21 +232,21 @@ impl IoDevice for Ata {
     }
 
     fn write(&mut self, port: u16, value: u8) {
-        match port {
-            // Data port (and its 0x1F1 mirror during the byte-pair
+        match port.wrapping_sub(self.port_base) {
+            // Data port (and its +1 mirror during the byte-pair
             // outw hack): accept the byte iff we're in a WRITE-data
-            // phase. Otherwise 0x1F1-write is Features, which we
+            // phase. Otherwise base+1-write is Features, which we
             // currently ignore (DMA modes etc).
-            0x1F0 if self.writing && self.drq() => self.push_buf_byte(value),
-            0x1F0 => {}
-            0x1F1 if self.writing && self.drq() => self.push_buf_byte(value),
-            0x1F1 => {}
-            0x1F2 => self.sector_count = value,
-            0x1F3 => self.lba_low = value,
-            0x1F4 => self.lba_mid = value,
-            0x1F5 => self.lba_high = value,
-            0x1F6 => self.drive_head = value,
-            0x1F7 => {
+            0 if self.writing && self.drq() => self.push_buf_byte(value),
+            0 => {}
+            1 if self.writing && self.drq() => self.push_buf_byte(value),
+            1 => {}
+            2 => self.sector_count = value,
+            3 => self.lba_low = value,
+            4 => self.lba_mid = value,
+            5 => self.lba_high = value,
+            6 => self.drive_head = value,
+            7 => {
                 // Issuing a command latches BSY briefly on real
                 // silicon; we complete synchronously, so BSY is
                 // never observable.
