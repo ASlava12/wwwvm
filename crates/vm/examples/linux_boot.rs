@@ -115,9 +115,12 @@ fn main() {
     // The stack at that moment names the caller — i.e. what
     // function decided this was unrecoverable.
     let stop_at_panic = env::var("WWWVM_STOP_AT_PANIC").is_ok();
+    let stop_at_eip = env::var("WWWVM_STOP_AT_EIP")
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     while steps < STEP_BUDGET {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
-        let chunk = if pg_on && stop_at_panic {
+        let chunk = if pg_on && (stop_at_panic || stop_at_eip.is_some()) {
             1
         } else if pg_on && (stop_at_first_pf || stop_at_first_exc) {
             100
@@ -172,6 +175,16 @@ fn main() {
             last_esp = esp;
             last_esp_align = aligned;
             last_eip = vm.cpu().ip;
+        }
+        if let Some(target) = stop_at_eip {
+            // Exact match — caller must pick the right boundary
+            // (e.g. just after a MOV they care about).
+            let eip = vm.cpu().ip;
+            if pg_on && eip == target {
+                println!("[{steps:>10}] HIT EIP target {target:08X} (sampled EIP={eip:08X})");
+                stop = st;
+                break;
+            }
         }
         if stop_at_panic && pg_on && (0xC08730E0..0xC0873200).contains(&vm.cpu().ip) {
             println!(

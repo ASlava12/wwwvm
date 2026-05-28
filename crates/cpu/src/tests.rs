@@ -8186,10 +8186,12 @@ fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {
     let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
     // Max basic leaf = 2 (we answer leaves 0, 1, and 2 — cache
     // descriptors). Linux's CPUID-walking code stops here.
-    assert_eq!(cpu.read_r32(0), 2);
-    assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"WWWV"));
-    assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"MxRu"));
-    assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"st  "));
+    assert_eq!(cpu.read_r32(0), 2); // EAX (idx 0)
+                                    // Vendor string in Intel's CPUID return-order EBX:EDX:ECX.
+                                    // Our r32 indices: EAX=0, ECX=1, EDX=2, EBX=3.
+    assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"WWWV")); // EBX
+    assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"MxRu")); // EDX
+    assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"st  ")); // ECX
 }
 
 /// CPUID leaf 2 — cache descriptors. Returns EAX bits 7:0 = 0x01
@@ -8218,7 +8220,9 @@ fn cpuid_leaf_1_advertises_implemented_features_in_edx() {
     let (cpu, _, _) = run_payload(&[0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xF4], 12);
     // Family 6, model 6, stepping 4.
     assert_eq!(cpu.read_r32(0), 0x0000_0664);
-    let edx = cpu.read_r32(1);
+    // Register index 2 = EDX (we use the r32 register encoding
+    // 0=EAX, 1=ECX, 2=EDX, 3=EBX throughout the CPU).
+    let edx = cpu.read_r32(2);
     assert_ne!(edx & (1 << 0), 0, "FPU");
     assert_ne!(edx & (1 << 2), 0, "DE (CR4.DE settable)");
     assert_ne!(edx & (1 << 3), 0, "PSE (4 MiB pages)");
@@ -8273,10 +8277,12 @@ fn cpuid_extended_leaves_return_brand_string() {
             0xF4,
         ];
         let (c, _, _) = run_payload(&prog, 12);
+        // Intel brand-string return order is EAX/EBX/ECX/EDX.
+        // Our r32 indices: 0=EAX, 1=ECX, 2=EDX, 3=EBX.
         s.extend_from_slice(&c.read_r32(0).to_le_bytes()); // EAX
         s.extend_from_slice(&c.read_r32(3).to_le_bytes()); // EBX
-        s.extend_from_slice(&c.read_r32(2).to_le_bytes()); // ECX
-        s.extend_from_slice(&c.read_r32(1).to_le_bytes()); // EDX
+        s.extend_from_slice(&c.read_r32(1).to_le_bytes()); // ECX
+        s.extend_from_slice(&c.read_r32(2).to_le_bytes()); // EDX
     }
     assert_eq!(s.len(), 48);
     let text = String::from_utf8(s).expect("ascii");

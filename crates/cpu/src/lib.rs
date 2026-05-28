@@ -7279,22 +7279,26 @@ fn brand_dword(offset: usize) -> u32 {
 fn cpuid_dispatch(cpu: &mut Cpu) {
     let leaf = cpu.read_r32(0);
     match leaf {
-        // Standard leaves.
+        // Standard leaves. Register indices used through this dispatch:
+        // 0 = EAX, 1 = ECX, 2 = EDX, 3 = EBX — matches r32 encoding,
+        // NOT the canonical "EAX/EBX/ECX/EDX" return-order Intel docs
+        // list, so the writes below pair the index with the explicit
+        // register name in the comment.
         0 => {
-            cpu.write_r32(0, 2); // max basic leaf = 2 (cache descriptors)
-                                 // Vendor string "WWWVMxRust  " in EBX, EDX, ECX.
-            cpu.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX
-            cpu.write_r32(1, u32::from_le_bytes(*b"MxRu")); // EDX
-            cpu.write_r32(2, u32::from_le_bytes(*b"st  ")); // ECX
+            cpu.write_r32(0, 2); // EAX = max basic leaf = 2 (cache descriptors)
+                                 // Vendor string "WWWVMxRust  " in EBX:EDX:ECX.
+            cpu.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX = chars 0..3
+            cpu.write_r32(2, u32::from_le_bytes(*b"MxRu")); // EDX = chars 4..7
+            cpu.write_r32(1, u32::from_le_bytes(*b"st  ")); // ECX = chars 8..11
         }
         1 => {
             // Family 6, model 6, stepping 4 — a generic Pentium-Pro
             // class shape. Family-6 keeps the kernel on its modern
             // probe paths rather than the antique-i386 branches.
-            cpu.write_r32(0, 0x0000_0664);
-            cpu.write_r32(3, CPUID_LEAF1_EBX); // EBX (brand idx / cflush / max-logical / APIC ID)
-            cpu.write_r32(2, 0); // ECX (SSE3+)
-            cpu.write_r32(1, CPUID_LEAF1_EDX); // EDX
+            cpu.write_r32(0, 0x0000_0664); // EAX = family/model/stepping
+            cpu.write_r32(3, CPUID_LEAF1_EBX); // EBX = brand idx / cflush / max-logical / APIC ID
+            cpu.write_r32(1, 0); // ECX (SSE3+) — we advertise none
+            cpu.write_r32(2, CPUID_LEAF1_EDX); // EDX = FPU/PSE/TSC/MSR/CX8/APIC/SEP/CMOV/CLFLUSH/FXSR/SSE/SSE2 etc.
         }
         2 => {
             // Cache descriptor leaf. EAX bits 7:0 = "iterations
@@ -7305,43 +7309,43 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
             // this leaf and tolerates an all-zero descriptor set —
             // it just falls through to the deterministic-cache
             // leaf (4) or to defaults.
-            cpu.write_r32(0, 0x0000_0001);
+            cpu.write_r32(0, 0x0000_0001); // EAX
             cpu.write_r32(3, 0); // EBX
-            cpu.write_r32(2, 0); // ECX
-            cpu.write_r32(1, 0); // EDX
+            cpu.write_r32(1, 0); // ECX
+            cpu.write_r32(2, 0); // EDX
         }
         // Extended leaves.
         0x8000_0000 => {
             // Max extended leaf supported = 0x80000008 (address widths).
-            cpu.write_r32(0, 0x8000_0008);
-            cpu.write_r32(3, 0);
-            cpu.write_r32(2, 0);
-            cpu.write_r32(1, 0);
+            cpu.write_r32(0, 0x8000_0008); // EAX
+            cpu.write_r32(3, 0); // EBX
+            cpu.write_r32(1, 0); // ECX
+            cpu.write_r32(2, 0); // EDX
         }
         0x8000_0001 => {
             // Extended feature flags — long-mode and 3DNow! both off.
-            cpu.write_r32(0, 0);
-            cpu.write_r32(3, 0);
-            cpu.write_r32(2, 0);
-            cpu.write_r32(1, 0);
+            cpu.write_r32(0, 0); // EAX
+            cpu.write_r32(3, 0); // EBX
+            cpu.write_r32(1, 0); // ECX
+            cpu.write_r32(2, 0); // EDX
         }
         // Brand string: 48 bytes split across three leaves of four
         // dwords each (EAX/EBX/ECX/EDX = positions 0/4/8/12).
         0x8000_0002..=0x8000_0004 => {
             let base = ((leaf - 0x8000_0002) as usize) * 16;
-            cpu.write_r32(0, brand_dword(base));
-            cpu.write_r32(3, brand_dword(base + 4));
-            cpu.write_r32(2, brand_dword(base + 8));
-            cpu.write_r32(1, brand_dword(base + 12));
+            cpu.write_r32(0, brand_dword(base)); // EAX = chars 0..3
+            cpu.write_r32(3, brand_dword(base + 4)); // EBX = chars 4..7
+            cpu.write_r32(1, brand_dword(base + 8)); // ECX = chars 8..11
+            cpu.write_r32(2, brand_dword(base + 12)); // EDX = chars 12..15
         }
         // Leaves 0x80000005 (AMD L1 cache info) and 0x80000006 (L2
         // cache info) are zeros on Intel and AMD-on-no-cache-info.
         // Linux's parse_amd_topology gracefully handles all-zero.
         0x8000_0005..=0x8000_0007 => {
-            cpu.write_r32(0, 0);
-            cpu.write_r32(3, 0);
-            cpu.write_r32(2, 0);
-            cpu.write_r32(1, 0);
+            cpu.write_r32(0, 0); // EAX
+            cpu.write_r32(3, 0); // EBX
+            cpu.write_r32(1, 0); // ECX
+            cpu.write_r32(2, 0); // EDX
         }
         // 0x80000008 — virtual / physical address widths.
         //   EAX bits  7:0  = physical address bits   = 32
@@ -7351,10 +7355,10 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
         // CR3 / PTE / MTRR base addresses. On 32-bit non-PAE,
         // 32-bit physical is exactly right.
         0x8000_0008 => {
-            cpu.write_r32(0, 0x0000_2020);
-            cpu.write_r32(3, 0);
-            cpu.write_r32(2, 0);
-            cpu.write_r32(1, 0);
+            cpu.write_r32(0, 0x0000_2020); // EAX = phys/virt bits
+            cpu.write_r32(3, 0); // EBX
+            cpu.write_r32(1, 0); // ECX
+            cpu.write_r32(2, 0); // EDX
         }
         _ => {
             cpu.write_r32(0, 0);
