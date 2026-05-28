@@ -23,6 +23,11 @@ const OFF_VERSION: usize = 0x206; // protocol version (u16)
 const OFF_CODE32_START: usize = 0x214; // 32-bit kernel entry (u32)
 const OFF_RAMDISK_IMAGE: usize = 0x218; // ramdisk address (u32)
 const OFF_RAMDISK_SIZE: usize = 0x21C; // ramdisk size (u32)
+const OFF_RELOCATABLE_KERNEL: usize = 0x234; // u8 — non-zero = can move
+const OFF_CMDLINE_SIZE: usize = 0x238; // u32 — max command-line length
+const OFF_PAYLOAD_OFFSET: usize = 0x248; // u32 — compressed payload offset
+const OFF_PAYLOAD_LENGTH: usize = 0x24C; // u32 — compressed payload length
+const OFF_INIT_SIZE: usize = 0x260; // u32 — total RAM needed (kernel + scratch)
 
 /// Parsed view of the bzImage setup header. All fields are read
 /// directly from the image with no further interpretation — for
@@ -48,6 +53,29 @@ pub struct BzImage {
     /// File offset of the protected-mode kernel payload — i.e. the
     /// data that starts at sector `(setup_sects + 1)`.
     pub payload_offset: usize,
+    /// Non-zero if the kernel can be loaded at any address that
+    /// satisfies its alignment. When zero the loader must place
+    /// the kernel at exactly `code32_start`. Modern Linux is
+    /// always relocatable (=1). Field added in protocol 2.05.
+    pub relocatable_kernel: u8,
+    /// Maximum command-line length the kernel will accept. 2.06+.
+    /// Loaders should truncate at this size to avoid kernel-side
+    /// overflow. Zero in older images.
+    pub cmdline_size: u32,
+    /// Offset within the bzImage file of the compressed kernel
+    /// payload. Distinct from `payload_offset` (which is the
+    /// classic "first byte after setup sectors"); the v2.08+
+    /// header field at 0x248 lets the loader find the compressed
+    /// data without walking the setup sectors. Zero for pre-2.08.
+    pub compressed_offset: u32,
+    /// Length in bytes of the compressed payload. 2.08+. Lets the
+    /// loader allocate exactly that much for the source buffer.
+    pub compressed_length: u32,
+    /// Total RAM the kernel needs while decompressing — the kernel
+    /// itself plus scratch space for the decompressor. A loader
+    /// that places the kernel elsewhere (relocatable) needs this
+    /// to avoid overwriting the destination region. 2.10+.
+    pub init_size: u32,
 }
 
 #[derive(Debug)]
@@ -108,6 +136,14 @@ pub fn parse(bytes: &[u8]) -> Result<BzImage, BzImageError> {
     let ramdisk_image = read_u32(bytes, OFF_RAMDISK_IMAGE);
     let ramdisk_size = read_u32(bytes, OFF_RAMDISK_SIZE);
     let payload_offset = (setup_sects as usize + 1) * 512;
+    // v2.05+ relocatable flag; older images had reserved zero here,
+    // so a 0 read still means "not relocatable" — the correct
+    // legacy semantics.
+    let relocatable_kernel = bytes[OFF_RELOCATABLE_KERNEL];
+    let cmdline_size = read_u32(bytes, OFF_CMDLINE_SIZE);
+    let compressed_offset = read_u32(bytes, OFF_PAYLOAD_OFFSET);
+    let compressed_length = read_u32(bytes, OFF_PAYLOAD_LENGTH);
+    let init_size = read_u32(bytes, OFF_INIT_SIZE);
     Ok(BzImage {
         setup_sects,
         version,
@@ -115,6 +151,11 @@ pub fn parse(bytes: &[u8]) -> Result<BzImage, BzImageError> {
         ramdisk_image,
         ramdisk_size,
         payload_offset,
+        relocatable_kernel,
+        cmdline_size,
+        compressed_offset,
+        compressed_length,
+        init_size,
     })
 }
 
@@ -182,6 +223,43 @@ mod tests {
         let bz = parse(&bytes).expect("parse");
         assert_eq!(bz.setup_sects, 4);
         assert_eq!(bz.payload_offset, 2560);
+    }
+
+    #[test]
+    fn reads_v2_10_modern_fields() {
+        // A 2.10-shape header with the v2.05+ fields modern
+        // bootloaders consult: relocatable=1, cmdline_size=2048,
+        // compressed payload at file offset 0x800 for 0x10_0000
+        // bytes, init_size=0x0080_0000 (kernel needs 8 MiB while
+        // decompressing).
+        let mut bytes = make_bz(1, 0x0010_0000, 0x020A);
+        bytes[OFF_RELOCATABLE_KERNEL] = 1;
+        bytes[OFF_CMDLINE_SIZE..OFF_CMDLINE_SIZE + 4].copy_from_slice(&2048u32.to_le_bytes());
+        bytes[OFF_PAYLOAD_OFFSET..OFF_PAYLOAD_OFFSET + 4]
+            .copy_from_slice(&0x0000_0800u32.to_le_bytes());
+        bytes[OFF_PAYLOAD_LENGTH..OFF_PAYLOAD_LENGTH + 4]
+            .copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        bytes[OFF_INIT_SIZE..OFF_INIT_SIZE + 4].copy_from_slice(&0x0080_0000u32.to_le_bytes());
+        let bz = parse(&bytes).expect("parse");
+        assert_eq!(bz.relocatable_kernel, 1);
+        assert_eq!(bz.cmdline_size, 2048);
+        assert_eq!(bz.compressed_offset, 0x0000_0800);
+        assert_eq!(bz.compressed_length, 0x0010_0000);
+        assert_eq!(bz.init_size, 0x0080_0000);
+    }
+
+    #[test]
+    fn pre_v2_05_image_reads_modern_fields_as_zero() {
+        // An old image with these fields unset (zero) must still
+        // parse — older Linux versions reserved this region as
+        // zero, so reading it back as zero is the correct legacy
+        // semantics (relocatable=false, no payload-offset shortcut,
+        // unbounded cmdline).
+        let bz = parse(&make_bz(1, 0x0010_0000, 0x0204)).expect("parse");
+        assert_eq!(bz.relocatable_kernel, 0);
+        assert_eq!(bz.cmdline_size, 0);
+        assert_eq!(bz.compressed_offset, 0);
+        assert_eq!(bz.init_size, 0);
     }
 
     #[test]
