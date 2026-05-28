@@ -146,16 +146,29 @@ ADC/SBB-арифметика, INT 0x80 syscall, strlen через REPNE SCASB,
 spinlock через LOCK CMPXCHG + PAUSE):
 
 - **Protected mode**: CR0.PE, GDT/LDT-дескрипторы, segment cache,
-  16- и 32-битные IDT-gates, #PF с CR2 и error-code, IRET/IRETD.
-- **Paging**: CR0.PG, CR3, 2-уровневый walk PDE/PTE, A20-gate.
+  16- и 32-битные IDT-gates с раздельным IF (interrupt vs trap),
+  #PF с CR2 и полным error-code (P/W/U-S/I-D), IRET/IRETD,
+  кросс-ring INT через TSS.SS0:ESP0, кросс-ring IRETD pops
+  user SS:ESP. CS.D bit из дескриптора latched в `code_size_32`
+  — 32-bit код работает без 0x66-stuffing каждого immediate.
+- **Paging**: CR0.PG, CR3, CR0.WP (supervisor write на R/W=0
+  стрелы #PF — нужно для COW), 2-уровневый walk PDE/PTE,
+  4 MiB PSE-страницы (CR4.PSE + PDE.PS), A20-gate, demand
+  paging с rewind IP к faulting instruction (IRETD ретраит
+  тот же MOV), I/D bit на instruction-fetch faults, U/S bit
+  на CPL=3 access.
 - **32-бит**: полный EIP, операнд/адрес-префиксы 0x66/0x67, SIB,
   ESP-стек, все ALU/shift/rotate/mul/div формы, TEST/XCHG/IMUL
   (2- и 3-операндные), MOVZX/MOVSX, CMOVcc/SETcc, BT/BTS/BTR/BTC,
-  BSF/BSR/BSWAP, XADD/CMPXCHG, SHLD/SHRD, far/near jumps + Jcc rel32,
-  ENTER/LEAVE, PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
-- **Системное**: CR2/CR3/CR4, RDMSR/WRMSR (TSC/APIC/SYSENTER),
-  RDTSC, CPUID (leaf 0/1 + ext 0x80000000..4 brand string,
-  EDX-флаги отражают реальный ISA: FPU/TSC/MSR/SEP/CMOV/FXSR/SSE/SSE2),
+  BSF/BSR/BSWAP, XADD/CMPXCHG, CMPXCHG8B (64-битный CAS),
+  SHLD/SHRD, far/near jumps + Jcc rel32, ENTER/LEAVE,
+  PUSHAD/POPAD/PUSHFD/POPFD, FS/GS префиксы.
+- **Системное**: CR2/CR3/CR4, MOV DR0..7 (stub-only),
+  RDMSR/WRMSR (TSC/APIC/SYSENTER + MISC_ENABLE/BIOS_SIGN_ID/
+  TSC_AUX/PLATFORM_ID/MTRR_DEF_TYPE), RDTSC + RDTSCP (с TSC_AUX
+  в ECX) + RDPMC (stub возвращает 0). CPUID: leaf 0/1/2 + ext
+  0x80000000..4. EDX-флаги: FPU/PSE/TSC/MSR/CX8/SEP/PGE/CMOV/
+  CLFLUSH/FXSR/SSE/SSE2. EBX содержит CLFLUSH line size = 64 байт.
   SYSENTER/SYSEXIT, LLDT/LTR/SGDT/SIDT/SMSW/LMSW,
   CLTS, INVLPG, WBINVD, PAUSE, LOCK, UD2 (#UD vector 6),
   RDMSR/WRMSR на неизвестных MSR раздают #GP(0) (как rdmsr_safe),
@@ -184,13 +197,16 @@ spinlock через LOCK CMPXCHG + PAUSE):
 - **BIOS-shim**: INT 0x10 (AH=0x00 set mode / 0x01 set cursor
   shape / 0x02 set cursor / 0x03 get cursor / 0x06 scroll up /
   0x07 scroll down / 0x08 read char+attr / 0x09 char+attr / 0x0E
-  TTY / 0x0F get mode / 0x13 write string), 0x12, 0x13 (AH=0x02
-  read sectors / 0x03 write sectors / 0x00 reset / 0x01 status /
-  0x08 get drive params / 0x41 LBA ext check),
-  0x15 (AH=0x86 wait µs / AH=0x88 ext-mem / AH=0xC0 config-stub /
-  AX=0xE801 mem split / AX=0xE820), 0x16 (AH=0x00 read / 0x01
-  peek / 0x02 shift flags), 0x1A (AH=0x00 get tick / 0x01 set tick /
-  0x02 RTC time / 0x04 RTC date — BCD из CMOS).
+  TTY / 0x0F get mode / 0x12/BL=10 VGA info / 0x13 write string),
+  0x12 low-mem, 0x13 (AH=0x02 read sectors / 0x03 write sectors /
+  0x00 reset / 0x01 status / 0x08 get drive params / 0x41 LBA ext
+  check), 0x15 (AH=0x86 wait µs / AH=0x88 ext-mem / AH=0xC0
+  config-stub / AH=0x24 A20 control [0/1/2/3] / AX=0xE801 mem split /
+  AX=0xE820), 0x16 (AH=0x00 read / 0x01 peek / 0x02 shift flags),
+  0x1A (AH=0x00 get tick / 0x01 set tick / 0x02 RTC time / 0x04
+  RTC date — BCD из CMOS). Неподдерживаемые подфункции для
+  INT 0x10/0x13/0x15 возвращают CF=1 / AH=0x86 — не падают через
+  null IVT entry.
 - **IDE/ATA два канала** (primary 0x1F0..0x1F7 + control 0x3F6,
   secondary 0x170..0x177 + control 0x376): IDENTIFY DEVICE,
   READ SECTORS и WRITE SECTORS (LBA28). Alt-status и device-control
@@ -198,8 +214,13 @@ spinlock через LOCK CMPXCHG + PAUSE):
   байтовых обращений подряд — оба продвигают буфер, в обе стороны
   (read drain и write fill).
 - **Загрузка**: cold-boot из disk-sector, ELF32-loader, bzImage
-  header parser + loader. Снапшот v11 round-trip'ит всё состояние,
-  включая LAPIC и HPET scratch buffers.
+  header parser + loader, `set_kernel_cmdline` / `set_ramdisk`,
+  `start_protected_mode_at` (skip real-mode trampoline; honors
+  boot protocol §4.1: ESI=0x90000, EBP/EDI/EBX=0, IF clear,
+  ESP=0x7C00), `load_pm_demo` (bundled synthetic bzImage что
+  печатает "Hello from PM!" в UART). Снапшот v12 round-trip'ит
+  всё состояние CPU (включая code_size_32, misc_enable, tsc_aux,
+  DR0..7) + RAM + LAPIC + HPET scratch buffers + devices.
 - **PCI** (порты 0xCF8/0xCFC, Mechanism #1): пустая шина — все
   чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
   Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются

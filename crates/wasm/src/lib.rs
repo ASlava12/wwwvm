@@ -250,6 +250,21 @@ impl WwwVm {
         self.inner.cpu().idtr.limit
     }
 
+    /// Low 32 bits of the time-stamp counter. JS debuggers show
+    /// this in the register panel so users can see the VM ticking.
+    /// JS lacks a native u64; the high bits are accessible via
+    /// `get_tsc_high()` for callers that want the full 64-bit
+    /// value (rare — TSC rolls over 32-bit only after ~4 billion
+    /// CPU steps).
+    pub fn get_tsc_low(&self) -> u32 {
+        self.inner.cpu().tsc as u32
+    }
+
+    /// High 32 bits of the TSC. Usually zero in practice.
+    pub fn get_tsc_high(&self) -> u32 {
+        (self.inner.cpu().tsc >> 32) as u32
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -607,6 +622,10 @@ mod tests {
         // IDTR was never loaded — base/limit are at construction defaults.
         assert_eq!(vm.get_idtr_base(), 0);
         assert_eq!(vm.get_idtr_limit(), 0);
+        // TSC advanced past zero — at least one step per instruction.
+        assert!(vm.get_tsc_low() > 0, "TSC must advance from zero");
+        // High half is 0 unless we ran for ~4B cycles.
+        assert_eq!(vm.get_tsc_high(), 0);
     }
 
     #[test]
