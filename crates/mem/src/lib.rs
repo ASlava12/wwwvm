@@ -48,6 +48,14 @@ pub struct Memory {
     /// (0xFEE0_00B0, which is a plain scratch write here). Transient
     /// — not snapshotted, since restoring mid-IRQ is a niche case.
     pending_lapic_irq: Option<u8>,
+    /// HPET per-timer period — the low 32 bits last written to each
+    /// timer's comparator register. In periodic mode (Tn_TYPE_CNF
+    /// bit 3 set) the comparator auto-advances by this value on
+    /// every match, turning the same comparator write into both
+    /// "first match target" and "period". Index 0..3 = timers 0..2.
+    /// Zero (the default) means no auto-advance — equivalent to
+    /// one-shot. Snapshotted along with hpet[] for resume.
+    hpet_period: [u32; 3],
 }
 
 impl Memory {
@@ -95,6 +103,7 @@ impl Memory {
             lapic,
             hpet,
             pending_lapic_irq: None,
+            hpet_period: [0; 3],
         }
     }
 
@@ -157,7 +166,25 @@ impl Memory {
             return;
         }
         if Self::is_hpet(addr) {
-            self.hpet[(addr - HPET_BASE) as usize] = value;
+            let off = (addr - HPET_BASE) as usize;
+            self.hpet[off] = value;
+            // Latch per-timer period from the low dword of each
+            // timer's comparator (0x108, 0x128, 0x148, each +0..4).
+            // We snapshot after each byte so a four-byte dword
+            // write converges to the final value, regardless of the
+            // store order the kernel uses.
+            for tn in 0..3 {
+                let cmp_lo_start = 0x108 + tn * 0x20;
+                if (cmp_lo_start..cmp_lo_start + 4).contains(&off) {
+                    self.hpet_period[tn] = u32::from_le_bytes([
+                        self.hpet[cmp_lo_start],
+                        self.hpet[cmp_lo_start + 1],
+                        self.hpet[cmp_lo_start + 2],
+                        self.hpet[cmp_lo_start + 3],
+                    ]);
+                    break;
+                }
+            }
             return;
         }
         let a = addr as usize;
@@ -315,6 +342,20 @@ impl Memory {
             if svr_enabled && self.pending_lapic_irq.is_none() {
                 self.pending_lapic_irq = Some(fsb_val as u8);
             }
+            // Periodic mode (Tn_TYPE_CNF, bit 3): the comparator
+            // auto-advances by the period after each match. Real
+            // HPET has a separate VAL_SET path to write a "period-
+            // only" value; we collapse that and treat each write to
+            // the comparator low dword as setting both the absolute
+            // target and the period. This is what the kernel sees
+            // when it writes the same value twice (the canonical
+            // periodic setup); it differs from real silicon only
+            // when the kernel uses VAL_SET to set period != target.
+            let periodic = cfg_lo & (1 << 3) != 0;
+            if periodic && self.hpet_period[tn] != 0 {
+                let new_cmp = cmp.wrapping_add(self.hpet_period[tn] as u64);
+                self.hpet[cmp_off..cmp_off + 8].copy_from_slice(&new_cmp.to_le_bytes());
+            }
         }
     }
 
@@ -386,6 +427,36 @@ impl Memory {
     /// `lapic_bytes` for the timer's MMIO state.
     pub fn hpet_bytes(&self) -> &[u8] {
         &self.hpet
+    }
+
+    /// Serialize the per-timer HPET periods as 12 bytes (3 × u32 LE).
+    /// Used by the v13 snapshot path so a periodic HPET timer set up
+    /// before a snapshot still auto-advances after restore. Pre-v13
+    /// snapshots omit this section and resume with periods=0
+    /// (effectively one-shot until the kernel re-arms the comparator).
+    pub fn hpet_period_bytes(&self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        for (i, p) in self.hpet_period.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+        }
+        out
+    }
+
+    /// Inverse of `hpet_period_bytes` — restore the per-timer periods
+    /// from a 12-byte buffer.
+    pub fn restore_hpet_period(&mut self, data: &[u8]) -> Result<(), usize> {
+        if data.len() != 12 {
+            return Err(12);
+        }
+        for i in 0..3 {
+            self.hpet_period[i] = u32::from_le_bytes([
+                data[i * 4],
+                data[i * 4 + 1],
+                data[i * 4 + 2],
+                data[i * 4 + 3],
+            ]);
+        }
+        Ok(())
     }
 
     pub fn restore_hpet(&mut self, data: &[u8]) -> Result<(), usize> {

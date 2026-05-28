@@ -1483,6 +1483,68 @@ fn hpet_timer_fsb_delivery_fires_irq_through_idt() {
     );
 }
 
+/// HPET periodic mode (Tn_TYPE_CNF, bit 3): the comparator
+/// auto-advances by the latched period after each match, so the
+/// timer keeps firing on a fixed cadence rather than going silent
+/// after one shot. Linux's HPET tick driver depends on this —
+/// without it the kernel would see exactly one tick and stall.
+#[test]
+fn hpet_timer_periodic_mode_fires_multiple_times() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+
+    // Kernel: same shape as the FSB-delivery one-shot test, plus
+    // bit 3 (TYPE_CNF) in the timer config to put it in periodic
+    // mode. Comparator = 8 → first match at counter==8; period
+    // latched on the comparator write = 8, so subsequent matches
+    // at 16, 24, 32, …
+    let kernel: &[u8] = &[
+        // IDT[0x42] at idt_base + 0x42*8 = 0x1210.
+        0xC7, 0x05, 0x10, 0x12, 0x00, 0x00, 0x00, 0x09, 0x08, 0x00, //
+        0xC7, 0x05, 0x14, 0x12, 0x00, 0x00, 0x00, 0x8E, 0x00, 0x00, //
+        // Pseudo-desc + LIDT.
+        0xC7, 0x05, 0x00, 0x06, 0x00, 0x00, 0xFF, 0x07, 0x00, 0x10, //
+        0xC7, 0x05, 0x04, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x0F, 0x01, 0x1D, 0x00, 0x06, 0x00, 0x00, //
+        // HPET Timer 0 Config = (1<<2)|(1<<3)|(1<<14) = 0x400C.
+        //   bit 2 INT_ENB, bit 3 TYPE (periodic), bit 14 FSB_EN.
+        0xC7, 0x05, 0x00, 0x01, 0xD0, 0xFE, 0x0C, 0x40, 0x00, 0x00, //
+        // HPET Timer 0 Comparator (low) = 8.
+        0xC7, 0x05, 0x08, 0x01, 0xD0, 0xFE, 0x08, 0x00, 0x00, 0x00, //
+        // HPET Timer 0 FSB Route low = 0x42 (vector).
+        0xC7, 0x05, 0x10, 0x01, 0xD0, 0xFE, 0x42, 0x00, 0x00, 0x00, //
+        // HPET General Configuration = 1 (ENABLE_CNF).
+        0xC7, 0x05, 0x10, 0x00, 0xD0, 0xFE, 0x01, 0x00, 0x00, 0x00, //
+        // STI.
+        0xFB, //
+        // Loop: CMP byte [0x900], 4; JB -7; HLT.
+        0x80, 0x3D, 0x00, 0x09, 0x00, 0x00, 0x04, //
+        0x72, 0xF7, //
+        0xF4,
+    ];
+    bz.extend_from_slice(kernel);
+
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    // Handler at 0x0900: INC byte [0x900]; IRETD.
+    vm.mem
+        .write_slice(0x0900, &[0xFE, 0x05, 0x00, 0x09, 0x00, 0x00, 0xCF]);
+
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+    vm.run_steps(8_000);
+
+    assert!(vm.is_halted(), "kernel didn't reach HLT after 4 ticks");
+    assert!(
+        vm.mem().read_u8(0x900) >= 4,
+        "expected ≥4 periodic ticks, got {}",
+        vm.mem().read_u8(0x900)
+    );
+}
+
 /// HPET Main Counter (0xFED0_00F0) ticks once per CPU step when
 /// General Configuration's ENABLE_CNF (0xFED0_0010 bit 0) is
 /// set, and freezes otherwise. Linux uses HPET as a wall-clock

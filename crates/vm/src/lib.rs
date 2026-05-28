@@ -823,13 +823,22 @@ pub mod snapshot {
     ///   this every Cpu field that survives reset is covered by
     ///   the snapshot; pre-v12 snapshots leave the new fields at
     ///   `Cpu::new()` defaults.
-    pub const VERSION: u8 = 12;
+    /// * v13 — appends 12 bytes of HPET per-timer period state
+    ///   (`Memory::hpet_period_bytes`) right after the v11 HPET MMIO
+    ///   buffer. Needed so a periodic-mode HPET timer set up before
+    ///   a snapshot still auto-advances on restore; pre-v13
+    ///   snapshots resume with periods=0 (one-shot until the kernel
+    ///   re-arms the comparator).
+    pub const VERSION: u8 = 13;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
     pub const LAPIC_LEN: usize = 4096;
     /// Bytes the v11 HPET section adds past the LAPIC region.
     pub const HPET_LEN: usize = 1024;
+    /// Bytes the v13 HPET-period extension adds past the v11 HPET
+    /// buffer: 3 timers × u32 LE = 12 bytes.
+    pub const HPET_PERIOD_LEN: usize = 12;
     /// Bytes consumed by header: magic + version + flags + reserved.
     pub const HEADER_LEN: usize = 16;
     /// Bytes consumed by the v1/v2 CPU image — 8 r16 + 6 sreg + ip +
@@ -1102,6 +1111,11 @@ impl Vm {
         // v11 HPET scratch window (1 KiB) follows the LAPIC.
         buf.extend_from_slice(self.mem.hpet_bytes());
 
+        // v13 HPET per-timer period (12 bytes) — software state that
+        // backs periodic-mode comparator auto-advance, kept outside
+        // the MMIO buffer so the guest can't read or clobber it.
+        buf.extend_from_slice(&self.mem.hpet_period_bytes());
+
         // Devices (v2-style length-prefixed records — see IoBus::snapshot).
         let dev = self.io.snapshot();
         let dev_len = dev.len() as u32;
@@ -1127,11 +1141,13 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=12) {
+        if !matches!(version, 1..=13) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            12 => snapshot::CPU_V12_LEN,
+            // v13 doesn't extend the CPU image — it appends HPET
+            // period state past the v11 HPET MMIO buffer.
+            12..=13 => snapshot::CPU_V12_LEN,
             // v10/v11 don't extend the CPU image — they append MMIO
             // sections (LAPIC, then HPET) between RAM and the device
             // blob.
@@ -1384,7 +1400,27 @@ impl Vm {
                     expected,
                     actual: snapshot::HPET_LEN,
                 })?;
-            lapic_end + snapshot::HPET_LEN
+            let hpet_end = lapic_end + snapshot::HPET_LEN;
+            // v13 HPET period extension. Pre-v13 snapshots leave the
+            // periods at zero, which degrades a periodic-mode timer
+            // to one-shot until the kernel re-writes the comparator.
+            if version >= 13 {
+                if bytes.len() < hpet_end + snapshot::HPET_PERIOD_LEN {
+                    return Err(SnapshotError::TooSmall {
+                        got: bytes.len(),
+                        need: hpet_end + snapshot::HPET_PERIOD_LEN,
+                    });
+                }
+                self.mem
+                    .restore_hpet_period(&bytes[hpet_end..hpet_end + snapshot::HPET_PERIOD_LEN])
+                    .map_err(|expected| SnapshotError::MemorySizeMismatch {
+                        expected,
+                        actual: snapshot::HPET_PERIOD_LEN,
+                    })?;
+                hpet_end + snapshot::HPET_PERIOD_LEN
+            } else {
+                hpet_end
+            }
         } else {
             lapic_end
         };
