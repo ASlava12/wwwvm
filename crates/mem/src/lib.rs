@@ -698,6 +698,34 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// HPET timer with INT_ENB_CNF (bit 2) clear must NOT fire an
+    /// IRQ when the comparator matches. Same setup as the
+    /// auto-advance test above but with bit 2 cleared. Pins the
+    /// `cfg_lo & ((1 << 2) | (1 << 14)) != (1 << 2) | (1 << 14)`
+    /// continue branch — a regression that dropped the bit-2
+    /// check would have made every comparator-matching tick
+    /// queue an IRQ even on disabled timers.
+    #[test]
+    fn tick_hpet_disabled_timer_does_not_fire_irq_on_comparator_match() {
+        let mut m = Memory::new(64);
+        m.write_u32(HPET_BASE + 0x10, 1); // HPET main enable
+                                          // Timer 0: bit 14 set (FSB_EN), but bit 2 (INT_ENB) clear.
+                                          // The kernel programs this transient state when it changes
+                                          // the FSB route mid-config; the timer must NOT fire until
+                                          // bit 2 lands.
+        m.write_u32(HPET_BASE + 0x100, 1 << 14);
+        m.write_u32(HPET_BASE + 0x108, 5);
+        m.write_u32(HPET_BASE + 0x110, 0x0000_0042);
+        for _ in 0..5 {
+            m.tick_hpet_counter();
+        }
+        assert_eq!(m.read_u32(HPET_BASE + 0xF0), 5, "counter still ticks");
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "disabled-timer match must not queue an IRQ"
+        );
+    }
+
     #[test]
     fn restore_full_rejects_size_mismatch() {
         let mut m = Memory::new(16);
