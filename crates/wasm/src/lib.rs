@@ -196,6 +196,21 @@ impl WwwVm {
         }
     }
 
+    /// Read a segment-register selector by standard x86 sreg index:
+    ///   0 ES, 1 CS, 2 SS, 3 DS, 4 FS, 5 GS. Anything else returns 0.
+    /// A JS debugger panel pairs this with `read_control_register(0)`
+    /// to show "PE+CS RPL = current CPL". The selector's hidden
+    /// descriptor cache (base / limit / access) isn't surfaced — JS
+    /// callers walking the GDT can resolve descriptors themselves
+    /// via `read_mem_u32`.
+    pub fn read_segment_selector(&self, idx: u8) -> u16 {
+        let cpu = self.inner.cpu();
+        if idx >= 6 {
+            return 0;
+        }
+        cpu.sregs[idx as usize]
+    }
+
     /// Snapshot the VGA text-mode buffer as 25 newline-separated rows
     /// of 80 ASCII characters. Attribute bytes are dropped. Useful
     /// for rendering the guest's text-mode display alongside the
@@ -518,6 +533,16 @@ mod tests {
         // CR1 / CR5+ are reserved/unmodelled — return 0.
         assert_eq!(vm.read_control_register(1), 0);
         assert_eq!(vm.read_control_register(7), 0);
+        // Segment selectors. start_protected_mode_at sets CS=0x08
+        // (ring-0 code) and DS/ES/FS/GS/SS=0x10 (ring-0 data).
+        assert_eq!(vm.read_segment_selector(1), 0x08, "CS");
+        assert_eq!(vm.read_segment_selector(0), 0x10, "ES");
+        assert_eq!(vm.read_segment_selector(2), 0x10, "SS");
+        assert_eq!(vm.read_segment_selector(3), 0x10, "DS");
+        assert_eq!(vm.read_segment_selector(4), 0x10, "FS");
+        assert_eq!(vm.read_segment_selector(5), 0x10, "GS");
+        // Out-of-range index returns 0 (no panic).
+        assert_eq!(vm.read_segment_selector(42), 0);
     }
 
     #[test]
