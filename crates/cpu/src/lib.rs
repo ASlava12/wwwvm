@@ -2466,6 +2466,17 @@ impl Cpu {
         match opcode {
             0x90 => { /* NOP */ }
             0xF4 => {
+                // HLT is a CPL=0 instruction. From ring 3 (or any
+                // ring with non-zero RPL on the current CS in PE
+                // mode) it must raise #GP(0) — the kernel's
+                // user-space oops handler catches that and reports
+                // "general protection in user code" rather than
+                // letting the guest wedge the CPU.
+                if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) != 0 {
+                    self.ip = op_ip;
+                    self.do_interrupt_with_error(13, Some(0), mem);
+                    return Ok(());
+                }
                 self.halted = true;
             }
             0xFA => {

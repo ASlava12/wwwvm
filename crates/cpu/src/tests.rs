@@ -4148,6 +4148,63 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
     assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
 }
 
+/// HLT from CPL=3 raises #GP(0) instead of halting the CPU. The
+/// fault uses the same cross-ring entry path as INT-from-ring-3:
+/// land on the kernel stack via TSS, push the user frame, then
+/// continue in the #GP handler. Real silicon does this so a
+/// userspace HLT becomes a SIGSEGV rather than wedging the CPU.
+#[test]
+fn hlt_in_ring_3_raises_gp_via_cross_ring_entry() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00,
+        0x00, 0x00, 0x92, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000); // TSS.ESP0
+    mem.write_u16(0x4008, 0x0010); // TSS.SS0
+                                   // IDT[13] = #GP gate. 32-bit interrupt gate to ring-0 code,
+                                   // DPL=3 so a fault from ring 3 reaches it.
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    mem.write_u8(0x8000, 0xF4); // user-mode HLT
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step HLT");
+
+    assert!(!cpu.halted, "HLT must not have committed");
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.sregs[sreg::SS], 0x0010);
+    assert_eq!(cpu.ip, 0x9000);
+    // Six 32-bit pushes (SS, ESP, FLAGS, CS, IP, EC) — note this
+    // is *one more* than the INT case because #GP carries an
+    // error code.
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x3000 - 24);
+    assert_eq!(mem.read_u32(0x3000 - 4), 0x23);
+    assert_eq!(mem.read_u32(0x3000 - 8), 0x2000);
+    assert_eq!(mem.read_u32(0x3000 - 16), 0x1B);
+    // Saved IP names the *start* of HLT — fault, not trap.
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+    assert_eq!(mem.read_u32(0x3000 - 24), 0);
+}
+
 /// Cross-ring entry: an INT from CPL=3 lands on the kernel stack
 /// via TSS.SS0:ESP0 and pushes the full five-dword frame (SS_user,
 /// ESP_user, FLAGS, CS_user, IP_user). This is the kernel-entry
