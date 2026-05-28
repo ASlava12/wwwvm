@@ -2837,6 +2837,85 @@ fn sse_comisd_sets_ordering_flags() {
     assert_eq!(compare(f64::NAN, 1.0), (true, true, true));
 }
 
+/// Packed SQRTPS then MINPS: sqrt four lanes, then clamp each to a
+/// per-lane ceiling. Confirms the unary (SQRT) and binary (MIN)
+/// packed-float paths and the x86 MIN tie rule.
+#[test]
+fn sse_sqrtps_then_minps() {
+    let mut mem = Memory::new(0x10_0000);
+    let a = [4.0f32, 9.0, 16.0, 25.0]; // sqrt → [2,3,4,5]
+    let lim = [3.0f32, 3.0, 3.0, 3.0];
+    for i in 0..4u32 {
+        mem.write_u32(0x600 + i * 4, a[i as usize].to_bits());
+        mem.write_u32(0x610 + i * 4, lim[i as usize].to_bits());
+    }
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x0F, 0x10, 0x06, 0x00, 0x06, // MOVUPS XMM0, [0x600]
+            0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVUPS XMM1, [0x610]
+            0x0F, 0x51, 0xC0, // SQRTPS XMM0, XMM0  → [2,3,4,5]
+            0x0F, 0x5D, 0xC1, // MINPS  XMM0, XMM1  → [2,3,3,3]
+            0x0F, 0x11, 0x06, 0x20, 0x06, // MOVUPS [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    let want = [2.0f32, 3.0, 3.0, 3.0];
+    for i in 0..4u32 {
+        assert_eq!(
+            f32::from_bits(mem.read_u32(0x620 + i * 4)),
+            want[i as usize]
+        );
+    }
+}
+
+/// Scalar SQRTSS then MINSS via the F3 prefix: only the low lane is
+/// touched, the upper three lanes survive untouched.
+#[test]
+fn sse_sqrtss_minss_scalar_preserves_upper() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 25.0f32.to_bits());
+    mem.write_u32(0x604, 0xAAAA_AAAA);
+    mem.write_u32(0x608, 0xBBBB_BBBB);
+    mem.write_u32(0x60C, 0xCCCC_CCCC);
+    mem.write_u32(0x610, 3.0f32.to_bits());
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0xF3, 0x0F, 0x10, 0x0E, 0x10, 0x06, // MOVSS XMM1, [0x610]
+            0xF3, 0x0F, 0x51, 0xC0, // SQRTSS XMM0, XMM0 → low=5.0
+            0xF3, 0x0F, 0x5D, 0xC1, // MINSS  XMM0, XMM1 → low=3.0
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(f32::from_bits(mem.read_u32(0x620)), 3.0);
+    assert_eq!(mem.read_u32(0x624), 0xAAAA_AAAA);
+    assert_eq!(mem.read_u32(0x628), 0xBBBB_BBBB);
+    assert_eq!(mem.read_u32(0x62C), 0xCCCC_CCCC);
+}
+
 /// SSE PXOR xmm, xmm — the canonical "zero an XMM register" idiom.
 #[test]
 fn sse_pxor_self_zeroes_register() {

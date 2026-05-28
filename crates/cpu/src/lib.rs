@@ -781,6 +781,32 @@ impl Cpu {
                         (self.xmm[reg as usize] & !LO64) | (r.to_bits() as u128);
                 }
             }
+            // Scalar MIN/MAX (5D/5F) and SQRT (51) — low lane only,
+            // upper bits preserved. SQRT is unary (source = rm).
+            0x51 | 0x5D | 0x5F => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let a = f32::from_bits(self.xmm[reg as usize] as u32);
+                    let b = f32::from_bits(self.read_xmm_rm32(rm, mem));
+                    let r = match op2 {
+                        0x51 => b.sqrt(),
+                        0x5D => fmin_max_f32(a, b, true),
+                        _ => fmin_max_f32(a, b, false),
+                    };
+                    self.xmm[reg as usize] =
+                        (self.xmm[reg as usize] & !LO32) | (r.to_bits() as u128);
+                } else {
+                    let a = f64::from_bits(self.xmm[reg as usize] as u64);
+                    let b = f64::from_bits(self.read_xmm_rm64(rm, mem));
+                    let r = match op2 {
+                        0x51 => b.sqrt(),
+                        0x5D => fmin_max(a, b, true),
+                        _ => fmin_max(a, b, false),
+                    };
+                    self.xmm[reg as usize] =
+                        (self.xmm[reg as usize] & !LO64) | (r.to_bits() as u128);
+                }
+            }
             // CVTSI2SS / CVTSI2SD — signed int32 (GP r/m32) → scalar
             // float in the low lane of the XMM dest, upper bits kept.
             //   F3 0F 2A  CVTSI2SS    F2 0F 2A  CVTSI2SD
@@ -4539,6 +4565,33 @@ impl Cpu {
                             }
                         };
                     }
+                    // Packed MIN/MAX (0F 5D / 0F 5F) — per-lane, with
+                    // x86's exact tie/NaN rule: MIN returns the second
+                    // operand unless the first is strictly less (so a
+                    // NaN or equal lane yields the source). 0x66 → PD.
+                    0x5D | 0x5F => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let a = self.xmm[reg as usize];
+                        let is_min = op2 == 0x5D;
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            packed_f64(a, b, |x, y| fmin_max(x, y, is_min))
+                        } else {
+                            packed_f32(a, b, |x, y| fmin_max_f32(x, y, is_min))
+                        };
+                    }
+                    // Packed SQRT (0F 51) — unary; each lane of the
+                    // source is square-rooted into the destination.
+                    // 0x66 → SQRTPD.
+                    0x51 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = if self.op_size_32 {
+                            packed_f64(s, s, |x, _| x.sqrt())
+                        } else {
+                            packed_f32(s, s, |x, _| x.sqrt())
+                        };
+                    }
 
                     // CMOVcc r16/32, r/m16/32 — 0x0F 0x40..0x4F.
                     // Conditional move: writes the source operand
@@ -5323,6 +5376,40 @@ fn comis_flags(ord: Option<std::cmp::Ordering>) -> (bool, bool, bool) {
         Some(Greater) => (false, false, false), // a > b
         Some(Less) => (false, false, true),     // a < b
         Some(Equal) => (true, false, false),    // a == b
+    }
+}
+
+/// x86 MIN/MAX lane rule for f64: `MIN` returns the source (`b`)
+/// unless the destination (`a`) is strictly less; `MAX` returns `b`
+/// unless `a` is strictly greater. This deliberately differs from
+/// `f64::min/max` — a NaN operand or an equal compare yields `b`,
+/// matching MINPD/MAXPD exactly.
+fn fmin_max(a: f64, b: f64, is_min: bool) -> f64 {
+    if is_min {
+        if a < b {
+            a
+        } else {
+            b
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Single-precision counterpart of [`fmin_max`] — MINPS/MAXPS.
+fn fmin_max_f32(a: f32, b: f32, is_min: bool) -> f32 {
+    if is_min {
+        if a < b {
+            a
+        } else {
+            b
+        }
+    } else if a > b {
+        a
+    } else {
+        b
     }
 }
 
