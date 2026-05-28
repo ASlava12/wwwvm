@@ -4053,25 +4053,44 @@ impl Cpu {
                 }
             }
 
+            // Port-IO instructions (IN / OUT, byte and word/dword
+            // forms, imm8 and DX-port variants) are all IOPL-
+            // sensitive. We don't model the per-port permission
+            // bitmap in TSS yet — just the coarse `CPL <= IOPL`
+            // check covers the common "user can't touch hardware"
+            // case (real silicon would additionally consult the
+            // bitmap when CPL > IOPL).
             0xEC => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // IN AL, DX
                 let port = self.regs[r16::DX];
                 let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xEE => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // OUT DX, AL
                 let port = self.regs[r16::DX];
                 let v = self.read_r8(0);
                 self.port_write(io, port, v);
             }
             0xE4 => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // IN AL, imm8
                 let port = self.fetch_u8(mem) as u16;
                 let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xE5 => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // IN AX/EAX, imm8 — two/four byte reads from
                 // consecutive ports. The 0x66 prefix widens to EAX
                 // (four bytes from port..port+3).
@@ -4086,12 +4105,18 @@ impl Cpu {
                 }
             }
             0xE6 => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // OUT imm8, AL
                 let port = self.fetch_u8(mem) as u16;
                 let v = self.read_r8(0);
                 self.port_write(io, port, v);
             }
             0xE7 => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // OUT imm8, AX/EAX — two/four byte writes to
                 // consecutive ports (0x66 → 32-bit form).
                 let port = self.fetch_u8(mem) as u16;
@@ -4105,6 +4130,9 @@ impl Cpu {
                 }
             }
             0xED => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // IN AX/EAX, DX
                 let port = self.regs[r16::DX];
                 if self.op_size_32 {
@@ -4117,6 +4145,9 @@ impl Cpu {
                 }
             }
             0xEF => {
+                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                    return Ok(());
+                }
                 // OUT DX, AX/EAX
                 let port = self.regs[r16::DX];
                 if self.op_size_32 {

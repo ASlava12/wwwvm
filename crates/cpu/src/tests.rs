@@ -4148,6 +4148,54 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
     assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
 }
 
+/// `IN AL, 0x60` from CPL=3 with IOPL=0 raises #GP via the same
+/// `raise_gp_if_below_iopl` path as CLI/STI. We only check the
+/// fault branch here; the positive branch (CPL ≤ IOPL) is exercised
+/// by the CLI test, since both arms share the helper.
+#[test]
+fn in_al_from_ring_3_with_iopl_zero_faults() {
+    let mut mem = Memory::new(0x10_0000);
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, // null
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF,
+        0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xF2,
+        0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+    ];
+    mem.write_slice(0x500, &gdt);
+    mem.write_u32(0x4004, 0x3000);
+    mem.write_u16(0x4008, 0x0010);
+    mem.write_slice(
+        0x6000 + 13 * 8,
+        &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+    );
+    // User-mode `IN AL, 0x60` — read the PS/2 data port. Without
+    // the guard this would read whatever the keyboard emulator
+    // returned; with it, the instruction faults at its first byte.
+    mem.write_slice(0x8000, &[0xE4, 0x60]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.idtr.base = 0x6000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem);
+    cpu.write_sreg(sreg::SS, 0x0023, &mem);
+    cpu.write_r32(r16::SP as u8, 0x2000);
+    cpu.ip = 0x8000;
+    cpu.flags = 0x0202; // IF set, IOPL=0
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step IN");
+
+    assert_eq!(cpu.sregs[sreg::CS], 0x0008);
+    assert_eq!(cpu.ip, 0x9000);
+    assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
+    assert_eq!(mem.read_u32(0x3000 - 24), 0);
+}
+
 /// CLI in CPL=3 fires #GP iff IOPL < CPL. Same setup pattern as
 /// the HLT-from-ring-3 test, run with two IOPL values back-to-back:
 /// IOPL=0 must fault; IOPL=3 lifts the guard and CLI commits.

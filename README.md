@@ -127,7 +127,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**416 тестов** зелёные (mem 11 + devices 45 + cpu 271 + vm 81 +
+**417 тестов** зелёные (mem 11 + devices 45 + cpu 272 + vm 81 +
 tutorial-anchor 2 + wasm 1 + proxy 5). Снапшот v11.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -226,7 +226,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 | MMX-стек (mm0..mm7, EMMS, packed-int MMX-only), помарки в SSE3+ (HADDPS/HADDPD, MOVDDUP, LDDQU) | средний | SSE2 готов в практическом смысле; Alpine ≥3.x линкуется именно с ним. MMX совершенно отдельный регистровый стек — линукс почти не пользуется в современном коде |
 | Real-mode setup execution (~16 KiB Linux boot-ASM) | очень большой | bzImage сам делает PE-переход — нужно выполнить его setup-код |
 | Kernel decompression (gzip/zstd) | средний | bzImage payload сжат; либо распаковывать, либо грузить vmlinux |
-| Ring 3 + полноценный TSS + privilege transitions | средний | Обе половины ring-3 round-trip работают: вход (INT из ring 3 переключает стек на TSS.SS0:ESP0 и кладёт пять-dword фрейм) и возврат (IRET с popped CS RPL > CPL тянет SS:ESP обратно). HLT/CLI/STI из CPL>IOPL раздают #GP(0). Остаётся: IN/OUT проверки IOPL + IO permission bitmap, SYSENTER-side TSS lookup |
+| Ring 3 + полноценный TSS + privilege transitions | средний | Обе половины ring-3 round-trip работают: вход (INT из ring 3 переключает стек на TSS.SS0:ESP0 и кладёт пять-dword фрейм) и возврат (IRET с popped CS RPL > CPL тянет SS:ESP обратно). HLT/CLI/STI и IN/OUT из CPL>IOPL раздают #GP(0). Остаётся: per-port IO permission bitmap в TSS, SYSENTER-side TSS lookup |
 | Полный #GP (из проверок прав сегментов, нулевых селекторов, ring transitions), плюс #DF/#NP/#SS | средний | #DE, #UD, #PF и существенный кусок #GP уже доезжают; остался #GP из ring transitions и #DF/#NP/#SS |
 | IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
 | APIC/HPET/реалистичный PIT-тайминг | средний | Расписание и таймеры ядра |
@@ -245,7 +245,7 @@ spinlock через LOCK CMPXCHG + PAUSE):
 cargo test --workspace
 ```
 
-Должно вывести 416 пройденных тестов на текущий момент. CI
+Должно вывести 417 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
