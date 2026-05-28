@@ -97,10 +97,34 @@ fn main() {
             Err(e) => eprintln!("initrd read {path}: {e}"),
         }
     } else if env::var_os("WWWVM_INITRD_BUILTIN").is_some() {
-        let cpio = build_builtin_initramfs();
+        // Optional pre-loaded input bytes: WWWVM_INIT_INPUT="X" makes
+        // the builtin /init read one byte from fd 0 first, prepend
+        // "echo " to it, then write it back. The example pushes that
+        // byte to the UART rx queue before boot so the kernel
+        // buffers it; once serial8250 enables IER bit 0 (RDA IRQ),
+        // our `irq_pending` flips, the kernel drains rx into the tty
+        // line discipline, and /init's `read(0, …)` returns it.
+        // Demonstrates the *full* bidirectional userspace path —
+        // RDA IRQ + THRE IRQ + cross-ring transitions, all wired up.
+        let echo_byte = env::var("WWWVM_INIT_INPUT")
+            .ok()
+            .and_then(|s| s.bytes().next());
+        let cpio = build_builtin_initramfs(echo_byte.is_some());
         match vm.set_ramdisk(&cpio) {
-            Ok(()) => println!("loaded builtin initrd: {} bytes", cpio.len()),
+            Ok(()) => println!(
+                "loaded builtin initrd: {} bytes ({})",
+                cpio.len(),
+                if echo_byte.is_some() {
+                    "echo mode"
+                } else {
+                    "hello mode"
+                }
+            ),
             Err(e) => eprintln!("set_ramdisk: {e:?}"),
+        }
+        if let Some(b) = echo_byte {
+            vm.send_input(&[b]);
+            println!("pushed {b:#04X} to UART rx queue");
         }
     }
 
@@ -699,34 +723,79 @@ fn main() {
 /// `console_on_rootfs` opens to seed PID 1's stdin/stdout/stderr).
 /// Threading this into the example removes the off-tree setup
 /// step from the reproduction recipe.
-fn build_builtin_initramfs() -> Vec<u8> {
+fn build_builtin_initramfs(echo_mode: bool) -> Vec<u8> {
     const LOAD_ADDR: u32 = 0x0804_8000;
     const ELF_HEADER_LEN: u32 = 52;
     const PHDR_LEN: u32 = 32;
     const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
-    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
-    let msg_len = msg.len() as u32;
+    // In hello mode the body is one message; in echo mode it's a
+    // "echo " prefix that gets written *before* the read, then the
+    // one byte read from stdin gets written after. Layout:
+    //   [code] [prefix bytes] [scratch byte for read]
+    let prefix: &[u8] = if echo_mode {
+        b"echo "
+    } else {
+        b"HELLO FROM USERSPACE\n"
+    };
+    let prefix_len = prefix.len() as u32;
 
-    // Build the code twice — once with a placeholder for msg_addr
-    // so we can measure code_len, then once with the real address.
-    let build_code = |msg_addr: u32| -> Vec<u8> {
-        let mut out = Vec::with_capacity(33);
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (sys_write)
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
-        out.push(0xB9); // mov ecx, imm32
-        out.extend_from_slice(&msg_addr.to_le_bytes());
-        out.extend_from_slice(&[0xBA]); // mov edx, imm32
-        out.extend_from_slice(&msg_len.to_le_bytes());
+    // Build the code twice — once with a placeholder for the data
+    // addresses so we can measure code_len, then once with the real
+    // addresses resolved.
+    let build_code = |prefix_addr: u32, read_buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(80);
+        // write(1, prefix, prefix_len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9); // mov ecx, prefix
+        out.extend_from_slice(&prefix_addr.to_le_bytes());
+        out.push(0xBA); // mov edx, prefix_len
+        out.extend_from_slice(&prefix_len.to_le_bytes());
         out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
-        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1 (sys_exit)
+        if echo_mode {
+            // read(0, read_buf, 1)
+            out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3 (sys_read)
+            out.extend_from_slice(&[0xBB, 0x00, 0x00, 0x00, 0x00]); // mov ebx, 0 (stdin)
+            out.push(0xB9); // mov ecx, read_buf
+            out.extend_from_slice(&read_buf_addr.to_le_bytes());
+            out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+            out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+                                                  // write(1, read_buf, 1)
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9); // mov ecx, read_buf
+            out.extend_from_slice(&read_buf_addr.to_le_bytes());
+            out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+            out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+                                                  // write(1, "\n", 1) — reuse a fixed newline at read_buf+1
+                                                  // (we'll leave a 0x0A in the data area immediately after
+                                                  // the read buffer).
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9); // mov ecx, read_buf+1 (newline)
+            out.extend_from_slice(&(read_buf_addr + 1).to_le_bytes());
+            out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+            out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+        }
+        // exit(42)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
         out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]); // mov ebx, 42
         out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
         out
     };
-    let code_len = build_code(0).len() as u32;
-    let msg_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
-    let mut body = build_code(msg_addr);
-    body.extend_from_slice(msg);
+    let code_len = build_code(0, 0).len() as u32;
+    let prefix_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
+    let read_buf_addr = prefix_addr + prefix_len;
+    let mut body = build_code(prefix_addr, read_buf_addr);
+    body.extend_from_slice(prefix);
+    if echo_mode {
+        // Two-byte data slot: [read_buf | newline]. We leave the
+        // first byte zero (the read overwrites it) and put 0x0A in
+        // the second byte so /init can use it for the trailing
+        // newline write without another data segment.
+        body.push(0x00);
+        body.push(b'\n');
+    }
     let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
 
     // ELF32 header.
