@@ -7286,10 +7286,15 @@ fn cpuid_dispatch(cpu: &mut Cpu) {
         // register name in the comment.
         0 => {
             cpu.write_r32(0, 2); // EAX = max basic leaf = 2 (cache descriptors)
-                                 // Vendor string "WWWVMxRust  " in EBX:EDX:ECX.
-            cpu.write_r32(3, u32::from_le_bytes(*b"WWWV")); // EBX = chars 0..3
-            cpu.write_r32(2, u32::from_le_bytes(*b"MxRu")); // EDX = chars 4..7
-            cpu.write_r32(1, u32::from_le_bytes(*b"st  ")); // ECX = chars 8..11
+                                 // Vendor string. We pretend to be "GenuineIntel" so
+                                 // Linux's vendor-specific early init runs and populates
+                                 // boot_cpu_data with full feature flags instead of the
+                                 // conservative "unknown vendor" path which clears FPU
+                                 // (and most caps) before fpu init runs. Layout per Intel
+                                 // SDM: EBX = "Genu", EDX = "ineI", ECX = "ntel".
+            cpu.write_r32(3, u32::from_le_bytes(*b"Genu")); // EBX = chars 0..3
+            cpu.write_r32(2, u32::from_le_bytes(*b"ineI")); // EDX = chars 4..7
+            cpu.write_r32(1, u32::from_le_bytes(*b"ntel")); // ECX = chars 8..11
         }
         1 => {
             // Family 6, model 6, stepping 4 — a generic Pentium-Pro

@@ -8189,9 +8189,10 @@ fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {
     assert_eq!(cpu.read_r32(0), 2); // EAX (idx 0)
                                     // Vendor string in Intel's CPUID return-order EBX:EDX:ECX.
                                     // Our r32 indices: EAX=0, ECX=1, EDX=2, EBX=3.
-    assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"WWWV")); // EBX
-    assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"MxRu")); // EDX
-    assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"st  ")); // ECX
+                                    // We pretend to be GenuineIntel so Linux's vendor-init runs.
+    assert_eq!(cpu.read_r32(3), u32::from_le_bytes(*b"Genu")); // EBX
+    assert_eq!(cpu.read_r32(2), u32::from_le_bytes(*b"ineI")); // EDX
+    assert_eq!(cpu.read_r32(1), u32::from_le_bytes(*b"ntel")); // ECX
 }
 
 /// CPUID leaf 2 — cache descriptors. Returns EAX bits 7:0 = 0x01
