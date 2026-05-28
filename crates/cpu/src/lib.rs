@@ -4837,11 +4837,24 @@ impl Cpu {
                     // CR0 (bit 3). Used by FPU context-switch code.
                     0x06 => self.cr0 &= !(1 << 3),
                     // INVD — 0x0F 0x08. Invalidate internal caches
-                    // without write-back. We don't model caches at
-                    // all, so it's a no-op.
-                    0x08 => {}
-                    // WBINVD — 0x0F 0x09. Same with write-back.
-                    0x09 => {}
+                    // without write-back. CPL=0 only — from ring 3
+                    // raise #GP(0) per the Intel SDM. We don't model
+                    // caches, so the privileged form is a no-op.
+                    0x08 => {
+                        if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) != 0 {
+                            self.ip = op_ip;
+                            self.do_interrupt_with_error(13, Some(0), mem);
+                            return Ok(());
+                        }
+                    }
+                    // WBINVD — 0x0F 0x09. Same privilege rule as INVD.
+                    0x09 => {
+                        if self.cr0 & 1 != 0 && (self.sregs[sreg::CS] & 3) != 0 {
+                            self.ip = op_ip;
+                            self.do_interrupt_with_error(13, Some(0), mem);
+                            return Ok(());
+                        }
+                    }
                     // RDTSC — 0x0F 0x31. Returns the time-stamp
                     // counter (low 32 bits in EAX, high 32 in EDX).
                     // We use the step counter — monotonically
