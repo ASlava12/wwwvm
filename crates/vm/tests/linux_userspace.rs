@@ -8332,6 +8332,121 @@ fn linux_userspace_pipe_rt_diag() {
     }
 }
 
+/// Milestone: a full anonymous-pipe round-trip in userspace.
+///
+/// `/init` does `pipe2(&fds, 0)`, `write(fds[1], "PIPE", 4)`,
+/// `read(fds[0], buf, 4)`, and emits every syscall return plus the
+/// fd pair and the round-tripped buffer over the UART. This proves
+/// the whole IPC chain end-to-end:
+///   * `sys_pipe2` allocates a pipe and `copy_to_user`s the fd pair,
+///   * `sys_write` queues bytes into the pipe buffer,
+///   * `sys_read` drains them back and `copy_to_user`s the payload.
+///
+/// This milestone is the regression guard for the REP-string
+/// page-fault rollback fix in the CPU (`crates/cpu/src/lib.rs`):
+/// before that fix, `copy_to_user`'s `rep movsl` ran its ECX count
+/// to zero against physical 0 on the first write to a fresh COW
+/// user page, so the EIP-rewind retry found ECX==0 and copied
+/// nothing — `pipe2` returned 0 but left `fds` as `[0, 0]`, and the
+/// round-trip silently failed. With the fix, the faulting `rep`
+/// rolls ESI/EDI/ECX back and re-runs after `do_wp_page`, landing
+/// the real data. See the blocker note in README.md ("anonymous
+/// pipe round-trip", marked FIXED).
+#[test]
+#[ignore = "boots a real Linux bzImage; ~55s wall-clock"]
+fn linux_userspace_pipe_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_pipe_rt();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let reached = run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).is_ok();
+    assert!(
+        reached,
+        "did not reach the end marker — the read likely blocked, meaning \
+         the write never reached the pipe (copy_to_user/pipe regression)"
+    );
+
+    // Strip ONLCR (\r\n -> \n) so the binary u32 values the kernel
+    // TTY would otherwise have mangled survive intact.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .map(|p| {
+                let off = p + marker.len();
+                u32::from_le_bytes(stripped[off..off + 4].try_into().unwrap())
+            })
+    };
+
+    let p2 = read_at(b"[USERSPACE P2=").map(|v| v as i32);
+    let f0 = read_at(b"F0=").map(|v| v as i32);
+    let f1 = read_at(b"F1=").map(|v| v as i32);
+    let wr = read_at(b"WR=").map(|v| v as i32);
+    let rd = read_at(b"RD=").map(|v| v as i32);
+    let buf = stripped
+        .windows(4)
+        .position(|w| w == b"BUF=")
+        .and_then(|bp| stripped.get(bp + 4..bp + 8))
+        .map(|s| s.to_vec());
+
+    assert_eq!(p2, Some(0), "pipe2 should return 0; got {p2:?}");
+    // /init inherits fds 0/1/2 (stdin/stdout/stderr), so pipe2's
+    // freshly-allocated read/write ends are the next two: 3 and 4.
+    let f0 = f0.expect("F0 marker missing");
+    let f1 = f1.expect("F1 marker missing");
+    assert!(
+        f0 >= 3 && f1 == f0 + 1,
+        "fds should be a consecutive pair >= 3 (read end then write end); \
+         got fds[0]={f0}, fds[1]={f1}"
+    );
+    assert_eq!(
+        wr,
+        Some(4),
+        "write(fds[1], \"PIPE\", 4) should return 4; got {wr:?}"
+    );
+    assert_eq!(
+        rd,
+        Some(4),
+        "read(fds[0], buf, 4) should return 4; got {rd:?}"
+    );
+    assert_eq!(
+        buf.as_deref(),
+        Some(&b"PIPE"[..]),
+        "the bytes read back from the pipe should be \"PIPE\"; got {:?}",
+        buf.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+}
+
 /// Diagnostic test for the `sys_pipe`-broken blocker: runs the
 /// minimal `build_initramfs_pipe_diag` /init and prints whatever
 /// sys_pipe2 returned plus the two fd slots. ALWAYS PASSES — its

@@ -3484,7 +3484,18 @@ impl Cpu {
             // Single-shot string ops. REP-prefixed paths go through the
             // 0xF2/0xF3 handler below.
             0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF => {
+                // Same #PF-rollback as the REP loop: step_string advances
+                // SI/DI even when the access faults, but step() rewinds
+                // EIP to re-execute this op after the handler. Without
+                // restoring SI/DI, the retry would operate on the *next*
+                // element and skip the faulting one. Snapshot + restore.
+                let esi_snap = self.read_r32(r16::SI as u8);
+                let edi_snap = self.read_r32(r16::DI as u8);
                 self.step_string(opcode, mem);
+                if self.pending_fault.get().is_some() {
+                    self.write_r32(r16::SI as u8, esi_snap);
+                    self.write_r32(r16::DI as u8, edi_snap);
+                }
             }
 
             // INSB / INSW / INSD / OUTSB / OUTSW / OUTSD — port-to-
@@ -3581,6 +3592,23 @@ impl Cpu {
                         if counter_done {
                             break;
                         }
+                        // Snapshot the string index registers before the
+                        // iteration. If this element raises a #PF (e.g.
+                        // `rep movsl` from copy_to_user hitting a fresh
+                        // COW / demand-zero user page), the partial
+                        // iteration must NOT commit: roll SI/DI back and
+                        // stop WITHOUT decrementing ECX, so that after the
+                        // page-fault handler maps the page in, IRETD
+                        // returns to this REP (EIP was rewound in step())
+                        // and it resumes from the *same* element. Without
+                        // this rollback, a faulting copy_to_user would run
+                        // ECX→0 against phys 0 and the rewound retry would
+                        // find ECX==0 and copy nothing — silently dropping
+                        // the whole transfer (the pipe2-fds-not-populated
+                        // bug). step_string advances SI/DI internally, so
+                        // we capture them here and restore on fault.
+                        let esi_snap = self.read_r32(r16::SI as u8);
+                        let edi_snap = self.read_r32(r16::DI as u8);
                         if is_io {
                             self.step_string_io(inner, mem, io);
                         } else if !self.step_string(inner, mem) {
@@ -3589,6 +3617,11 @@ impl Cpu {
                                 cs: op_cs,
                                 ip: op_ip,
                             });
+                        }
+                        if self.pending_fault.get().is_some() {
+                            self.write_r32(r16::SI as u8, esi_snap);
+                            self.write_r32(r16::DI as u8, edi_snap);
+                            break;
                         }
                         if self.addr_size_32 {
                             let c = self.read_r32(r16::CX as u8).wrapping_sub(1);
