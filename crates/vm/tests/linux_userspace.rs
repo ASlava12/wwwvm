@@ -142,6 +142,14 @@
 //!     "DATA". Pins the kernel's `struct file` position
 //!     bookkeeping; sequential read at offset 0 doesn't.
 //!
+//!   - `linux_userspace_dup2_milestone` — fd duplication for
+//!     shell-style redirection: /init opens `/log`, dup2's it
+//!     onto fd 1, writes "REDIRECTED" via fd 1 (should land in
+//!     /log, NOT UART), closes, reopens /log, reads back, prints
+//!     via fd 2 (stderr → /dev/console). Test asserts the 10
+//!     bytes round-trip — if dup2 didn't take effect, /log would
+//!     be empty and the assert fires. Foundation for `cmd > file`.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -521,6 +529,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let file_io = build_initramfs_file_io();
     let stat = build_initramfs_stat();
     let lseek = build_initramfs_lseek();
+    let dup2 = build_initramfs_dup2();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -538,6 +547,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&file_io[0..6], b"070701");
     assert_eq!(&stat[0..6], b"070701");
     assert_eq!(&lseek[0..6], b"070701");
+    assert_eq!(&dup2[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -556,6 +566,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-file-io.cpio", &file_io);
         let _ = std::fs::write("/tmp/wwwvm-stat.cpio", &stat);
         let _ = std::fs::write("/tmp/wwwvm-lseek.cpio", &lseek);
+        let _ = std::fs::write("/tmp/wwwvm-dup2.cpio", &dup2);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1841,6 +1852,167 @@ fn build_initramfs_lseek() -> Vec<u8> {
     );
     let fd_zeros = [0u8; 4];
     let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init proves `sys_dup2` (syscall 63) works
+/// — the foundation primitive shells use for stdin/stdout/stderr
+/// redirection. Plan:
+///
+///   fd_log = open("/log", O_CREAT|O_WRONLY, 0o644)
+///   dup2(fd_log, 1)         ; now fd 1 ALSO points to /log
+///   write(1, "REDIRECTED", 10)  ; goes to /log, NOT to UART
+///   close(fd_log)
+///   close(1)                ; closes /log via fd 1
+///   fd_read = open("/log", O_RDONLY)   ; gets fd 1 (lowest free)
+///   read(fd_read, buf, 10)
+///   close(fd_read)
+///   write(2, "[USERSPACE DUP2=", 16)   ; fd 2 still /dev/console
+///   write(2, buf, 10)
+///   write(2, "][USERSPACE END]\n", 17)
+///   exit(0)
+///
+/// Pins:
+///   - sys_dup2: kernel must wire the existing `struct file *`
+///     into the newfd slot of /init's fd table, releasing
+///     whatever was there before
+///   - shared file struct: writes through both fd_log and fd 1
+///     hit the same backing file (the `f_pos` of /log is shared
+///     across both fds — that's the whole point of dup2)
+///   - fd 2 == /dev/console: every existing milestone writes
+///     through fd 1; this proves the kernel set up fd 2 the
+///     same way so the diagnostic markers land in UART
+///
+/// If dup2 silently failed, write(1, "REDIRECTED", 10) would go
+/// to UART directly (unchanged fd 1), the /log file would be
+/// empty, and the test would see `[USERSPACE DUP2=][USERSPACE END]`
+/// — no 10 bytes between the markers — and fail the assertion.
+fn build_initramfs_dup2() -> Vec<u8> {
+    let path: &[u8] = b"/log\0";
+    let payload: &[u8] = b"REDIRECTED"; // 10 bytes
+    let marker_pre: &[u8] = b"[USERSPACE DUP2=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(320);
+        // fd_log = sys_open(path, O_CREAT|O_WRONLY=0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]); // mov ecx, 0x41
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[fd], eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_dup2(fd_log, 1) — sys 63
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x3F, 0x00, 0x00, 0x00]); // mov eax, 63
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_write(1, payload, 10) — should go to /log via dup2'd fd 1
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]); // mov edx, 10
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd_log)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(1) — closes the dup2-target slot
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd_read = sys_open(path, O_RDONLY=0, 0)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[fd] = eax (reuse slot)
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_read(fd_read, buf, 10)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd_read)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(2, marker_pre, len) — fd 2 untouched by dup2 → UART
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x02, 0x00, 0x00, 0x00]); // mov ebx, 2
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(2, buf, 10)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x02, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(2, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x02, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let buf_addr = fd_addr + 4;
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 10];
     let binary = make_init_elf32_safe(
         &code,
         &[
@@ -3914,5 +4086,72 @@ fn linux_userspace_lseek_milestone() {
          take effect; {}",
         lseek_bytes,
         dump_uart_on_failure(&cumulative, "lseek-wrong")
+    );
+}
+
+/// `sys_dup2` milestone: /init opens `/log` for write, dup2's
+/// its fd onto fd 1, writes "REDIRECTED" via fd 1 (should land
+/// in /log, NOT UART), closes the fds, reopens /log, reads it
+/// back, prints via fd 2 (stderr → /dev/console → UART). Test
+/// asserts the 10 bytes between markers equal `b"REDIRECTED"`.
+///
+/// Foundation for shell I/O redirection: `cmd > file` is exactly
+/// `open(file) + dup2(fd_file, 1) + close(fd_file) + exec(cmd)`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_dup2_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_dup2();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE DUP2=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — dup2 may have failed, \
+                 or write to fd 2 doesn't reach UART; {}",
+                dump_uart_on_failure(&cumulative, "dup2")
+            )
+        });
+    eprintln!("dup2 milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let buf_start = pre_pos + marker_pre.len();
+    let dup2_bytes: [u8; 10] = cumulative[buf_start..buf_start + 10]
+        .try_into()
+        .expect("10 bytes between markers");
+    eprintln!(
+        "dup2 round-trip via /log: {:?}",
+        std::str::from_utf8(&dup2_bytes).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        &dup2_bytes,
+        b"REDIRECTED",
+        "expected 10 bytes round-tripped via /log to equal b\"REDIRECTED\", got \
+         {:02X?} — if all zeros, dup2 silently failed and /log was empty when \
+         we tried to read it back; {}",
+        dup2_bytes,
+        dump_uart_on_failure(&cumulative, "dup2-wrong")
     );
 }
