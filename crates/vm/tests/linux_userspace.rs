@@ -129,6 +129,21 @@ const INIT_ENTRY_OFFSET: u32 = 52 + 32;
 /// stops at TRAILER!!! and ignores the padding, but tools like
 /// `cpio -t` get unhappy without it.
 fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
+    // Heads-up for future contributors: /init binaries of size
+    // 600..=602 hit a kernel boot stall — see
+    // `build_initramfs_hello_padded_to_600`'s doc-block for the
+    // bisection summary. If a new builder accidentally lands a
+    // binary in that range, the matching ignored milestone will
+    // hang ~9 minutes when run with --ignored. The bug isn't in
+    // this helper, but the helper is the chokepoint everyone goes
+    // through, so the warning lives here.
+    if (600..=602).contains(&init_binary.len()) && cfg!(debug_assertions) {
+        eprintln!(
+            "build_cpio_archive: WARNING — /init binary length {} is in the \
+             known bad range 600..=602. Boot will stall in pata_legacy probe.",
+            init_binary.len()
+        );
+    }
     let mut archive = Vec::new();
     archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
     archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
