@@ -94,6 +94,14 @@
 //!     failure, so a kernel that rejected the grow shows as
 //!     `new == old` and the assert fires.
 //!
+//!   - `linux_userspace_argv_milestone` — process-startup ABI:
+//!     /init forks; child execve's /helper with argv
+//!     `["/helper", "ARG1"]`; /helper reads `argv[1]` off
+//!     `[esp+8]` and writes the string between markers. Test
+//!     asserts the 4 bytes equal `b"ARG1"`. Pins the kernel's
+//!     `copy_strings` path in execve (skipped when argv is
+//!     NULL) plus the i386 SysV stack layout at entry.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -467,6 +475,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let execve_chain = build_initramfs_execve_chain();
     let brk = build_initramfs_brk();
     let brk_extend = build_initramfs_brk_extend();
+    let argv = build_initramfs_argv();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -478,6 +487,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&execve_chain[0..6], b"070701");
     assert_eq!(&brk[0..6], b"070701");
     assert_eq!(&brk_extend[0..6], b"070701");
+    assert_eq!(&argv[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -490,6 +500,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-execve-chain.cpio", &execve_chain);
         let _ = std::fs::write("/tmp/wwwvm-brk.cpio", &brk);
         let _ = std::fs::write("/tmp/wwwvm-brk-extend.cpio", &brk_extend);
+        let _ = std::fs::write("/tmp/wwwvm-argv.cpio", &argv);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1544,6 +1555,153 @@ fn build_initramfs_execve() -> Vec<u8> {
     build_cpio_archive_with_helper(&init_binary, "helper", &helper_binary)
 }
 
+/// Build a cpio whose /init execve's /helper with a real argv
+/// `["/helper", "ARG1"]`, and /helper reads `argv[1]` off its
+/// own stack at entry (i386 SysV: `[esp+0] = argc`, `[esp+4] =
+/// argv[0]`, `[esp+8] = argv[1]`) and writes the pointed-to
+/// string out: `[USERSPACE ARGV1=ARG1][USERSPACE END]`.
+///
+/// What this pins beyond the basic execve milestone:
+///   - kernel `copy_strings` during execve: argv pointers and
+///     strings are walked in /init's old userspace, packed into
+///     a kernel buffer, and re-laid-out on the NEW process's
+///     stack (the existing execve test passes argv=NULL, so the
+///     copy_strings path is skipped entirely)
+///   - process-startup ABI: kernel sets up argc/argv/envp/auxv
+///     in the standard layout at the new process's esp, and
+///     userspace can read them through plain mov
+///
+/// /init data layout (addresses computed at build time):
+///   argv_arr (12 bytes) — [helper_path_addr, arg1_addr, 0]
+///   helper_path "/helper\0"
+///   arg1 "ARG1\0"
+///   fail_marker (printed only if execve returns to child)
+fn build_initramfs_argv() -> Vec<u8> {
+    let helper_path: &[u8] = b"/helper\0";
+    let arg1: &[u8] = b"ARG1\0";
+    let init_fail_marker: &[u8] = b"[USERSPACE EXECVE_FAILED]\n";
+
+    // /init code: fork → child execve("/helper", argv_arr, NULL);
+    // on failure write fail_marker and exit(1). Parent waitpids.
+    let init_build_code = |helper_path_addr: u32, argv_arr_addr: u32, fail_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        // sys_fork
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // test eax, eax; jnz parent (disp8 patched)
+        out.extend_from_slice(&[0x85, 0xC0]);
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]);
+        // child: sys_execve(helper_path, argv_arr, NULL)
+        out.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+        out.push(0xBB);
+        out.extend_from_slice(&helper_path_addr.to_le_bytes()); // ebx
+        out.push(0xB9);
+        out.extend_from_slice(&argv_arr_addr.to_le_bytes()); // ecx = argv
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (envp = NULL)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // execve returned → failure. Write fail_marker, exit(1).
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&fail_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(init_fail_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "init's child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+
+        // parent: sys_waitpid(-1, NULL, 0); exit(0)
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let init_code_len = init_build_code(0, 0, 0).len() as u32;
+    let argv_arr_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + init_code_len;
+    let helper_path_addr = argv_arr_addr + 12; // 3 pointers * 4 bytes
+    let arg1_addr = helper_path_addr + helper_path.len() as u32;
+    let fail_addr = arg1_addr + arg1.len() as u32;
+
+    // argv_arr: [helper_path_addr, arg1_addr, NULL]
+    let mut argv_arr = Vec::with_capacity(12);
+    argv_arr.extend_from_slice(&helper_path_addr.to_le_bytes());
+    argv_arr.extend_from_slice(&arg1_addr.to_le_bytes());
+    argv_arr.extend_from_slice(&0u32.to_le_bytes());
+
+    let init_code = init_build_code(helper_path_addr, argv_arr_addr, fail_addr);
+    let init_binary = make_init_elf32_safe(
+        &init_code,
+        &[&argv_arr, helper_path, arg1, init_fail_marker],
+        5,
+    );
+
+    // /helper: reads argv[1] off stack ([esp+8]), writes the 4
+    // bytes "ARG1" pointed to between markers. We assume argv[1]
+    // is 4 chars + NUL; for this test the value is fixed at
+    // build time so write length = 4 is fine. A real getenv-
+    // style reader would call strlen first.
+    let helper_marker_pre: &[u8] = b"[USERSPACE ARGV1=";
+    let helper_marker_post: &[u8] = b"][USERSPACE END]\n";
+    let helper_build_code = |pre_addr: u32, post_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(80);
+        // mov esi, [esp+8] — cache argv[1] pointer. esi survives
+        // i386 syscall round-trips (kernel restores GP regs on
+        // sysret-ish path), so no need to spill to memory.
+        out.extend_from_slice(&[0x8B, 0x74, 0x24, 0x08]);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(helper_marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, argv[1], 4) — restore ecx from esi.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x89, 0xF1]); // mov ecx, esi
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(helper_marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let helper_code_len = helper_build_code(0, 0).len() as u32;
+    let helper_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + helper_code_len;
+    let helper_post_addr = helper_pre_addr + helper_marker_pre.len() as u32;
+    let helper_code = helper_build_code(helper_pre_addr, helper_post_addr);
+    let helper_binary =
+        make_init_elf32_safe(&helper_code, &[helper_marker_pre, helper_marker_post], 5);
+
+    build_cpio_archive_with_helper(&init_binary, "helper", &helper_binary)
+}
+
 /// Build a cpio with THREE executables — /init, /h1, /h2 — so
 /// /init forks, child execve's /h1, /h1 execve's /h2, /h2 writes
 /// the OK marker and exits. The extra hop over the basic execve
@@ -2556,5 +2714,91 @@ fn linux_userspace_brk_extend_milestone() {
          new=0x{new_brk:08X}; either the kernel rejected the grow (returned old) or \
          allocated a different size; {}",
         dump_uart_on_failure(&cumulative, "brk-extend-mismatch")
+    );
+}
+
+/// Argv passing milestone: /init forks; child execve's /helper
+/// with argv `["/helper", "ARG1"]`; /helper reads `argv[1]` off
+/// its stack and writes the pointed-to string between markers.
+/// Test asserts the 4 bytes between `[USERSPACE ARGV1=` and
+/// `][USERSPACE END]` equal `b"ARG1"`. Pins the kernel's
+/// `copy_strings` path in execve (skipped when argv is NULL)
+/// plus the i386 SysV process-startup ABI: at entry,
+/// `[esp+0]=argc, [esp+4]=argv[0], [esp+8]=argv[1]`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_argv_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_argv();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE ARGV1=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let marker_failed: &[u8] = b"[USERSPACE EXECVE_FAILED]";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            let cause = if cumulative
+                .windows(marker_failed.len())
+                .any(|w| w == marker_failed)
+            {
+                "execve(\"/helper\", argv, NULL) returned to /init's child — the \
+                 copy_strings/argv path may be rejecting the argv layout"
+            } else {
+                "no marker at all — fork failed before execve, or kernel hung in \
+                 execve before reaching userspace"
+            };
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {cause}; {}",
+                dump_uart_on_failure(&cumulative, "argv")
+            )
+        });
+    eprintln!("argv milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let buf_start = pre_pos + marker_pre.len();
+    let argv1_bytes: [u8; 4] = cumulative[buf_start..buf_start + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    eprintln!(
+        "argv[1] returned: {:?} (raw: {:02X} {:02X} {:02X} {:02X})",
+        std::str::from_utf8(&argv1_bytes).unwrap_or("<non-utf8>"),
+        argv1_bytes[0],
+        argv1_bytes[1],
+        argv1_bytes[2],
+        argv1_bytes[3],
+    );
+    assert_eq!(
+        &argv1_bytes,
+        b"ARG1",
+        "expected 4 bytes argv[1] = b\"ARG1\", got {:02X?}; {}",
+        argv1_bytes,
+        dump_uart_on_failure(&cumulative, "argv-wrong")
+    );
+    assert!(
+        !cumulative
+            .windows(marker_failed.len())
+            .any(|w| w == marker_failed),
+        "saw EXECVE_FAILED too — somehow both branches ran; {}",
+        dump_uart_on_failure(&cumulative, "argv-both")
     );
 }
