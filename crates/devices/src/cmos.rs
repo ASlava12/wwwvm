@@ -201,4 +201,50 @@ mod tests {
         cmos.set_storage_byte(reg::SECONDS, 7);
         assert_eq!(cmos.read(0x71), 7);
     }
+
+    /// snapshot/restore must round-trip both the latched index
+    /// (so a guest mid-INDEX-then-DATA sequence resumes at the
+    /// right register) and the full 128-byte storage backing
+    /// store. Without index round-trip, a snapshot taken between
+    /// `out 0x70, X` and `in al, 0x71` would resume reading the
+    /// wrong register on the other side.
+    #[test]
+    fn snapshot_round_trip_preserves_index_and_storage() {
+        let mut cmos = Cmos::new();
+        cmos.set_time(26, 5, 27, 8, 15, 30);
+        // Park the index latch at a non-default register so we
+        // know the round-trip actually carries it.
+        cmos.write(0x70, reg::MINUTES);
+        // Sentinel write into a non-time scratch register too.
+        cmos.write(0x70, 0x40);
+        cmos.write(0x71, 0xAB);
+        // And finally re-park the index at SECONDS so we can
+        // check both halves: index latch AND storage contents.
+        cmos.write(0x70, reg::SECONDS);
+
+        let mut buf = Vec::new();
+        cmos.snapshot_into(&mut buf);
+        let mut cmos2 = Cmos::new();
+        let consumed = cmos2.restore(&buf).expect("restore");
+        assert_eq!(consumed, 1 + 128);
+
+        // Index round-tripped.
+        assert_eq!(cmos2.read(0x71), cmos.read(0x71), "index latch");
+        // Time bytes round-tripped through storage (binary, not BCD).
+        assert_eq!(cmos2.storage_byte(reg::SECONDS), 30);
+        assert_eq!(cmos2.storage_byte(reg::MINUTES), 15);
+        assert_eq!(cmos2.storage_byte(reg::HOURS), 8);
+        // Scratch register round-tripped too.
+        assert_eq!(cmos2.storage_byte(0x40), 0xAB);
+    }
+
+    /// restore must reject a truncated blob rather than panic on
+    /// the slice access. Boundary: 128 bytes alone is too short
+    /// (index byte missing).
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let mut cmos = Cmos::new();
+        let err = cmos.restore(&[0u8; 128]).unwrap_err();
+        assert!(err.contains("truncated"));
+    }
 }
