@@ -9268,6 +9268,64 @@ fn shrd_r16_sets_cf_to_last_bit_shifted_out() {
     assert!(cpu.has(flag::CF), "SHRD must set CF to bit shifted out (1)");
 }
 
+/// LOOP must decrement and test the FULL ECX when the address size is
+/// 32-bit (Intel SDM uses the address-size attribute to pick the count
+/// register). Regression for the bug where it always used the low 16-bit
+/// CX, mis-deciding the branch and leaving the upper half of ECX stale.
+#[test]
+fn loop_uses_full_ecx_in_32bit_address_mode() {
+    let mut mem = Memory::new(0x10_0000);
+    // LOOP $ : E2 FE (rel8 = -2) self-loops back to its own start.
+    mem.write_slice(0x7C00, &[0xE2, 0xFE]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true; // -> addr_size_32 defaults true at dispatch
+    cpu.ip = 0x7C00;
+    cpu.write_r32(r16::CX as u8, 0x0001_0001); // CX=0x0001, high=0x0001
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    // ECX -> 0x0001_0000 (nonzero) -> branch TAKEN -> ip back at 0x7C00.
+    assert_eq!(
+        cpu.read_r32(r16::CX as u8),
+        0x0001_0000,
+        "LOOP must decrement full ECX"
+    );
+    assert_eq!(cpu.ip, 0x7C00, "branch taken: ECX (0x10000) != 0");
+
+    // Borrow must propagate from the low word into the upper half.
+    cpu.ip = 0x7C00;
+    cpu.write_r32(r16::CX as u8, 0x0001_0000);
+    cpu.step(&mut mem, &mut io).expect("step");
+    assert_eq!(
+        cpu.read_r32(r16::CX as u8),
+        0x0000_FFFF,
+        "borrow out of the low word must decrement the upper half"
+    );
+    assert_eq!(cpu.ip, 0x7C00, "branch taken: ECX (0xFFFF) != 0");
+}
+
+/// JECXZ (0xE3 with 32-bit address size) must test the full ECX, not
+/// just CX. Regression: with ECX=0x0001_0000 the low word is 0 but the
+/// full register is nonzero, so the branch must NOT be taken.
+#[test]
+fn jecxz_32bit_addr_tests_full_ecx_not_just_cx() {
+    let mut mem = Memory::new(0x10_0000);
+    // E3 FE F4 : JECXZ $ ; HLT. "Not taken" advances ip past the 2-byte
+    // insn to 0x7C02; "taken" jumps back to 0x7C00.
+    mem.write_slice(0x7C00, &[0xE3, 0xFE, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true;
+    cpu.ip = 0x7C00;
+    cpu.write_r32(r16::CX as u8, 0x0001_0000); // CX low word == 0, full ECX != 0
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    assert_eq!(
+        cpu.ip, 0x7C02,
+        "JECXZ must fall through when full ECX (0x10000) is nonzero"
+    );
+}
+
 /// SHLD must set CF to the last bit shifted out of the high end of the
 /// destination (companion regression to `shrd_r16_sets_cf...`).
 #[test]

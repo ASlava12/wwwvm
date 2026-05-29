@@ -3658,25 +3658,44 @@ impl Cpu {
             //   0xE2 LOOP            — unconditional on flags
             0xE0..=0xE2 => {
                 let rel = self.fetch_u8(mem) as i8;
-                let cx = self.regs[r16::CX].wrapping_sub(1);
-                self.regs[r16::CX] = cx;
+                // Counter is ECX when the effective address size is
+                // 32-bit, else CX (Intel SDM: LOOP uses the address-size
+                // attribute to select the count register). Mirror the
+                // REP loop's addr_size_32 split so the upper half of ECX
+                // borrows correctly instead of being left stale.
+                let counter_nonzero = if self.addr_size_32 {
+                    let c = self.read_r32(r16::CX as u8).wrapping_sub(1);
+                    self.write_r32(r16::CX as u8, c);
+                    c != 0
+                } else {
+                    let c = self.regs[r16::CX].wrapping_sub(1);
+                    self.regs[r16::CX] = c;
+                    c != 0
+                };
                 let cond = match opcode {
                     0xE2 => true,
                     0xE1 => self.has(flag::ZF),
                     0xE0 => !self.has(flag::ZF),
                     _ => unreachable!(),
                 };
-                if cx != 0 && cond {
+                if counter_nonzero && cond {
                     self.ip = self.ip.wrapping_add(rel as i32 as u32);
                 }
             }
 
-            // JCXZ rel8 — branch if CX == 0. CX is NOT decremented;
-            // this is the idiomatic guard before a LOOP that would
-            // otherwise iterate 65536 times when CX starts at 0.
+            // JCXZ/JECXZ rel8 — branch if the count register is 0. The
+            // counter is NOT decremented; this is the idiomatic guard
+            // before a LOOP that would otherwise iterate 2^32/2^16 times
+            // when the count starts at 0. 0xE3 is JCXZ (test CX) when
+            // address size is 16-bit and JECXZ (test full ECX) when 32.
             0xE3 => {
                 let rel = self.fetch_u8(mem) as i8;
-                if self.regs[r16::CX] == 0 {
+                let counter_zero = if self.addr_size_32 {
+                    self.read_r32(r16::CX as u8) == 0
+                } else {
+                    self.regs[r16::CX] == 0
+                };
+                if counter_zero {
                     self.ip = self.ip.wrapping_add(rel as i32 as u32);
                 }
             }
