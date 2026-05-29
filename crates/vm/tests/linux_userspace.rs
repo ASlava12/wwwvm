@@ -150,6 +150,14 @@
 //!     bytes round-trip — if dup2 didn't take effect, /log would
 //!     be empty and the assert fires. Foundation for `cmd > file`.
 //!
+//!   - `linux_userspace_unlink_milestone` — file deletion +
+//!     `-errno` return path: /init creates `/probe`, calls
+//!     `sys_unlink`, then `sys_stat64("/probe", …)` which MUST
+//!     fail with `-ENOENT`. Test asserts the stat return is
+//!     `0xFFFFFFFE` (= -2 sign-extended). First milestone to
+//!     verify a syscall FAILURE — proves the negative-result
+//!     ABI works the same as success returns.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -530,6 +538,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let stat = build_initramfs_stat();
     let lseek = build_initramfs_lseek();
     let dup2 = build_initramfs_dup2();
+    let unlink = build_initramfs_unlink();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -548,6 +557,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&stat[0..6], b"070701");
     assert_eq!(&lseek[0..6], b"070701");
     assert_eq!(&dup2[0..6], b"070701");
+    assert_eq!(&unlink[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -567,6 +577,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-stat.cpio", &stat);
         let _ = std::fs::write("/tmp/wwwvm-lseek.cpio", &lseek);
         let _ = std::fs::write("/tmp/wwwvm-dup2.cpio", &dup2);
+        let _ = std::fs::write("/tmp/wwwvm-unlink.cpio", &unlink);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2022,6 +2033,129 @@ fn build_initramfs_dup2() -> Vec<u8> {
             marker_post,
             &fd_zeros,
             &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/probe`, calls
+/// `sys_unlink("/probe")` (syscall 10), then calls
+/// `sys_stat64("/probe", &statbuf)` which MUST fail with
+/// `-ENOENT`. /init writes the stat-after-unlink return code
+/// between `[USERSPACE UNLINKED_STAT=…][USERSPACE END]`. Test
+/// asserts the 4 bytes equal `0xFFFFFFFE` (which is `-2` sign-
+/// extended; `-ENOENT == 2`).
+///
+/// Pins:
+///   - `sys_unlink`: kernel must remove the dentry from its
+///     parent, decrement the inode's link count, and (since
+///     nothing holds it open) free the inode
+///   - negative-result handling: until now every milestone's
+///     syscalls succeeded. unlink+stat catches a kernel that
+///     might silently report success on a missing file
+///   - syscall-return-as-errno ABI: `-errno` is returned in
+///     eax as a signed-extended negative; the test catches
+///     `-2 != 0` and `-2 == 0xFFFFFFFE` as u32 LE
+fn build_initramfs_unlink() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let marker_pre: &[u8] = b"[USERSPACE UNLINKED_STAT=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      statbuf_addr: u32,
+                      ret_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open(path, O_CREAT|O_WRONLY=0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]); // mov ecx, O_CREAT|O_WRONLY
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[fd], eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_unlink(path) — sys 10
+        out.extend_from_slice(&[0xB8, 0x0A, 0x00, 0x00, 0x00]); // mov eax, 10
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_stat64(path, &statbuf) — should now fail with -ENOENT
+        out.extend_from_slice(&[0xB8, 0xC3, 0x00, 0x00, 0x00]); // mov eax, 195
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&statbuf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[ret_buf], eax — save the (expected -ENOENT) return
+        out.push(0xA3);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, ret_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_pre_addr = path_addr + path.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let statbuf_addr = fd_addr + 4;
+    let ret_buf_addr = statbuf_addr + 100;
+    let code = build_code(
+        path_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        statbuf_addr,
+        ret_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let statbuf_zeros = [0u8; 100];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &statbuf_zeros,
+            &ret_zeros,
         ],
         7,
     );
@@ -4153,5 +4287,76 @@ fn linux_userspace_dup2_milestone() {
          we tried to read it back; {}",
         dup2_bytes,
         dump_uart_on_failure(&cumulative, "dup2-wrong")
+    );
+}
+
+/// File-deletion milestone: /init creates `/probe`, calls
+/// `sys_unlink("/probe")`, then `sys_stat64("/probe", …)` which
+/// MUST fail with `-ENOENT`. /init writes the stat-after-unlink
+/// return code between `[USERSPACE UNLINKED_STAT=…][USERSPACE END]`.
+/// Test asserts the value equals `0xFFFFFFFE` (`-2` sign-extended).
+///
+/// Pins the kernel's unlink path AND the negative-result return
+/// ABI: every previous milestone's syscalls succeeded, so an
+/// implicit assumption was that the kernel always returns 0 on
+/// success. This test's whole point is that the kernel correctly
+/// signals failure via `-errno` in eax.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_unlink_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_unlink();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE UNLINKED_STAT=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — unlink may have hung, \
+                 or stat after unlink crashed; {}",
+                dump_uart_on_failure(&cumulative, "unlink")
+            )
+        });
+    eprintln!("unlink milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let off = pre_pos + marker_pre.len();
+    let ret_bytes: [u8; 4] = cumulative[off..off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let ret = u32::from_le_bytes(ret_bytes);
+    eprintln!(
+        "stat after unlink returned 0x{ret:08X} = {} (signed)",
+        ret as i32
+    );
+    // -ENOENT = -2 ⇒ 0xFFFFFFFE as u32 LE.
+    assert_eq!(
+        ret,
+        0xFFFF_FFFE,
+        "expected stat-after-unlink to return -ENOENT (-2 = 0xFFFFFFFE), got \
+         0x{ret:08X} — if 0, unlink didn't actually delete the file (stat still \
+         finds it); {}",
+        dump_uart_on_failure(&cumulative, "unlink-wrong")
     );
 }
