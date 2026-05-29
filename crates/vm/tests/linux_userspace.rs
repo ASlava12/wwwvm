@@ -185,6 +185,15 @@
 //!     kernel's iovec walker — every prior write milestone used
 //!     a single contiguous buffer.
 //!
+//!   - `linux_userspace_rename_milestone` — file rename: /init
+//!     creates `/a` with "RENDATA", calls `sys_rename("/a",
+//!     "/b")`, opens `/b`, reads content back, prints. Test
+//!     asserts the round-trip equals `b"RENDATA"`. Pins the
+//!     kernel's dentry rename path — the inode moves with the
+//!     dentry, the content stays intact, and the OLD path
+//!     becomes inaccessible (the read goes through /b's new
+//!     dentry).
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -570,6 +579,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let chdir = build_initramfs_chdir();
     let nanosleep = build_initramfs_nanosleep();
     let writev = build_initramfs_writev();
+    let rename = build_initramfs_rename();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -593,6 +603,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&chdir[0..6], b"070701");
     assert_eq!(&nanosleep[0..6], b"070701");
     assert_eq!(&writev[0..6], b"070701");
+    assert_eq!(&rename[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -617,6 +628,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-chdir.cpio", &chdir);
         let _ = std::fs::write("/tmp/wwwvm-nanosleep.cpio", &nanosleep);
         let _ = std::fs::write("/tmp/wwwvm-writev.cpio", &writev);
+        let _ = std::fs::write("/tmp/wwwvm-rename.cpio", &rename);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2511,6 +2523,148 @@ fn build_initramfs_writev() -> Vec<u8> {
     iov_bytes.extend_from_slice(&(vec2.len() as u32).to_le_bytes());
 
     let binary = make_init_elf32_safe(&code, &[&iov_bytes, vec1, vec2], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/a` with 7 bytes "RENDATA",
+/// calls `sys_rename("/a", "/b")` (syscall 38), then opens `/b`
+/// and reads the content back. Writes the 7 bytes between
+/// `[USERSPACE RENAMED=…][USERSPACE END]`. Test asserts the
+/// round-trip via the NEW path equals `b"RENDATA"` — proves
+/// rename moved the inode (not copied) and the original content
+/// is reachable through the new name. If rename had failed, /b
+/// wouldn't exist and the open + read would have left buf as
+/// zeros (or read would have returned -ENOENT and buf is
+/// uninitialized garbage).
+fn build_initramfs_rename() -> Vec<u8> {
+    let old_path: &[u8] = b"/a\0";
+    let new_path: &[u8] = b"/b\0";
+    let payload: &[u8] = b"RENDATA"; // 7 bytes
+    let marker_pre: &[u8] = b"[USERSPACE RENAMED=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |old_path_addr: u32,
+                      new_path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open(old_path, O_CREAT|O_WRONLY=0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&old_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[fd] = eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_write(fd, payload, 7)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_rename(old_path, new_path) — sys 38
+        out.extend_from_slice(&[0xB8, 0x26, 0x00, 0x00, 0x00]); // mov eax, 38
+        out.push(0xBB);
+        out.extend_from_slice(&old_path_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&new_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd = sys_open(new_path, O_RDONLY, 0)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&new_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_read(fd, buf, 7)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 7)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let old_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let new_path_addr = old_path_addr + old_path.len() as u32;
+    let payload_addr = new_path_addr + new_path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let buf_addr = fd_addr + 4;
+    let code = build_code(
+        old_path_addr,
+        new_path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 7];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            old_path,
+            new_path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &buf_zeros,
+        ],
+        7,
+    );
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
@@ -5012,6 +5166,69 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_rename` milestone: /init creates `/a` with "RENDATA",
+/// renames to `/b`, opens `/b`, reads the content, prints between
+/// markers. Test asserts the round-tripped 7 bytes equal
+/// `b"RENDATA"`. Pins kernel's dentry-tree rename path —
+/// inode moves with the dentry, content stays intact.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_rename_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_rename();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE RENAMED=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — rename may have failed \
+                 and the subsequent open(/b) returned -ENOENT; {}",
+                dump_uart_on_failure(&cumulative, "rename")
+            )
+        });
+    eprintln!("rename milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let buf_start = pre_pos + marker_pre.len();
+    let rename_bytes: [u8; 7] = cumulative[buf_start..buf_start + 7]
+        .try_into()
+        .expect("7 bytes between markers");
+    eprintln!(
+        "rename round-trip via /b: {:?}",
+        std::str::from_utf8(&rename_bytes).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        &rename_bytes,
+        b"RENDATA",
+        "expected content via /b = b\"RENDATA\", got {:02X?} — if all zeros, rename \
+         likely failed and the second open got -ENOENT; {}",
+        rename_bytes,
+        dump_uart_on_failure(&cumulative, "rename-wrong")
     );
 }
 
