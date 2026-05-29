@@ -1720,6 +1720,140 @@ fn build_initramfs_mmap() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init creates a file, writes 8 bytes to it,
+/// then maps it with `mmap2(NULL, 0x1000, PROT_READ, MAP_PRIVATE,
+/// fd, 0)` — a *file-backed* mapping — and dumps the mapped bytes
+/// to the console by `write(1, mapped_addr, 8)`:
+///
+///   `[USERSPACE FMAP=<4 addr>DATA=<8 bytes>][USERSPACE END]`
+///
+/// This is a distinct kernel path from the anonymous-mmap and
+/// brk/COW milestones: the first access to the mapping (the
+/// `write` syscall's `copy_from_user` reading `mapped_addr`)
+/// triggers a *file* page fault — `filemap_fault`/`shmem_fault`
+/// pulls the page from the file's page cache and installs it in
+/// the process's address space. This is exactly how `ld.so` maps
+/// shared-object text/data pages, so it's directly on the path to
+/// a dynamically-linked userspace.
+///
+/// Assertions: the returned address is page-aligned and in
+/// `[INIT_LOAD_ADDR, 0xC0000000)`, and the bytes read back through
+/// the mapping equal the file's contents (`"MAPDATA8"`).
+fn build_initramfs_file_mmap() -> Vec<u8> {
+    let path: &[u8] = b"/mapped\0";
+    let payload: &[u8] = b"MAPDATA8";
+    let marker_pre: &[u8] = b"[USERSPACE FMAP=";
+    let marker_mid: &[u8] = b"DATA=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      fd_addr: u32,
+                      addr_buf: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // fd = open(path, O_CREAT|O_RDWR = 0x42, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x42, 0x00, 0x00, 0x00]); // mov ecx, 0x42
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[fd], eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // write(fd, payload, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // addr = mmap2(NULL, 0x1000, PROT_READ=1, MAP_PRIVATE=2, fd, 0)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]); // mov eax, 192
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (addr=0)
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, PROT_READ
+        out.extend_from_slice(&[0xBE, 0x02, 0x00, 0x00, 0x00]); // mov esi, MAP_PRIVATE
+        out.extend_from_slice(&[0x8B, 0x3D]); // mov edi, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xED]); // xor ebp, ebp (pgoff=0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[addr_buf], eax
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        // close(fd) — the mapping keeps its own reference to the file.
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // emit FMAP=<addr>
+        w(marker_pre_addr, marker_pre.len() as u32, &mut out);
+        w(addr_buf, 4, &mut out);
+        // emit DATA=<mapped bytes>: write(1, [addr_buf], 8). Reading
+        // through the mapping here is what faults the file page in.
+        w(marker_mid_addr, marker_mid.len() as u32, &mut out);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.extend_from_slice(&[0x8B, 0x0D]); // mov ecx, ds:[addr_buf] (the mapped addr)
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // emit END
+        w(marker_end_addr, marker_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let fd_addr = marker_end_addr + marker_end.len() as u32;
+    let addr_buf = fd_addr + 4;
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        fd_addr,
+        addr_buf,
+    );
+    let fd_zeros = [0u8; 4];
+    let addr_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_mid,
+            marker_end,
+            &fd_zeros,
+            &addr_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -7312,6 +7446,112 @@ fn linux_userspace_mmap_milestone() {
         "expected byte read back to equal sentinel 0x42, got 0x{val_byte:02X} — \
          either the page isn't backed by RAM or writes aren't persisting; {}",
         dump_uart_on_failure(&cumulative, "mmap-byte")
+    );
+}
+
+/// File-backed mmap milestone: /init writes `"MAPDATA8"` to a file,
+/// maps it `PROT_READ|MAP_PRIVATE`, and dumps the mapped bytes via
+/// `write(1, mapped_addr, 8)`. The dump's `copy_from_user` is the
+/// first touch of the mapping, so it faults the file page in from
+/// the page cache (`filemap_fault`/`shmem_fault`) — a different
+/// kernel path than anonymous mmap or COW, and the one `ld.so` uses
+/// to map shared objects. Asserts the address is a valid
+/// page-aligned userspace pointer and the mapped bytes equal the
+/// file contents.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_file_mmap_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_file_mmap();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — file-backed mmap may have \
+             returned -errno and dumping the bad pointer SIGSEGV'd /init; {}",
+            dump_uart_on_failure(&cumulative, "file-mmap")
+        )
+    });
+
+    // Strip ONLCR so a 0x0A in the binary address survives intact.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let find_after = |marker: &[u8]| -> Option<usize> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .map(|p| p + marker.len())
+    };
+
+    let addr = find_after(b"[USERSPACE FMAP=")
+        .and_then(|o| stripped.get(o..o + 4))
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or_else(|| {
+            panic!(
+                "FMAP marker not found; {}",
+                dump_uart_on_failure(&cumulative, "file-mmap-addr")
+            )
+        });
+    let data = find_after(b"DATA=")
+        .and_then(|o| stripped.get(o..o + 8))
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| {
+            panic!(
+                "DATA marker not found; {}",
+                dump_uart_on_failure(&cumulative, "file-mmap-data")
+            )
+        });
+    eprintln!(
+        "file-backed mmap addr = 0x{addr:08X}, mapped bytes = {:?}",
+        String::from_utf8_lossy(&data)
+    );
+
+    const KERNEL_BASE: u32 = 0xC000_0000;
+    assert!(
+        (INIT_LOAD_ADDR..KERNEL_BASE).contains(&addr),
+        "mmap addr 0x{addr:08X} outside userspace range; {}",
+        dump_uart_on_failure(&cumulative, "file-mmap-range")
+    );
+    assert_eq!(
+        addr & 0xFFF,
+        0,
+        "mmap addr 0x{addr:08X} not page-aligned; {}",
+        dump_uart_on_failure(&cumulative, "file-mmap-align")
+    );
+    assert_eq!(
+        data.as_slice(),
+        b"MAPDATA8",
+        "bytes read through the file mapping should equal the file contents \
+         \"MAPDATA8\"; got {:?} (all-zero ⇒ the file page wasn't faulted in); {}",
+        String::from_utf8_lossy(&data),
+        dump_uart_on_failure(&cumulative, "file-mmap-bytes")
     );
 }
 
