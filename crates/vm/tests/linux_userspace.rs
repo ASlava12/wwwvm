@@ -67,6 +67,15 @@
 //!     jump to /helper's entry. If execve had returned to child
 //!     (failure), the FAILED marker would have shown instead.
 //!
+//!   - `linux_userspace_execve_chain_milestone` — execve from
+//!     an already-exec'd image: /init forks; child execve's /h1;
+//!     /h1 execve's /h2; /h2 writes `[USERSPACE H2_OK]` and exits.
+//!     Two distinct FAILED markers (one per hop) identify which
+//!     hop broke if the test fails. Pins execve being callable
+//!     from a process started via execve itself (not a one-shot
+//!     post-fork-only fast path), and a second mm-swap that
+//!     follows the first.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -279,6 +288,33 @@ fn build_cpio_archive_with_helper(
     archive
 }
 
+/// Same shape as `build_cpio_archive_with_helper` but with THREE
+/// executables — /init plus two more named binaries. Used by the
+/// execve-chain milestone, where /init forks + child execves /h1,
+/// /h1 in turn execves /h2, and /h2 is the one that writes the OK
+/// marker. Pins the harder version of execve: it can be called
+/// from a non-PID-1 process that was *itself* started via
+/// execve (not via initramfs boot exec).
+fn build_cpio_archive_with_two_helpers(
+    init_binary: &[u8],
+    h1_name: &str,
+    h1_binary: &[u8],
+    h2_name: &str,
+    h2_binary: &[u8],
+) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry(h1_name, h1_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry(h2_name, h2_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -410,6 +446,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let gettimeofday = build_initramfs_gettimeofday();
     let fork = build_initramfs_fork();
     let execve = build_initramfs_execve();
+    let execve_chain = build_initramfs_execve_chain();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -418,6 +455,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&gettimeofday[0..6], b"070701");
     assert_eq!(&fork[0..6], b"070701");
     assert_eq!(&execve[0..6], b"070701");
+    assert_eq!(&execve_chain[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -427,6 +465,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-gettimeofday.cpio", &gettimeofday);
         let _ = std::fs::write("/tmp/wwwvm-fork.cpio", &fork);
         let _ = std::fs::write("/tmp/wwwvm-execve.cpio", &execve);
+        let _ = std::fs::write("/tmp/wwwvm-execve-chain.cpio", &execve_chain);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1305,6 +1344,153 @@ fn build_initramfs_execve() -> Vec<u8> {
     build_cpio_archive_with_helper(&init_binary, "helper", &helper_binary)
 }
 
+/// Build a cpio with THREE executables — /init, /h1, /h2 — so
+/// /init forks, child execve's /h1, /h1 execve's /h2, /h2 writes
+/// the OK marker and exits. The extra hop over the basic execve
+/// milestone pins:
+///
+///   - execve called from a *non-PID-1* process (the forked child
+///     is PID 2+; existing execve milestone covered child→helper,
+///     but child is still the same process as the forked one; here
+///     /h1 became a new process via execve and *that* /h1 has to
+///     execve again — proves execve doesn't have a one-shot
+///     post-fork-only fast path)
+///   - process-image swap from an *already-exec'd* image, not
+///     from the original fork (the kernel has to tear down /h1's
+///     mm and set up /h2's, exactly like the first swap from the
+///     forked /init image to /h1)
+///   - VFS lookup still works after the first execve (path
+///     resolution from "/h2" through initramfs root)
+///
+/// Each stage has its own distinct FAILED marker, so a failure
+/// at any stage tells the test exactly which level broke (rather
+/// than just "OK didn't appear"):
+///
+///   /init's child writes `[USERSPACE H1_EXEC_FAILED]` if its
+///     execve("/h1", ...) returns
+///   /h1 writes `[USERSPACE H2_EXEC_FAILED]` if its
+///     execve("/h2", ...) returns
+///   /h2 writes `[USERSPACE H2_OK]\n` — the success marker
+fn build_initramfs_execve_chain() -> Vec<u8> {
+    // Shared shape for /init's child path + /h1: an ELF that
+    // execve's a path and writes a marker on failure.
+    let make_execer = |target_path: &[u8], fail_marker: &[u8]| -> Vec<u8> {
+        let build_code = |target_addr: u32, fail_addr: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(64);
+            // sys_execve(target, NULL, NULL) — sys 11.
+            out.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+            out.push(0xBB);
+            out.extend_from_slice(&target_addr.to_le_bytes());
+            out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+            out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // Only reached if execve FAILED. Write fail marker.
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&fail_addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&(fail_marker.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // exit(1)
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out
+        };
+        let code_len = build_code(0, 0).len() as u32;
+        let target_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+        let fail_addr = target_addr + target_path.len() as u32;
+        let code = build_code(target_addr, fail_addr);
+        make_init_elf32_safe(&code, &[target_path, fail_marker], 5)
+    };
+
+    // /h2 — leaf: just writes OK and exits.
+    let h2_marker: &[u8] = b"[USERSPACE H2_OK]\n";
+    let h2_build_code = |marker_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(40);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(h2_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let h2_code_len = h2_build_code(0).len() as u32;
+    let h2_marker_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + h2_code_len;
+    let h2_code = h2_build_code(h2_marker_addr);
+    let h2_binary = make_init_elf32_safe(&h2_code, &[h2_marker], 5);
+
+    // /h1 — exec'er: execve("/h2", NULL, NULL).
+    let h1_binary = make_execer(b"/h2\0", b"[USERSPACE H2_EXEC_FAILED]\n");
+
+    // /init — forks; child execve's /h1; parent waitpids and exits.
+    let init_fail_marker: &[u8] = b"[USERSPACE H1_EXEC_FAILED]\n";
+    let h1_path: &[u8] = b"/h1\0";
+    let init_build_code = |h1_path_addr: u32, fail_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        // sys_fork
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // test eax, eax; jnz parent (disp8 to be patched)
+        out.extend_from_slice(&[0x85, 0xC0]);
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]);
+
+        // child: execve("/h1", NULL, NULL)
+        out.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+        out.push(0xBB);
+        out.extend_from_slice(&h1_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // only reached on failure: write fail marker
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&fail_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(init_fail_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(1)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "init's child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+
+        // parent: sys_waitpid(-1, NULL, 0); exit(0)
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let init_code_len = init_build_code(0, 0).len() as u32;
+    let h1_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + init_code_len;
+    let fail_addr = h1_path_addr + h1_path.len() as u32;
+    let init_code = init_build_code(h1_path_addr, fail_addr);
+    let init_binary = make_init_elf32_safe(&init_code, &[h1_path, init_fail_marker], 5);
+
+    build_cpio_archive_with_two_helpers(&init_binary, "h1", &h1_binary, "h2", &h2_binary)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -1931,5 +2117,80 @@ fn linux_userspace_execve_milestone() {
         "saw FAILED marker too — both branches ran, which means execve happened \
          AND then somehow returned. Shouldn't be possible; {}",
         dump_uart_on_failure(&cumulative, "execve-both")
+    );
+}
+
+/// Execve-chain milestone: /init → fork → child execve("/h1") →
+/// /h1 execve("/h2") → /h2 writes `[USERSPACE H2_OK]` and exits.
+/// Two distinct execve-FAILED markers tell the test exactly
+/// which hop broke. Pins execve called from a process that was
+/// *itself* started via execve (proves it's not a one-shot
+/// post-fork-only fast path).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_execve_chain_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_execve_chain();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_ok: &[u8] = b"[USERSPACE H2_OK]";
+    let marker_h1_failed: &[u8] = b"[USERSPACE H1_EXEC_FAILED]";
+    let marker_h2_failed: &[u8] = b"[USERSPACE H2_EXEC_FAILED]";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_ok, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            let cause = if cumulative
+                .windows(marker_h1_failed.len())
+                .any(|w| w == marker_h1_failed)
+            {
+                "/init's child saw execve(\"/h1\") return — first hop broke (path lookup? \
+                 mm setup?)"
+            } else if cumulative
+                .windows(marker_h2_failed.len())
+                .any(|w| w == marker_h2_failed)
+            {
+                "/h1 saw execve(\"/h2\") return — second hop broke (execve from \
+                 already-exec'd image fails)"
+            } else {
+                "no marker — fork may have failed, or first execve hung before either \
+                 returning or reaching /h1's userspace"
+            };
+            panic!(
+                "`[USERSPACE H2_OK]` not seen in 16 B steps; {cause}; {}",
+                dump_uart_on_failure(&cumulative, "execve-chain")
+            )
+        });
+    eprintln!("H2_OK marker seen after {steps} steps");
+    // Neither fail marker should be present. The whole point of
+    // the chain is that BOTH execve's succeed.
+    assert!(
+        !cumulative
+            .windows(marker_h1_failed.len())
+            .any(|w| w == marker_h1_failed),
+        "saw H1_EXEC_FAILED but also OK — impossible without two children; {}",
+        dump_uart_on_failure(&cumulative, "execve-chain-h1-fail")
+    );
+    assert!(
+        !cumulative
+            .windows(marker_h2_failed.len())
+            .any(|w| w == marker_h2_failed),
+        "saw H2_EXEC_FAILED but also OK — impossible without two children; {}",
+        dump_uart_on_failure(&cumulative, "execve-chain-h2-fail")
     );
 }
