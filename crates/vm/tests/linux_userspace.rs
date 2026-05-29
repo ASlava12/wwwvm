@@ -1990,6 +1990,122 @@ fn build_initramfs_exec_mmap() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init sets up thread-local storage exactly the
+/// way glibc/musl do on i386 — via `set_thread_area` (syscall 243)
+/// plus a `%gs`-relative read — then reports the result:
+///
+///   `[USERSPACE STA=<4 ret>ENT=<4 entry>TLS=<4 gs:0>][USERSPACE END]`
+///
+/// Sequence:
+///   * fill a `struct user_desc` { entry_number=-1 (kernel picks),
+///     base_addr=<tls block>, limit=0xFFFFF, flags=seg_32bit|
+///     limit_in_pages|useable=0x51 },
+///   * `set_thread_area(&ud)` — the kernel allocates a GDT TLS slot,
+///     writes its base into that descriptor, and writes the chosen
+///     entry_number back into the struct,
+///   * build the selector `(entry<<3)|3`, `mov gs, ax`,
+///   * `mov eax, gs:[0]` — reads the first word of the TLS block
+///     through the freshly-installed segment base.
+///
+/// The TLS block's first word is a sentinel `0x12345678`; reading it
+/// back through `%gs:0` proves the whole chain: set_thread_area built
+/// a correct GDT descriptor, `mov gs` cached its base, and a
+/// segment-relative load uses that base. This is the precise
+/// mechanism every glibc/musl program relies on before `main`.
+/// Asserts STA==0 and the `%gs:0` read equals the sentinel.
+fn build_initramfs_set_thread_area() -> Vec<u8> {
+    let m_sta: &[u8] = b"[USERSPACE STA=";
+    let m_ent: &[u8] = b"ENT=";
+    let m_tls: &[u8] = b"TLS=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const SENTINEL: u32 = 0x1234_5678;
+
+    let build_code = |m_sta_addr: u32,
+                      m_ent_addr: u32,
+                      m_tls_addr: u32,
+                      m_end_addr: u32,
+                      ud_addr: u32,
+                      sta_buf: u32,
+                      gs_buf: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // set_thread_area(&ud) — sys 243
+        out.extend_from_slice(&[0xB8, 0xF3, 0x00, 0x00, 0x00]); // mov eax, 243
+        out.push(0xBB);
+        out.extend_from_slice(&ud_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[sta_buf], eax (return code)
+        out.extend_from_slice(&sta_buf.to_le_bytes());
+        // selector = (entry_number << 3) | 3 ; load into gs
+        out.push(0xA1); // mov eax, ds:[ud] (entry_number, written back)
+        out.extend_from_slice(&ud_addr.to_le_bytes());
+        out.extend_from_slice(&[0xC1, 0xE0, 0x03]); // shl eax, 3
+        out.extend_from_slice(&[0x83, 0xC8, 0x03]); // or eax, 3
+        out.extend_from_slice(&[0x8E, 0xE8]); // mov gs, ax
+                                              // eax = gs:[0] — read the TLS block's first word.
+        out.extend_from_slice(&[0x65, 0xA1, 0x00, 0x00, 0x00, 0x00]); // mov eax, gs:[0]
+        out.push(0xA3); // mov ds:[gs_buf], eax
+        out.extend_from_slice(&gs_buf.to_le_bytes());
+        // emit STA=<ret> ENT=<entry> TLS=<gs:0> END
+        w(m_sta_addr, m_sta.len() as u32, &mut out);
+        w(sta_buf, 4, &mut out);
+        w(m_ent_addr, m_ent.len() as u32, &mut out);
+        w(ud_addr, 4, &mut out); // entry_number, written back by the kernel
+        w(m_tls_addr, m_tls.len() as u32, &mut out);
+        w(gs_buf, 4, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let m_sta_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_ent_addr = m_sta_addr + m_sta.len() as u32;
+    let m_tls_addr = m_ent_addr + m_ent.len() as u32;
+    let m_end_addr = m_tls_addr + m_tls.len() as u32;
+    let ud_addr = m_end_addr + m_end.len() as u32;
+    let tls_addr = ud_addr + 16; // user_desc is 16 bytes
+    let sta_buf = tls_addr + 16; // tls block is 16 bytes
+    let gs_buf = sta_buf + 4;
+    let code = build_code(
+        m_sta_addr, m_ent_addr, m_tls_addr, m_end_addr, ud_addr, sta_buf, gs_buf,
+    );
+
+    // struct user_desc: entry=-1, base=tls_addr, limit=0xFFFFF,
+    // flags = seg_32bit(0x1)|limit_in_pages(0x10)|useable(0x40) = 0x51.
+    let mut user_desc = Vec::with_capacity(16);
+    user_desc.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    user_desc.extend_from_slice(&tls_addr.to_le_bytes());
+    user_desc.extend_from_slice(&0x000F_FFFFu32.to_le_bytes());
+    user_desc.extend_from_slice(&0x0000_0051u32.to_le_bytes());
+    // TLS block: sentinel at offset 0, padded to 16 bytes.
+    let mut tls_block = Vec::with_capacity(16);
+    tls_block.extend_from_slice(&SENTINEL.to_le_bytes());
+    tls_block.extend_from_slice(&[0u8; 12]);
+    let sta_zeros = [0u8; 4];
+    let gs_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            m_sta, m_ent, m_tls, m_end, &user_desc, &tls_block, &sta_zeros, &gs_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -7777,6 +7893,87 @@ fn linux_userspace_exec_mmap_milestone() {
          mapping) never appeared — instruction fetch from the mapped page \
          failed; {}",
         dump_uart_on_failure(&cumulative, "exec-mmap-ran")
+    );
+}
+
+/// TLS milestone: /init sets up thread-local storage with
+/// `set_thread_area` (sys 243), loads the returned selector into
+/// `%gs`, and reads the TLS block's first word via `%gs:0`. Asserts
+/// the syscall returned 0 and the `%gs:0` read equals the sentinel
+/// (`0x12345678`) placed at the TLS base. Pins the full i386 TLS
+/// chain glibc/musl use before `main`: GDT TLS-descriptor setup,
+/// `mov gs` caching the descriptor base, and a segment-relative load
+/// honouring that base.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_set_thread_area_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_set_thread_area();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — set_thread_area or the \
+             `mov gs`/`%gs:0` read likely faulted; {}",
+            dump_uart_on_failure(&cumulative, "set-thread-area")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let sta = read_at(b"[USERSPACE STA=").map(|v| v as i32);
+    let ent = read_at(b"ENT=").map(|v| v as i32);
+    let tls = read_at(b"TLS=");
+    eprintln!("set_thread_area ret={sta:?}, entry_number={ent:?}, gs:0 read={tls:#x?}");
+
+    assert_eq!(
+        sta,
+        Some(0),
+        "set_thread_area should return 0; got {sta:?}; {}",
+        dump_uart_on_failure(&cumulative, "sta-ret")
+    );
+    assert_eq!(
+        tls,
+        Some(0x1234_5678),
+        "reading %gs:0 should return the TLS sentinel 0x12345678 — proving the \
+         GDT TLS descriptor base was installed and `mov gs` cached it; got \
+         {tls:#x?}; {}",
+        dump_uart_on_failure(&cumulative, "tls-read")
     );
 }
 
