@@ -246,6 +246,13 @@
 //!     Pins the kernel's sysinfo path that fills uptime + load
 //!     averages + memory totals + procs count via copy_to_user.
 //!
+//!   - `linux_userspace_mprotect_milestone` — page protection
+//!     change: /init mmap's R+W, writes 0x42, mprotects to R
+//!     only, reads back. Test asserts ret == 0 AND byte == 0x42.
+//!     Pins kernel's per-VMA `vm_flags` mutation by mprotect AND
+//!     data preservation across permission change. Doesn't test
+//!     write-after-mprotect (would SIGSEGV /init).
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -639,6 +646,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let statfs = build_initramfs_statfs();
     let fcntl = build_initramfs_fcntl();
     let sysinfo = build_initramfs_sysinfo();
+    let mprotect = build_initramfs_mprotect();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -670,6 +678,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&statfs[0..6], b"070701");
     assert_eq!(&fcntl[0..6], b"070701");
     assert_eq!(&sysinfo[0..6], b"070701");
+    assert_eq!(&mprotect[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -702,6 +711,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-statfs.cpio", &statfs);
         let _ = std::fs::write("/tmp/wwwvm-fcntl.cpio", &fcntl);
         let _ = std::fs::write("/tmp/wwwvm-sysinfo.cpio", &sysinfo);
+        let _ = std::fs::write("/tmp/wwwvm-mprotect.cpio", &mprotect);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -3092,6 +3102,124 @@ fn build_initramfs_fcntl() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[path, marker_pre, marker_post, &fd_zeros, &flags_zeros],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init mmap's an anonymous page R+W,
+/// writes 0x42 to it, calls `sys_mprotect(addr, 4096, PROT_READ)`
+/// (syscall 125) to drop write permission, then reads the byte
+/// back. /init writes `mprotect`'s eax return AND the byte
+/// between `[USERSPACE MPROT_RET=<4>BYTE=<1>][USERSPACE END]`.
+/// Test asserts mprotect_ret == 0 AND byte == 0x42.
+///
+/// What this pins beyond mmap: kernel's per-VMA protection
+/// state-machine. After mprotect, the VMA's `vm_flags` has
+/// VM_WRITE cleared. We don't test write-after-mprotect
+/// (would SIGSEGV /init); we test the soft case — mprotect
+/// returns 0 AND data is preserved.
+fn build_initramfs_mprotect() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE MPROT_RET=";
+    let marker_mid: &[u8] = b"BYTE=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      ret_buf_addr: u32,
+                      byte_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // sys_mmap2(NULL, 0x1000, R|W=3, ANON|PRIVATE=0x22, -1, 0)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]); // mov eax, 192
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        out.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]); // mov edx, 3
+        out.extend_from_slice(&[0xBE, 0x22, 0x00, 0x00, 0x00]); // mov esi, 0x22
+        out.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]); // mov edi, -1
+        out.extend_from_slice(&[0x31, 0xED]); // xor ebp, ebp
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Stash mmap addr in esi (preserved across syscalls).
+        out.extend_from_slice(&[0x89, 0xC6]); // mov esi, eax
+                                              // Write 0x42 into the page: mov byte ptr [esi], 0x42
+        out.extend_from_slice(&[0xC6, 0x06, 0x42]);
+        // sys_mprotect(addr, 4096, PROT_READ=1) — sys 125
+        out.extend_from_slice(&[0xB8, 0x7D, 0x00, 0x00, 0x00]); // mov eax, 125
+        out.extend_from_slice(&[0x89, 0xF3]); // mov ebx, esi
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 4096
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, PROT_READ
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Store mprotect's eax return.
+        out.push(0xA3);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        // Read the byte back from the (now RO) page.
+        out.extend_from_slice(&[0x8A, 0x06]); // mov al, [esi]
+        out.push(0xA2);
+        out.extend_from_slice(&byte_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, ret_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, byte_buf, 1)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&byte_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let ret_buf_addr = marker_end_addr + marker_end.len() as u32;
+    let byte_buf_addr = ret_buf_addr + 4;
+    let code = build_code(
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        ret_buf_addr,
+        byte_buf_addr,
+    );
+    let ret_zeros = [0u8; 4];
+    let byte_zeros = [0u8; 1];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_mid, marker_end, &ret_zeros, &byte_zeros],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -5976,6 +6104,88 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_mprotect` milestone: /init mmap's a page R+W, writes
+/// `0x42`, calls `sys_mprotect(addr, 4096, PROT_READ)`, reads
+/// the byte back. Test asserts mprotect ret == 0 AND byte == 0x42.
+/// Pins kernel's per-VMA `vm_flags` mutation by mprotect and
+/// the fact that data is preserved through a permission change.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_mprotect_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_mprotect();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE MPROT_RET=";
+    let marker_mid: &[u8] = b"BYTE=";
+    let marker_end_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "mprotect")
+            )
+        });
+    eprintln!("mprotect milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let ret_off = pre_pos + marker_pre.len();
+    let mprotect_ret = u32::from_le_bytes(stripped[ret_off..ret_off + 4].try_into().unwrap());
+
+    let mid_pos = stripped
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid");
+    let byte = stripped[mid_pos + marker_mid.len()];
+
+    eprintln!("mprotect ret = 0x{mprotect_ret:08X}, byte read back = 0x{byte:02X}");
+    assert_eq!(
+        mprotect_ret,
+        0,
+        "expected mprotect to return 0, got 0x{mprotect_ret:08X}; {}",
+        dump_uart_on_failure(&cumulative, "mprotect-ret")
+    );
+    assert_eq!(
+        byte,
+        0x42,
+        "expected byte read after mprotect-to-RO to equal sentinel 0x42, \
+         got 0x{byte:02X} — data lost across permission change; {}",
+        dump_uart_on_failure(&cumulative, "mprotect-byte")
     );
 }
 
