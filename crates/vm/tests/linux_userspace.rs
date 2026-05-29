@@ -165,6 +165,18 @@
 //!     5 bytes round-trip equal `b"INDIR"`. Every prior file
 //!     test used flat paths at `/`; this one walks two levels.
 //!
+//!   - `linux_userspace_nanosleep_milestone` — timer wakeup:
+//!     /init samples `sys_time` before and after `sys_nanosleep(1
+//!     sec)`, prints both. Test asserts `t1 > t0` — proves the
+//!     kernel held the process off for ≥ 1 second of guest wall
+//!     time. Pins PIT/LAPIC IRQs → jiffies → timer wheel →
+//!     task wakeup end-to-end. Until now every milestone ran
+//!     in "instant" guest time. NOTE: the test strips `\r\n`
+//!     ONLCR translation when extracting binary u32 from UART
+//!     — a `0x0A` byte in t0/t1 was being padded by the kernel
+//!     TTY's `0x0D` and shifting the decoded value. Reusable
+//!     pattern for any future binary-data milestone.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -548,6 +560,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let unlink = build_initramfs_unlink();
     let mkdir = build_initramfs_mkdir();
     let chdir = build_initramfs_chdir();
+    let nanosleep = build_initramfs_nanosleep();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -569,6 +582,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&unlink[0..6], b"070701");
     assert_eq!(&mkdir[0..6], b"070701");
     assert_eq!(&chdir[0..6], b"070701");
+    assert_eq!(&nanosleep[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -591,6 +605,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-unlink.cpio", &unlink);
         let _ = std::fs::write("/tmp/wwwvm-mkdir.cpio", &mkdir);
         let _ = std::fs::write("/tmp/wwwvm-chdir.cpio", &chdir);
+        let _ = std::fs::write("/tmp/wwwvm-nanosleep.cpio", &nanosleep);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2309,6 +2324,128 @@ fn build_initramfs_mkdir() -> Vec<u8> {
             marker_post,
             &fd_zeros,
             &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init samples `sys_time(NULL)` before and
+/// after `sys_nanosleep(&ts, NULL)` with `ts = {tv_sec=1,
+/// tv_nsec=0}`, and writes both time samples between markers.
+/// Test asserts `t1 - t0 >= 1` — proves the kernel actually
+/// slept the process for at least 1 second of guest wall time.
+///
+/// Pins:
+///   - sys_nanosleep: kernel sets TASK_INTERRUPTIBLE, arms a
+///     timer for `req->tv_sec + req->tv_nsec/1e9` and schedules
+///     out. When the timer fires, the task is woken and the
+///     syscall returns.
+///   - timer + scheduler integration: until now every milestone
+///     ran to completion in "instant" guest time (no sleeps).
+///     This one proves PIT/LAPIC IRQs actually advance jiffies
+///     and trigger task wakeups end-to-end.
+fn build_initramfs_nanosleep() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE T0=";
+    let marker_mid: &[u8] = b"T1=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      ts_addr: u32,
+                      t0_buf_addr: u32,
+                      t1_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // sys_time(NULL) → eax = time_t
+        out.extend_from_slice(&[0xB8, 0x0D, 0x00, 0x00, 0x00]); // mov eax, 13
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[t0_buf], eax
+        out.extend_from_slice(&t0_buf_addr.to_le_bytes());
+        // sys_nanosleep(&ts, NULL) — sys 162. ts already contains
+        // {1, 0} = 1 second since the data segment was built with
+        // 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00.
+        out.extend_from_slice(&[0xB8, 0xA2, 0x00, 0x00, 0x00]); // mov eax, 162
+        out.push(0xBB);
+        out.extend_from_slice(&ts_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (rem = NULL)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_time(NULL) → eax = time_t (post-sleep)
+        out.extend_from_slice(&[0xB8, 0x0D, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[t1_buf], eax
+        out.extend_from_slice(&t1_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, t0_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&t0_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, t1_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&t1_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let ts_addr = marker_end_addr + marker_end.len() as u32;
+    let t0_buf_addr = ts_addr + 8;
+    let t1_buf_addr = t0_buf_addr + 4;
+    let code = build_code(
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        ts_addr,
+        t0_buf_addr,
+        t1_buf_addr,
+    );
+    // struct timespec { tv_sec=1, tv_nsec=0 } — 8 bytes
+    let ts_data: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let t0_zeros = [0u8; 4];
+    let t1_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            marker_pre, marker_mid, marker_end, &ts_data, &t0_zeros, &t1_zeros,
         ],
         7,
     );
@@ -4813,6 +4950,97 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// Timer + scheduler milestone: /init samples `sys_time` before
+/// and after `sys_nanosleep(1 sec)`, writes both time samples
+/// between markers. Test asserts `t1 - t0 >= 1` — proves the
+/// kernel actually held the process off for 1 second of guest
+/// wall time. Until now every milestone ran in "instant" guest
+/// time; this pins PIT/LAPIC IRQs → jiffies → timer wheel →
+/// task wakeup end-to-end.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_nanosleep_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_nanosleep();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE T0=";
+    let marker_mid: &[u8] = b"T1=";
+    let marker_end_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — nanosleep may have \
+                 returned -errno or never woken up; {}",
+                dump_uart_on_failure(&cumulative, "nanosleep")
+            )
+        });
+    eprintln!("nanosleep milestone end marker after {steps} steps");
+
+    // The kernel TTY ONLCR-translates every `\n` /init writes
+    // into `\r\n` — fine for text markers, but for binary t0/t1
+    // bytes it pads the stream and shifts decoded u32 values.
+    // Undo the translation: any `\r` followed by `\n` was added
+    // by the kernel, not by /init. Strip those `\r`s into a
+    // separate buffer used for binary extraction; keep the
+    // original cumulative for marker searches that already
+    // include the `\r\n`.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let t0_off = pre_pos + marker_pre.len();
+    let t0 = u32::from_le_bytes(stripped[t0_off..t0_off + 4].try_into().unwrap());
+
+    let mid_pos = stripped
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid");
+    let t1_off = mid_pos + marker_mid.len();
+    let t1 = u32::from_le_bytes(stripped[t1_off..t1_off + 4].try_into().unwrap());
+
+    eprintln!(
+        "t0 = {t0}, t1 = {t1}, delta = {} seconds",
+        t1.wrapping_sub(t0)
+    );
+    assert!(
+        t1 > t0,
+        "expected t1 > t0 (kernel slept at least 1 second), got t0={t0} t1={t1} \
+         (delta = {}); nanosleep may not have actually waited; {}",
+        t1.wrapping_sub(t0),
+        dump_uart_on_failure(&cumulative, "nanosleep-no-wait")
     );
 }
 
