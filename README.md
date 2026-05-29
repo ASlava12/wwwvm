@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**609 тестов** зелёные (mem 30 + devices 77 + cpu 357 + vm 128 +
+**611 тестов** зелёные (mem 30 + devices 77 + cpu 359 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -303,6 +303,17 @@ U/S и WP пейджинг-чеки, IRET EFLAGS-маскирование/SS-rel
 limit/present чеки, far-transfer privilege/gates. Не реализованы (редкие
 опкоды, ядро/userspace не используют): LAR/LSL, BOUND, SMSW/SLDT/STR
 32-bit zero-ext. Детали в memory `cpu-audit-deferred-findings`.
+
+**Третий проход — атомики и bit-string (30 мая 2026):**
+CMPXCHG/CMPXCHG8B/XADD/XCHG/LOCK + BT/BTS/BTR/BTC/BSF/BSR. Найдено всего
+2 бага — и НИ ОДНОГО в CMPXCHG/CMPXCHG8B, bitmap-операциях
+(BT/BTS/BTR/BTC с reg-индексом, адресующим дальние байты) или BSF/BSR:
+атомарные + bitmap-примитивы ядра корректны. Исправлено: XADD писал dest
+раньше src → вырожденный `XADD AX,AX` оставлял старое значение вместо
+2×old (ядерный `LOCK XADD [mem],reg` всегда был корректен — разное
+хранилище). Отложено: LOCK-префикс (0xF0) как отдельный no-op-шаг
+теряет префикс, стоящий ПЕРЕД ним (`66 F0 …`, неканонический порядок —
+ассемблеры так не генерят); канонический `F0 66 …` работает.
 
 ## Что уже работает (i386-ядро)
 
