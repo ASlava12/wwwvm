@@ -456,6 +456,32 @@ fn linux_userspace_hello_padded_to_608_milestone() {
     );
 }
 
+/// Companion to `build_initramfs_uname_lands_at_a_known_bad_binary_size`:
+/// pin the known-good points where `build_initramfs_hello_padded_to`
+/// lands for the boundary sizes our bisection probes used. If
+/// the helper's arithmetic regresses, the next debug pass would
+/// land at the wrong size and the integration result wouldn't
+/// match the recorded bisection.
+#[test]
+fn build_initramfs_hello_padded_to_known_good_sizes() {
+    // (target, expected /init size from cpio header — same as target)
+    for target in [601usize, 604, 605, 608] {
+        let cpio = build_initramfs_hello_padded_to(target);
+        let filesize_field = std::str::from_utf8(&cpio[6 + 6 * 8..6 + 7 * 8]).unwrap();
+        let init_size = usize::from_str_radix(filesize_field, 16).unwrap();
+        assert_eq!(
+            init_size, target,
+            "padded-hello target={target} landed at {init_size}; \
+             would break the bisection's recorded outcome"
+        );
+        // And the known-good ones MUST NOT be in the bad set.
+        assert!(
+            !matches!(init_size, 600 | 602),
+            "padded-hello target={target} landed at known-bad {init_size}"
+        );
+    }
+}
+
 /// Probe whether /init binary size 601 (the only untested point
 /// in the bad range — 600 and 602 are confirmed-hanging) is also
 /// bad. If this hangs, the entire 600..=602 range is direct
