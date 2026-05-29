@@ -154,6 +154,51 @@ const INIT_LOAD_ADDR: u32 = 0x0804_8000;
 /// address space — ELF + PHDR sit before it.
 const INIT_ENTRY_OFFSET: u32 = 52 + 32;
 
+/// /init binary sizes that trigger the
+/// "stalls-in-pata_legacy-probe, kernel never reaches /init exec"
+/// boot bug. The 17-probe bisection around 600 found {600, 602};
+/// adding `gettimeofday_milestone` on 2026-05-29 surfaced 213
+/// (same symptoms, very different size — so the bad set is wider
+/// than the bisection's 588..608 window suggested). Treat this
+/// list as a non-exhaustive lower bound; landing at a previously
+/// untested size means another 8-minute discovery if it's also
+/// bad. The blocker note in README has the full diagnosis.
+const KNOWN_BAD_INIT_SIZES: &[usize] = &[213, 600, 602];
+
+/// Wrap `make_init_elf32` with a known-bad-size dodge for
+/// production milestones. If the raw ELF lands at a size in
+/// `KNOWN_BAD_INIT_SIZES`, append 4 zero bytes as an extra data
+/// segment so PHDR's `p_filesz` and the cpio's `c_filesize`
+/// grow together (the bug seems to depend on `c_filesize` in
+/// the unpacker, but keeping both in sync hedges against the
+/// alternative). Bisection probes and `build_initramfs_uname`
+/// (which intentionally hangs at 600) call `make_init_elf32`
+/// directly to preserve their specific sizes; everything else
+/// should funnel through this.
+fn make_init_elf32_safe(code: &[u8], data_segments: &[&[u8]], pt_flags: u32) -> Vec<u8> {
+    let binary = make_init_elf32(code, data_segments, pt_flags);
+    if !KNOWN_BAD_INIT_SIZES.contains(&binary.len()) {
+        return binary;
+    }
+    // Rebuild with a 4-byte tail-pad. 4 bytes is enough to step
+    // past adjacent bad sizes ({600, 602} are 2 apart but 213
+    // is isolated in our current sample); if both N and N+4 are
+    // bad we'll discover it on the next surprise — the function
+    // asserts the dodge succeeded in debug builds so a future
+    // discovery panics loudly rather than hanging silently.
+    let pad = [0u8; 4];
+    let mut segs: Vec<&[u8]> = data_segments.to_vec();
+    segs.push(&pad);
+    let binary = make_init_elf32(code, &segs, pt_flags);
+    debug_assert!(
+        !KNOWN_BAD_INIT_SIZES.contains(&binary.len()),
+        "make_init_elf32_safe: +4-byte pad still landed at known-bad size {}; \
+         widen KNOWN_BAD_INIT_SIZES or change the pad amount",
+        binary.len()
+    );
+    binary
+}
+
 /// Assemble the cpio archive: /init (regular ELF), /dev (dir),
 /// /dev/console (CHR 5:1 so Linux's `console_on_rootfs` can
 /// open it), and an optional /proc directory (only the procfs-
@@ -219,7 +264,7 @@ fn build_initramfs_hello() -> Vec<u8> {
     let code_len = build_code(0).len() as u32;
     let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
     let code = build_code(msg_addr);
-    let binary = make_init_elf32(&code, &[msg], 5);
+    let binary = make_init_elf32_safe(&code, &[msg], 5);
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
@@ -360,6 +405,55 @@ fn init_cpio_archives_start_with_newc_magic() {
             build_initramfs_hello_padded_to(601),
         );
     }
+}
+
+/// Pins the safe-wrapper's invariant: any input that would
+/// land at a `KNOWN_BAD_INIT_SIZES` entry gets shifted off by
+/// `make_init_elf32_safe`, and any input that wouldn't is
+/// returned byte-identical. Cheap fast unit test — no
+/// vmlinuz required, runs in default `cargo test`. Future
+/// production builders that funnel through `_safe` rely on
+/// this dodge; if the wrapper regresses, every production
+/// milestone could silently start hanging again.
+#[test]
+fn make_init_elf32_safe_dodges_known_bad_sizes() {
+    // Construct a code segment that lands at each known-bad size.
+    // The bare ELF+PHDR is 84 bytes, so a `code` of `N - 84` bytes
+    // (with empty `data_segments`) produces a binary of exactly N.
+    for &bad in KNOWN_BAD_INIT_SIZES {
+        let code = vec![0x90u8; bad - 84];
+        let raw = make_init_elf32(&code, &[], 5);
+        assert_eq!(
+            raw.len(),
+            bad,
+            "raw make_init_elf32 should land at exactly {bad} for this construction",
+        );
+        let safe = make_init_elf32_safe(&code, &[], 5);
+        assert_ne!(
+            safe.len(),
+            bad,
+            "make_init_elf32_safe should dodge bad size {bad}",
+        );
+        assert!(
+            !KNOWN_BAD_INIT_SIZES.contains(&safe.len()),
+            "make_init_elf32_safe dodge landed at another bad size {} \
+             (came from {bad}); widen the pad or the BAD list",
+            safe.len(),
+        );
+    }
+    // A confirmed-good size (217 — the gettimeofday production
+    // milestone's actual binary size after its own safe dodge)
+    // must be returned untouched.
+    let code = vec![0x90u8; 217 - 84];
+    let raw = make_init_elf32(&code, &[], 5);
+    assert_eq!(raw.len(), 217);
+    let safe = make_init_elf32_safe(&code, &[], 5);
+    assert_eq!(
+        safe.len(),
+        217,
+        "good size 217 should pass through untouched, got {}",
+        safe.len(),
+    );
 }
 
 /// Hello /init padded to exactly 600 bytes — the **minimal**
@@ -713,7 +807,7 @@ fn build_initramfs_proc_version() -> Vec<u8> {
         buf_addr,
     );
     let buf_zeros = vec![0u8; BUF_LEN as usize];
-    let binary = make_init_elf32(
+    let binary = make_init_elf32_safe(
         &code,
         &[
             marker_pre,
@@ -793,7 +887,7 @@ fn build_initramfs_time() -> Vec<u8> {
     let buf_addr = marker_post_addr + marker_post.len() as u32;
     let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
     let buf_zeros = [0u8; 4];
-    let binary = make_init_elf32(
+    let binary = make_init_elf32_safe(
         &code,
         &[marker_pre, marker_post, &buf_zeros],
         7, // R | W | X — /init writes time_t into buf
@@ -859,7 +953,7 @@ fn build_initramfs_getpid() -> Vec<u8> {
     let buf_addr = marker_post_addr + marker_post.len() as u32;
     let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
     let buf_zeros = [0u8; 4];
-    let binary = make_init_elf32(
+    let binary = make_init_elf32_safe(
         &code,
         &[marker_pre, marker_post, &buf_zeros],
         7, // R | W | X — /init writes pid into buf
@@ -927,22 +1021,14 @@ fn build_initramfs_gettimeofday() -> Vec<u8> {
     let buf_addr = marker_post_addr + marker_post.len() as u32;
     let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
     let buf_zeros = [0u8; 8]; // struct timeval = 8 bytes
-                              // Tail-pad dodges a NEW bad-set hit found 2026-05-29: this
-                              // builder, before the pad, produced an /init of exactly 213
-                              // bytes — and that size triggers the same kernel-stalls-in-
-                              // pata_legacy-probe symptom as the {600, 602} bisection
-                              // (full kernel boot, "Trying to unpack rootfs image as
-                              // initramfs..." appears, then nothing — no "Run /init",
-                              // no userspace, budget exhausts at 8.7 min). The original
-                              // bisection only swept sizes 588..608, so it missed that
-                              // the bad set extends much further. With this 12-byte
-                              // tail pad the binary is 225 bytes and the test passes
-                              // in ~52 s. The blocker note in README has the wider
-                              // diagnosis. The bytes are unreferenced by /init code.
-    let tail_pad = [0u8; 12];
-    let binary = make_init_elf32(
+                              // make_init_elf32_safe auto-pads if the result lands at a
+                              // known-bad size (this builder's raw output is exactly 213
+                              // bytes — see the discovery in commit e86ed9a). With the
+                              // safe wrapper the binary comes out at 217 (213 + 4-byte
+                              // pad), which is currently confirmed-good.
+    let binary = make_init_elf32_safe(
         &code,
-        &[marker_pre, marker_post, &buf_zeros, &tail_pad],
+        &[marker_pre, marker_post, &buf_zeros],
         7, // R | W | X — kernel copy_to_user writes timeval into buf
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
