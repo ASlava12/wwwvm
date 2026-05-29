@@ -209,6 +209,14 @@
 //!     `setattr → notify_change` path that updates
 //!     `inode->i_mode` AND stat reflecting the change.
 //!
+//!   - `linux_userspace_getppid_in_child_milestone` —
+//!     parent-child link: /init forks; child calls
+//!     `sys_getppid` which returns /init's PID (= 1); test
+//!     asserts equality. Pins the kernel's `real_parent`
+//!     setup during fork — if the kernel left child's
+//!     `real_parent` pointing at swapper or kthreadd, the
+//!     test would see 0 or 2 instead of 1.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -597,6 +605,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let rename = build_initramfs_rename();
     let truncate = build_initramfs_truncate();
     let chmod = build_initramfs_chmod();
+    let getppid_in_child = build_initramfs_getppid_in_child();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -623,6 +632,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&rename[0..6], b"070701");
     assert_eq!(&truncate[0..6], b"070701");
     assert_eq!(&chmod[0..6], b"070701");
+    assert_eq!(&getppid_in_child[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -650,6 +660,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-rename.cpio", &rename);
         let _ = std::fs::write("/tmp/wwwvm-truncate.cpio", &truncate);
         let _ = std::fs::write("/tmp/wwwvm-chmod.cpio", &chmod);
+        let _ = std::fs::write("/tmp/wwwvm-getppid-in-child.cpio", &getppid_in_child);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2802,6 +2813,91 @@ fn build_initramfs_chmod() -> Vec<u8> {
         ],
         7,
     );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init forks; the child calls
+/// `sys_getppid` (syscall 64) and writes the returned PID
+/// between `[USERSPACE PARENT_PID=…][USERSPACE END]`. Parent
+/// waitpid's the child. Test asserts the child's getppid result
+/// equals 1 — proves the kernel set the child's `real_parent`
+/// to point at /init (PID 1) on fork.
+fn build_initramfs_getppid_in_child() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE PARENT_PID=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // sys_fork
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // test eax, eax; jnz parent (disp8 patched after we know
+        // the child block's size)
+        out.extend_from_slice(&[0x85, 0xC0]);
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]); // placeholder
+
+        // child:
+        // sys_getppid → eax
+        out.extend_from_slice(&[0xB8, 0x40, 0x00, 0x00, 0x00]); // mov eax, 64
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[buf] = eax
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // child exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+
+        // parent: sys_waitpid(-1, NULL, 0); exit(0)
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]); // mov eax, 7
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(&code, &[marker_pre, marker_post, &buf_zeros], 7);
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
@@ -5437,6 +5533,76 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_getppid` in forked child: /init forks; child calls
+/// `sys_getppid` (syscall 64) which should return /init's PID
+/// (equal to 1). Test asserts the 4-byte value between markers
+/// equals 1 — pins the kernel's parent-child link in task struct
+/// via the `real_parent` field at fork time.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_getppid_in_child_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_getppid_in_child();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE PARENT_PID=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "getppid_in_child")
+            )
+        });
+    eprintln!("getppid milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let ppid_off = pre_pos + marker_pre.len();
+    let ppid_bytes: [u8; 4] = stripped[ppid_off..ppid_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let ppid = u32::from_le_bytes(ppid_bytes);
+    eprintln!("child's getppid returned ppid = {ppid}");
+    assert_eq!(
+        ppid,
+        1,
+        "expected child's getppid = 1 (parent is /init = PID 1), got {ppid}; {}",
+        dump_uart_on_failure(&cumulative, "getppid-wrong")
     );
 }
 
