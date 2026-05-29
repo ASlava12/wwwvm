@@ -1974,6 +1974,135 @@ fn build_initramfs_file_mmap() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init tests file-backed mmap at a NON-ZERO file
+/// offset — the case ld.so uses to place each shared object's later
+/// PT_LOAD segments, and the prime suspect for the dynamic-linking
+/// failure (`file_mmap_milestone` only covers offset 0). /init:
+/// creates a file, `lseek`s to 4096, writes `"OFFSETOK"` at offset
+/// 4096 (page 1; page 0 is a sparse zero hole), then
+/// `mmap2(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, pgoff=1)` and dumps
+/// the mapped bytes:
+///
+///   `[USERSPACE FOFF=<4 addr>DATA=<8 bytes>][USERSPACE END]`
+///
+/// If the mapped bytes are `"OFFSETOK"`, non-zero-offset file mapping
+/// works; if they're zero, the mapping wrongly returned page 0 — a
+/// real bug, and very likely the dynamic-linking root cause.
+fn build_initramfs_file_mmap_offset() -> Vec<u8> {
+    let path: &[u8] = b"/m2\0";
+    let payload: &[u8] = b"OFFSETOK";
+    let marker_pre: &[u8] = b"[USERSPACE FOFF=";
+    let marker_mid: &[u8] = b"DATA=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      fd_addr: u32,
+                      addr_buf: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // fd = open(path, O_CREAT|O_RDWR = 0x42, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x42, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[fd], eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // lseek(fd, 4096, SEEK_SET=0) — sys 19
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x13, 0x00, 0x00, 0x00]); // mov eax, 19
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 4096
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (SEEK_SET)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(fd, payload, 8) at offset 4096
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // addr = mmap2(NULL, 4096, PROT_READ=1, MAP_PRIVATE=2, fd, pgoff=1)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // PROT_READ
+        out.extend_from_slice(&[0xBE, 0x02, 0x00, 0x00, 0x00]); // MAP_PRIVATE
+        out.extend_from_slice(&[0x8B, 0x3D]); // mov edi, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBD, 0x01, 0x00, 0x00, 0x00]); // mov ebp, 1 (pgoff=1 → byte 4096)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[addr_buf], eax
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        // emit FOFF=<addr>
+        w(marker_pre_addr, marker_pre.len() as u32, &mut out);
+        w(addr_buf, 4, &mut out);
+        // emit DATA=<8 mapped bytes> — write(1, [addr_buf], 8)
+        w(marker_mid_addr, marker_mid.len() as u32, &mut out);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x8B, 0x0D]); // mov ecx, ds:[addr_buf]
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        w(marker_end_addr, marker_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let fd_addr = marker_end_addr + marker_end.len() as u32;
+    let addr_buf = fd_addr + 4;
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        fd_addr,
+        addr_buf,
+    );
+    let fd_zeros = [0u8; 4];
+    let addr_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_mid,
+            marker_end,
+            &fd_zeros,
+            &addr_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init writes a tiny machine-code function to a
 /// file, maps it `PROT_READ|PROT_EXEC` (MAP_PRIVATE), and `CALL`s
 /// into the mapping — proving the emulator can *fetch and execute*
@@ -8712,6 +8841,76 @@ fn linux_userspace_file_mmap_milestone() {
          \"MAPDATA8\"; got {:?} (all-zero ⇒ the file page wasn't faulted in); {}",
         String::from_utf8_lossy(&data),
         dump_uart_on_failure(&cumulative, "file-mmap-bytes")
+    );
+}
+
+/// Milestone: file-backed mmap at a NON-ZERO file offset. /init writes
+/// `"OFFSETOK"` at file offset 4096 (page 1) and maps that page with
+/// `mmap2(.., fd, pgoff=1)`. Asserts the mapped bytes equal `"OFFSETOK"`
+/// — i.e. the mapping returns page 1's content, not page 0. This is the
+/// case ld.so uses to place a shared object's later PT_LOAD segments,
+/// and was the prime suspect for the dynamic-linking failure.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_file_mmap_offset_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_file_mmap_offset();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen — file-mmap-at-offset path stalled; {}",
+            dump_uart_on_failure(&cumulative, "file-mmap-offset")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let data = stripped
+        .windows(5)
+        .position(|w| w == b"DATA=")
+        .and_then(|p| stripped.get(p + 5..p + 13))
+        .map(|s| s.to_vec());
+    eprintln!(
+        "file-mmap @ offset 4096: mapped bytes = {:?}",
+        data.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+    assert_eq!(
+        data.as_deref(),
+        Some(&b"OFFSETOK"[..]),
+        "mmap at pgoff=1 should return file offset 4096 (\"OFFSETOK\"); got {:?} \
+         (zero ⇒ it wrongly returned page 0 — a non-zero-offset file-mmap bug); {}",
+        data.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned()),
+        dump_uart_on_failure(&cumulative, "file-mmap-offset-bytes")
     );
 }
 
