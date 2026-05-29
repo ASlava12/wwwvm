@@ -744,6 +744,48 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// A write to LAPIC Initial Count (0x380..0x384) must also
+    /// land in Current Count (0x390..0x394). Real silicon snaps
+    /// `current = initial` atomically on the write; without this
+    /// mirror, the kernel reprogrammming the LAPIC timer would
+    /// see Current Count unchanged and assume the timer hadn't
+    /// been re-armed. Pinned at the *write side* — the tick-time
+    /// reload (periodic mode) is covered by
+    /// `tick_lapic_timer_periodic_mode_reloads_current_from_initial`.
+    #[test]
+    fn lapic_initial_count_write_mirrors_into_current_count() {
+        let mut m = Memory::new(64);
+        // Park Current Count at a sentinel before writing Initial.
+        m.write_u32(LAPIC_BASE + 0x390, 0xDEAD_BEEF);
+        m.write_u32(LAPIC_BASE + 0x380, 0x1234_5678);
+        assert_eq!(
+            m.read_u32(LAPIC_BASE + 0x390),
+            0x1234_5678,
+            "write to Initial Count must snap Current Count to match"
+        );
+        // Sanity: Initial Count itself round-trips.
+        assert_eq!(m.read_u32(LAPIC_BASE + 0x380), 0x1234_5678);
+    }
+
+    /// Negative companion: a write *outside* the Initial Count
+    /// range must NOT touch Current Count. A regression that
+    /// loosened the range check (e.g. `0x380..0x394` by mistake)
+    /// would have any kernel write to neighboring registers — TPR
+    /// at 0x080, EOI at 0xB0, etc — silently smash the timer
+    /// Current Count.
+    #[test]
+    fn lapic_non_initial_count_write_leaves_current_count_alone() {
+        let mut m = Memory::new(64);
+        m.write_u32(LAPIC_BASE + 0x390, 0xDEAD_BEEF);
+        // Write to TPR (0x080) — utterly unrelated to timer.
+        m.write_u32(LAPIC_BASE + 0x080, 0x0000_0011);
+        assert_eq!(
+            m.read_u32(LAPIC_BASE + 0x390),
+            0xDEAD_BEEF,
+            "writes outside 0x380..0x384 must not touch Current Count"
+        );
+    }
+
     /// Self-IPI through the ICR low register (write to 0x303
     /// completes the dword) must queue the IRQ at the vector
     /// encoded in ICR[7:0]. This is the exact path Linux's
