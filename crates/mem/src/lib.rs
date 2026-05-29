@@ -744,6 +744,32 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// HPET main counter must freeze when ENABLE_CNF (General
+    /// Configuration register, offset 0x010 bit 0) is clear.
+    /// Linux relies on this for HPET pause-during-resume — without
+    /// it, an S3 wake-up would see the counter run during sleep and
+    /// the kernel's TSC-vs-HPET drift detector trips. Positive
+    /// companion: with ENABLE_CNF set, the counter increments.
+    #[test]
+    fn tick_hpet_counter_does_not_advance_when_enable_cnf_clear() {
+        let mut m = Memory::new(64);
+        // ENABLE_CNF = 0 — the architectural reset state.
+        assert_eq!(m.read_u32(HPET_BASE + 0x10) & 1, 0);
+        // Park a sentinel in the main counter so we can detect any
+        // unauthorized advance.
+        m.write_u32(HPET_BASE + 0xF0, 0xABCD_1234);
+        m.tick_hpet_counter();
+        assert_eq!(
+            m.read_u32(HPET_BASE + 0xF0),
+            0xABCD_1234,
+            "main counter must stay frozen while ENABLE_CNF=0"
+        );
+        // Flip ENABLE_CNF and tick once — counter advances by 1.
+        m.write_u32(HPET_BASE + 0x10, 1);
+        m.tick_hpet_counter();
+        assert_eq!(m.read_u32(HPET_BASE + 0xF0), 0xABCD_1235);
+    }
+
     /// HPET timer with INT_ENB_CNF (bit 2) clear must NOT fire an
     /// IRQ when the comparator matches. Same setup as the
     /// auto-advance test above but with bit 2 cleared. Pins the
