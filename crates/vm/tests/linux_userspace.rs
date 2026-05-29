@@ -9271,6 +9271,137 @@ fn linux_userspace_eventfd_milestone() {
     );
 }
 
+/// Milestone: boot a REAL, statically-linked i386 binary as /init —
+/// genuine compiler+glibc-generated machine code, not a hand-assembled
+/// syscall stub. Uses glibc's static `ldconfig` (37 KB) extracted from
+/// the Tinycore rootfs; the path comes from `WWWVM_STATIC_INIT`
+/// (default `/tmp/wwwvm-linux/static-ldconfig`) and the test SKIPS if
+/// absent, exactly like the kernel-dependent milestones (see the
+/// README build-deps note for how to extract it). To get one:
+/// `7z e Core-current.iso boot/core.gz && zcat core.gz | cpio -id
+/// sbin/ldconfig`.
+///
+/// This is the capstone integration test: a single binary exercises
+/// the whole stack at once — the kernel's ELF loader on a real
+/// ET_EXEC, glibc's static CRT startup (`__libc_start_main`), TLS via
+/// `set_thread_area`, brk/mmap for the malloc arena, and real fs
+/// syscalls. ldconfig scans the (absent) library dirs, prints its
+/// genuine "skipping /lib …" diagnostics, and `exit(0)`s cleanly.
+///
+/// Asserts: /init was exec'd, ldconfig's real output appeared
+/// (`skipping /lib`, proving glibc + ldconfig's `main` ran), and it
+/// exited with code 0 (the clean-exit init panic). This proves the
+/// emulator runs actual compiled+linked Linux software.
+#[test]
+#[ignore = "requires WWWVM_STATIC_INIT (real static glibc binary); ~60s"]
+fn linux_userspace_real_static_binary_milestone() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let binpath = std::env::var("WWWVM_STATIC_INIT")
+        .unwrap_or_else(|_| "/tmp/wwwvm-linux/static-ldconfig".to_string());
+    let initbin = match std::fs::read(&binpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read static init {binpath}: {e}");
+            return;
+        }
+    };
+    eprintln!("static /init = {binpath} ({} bytes)", initbin.len());
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_cpio_archive(&initbin, /* proc_dir */ true);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    // The clean-exit init panic; ldconfig prints its output and
+    // exit(0)s before this. We stop here so we don't run on into the
+    // post-panic reboot stub (which hits an unimplemented opcode).
+    let exit_marker = "Attempted to kill init! exitcode=0x00000000";
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 8_000_000_000u64;
+    let mut steps = 0u64;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        if String::from_utf8_lossy(&cumulative).contains(exit_marker) {
+            stop_reason = "reached clean-exit panic".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== real static /init milestone ===");
+    eprintln!("  steps run: {steps}");
+    eprintln!("  stop reason: {stop_reason}");
+    let reached = text.contains("Run /init as init process");
+    let ldconfig_ran = text.contains("skipping /lib");
+    let clean_exit = text.contains(exit_marker);
+    eprintln!("  reached /init exec: {reached}");
+    eprintln!("  ldconfig output (skipping /lib): {ldconfig_ran}");
+    eprintln!("  clean exit (exitcode=0): {clean_exit}");
+    for needle in ["segfault at", "trap invalid opcode", "Kernel panic"] {
+        if let Some(p) = text.find(needle) {
+            let endp = text[p..]
+                .find('\n')
+                .map(|n| p + n)
+                .unwrap_or((p + 120).min(text.len()));
+            eprintln!("  [{needle}] {:?}", &text[p..endp]);
+        }
+    }
+
+    assert!(
+        reached,
+        "the kernel never exec'd /init — the real ELF didn't load; {}",
+        dump_uart_on_failure(&cumulative, "real-static-exec")
+    );
+    assert!(
+        ldconfig_ran,
+        "ldconfig's real output (\"skipping /lib\") never appeared — glibc \
+         static startup or ldconfig's main didn't run; {}",
+        dump_uart_on_failure(&cumulative, "real-static-output")
+    );
+    assert!(
+        clean_exit,
+        "the binary did not exit cleanly with code 0 (no exitcode=0x00000000 \
+         init panic) — it likely crashed mid-run; {}",
+        dump_uart_on_failure(&cumulative, "real-static-exit")
+    );
+}
+
 /// File-I/O round-trip milestone: /init creates a new file in
 /// initramfs (`/test_file`) with `open(O_CREAT|O_WRONLY, 0o644)`,
 /// writes `b"TESTDATA"` to it, closes, reopens read-only, reads
