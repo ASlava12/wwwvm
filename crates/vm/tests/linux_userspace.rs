@@ -137,12 +137,12 @@ fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
     // hang ~9 minutes when run with --ignored. The bug isn't in
     // this helper, but the helper is the chokepoint everyone goes
     // through, so the warning lives here.
-    if (600..=602).contains(&init_binary.len()) && cfg!(debug_assertions) {
+    if matches!(init_binary.len(), 600 | 602) && cfg!(debug_assertions) {
         eprintln!(
-            "build_cpio_archive: WARNING — /init binary length {} lies in the \
-             known bad range 600..=602 (sizes 600 and 602 confirmed-hanging in \
-             `4c68139`; 601 untested but extrapolated). Boot likely stalls in \
-             pata_legacy probe — see build_initramfs_hello_padded_to_600.",
+            "build_cpio_archive: WARNING — /init binary length {} is a known-bad \
+             size. The bad set is sparse: 600 and 602 hang the kernel boot \
+             (confirmed in `4c68139`, `d6fd05f`); 601 works (`d6fd05f`). Boot \
+             stalls in pata_legacy probe — see build_initramfs_hello_padded_to_600.",
             init_binary.len()
         );
     }
@@ -193,14 +193,25 @@ fn build_initramfs_hello() -> Vec<u8> {
 /// sysname[0..65] slot bracketed by a unique marker. **This
 /// builder hangs kernel boot.** Kept around because it's used by
 /// `init_cpio_archives_start_with_newc_magic` as a sanity-check
-/// input, AND it's the canonical reproducer for the boot stall
-/// we bisected to "/init binary size 600..=602 bytes" across
-/// `b67d7cb`..`a25f98e` (10 ignored probes).
+/// input, AND it's a canonical reproducer for the boot stall.
+///
+/// Bisection result (10 probes `b67d7cb`..`a25f98e`, then
+/// `4c68139` + `d6fd05f`):
+///
+///   | /init size | works? |
+///   |------------|--------|
+///   | 588        |  ✓     |
+///   | 600        |  ✗     |
+///   | 601        |  ✓     |
+///   | 602        |  ✗     |
+///   | 604+       |  ✓     |
+///
+/// **The bad SET is {600, 602} — sparse, not a range.** This
+/// builder lands at exactly 600.
 ///
 /// Binary-size math:
 ///   ELF+PHDR (84) + code (90, 5 syscalls × ~22 bytes) +
 ///   marker_pre (19) + marker_post (17) + buf_zeros (390) = 600.
-/// Exactly the low end of the bad range — that's why it hangs.
 ///
 /// The exact mechanism is still unknown — kernel never reaches
 /// /init exec, stuck in pata_legacy probe at 16 B steps. Future
@@ -442,23 +453,22 @@ fn linux_userspace_hello_padded_to_601_milestone() {
 /// Pin `build_initramfs_uname` as the canonical reproducer of the
 /// /init-binary-size-600 stall: extract the /init filesize from
 /// the cpio header (field 6 of the 13 ASCII-hex fields after the
-/// 6-byte magic) and assert it lands inside the bad range we
-/// bisected. If a future refactor accidentally changes the code
-/// layout enough to push the binary out of 600..=602, the
-/// "canonical reproducer" loses its bug-reproducing property and
-/// this test fails — prompting a re-bisection.
+/// 6-byte magic) and assert it equals one of the known-bad
+/// sizes (600 or 602; 601 works, see `d6fd05f`). If a future
+/// refactor accidentally changes the code layout enough to push
+/// the binary out of the bad set, the "canonical reproducer"
+/// loses its bug-reproducing property and this test fails —
+/// prompting a re-bisection.
 #[test]
-fn build_initramfs_uname_lands_in_the_bad_binary_size_range() {
+fn build_initramfs_uname_lands_at_a_known_bad_binary_size() {
     let cpio = build_initramfs_uname();
-    // cpio newc header: 6-byte magic + 13 8-byte ASCII-hex fields.
-    // Field 6 (0-indexed) is c_filesize.
     let filesize_field = std::str::from_utf8(&cpio[6 + 6 * 8..6 + 7 * 8]).unwrap();
     let init_size = u32::from_str_radix(filesize_field, 16).unwrap();
     assert!(
-        (600..=602).contains(&init_size),
+        matches!(init_size, 600 | 602),
         "build_initramfs_uname produced /init of size {init_size}; \
-         expected in 600..=602 (the known-bad range from the bisection \
-         that lives in this builder's doc-block)"
+         expected 600 or 602 (the confirmed-hanging sizes; 601 works \
+         per `d6fd05f`)"
     );
 }
 
