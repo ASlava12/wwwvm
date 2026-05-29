@@ -2207,6 +2207,145 @@ fn build_initramfs_shared_mmap() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init exercises `sys_futex` WAIT/WAKE across a
+/// shared page — the kernel primitive every pthread mutex/condvar is
+/// built on. It maps a MAP_SHARED page (the futex word, init 0),
+/// forks, and:
+///   * child: `futex(&word, FUTEX_WAIT, 0, NULL)` — blocks because
+///     *word == 0 and nothing changes it,
+///   * parent: spins `futex(&word, FUTEX_WAKE, 1)` until it reports
+///     it woke a waiter (return >= 1), then `waitpid`s the child.
+///
+/// Output: `[USERSPACE WOKE=<4 wait-ret>WAKE=<4 wake-ret>][USERSPACE END]`.
+/// The WAKE return == 1 is the decisive proof: the kernel only
+/// reports waking 1 task if the child was genuinely blocked in
+/// FUTEX_WAIT and FUTEX_WAKE found and woke it — i.e. the full
+/// kernel-side wait-queue handoff worked. The child's WAIT return ==
+/// 0 confirms it returned via a wake (not -EAGAIN). The spin makes
+/// the handoff deterministic regardless of fork scheduling order.
+fn build_initramfs_futex() -> Vec<u8> {
+    let m_woke: &[u8] = b"[USERSPACE WOKE=";
+    let m_wake: &[u8] = b"WAKE=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const WAKE_SPIN_CAP: u32 = 0x0010_0000;
+
+    let build_code = |m_woke_addr: u32,
+                      m_wake_addr: u32,
+                      m_end_addr: u32,
+                      addr_buf: u32,
+                      wait_ret: u32,
+                      wake_ret: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // addr = mmap2(NULL, 0x1000, R|W, MAP_SHARED|ANON=0x21, -1, 0)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBE, 0x21, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xED]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[addr_buf], eax
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        // fork
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]); // jnz parent (patched)
+
+        // ===== CHILD: futex(&word, FUTEX_WAIT, 0, NULL) =====
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[addr_buf] (uaddr)
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0xF0, 0x00, 0x00, 0x00]); // mov eax, 240 (futex)
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (op = FUTEX_WAIT)
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (val = 0)
+        out.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi (timeout = NULL)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wait_ret], eax
+        out.extend_from_slice(&wait_ret.to_le_bytes());
+        w(m_woke_addr, m_woke.len() as u32, &mut out);
+        w(wait_ret, 4, &mut out);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0)
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+
+        // ===== PARENT =====
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+        // ebp = spin cap
+        out.push(0xBD); // mov ebp, imm32
+        out.extend_from_slice(&WAKE_SPIN_CAP.to_le_bytes());
+        let wake_loop = out.len();
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[addr_buf]
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0xF0, 0x00, 0x00, 0x00]); // mov eax, 240
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1 (FUTEX_WAKE)
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (wake up to 1)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wake_ret], eax
+        out.extend_from_slice(&wake_ret.to_le_bytes());
+        out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        let jg_at = out.len();
+        out.extend_from_slice(&[0x7F, 0x00]); // jg wake_done (woke >=1) (patched)
+        out.push(0x4D); // dec ebp
+                        // jnz wake_loop (backward)
+        out.push(0x75);
+        let after = out.len() + 1;
+        out.push(((wake_loop as i32) - (after as i32)) as u8);
+        let wake_done = out.len();
+        out[jg_at + 1] = (wake_done - (jg_at + 2)) as u8;
+        // waitpid(-1, NULL, 0)
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // emit WAKE=<wake_ret> END
+        w(m_wake_addr, m_wake.len() as u32, &mut out);
+        w(wake_ret, 4, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0)
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let m_woke_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_wake_addr = m_woke_addr + m_woke.len() as u32;
+    let m_end_addr = m_wake_addr + m_wake.len() as u32;
+    let addr_buf = m_end_addr + m_end.len() as u32;
+    let wait_ret = addr_buf + 4;
+    let wake_ret = wait_ret + 4;
+    let code = build_code(
+        m_woke_addr,
+        m_wake_addr,
+        m_end_addr,
+        addr_buf,
+        wait_ret,
+        wake_ret,
+    );
+    let z4 = [0u8; 4];
+    let binary = make_init_elf32_safe(&code, &[m_woke, m_wake, m_end, &z4, &z4, &z4], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -8148,6 +8287,84 @@ fn linux_userspace_shared_mmap_milestone() {
         "parent should see the child's write through the MAP_SHARED page; got \
          {shm:#010x} (zero ⇒ the mapping behaved as private/COW, not shared); {}",
         dump_uart_on_failure(&cumulative, "shm-value")
+    );
+}
+
+/// Futex milestone: /init forks; the child blocks in
+/// `futex(FUTEX_WAIT)` on a shared word, the parent spins
+/// `futex(FUTEX_WAKE)` until it wakes the waiter, then reaps it.
+/// Asserts the child's WAIT returned 0 (woken, not -EAGAIN) and the
+/// parent's WAKE returned 1 (exactly one task woken). The latter is
+/// the decisive proof of the kernel-side futex wait-queue handoff —
+/// the primitive under every pthread mutex/condvar.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_futex_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_futex();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — futex WAIT never woke \
+             (the parent's WAKE didn't find the blocked child, or WAIT didn't \
+             block), so waitpid deadlocked; {}",
+            dump_uart_on_failure(&cumulative, "futex")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<i32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| i32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let woke = read_at(b"[USERSPACE WOKE=");
+    let wake = read_at(b"WAKE=");
+    eprintln!("futex: child WAIT ret={woke:?}, parent WAKE ret={wake:?}");
+    assert_eq!(
+        woke,
+        Some(0),
+        "child's FUTEX_WAIT should return 0 (woken), not -EAGAIN/-errno; got {woke:?}; {}",
+        dump_uart_on_failure(&cumulative, "futex-wait")
+    );
+    assert_eq!(
+        wake,
+        Some(1),
+        "parent's FUTEX_WAKE should report waking exactly 1 task (proving the \
+         child was blocked in the futex wait-queue and got woken); got {wake:?}; {}",
+        dump_uart_on_failure(&cumulative, "futex-wake")
     );
 }
 
