@@ -194,6 +194,13 @@
 //!     becomes inaccessible (the read goes through /b's new
 //!     dentry).
 //!
+//!   - `linux_userspace_truncate_milestone` — file shrink:
+//!     /init writes a 10-byte file, calls `sys_truncate(path,
+//!     4)`, then `sys_stat64` and reads `st_size` back. Test
+//!     asserts the value equals 4 — proves the kernel
+//!     SHRANK the file. The stat milestone only pins write
+//!     extending i_size; this one pins truncate shrinking it.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -580,6 +587,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let nanosleep = build_initramfs_nanosleep();
     let writev = build_initramfs_writev();
     let rename = build_initramfs_rename();
+    let truncate = build_initramfs_truncate();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -604,6 +612,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&nanosleep[0..6], b"070701");
     assert_eq!(&writev[0..6], b"070701");
     assert_eq!(&rename[0..6], b"070701");
+    assert_eq!(&truncate[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -629,6 +638,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-nanosleep.cpio", &nanosleep);
         let _ = std::fs::write("/tmp/wwwvm-writev.cpio", &writev);
         let _ = std::fs::write("/tmp/wwwvm-rename.cpio", &rename);
+        let _ = std::fs::write("/tmp/wwwvm-truncate.cpio", &truncate);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2662,6 +2672,140 @@ fn build_initramfs_rename() -> Vec<u8> {
             marker_post,
             &fd_zeros,
             &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/probe` with 10 bytes,
+/// calls `sys_truncate("/probe", 4)` (syscall 92), then
+/// `sys_stat64` and reads `st_size` (low 4 bytes at offset 44)
+/// back out. Writes the 4-byte size between
+/// `[USERSPACE TRUNC_SIZE=…][USERSPACE END]`. Test asserts the
+/// value equals 4 — proves the kernel shrank the file via
+/// truncate, not just left it at the original 10 bytes.
+///
+/// Different from the stat milestone: that one only proves
+/// write extends `i_size`. This one proves truncate SHRINKS it
+/// (kernel calls `setattr_should_drop_sgid` and
+/// `vmtruncate` → `simple_setsize` to shrink the page cache and
+/// inode's `i_size`).
+fn build_initramfs_truncate() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let payload: &[u8] = b"ABCDEFGHIJ"; // 10 bytes
+    let marker_pre: &[u8] = b"[USERSPACE TRUNC_SIZE=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      statbuf_addr: u32,
+                      size_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open(path, O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_write(fd, payload, 10)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_truncate(path, 4) — sys 92
+        out.extend_from_slice(&[0xB8, 0x5C, 0x00, 0x00, 0x00]); // mov eax, 92
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x04, 0x00, 0x00, 0x00]); // mov ecx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_stat64(path, &statbuf) — sys 195
+        out.extend_from_slice(&[0xB8, 0xC3, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&statbuf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Read st_size low 4 bytes at offset 44 and store.
+        out.push(0xA1);
+        out.extend_from_slice(&(statbuf_addr + 44).to_le_bytes());
+        out.push(0xA3);
+        out.extend_from_slice(&size_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, size_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&size_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let statbuf_addr = fd_addr + 4;
+    let size_buf_addr = statbuf_addr + 100;
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        statbuf_addr,
+        size_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let statbuf_zeros = [0u8; 100];
+    let size_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &statbuf_zeros,
+            &size_zeros,
         ],
         7,
     );
@@ -5166,6 +5310,80 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_truncate` milestone: /init writes a 10-byte file, calls
+/// `sys_truncate(path, 4)`, then `sys_stat64` and reads
+/// `st_size`. Test asserts the value equals 4 — proves the
+/// kernel actually shrank the file. Different from the stat
+/// milestone which only proves write extends `i_size`; this one
+/// proves truncate shrinks it.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_truncate_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_truncate();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE TRUNC_SIZE=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "truncate")
+            )
+        });
+    eprintln!("truncate milestone end marker after {steps} steps");
+
+    // Binary u32 may contain 0x0A which kernel ONLCRs — strip
+    // `\r\n` → `\n` before extraction (same pattern as nanosleep).
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let size_off = pre_pos + marker_pre.len();
+    let size_bytes: [u8; 4] = stripped[size_off..size_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let st_size = u32::from_le_bytes(size_bytes);
+    eprintln!("stat after truncate returned st_size = {st_size}");
+    assert_eq!(
+        st_size,
+        4,
+        "expected st_size = 4 (after truncating 10-byte file to 4), got {st_size}; \
+         if it equals 10, truncate didn't shrink; {}",
+        dump_uart_on_failure(&cumulative, "truncate-wrong")
     );
 }
 
