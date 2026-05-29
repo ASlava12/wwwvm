@@ -2778,6 +2778,120 @@ fn build_initramfs_epoll() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init exercises `eventfd` — the lightweight
+/// 64-bit counter fd that pairs with epoll to wake event loops. It
+/// `eventfd2(0, 0)`s a counter fd, `write`s the 8-byte value 42 to
+/// add to the counter, then `read`s the 8-byte counter back (which
+/// returns the count and resets it to 0):
+///
+///   `[USERSPACE EFD=<4>WR=<4>RD=<4>CNT=<8>][USERSPACE END]`
+///
+/// Pins the eventfd subsystem (`fs/eventfd.c`) and its strict 8-byte
+/// counter read/write protocol. The test asserts a valid fd, both
+/// transfers moved 8 bytes, and the counter read back equals the 42
+/// that was written.
+fn build_initramfs_eventfd() -> Vec<u8> {
+    let m_efd: &[u8] = b"[USERSPACE EFD=";
+    let m_wr: &[u8] = b"WR=";
+    let m_rd: &[u8] = b"RD=";
+    let m_cnt: &[u8] = b"CNT=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const ADD_VALUE: u64 = 42;
+
+    #[allow(clippy::too_many_arguments)]
+    let build_code = |m_efd_addr: u32,
+                      m_wr_addr: u32,
+                      m_rd_addr: u32,
+                      m_cnt_addr: u32,
+                      m_end_addr: u32,
+                      val8_addr: u32,
+                      efd_buf: u32,
+                      wr_ret: u32,
+                      rd_ret: u32,
+                      buf8_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // efd = eventfd2(0, 0) — sys 328
+        out.extend_from_slice(&[0xB8, 0x48, 0x01, 0x00, 0x00]); // mov eax, 328
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (initval 0)
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (flags 0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[efd_buf], eax
+        out.extend_from_slice(&efd_buf.to_le_bytes());
+        // write(efd, val8, 8) — add 42 to the counter
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[efd_buf]
+        out.extend_from_slice(&efd_buf.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&val8_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wr_ret], eax
+        out.extend_from_slice(&wr_ret.to_le_bytes());
+        // read(efd, buf8, 8) — drain the counter (returns 42, resets to 0)
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[efd_buf]
+        out.extend_from_slice(&efd_buf.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        out.push(0xB9);
+        out.extend_from_slice(&buf8_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[rd_ret], eax
+        out.extend_from_slice(&rd_ret.to_le_bytes());
+        // emit EFD=<efd> WR=<wr> RD=<rd> CNT=<buf8> END
+        w(m_efd_addr, m_efd.len() as u32, &mut out);
+        w(efd_buf, 4, &mut out);
+        w(m_wr_addr, m_wr.len() as u32, &mut out);
+        w(wr_ret, 4, &mut out);
+        w(m_rd_addr, m_rd.len() as u32, &mut out);
+        w(rd_ret, 4, &mut out);
+        w(m_cnt_addr, m_cnt.len() as u32, &mut out);
+        w(buf8_addr, 8, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let m_efd_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_wr_addr = m_efd_addr + m_efd.len() as u32;
+    let m_rd_addr = m_wr_addr + m_wr.len() as u32;
+    let m_cnt_addr = m_rd_addr + m_rd.len() as u32;
+    let m_end_addr = m_cnt_addr + m_cnt.len() as u32;
+    let val8_addr = m_end_addr + m_end.len() as u32;
+    let efd_buf = val8_addr + 8;
+    let wr_ret = efd_buf + 4;
+    let rd_ret = wr_ret + 4;
+    let buf8_addr = rd_ret + 4;
+    let code = build_code(
+        m_efd_addr, m_wr_addr, m_rd_addr, m_cnt_addr, m_end_addr, val8_addr, efd_buf, wr_ret,
+        rd_ret, buf8_addr,
+    );
+    let val8 = ADD_VALUE.to_le_bytes();
+    let efd_z = [0u8; 4];
+    let buf8_z = [0u8; 8];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            m_efd, m_wr, m_rd, m_cnt, m_end, &val8, &efd_z, &efd_z, &efd_z, &buf8_z,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -9064,6 +9178,96 @@ fn linux_userspace_epoll_milestone() {
         "the 64-bit data cookie should round-trip through the kernel; got \
          {dat:#x?}; {}",
         dump_uart_on_failure(&cumulative, "epoll-cookie")
+    );
+}
+
+/// eventfd milestone: /init `eventfd2(0,0)`s a counter fd, `write`s
+/// the 8-byte value 42 to add to the counter, then `read`s the
+/// counter back. Asserts a valid fd, both transfers moved 8 bytes,
+/// and the counter read equals 42 — pinning the eventfd subsystem
+/// and its 8-byte add/drain protocol (the standard epoll wakeup fd).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_eventfd_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_eventfd();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — eventfd2 likely returned \
+             -errno or the read blocked; {}",
+            dump_uart_on_failure(&cumulative, "eventfd")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let i32_at = |marker: &[u8]| -> Option<i32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| i32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let efd = i32_at(b"[USERSPACE EFD=");
+    let wr = i32_at(b"WR=");
+    let rd = i32_at(b"RD=");
+    let cnt = stripped
+        .windows(4)
+        .position(|w| w == b"CNT=")
+        .and_then(|p| stripped.get(p + 4..p + 12))
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+    eprintln!("eventfd: fd={efd:?} write={wr:?} read={rd:?} counter={cnt:?}");
+
+    assert!(
+        efd.map(|v| v >= 3).unwrap_or(false),
+        "eventfd2 should return a valid fd ≥ 3; got {efd:?}; {}",
+        dump_uart_on_failure(&cumulative, "eventfd-fd")
+    );
+    assert_eq!(
+        wr,
+        Some(8),
+        "write to eventfd should move 8 bytes; got {wr:?}"
+    );
+    assert_eq!(
+        rd,
+        Some(8),
+        "read from eventfd should move 8 bytes; got {rd:?}"
+    );
+    assert_eq!(
+        cnt,
+        Some(42),
+        "eventfd counter read should equal the 42 written; got {cnt:?}; {}",
+        dump_uart_on_failure(&cumulative, "eventfd-cnt")
     );
 }
 
