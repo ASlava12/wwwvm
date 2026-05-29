@@ -264,13 +264,20 @@ fn init_cpio_archives_start_with_newc_magic() {
     }
 }
 
-/// Hello /init padded to exactly 600 bytes — the simplest known
-/// reproducer of the binary-size-in-bad-range stall. If this
-/// hangs the same way the original uname /init does, we have a
-/// minimal-asm minimal-data reproducer for the next kernel-side
-/// debug pass: no uname syscall, no buf write, no marker
-/// segments, just the hello write + exit + 461 bytes of trailing
-/// zeros to push the binary to 600 bytes total.
+/// Hello /init padded to exactly 600 bytes — the **minimal**
+/// known reproducer of the binary-size-in-bad-range stall.
+/// Confirmed in `4fe22d2`: this /init hangs (519.36 s) the same
+/// way the original 600-byte uname /init does, with the kernel
+/// stuck in pata_legacy probe at 16 B steps. Binary size 600 is
+/// the trigger; no other property required.
+///
+/// Anatomy:
+///   ELF+PHDR (84) + code (34, just write+exit) + msg (21) +
+///   461 zero pad = 600.
+///
+/// For the future kernel-side debug pass: this is the simplest
+/// /init that exhibits the bug — anyone instrumenting the
+/// kernel can use it instead of the larger uname /init.
 fn build_initramfs_hello_padded_to_600() -> Vec<u8> {
     let msg: &[u8] = b"HELLO FROM USERSPACE\n";
     let msg_len = msg.len() as u32;
