@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**591 тестов** зелёные (mem 30 + devices 77 + cpu 339 + vm 128 +
+**604 теста** зелёные (mem 30 + devices 77 + cpu 352 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -273,6 +273,21 @@ CI gates: `cargo fmt --check`,
 `crates/vm/tests/tutorial_examples.rs` пин-fиксируют hex-байты из
 `docs/HAND_ASSEMBLY.md` — любое смещение между документацией и
 поведением VM ловит CI.
+
+**Аудит корректности CPU (30 мая 2026):** многоагентный adversarial-
+аудит ISA-семантики против Intel SDM нашёл и исправил 5 багов (каждый
+с teeth-confirmed unit-тестом): (1) SHLD/SHRD затирали CF через
+`flags_logic` после вычисления → CF всегда 0; (2) LOOP/JCXZ/JECXZ
+использовали 16-бит CX вместо полного ECX в 32-битном addr-mode; (3)
+MOVZX/MOVSX r16,r/m16 (0x66 0F B7/BF) затирали верхнюю половину
+регистра вместо preserve; (4) IDIV INT_MIN/-1 паниковал («divide with
+overflow») в debug вместо #DE; (5) AF (auxiliary carry) не считался ни
+одним ALU-помощником → `ADD; DAA` использовал stale AF. Отложено
+(экзотика, низкий приоритет): POP [ESP]-base post-increment EA, и
+не-rollback ESP при #GP на faulting POP-в-сегмент. Дубль BCD-находки
+(AAA/AAS byte-carry в AH) НЕ исправлены — поведение эмулятора (раздельный
+`AL±=6; AH±=1`) совпадает с реальным кремнием для valid-domain входов;
+«AX±=106h» из новых SDM расходится только на out-of-domain входах.
 
 ## Что уже работает (i386-ядро)
 
@@ -1186,7 +1201,7 @@ milestone'ы re-verified зелёными на Tinycore 15.x kernel'е при
 cargo test --workspace
 ```
 
-Должно вывести 591 пройденных тестов на текущий момент. CI
+Должно вывести 604 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
