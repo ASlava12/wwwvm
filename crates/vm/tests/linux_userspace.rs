@@ -158,6 +158,13 @@
 //!     verify a syscall FAILURE — proves the negative-result
 //!     ABI works the same as success returns.
 //!
+//!   - `linux_userspace_mkdir_milestone` — directory creation +
+//!     multi-level path resolution: /init creates `/dir` via
+//!     `sys_mkdir`, then `/dir/test` (file-in-subdirectory),
+//!     writes "INDIR", reads back, prints. Test asserts the
+//!     5 bytes round-trip equal `b"INDIR"`. Every prior file
+//!     test used flat paths at `/`; this one walks two levels.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -539,6 +546,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let lseek = build_initramfs_lseek();
     let dup2 = build_initramfs_dup2();
     let unlink = build_initramfs_unlink();
+    let mkdir = build_initramfs_mkdir();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -558,6 +566,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&lseek[0..6], b"070701");
     assert_eq!(&dup2[0..6], b"070701");
     assert_eq!(&unlink[0..6], b"070701");
+    assert_eq!(&mkdir[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -578,6 +587,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-lseek.cpio", &lseek);
         let _ = std::fs::write("/tmp/wwwvm-dup2.cpio", &dup2);
         let _ = std::fs::write("/tmp/wwwvm-unlink.cpio", &unlink);
+        let _ = std::fs::write("/tmp/wwwvm-mkdir.cpio", &mkdir);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2156,6 +2166,146 @@ fn build_initramfs_unlink() -> Vec<u8> {
             &fd_zeros,
             &statbuf_zeros,
             &ret_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/dir` via `sys_mkdir`, then
+/// creates `/dir/test` with 5 bytes "INDIR" (open + write +
+/// close), reopens for read, and prints the round-tripped bytes
+/// between `[USERSPACE FILE_IN_DIR=…][USERSPACE END]`. Pins:
+///   - sys_mkdir: kernel allocates a directory inode + dentry
+///     attached to the parent (rootfs) dentry
+///   - multi-level path resolution: open("/dir/test", ...) walks
+///     "dir" first, then "test" inside it. Until now every test
+///     used flat paths at /
+fn build_initramfs_mkdir() -> Vec<u8> {
+    let dir_path: &[u8] = b"/dir\0";
+    let file_path: &[u8] = b"/dir/test\0";
+    let payload: &[u8] = b"INDIR";
+    let marker_pre: &[u8] = b"[USERSPACE FILE_IN_DIR=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |dir_path_addr: u32,
+                      file_path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // sys_mkdir(dir_path, 0o755) — sys 39
+        out.extend_from_slice(&[0xB8, 0x27, 0x00, 0x00, 0x00]); // mov eax, 39
+        out.push(0xBB);
+        out.extend_from_slice(&dir_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0xED, 0x01, 0x00, 0x00]); // mov ecx, 0o755 = 0x1ED
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd = sys_open(file_path, O_CREAT|O_WRONLY=0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&file_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[fd] = eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_write(fd, payload, 5)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x05, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd = sys_open(file_path, O_RDONLY, 0)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&file_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_read(fd, buf, 5)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x05, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 5)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x05, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let dir_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let file_path_addr = dir_path_addr + dir_path.len() as u32;
+    let payload_addr = file_path_addr + file_path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let buf_addr = fd_addr + 4;
+    let code = build_code(
+        dir_path_addr,
+        file_path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 5];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            dir_path,
+            file_path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &buf_zeros,
         ],
         7,
     );
@@ -4472,6 +4622,71 @@ fn linux_userspace_unlink_milestone() {
          0x{ret:08X} — if 0, unlink didn't actually delete the file (stat still \
          finds it); {}",
         dump_uart_on_failure(&cumulative, "unlink-wrong")
+    );
+}
+
+/// Directory + nested file milestone: /init creates `/dir` via
+/// `sys_mkdir`, then creates `/dir/test` with 5 bytes "INDIR",
+/// closes, reopens, reads back, prints. Test asserts the
+/// 5 bytes round-trip equal `b"INDIR"`. Pins kernel directory
+/// inode allocation AND multi-level path resolution (every
+/// previous milestone used flat paths at /).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_mkdir_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_mkdir();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE FILE_IN_DIR=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — mkdir may have returned \
+                 -errno or the subsequent open failed; {}",
+                dump_uart_on_failure(&cumulative, "mkdir")
+            )
+        });
+    eprintln!("mkdir milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let buf_start = pre_pos + marker_pre.len();
+    let file_bytes: [u8; 5] = cumulative[buf_start..buf_start + 5]
+        .try_into()
+        .expect("5 bytes between markers");
+    eprintln!(
+        "file in /dir round-tripped: {:?}",
+        std::str::from_utf8(&file_bytes).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        &file_bytes,
+        b"INDIR",
+        "expected round-trip = b\"INDIR\", got {:02X?} — if all zeros, either \
+         mkdir didn't create /dir (subsequent open failed with -ENOENT) or the \
+         write into /dir/test never happened; {}",
+        file_bytes,
+        dump_uart_on_failure(&cumulative, "mkdir-wrong")
     );
 }
 
