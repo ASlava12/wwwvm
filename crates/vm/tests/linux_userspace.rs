@@ -4425,6 +4425,155 @@ fn build_initramfs_chdir() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init does a full pipe round-trip and
+/// reports EVERY syscall return, emitting the diagnostics that
+/// precede the (potentially blocking) read BEFORE the read, so a
+/// blocked read still leaves the decisive data in UART:
+///
+///   pipe2(&fds, 0)                          -> p2_ret; fds=[r,w]
+///   wr = write(fds[1], "PIPE", 4)
+///   write(1, "[USERSPACE P2=<p2>F0=<r>F1=<w>WR=<wr> ", ...)  <-- before read
+///   rd = read(fds[0], buf, 4)               <-- may block if pipe empty
+///   write(1, "RD=<rd>BUF=<buf>][USERSPACE END]\n", ...)
+///
+/// All fd/return values are read from the fds buffer / stashed
+/// eax. Output via fd 1 (the console; the pipe write end is fd 4
+/// per the diag, distinct from fd 1, so this is safe). Test uses
+/// a bounded step budget so a blocked read fails fast.
+fn build_initramfs_pipe_rt() -> Vec<u8> {
+    let pipe_msg: &[u8] = b"PIPE";
+    let m_p2: &[u8] = b"[USERSPACE P2=";
+    let m_f0: &[u8] = b"F0=";
+    let m_f1: &[u8] = b"F1=";
+    let m_wr: &[u8] = b"WR=";
+    let m_rd: &[u8] = b"RD=";
+    let m_buf: &[u8] = b"BUF=";
+    let m_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |pipe_msg_addr: u32,
+                      m_p2_addr: u32,
+                      m_f0_addr: u32,
+                      m_f1_addr: u32,
+                      m_wr_addr: u32,
+                      m_rd_addr: u32,
+                      m_buf_addr: u32,
+                      m_post_addr: u32,
+                      fds_addr: u32,
+                      buf_addr: u32,
+                      p2_ret_addr: u32,
+                      wr_ret_addr: u32,
+                      rd_ret_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(384);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // sys_pipe2(&fds, 0) — sys 331
+        out.extend_from_slice(&[0xB8, 0x4B, 0x01, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[p2_ret] = eax
+        out.extend_from_slice(&p2_ret_addr.to_le_bytes());
+        // Emit fds IMMEDIATELY after pipe2 (before any write), so
+        // F0/F1 reflect exactly what pipe2 populated, isolated from
+        // any later effect. (Finding: they read [0,0] — pipe2
+        // returns 0 but doesn't copy the fd pair to userspace on
+        // the Tinycore 15.x kernel.)
+        w(m_p2_addr, m_p2.len() as u32, &mut out);
+        w(p2_ret_addr, 4, &mut out);
+        w(m_f0_addr, m_f0.len() as u32, &mut out);
+        w(fds_addr, 4, &mut out); // fds[0] immediately post-pipe2
+        w(m_f1_addr, m_f1.len() as u32, &mut out);
+        w(fds_addr + 4, 4, &mut out); // fds[1] immediately post-pipe2
+                                      // wr = write(fds[1], pipe_msg, 4)
+        out.push(0xA1); // mov eax, ds:[fds+4]  (write end)
+        out.extend_from_slice(&(fds_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&pipe_msg_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]); // mov edx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[wr_ret] = eax
+        out.extend_from_slice(&wr_ret_addr.to_le_bytes());
+        // Emit WR (the immediate F0/F1 + P2 were emitted above).
+        w(m_wr_addr, m_wr.len() as u32, &mut out);
+        w(wr_ret_addr, 4, &mut out);
+        // rd = read(fds[0], buf, 4)  — may block if pipe empty
+        out.push(0xA1); // mov eax, ds:[fds]  (read end)
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]); // mov edx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[rd_ret] = eax
+        out.extend_from_slice(&rd_ret_addr.to_le_bytes());
+        // Emit post-read: RD, BUF, end.
+        w(m_rd_addr, m_rd.len() as u32, &mut out);
+        w(rd_ret_addr, 4, &mut out);
+        w(m_buf_addr, m_buf.len() as u32, &mut out);
+        w(buf_addr, 4, &mut out);
+        w(m_post_addr, m_post.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let pipe_msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_p2_addr = pipe_msg_addr + pipe_msg.len() as u32;
+    let m_f0_addr = m_p2_addr + m_p2.len() as u32;
+    let m_f1_addr = m_f0_addr + m_f0.len() as u32;
+    let m_wr_addr = m_f1_addr + m_f1.len() as u32;
+    let m_rd_addr = m_wr_addr + m_wr.len() as u32;
+    let m_buf_addr = m_rd_addr + m_rd.len() as u32;
+    let m_post_addr = m_buf_addr + m_buf.len() as u32;
+    let fds_addr = m_post_addr + m_post.len() as u32;
+    let buf_addr = fds_addr + 8;
+    let p2_ret_addr = buf_addr + 4;
+    let wr_ret_addr = p2_ret_addr + 4;
+    let rd_ret_addr = wr_ret_addr + 4;
+    let code = build_code(
+        pipe_msg_addr,
+        m_p2_addr,
+        m_f0_addr,
+        m_f1_addr,
+        m_wr_addr,
+        m_rd_addr,
+        m_buf_addr,
+        m_post_addr,
+        fds_addr,
+        buf_addr,
+        p2_ret_addr,
+        wr_ret_addr,
+        rd_ret_addr,
+    );
+    let fds_zeros = [0u8; 8];
+    let buf_zeros = [0u8; 4];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            pipe_msg, m_p2, m_f0, m_f1, m_wr, m_rd, m_buf, m_post, &fds_zeros, &buf_zeros,
+            &ret_zeros, &ret_zeros, &ret_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Diagnostic /init for the prior `sys_pipe`-broken blocker
 /// investigation: calls `sys_pipe2(&fds, 0)` then writes eax +
 /// fd slots without touching the pipe further. Kept around as
@@ -8078,6 +8227,109 @@ fn linux_userspace_chdir_milestone() {
         &cwd_bytes[..4],
         dump_uart_on_failure(&cumulative, "chdir-cwd")
     );
+}
+
+/// Diagnostic test for the pipe round-trip: runs
+/// `build_initramfs_pipe_rt` which reports pipe2 ret, both fds,
+/// write ret, read ret, and the round-tripped buffer. Emits the
+/// pre-read values BEFORE the (possibly blocking) read, and uses
+/// a bounded 6 B step budget, so a blocked read still leaves the
+/// decisive P2/F0/F1/WR data in UART and fails in ~2 min not ~9.
+/// ALWAYS PASSES (or skips) — it logs for analysis; promotion to
+/// an asserting milestone happens once the data confirms the
+/// round-trip works.
+#[test]
+#[ignore = "diagnostic for pipe round-trip; logs all syscall returns, ~bounded"]
+fn linux_userspace_pipe_rt_diag() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_pipe_rt();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let m_p2: &[u8] = b"[USERSPACE P2=";
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    // Bounded budget: userspace is reached ~2.1 B; 6 B leaves
+    // headroom for the syscalls but bounds a blocked read.
+    let reached = run_until_marker(&mut vm, end, 6_000_000_000, &mut cumulative).is_ok();
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .map(|p| {
+                let off = p + marker.len();
+                u32::from_le_bytes(stripped[off..off + 4].try_into().unwrap())
+            })
+    };
+    // Ground-truth hex dump of the marker region — resolves any
+    // ambiguity about what bytes actually landed where.
+    if let Some(p) = stripped.windows(14).position(|w| w == b"[USERSPACE P2=") {
+        let endp = (p + 96).min(stripped.len());
+        eprintln!(
+            "  raw stripped[P2..+{}] = {:02X?}",
+            endp - p,
+            &stripped[p..endp]
+        );
+        eprintln!(
+            "  raw stripped[P2..] as str = {:?}",
+            String::from_utf8_lossy(&stripped[p..endp])
+        );
+    }
+    eprintln!("=== pipe round-trip diagnostic (reached_end={reached}) ===");
+    eprintln!(
+        "  pipe2 ret = {:?}",
+        read_at(b"[USERSPACE P2=").map(|v| v as i32)
+    );
+    eprintln!(
+        "  fds[0] (read end)  = {:?}",
+        read_at(b"F0=").map(|v| v as i32)
+    );
+    eprintln!(
+        "  fds[1] (write end) = {:?}",
+        read_at(b"F1=").map(|v| v as i32)
+    );
+    eprintln!("  write ret = {:?}", read_at(b"WR=").map(|v| v as i32));
+    eprintln!("  read ret  = {:?}", read_at(b"RD=").map(|v| v as i32));
+    if let Some(bp) = stripped.windows(4).position(|w| w == b"BUF=") {
+        let off = bp + 4;
+        if off + 4 <= stripped.len() {
+            eprintln!(
+                "  buf = {:?}",
+                std::str::from_utf8(&stripped[off..off + 4]).unwrap_or("<non-utf8>")
+            );
+        }
+    }
+    let _ = m_p2;
+    if !reached {
+        eprintln!("  → read BLOCKED (pipe empty) — write didn't reach the pipe write end");
+    }
 }
 
 /// Diagnostic test for the `sys_pipe`-broken blocker: runs the
