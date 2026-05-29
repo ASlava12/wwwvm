@@ -224,6 +224,14 @@
 //!     the pair. First test that pairs the success and
 //!     failure-on-purpose return paths in one shot.
 //!
+//!   - `linux_userspace_statfs_milestone` — filesystem
+//!     metadata: /init calls `sys_statfs64("/", 84, &buf)`
+//!     (syscall 268), reads `f_type`. Test asserts the value
+//!     equals `TMPFS_MAGIC = 0x01021994` — proves rootfs is
+//!     tmpfs AND the kernel filled the statfs struct. NOTE:
+//!     legacy `sys_statfs` (syscall 99) returned 0/error in
+//!     our kernel build; modern Linux prefers statfs64.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -614,6 +622,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let chmod = build_initramfs_chmod();
     let getppid_in_child = build_initramfs_getppid_in_child();
     let access = build_initramfs_access();
+    let statfs = build_initramfs_statfs();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -642,6 +651,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&chmod[0..6], b"070701");
     assert_eq!(&getppid_in_child[0..6], b"070701");
     assert_eq!(&access[0..6], b"070701");
+    assert_eq!(&statfs[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -671,6 +681,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-chmod.cpio", &chmod);
         let _ = std::fs::write("/tmp/wwwvm-getppid-in-child.cpio", &getppid_in_child);
         let _ = std::fs::write("/tmp/wwwvm-access.cpio", &access);
+        let _ = std::fs::write("/tmp/wwwvm-statfs.cpio", &statfs);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2958,6 +2969,95 @@ fn build_initramfs_access() -> Vec<u8> {
             &pre_zeros,
             &post_zeros,
         ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init calls `sys_statfs("/", &buf)`
+/// (syscall 99) and reads `f_type` (first 4 bytes of struct
+/// statfs) back out. Writes the 4-byte magic between
+/// `[USERSPACE FS_TYPE=…][USERSPACE END]`. Test asserts the
+/// value equals `TMPFS_MAGIC = 0x01021994` — proves the rootfs
+/// is tmpfs as expected, AND that the kernel fills the statfs
+/// struct correctly via `copy_to_user`.
+fn build_initramfs_statfs() -> Vec<u8> {
+    let path: &[u8] = b"/\0";
+    let marker_pre: &[u8] = b"[USERSPACE FS_TYPE=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      buf_addr: u32,
+                      type_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // sys_statfs64(path, size=84, &buf) — sys 268.
+        // Modern kernels prefer this over legacy sys_statfs;
+        // first attempt with syscall 99 returned 0 in f_type,
+        // suggesting it may have returned -errno in our build.
+        out.extend_from_slice(&[0xB8, 0x0C, 0x01, 0x00, 0x00]); // mov eax, 268
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x54, 0x00, 0x00, 0x00]); // mov ecx, 84
+        out.push(0xBA);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov eax, ds:[buf+0] (f_type) → ds:[type_buf]
+        out.push(0xA1);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.push(0xA3);
+        out.extend_from_slice(&type_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, type_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&type_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_pre_addr = path_addr + path.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    // struct statfs64 is 84 bytes on i386
+    let type_buf_addr = buf_addr + 84;
+    let code = build_code(
+        path_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        buf_addr,
+        type_buf_addr,
+    );
+    let buf_zeros = [0u8; 84];
+    let type_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[path, marker_pre, marker_post, &buf_zeros, &type_zeros],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -5680,6 +5780,75 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_statfs` milestone: /init calls `sys_statfs("/", &buf)`,
+/// reads the first 4 bytes (f_type). Test asserts they equal
+/// `TMPFS_MAGIC = 0x01021994` — proves rootfs is tmpfs AND the
+/// kernel filled the statfs struct.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_statfs_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_statfs();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE FS_TYPE=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "statfs")
+            )
+        });
+    eprintln!("statfs milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let type_off = pre_pos + marker_pre.len();
+    let f_type = u32::from_le_bytes(stripped[type_off..type_off + 4].try_into().unwrap());
+    eprintln!("statfs returned f_type = 0x{f_type:08X}");
+    // TMPFS_MAGIC = 0x01021994 (defined in linux/magic.h)
+    assert_eq!(
+        f_type,
+        0x0102_1994,
+        "expected f_type = TMPFS_MAGIC (0x01021994), got 0x{f_type:08X}; \
+         if it's a different magic, the rootfs is something other than tmpfs; \
+         if 0, statfs returned -errno or didn't fill the struct; {}",
+        dump_uart_on_failure(&cumulative, "statfs-wrong")
     );
 }
 
