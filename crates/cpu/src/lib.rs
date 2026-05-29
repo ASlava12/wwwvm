@@ -307,6 +307,38 @@ pub struct Cpu {
     /// `sregs[idx] << 4`, so once PM is on, the visible selector
     /// and the active translation base diverge — same as real x86.
     pub seg_cache: [SegmentCache; 6],
+    /// Optional debug instruction-trace ring. `None` (zero overhead)
+    /// unless `enable_pf_trace` is called. When `Some`, records
+    /// `(eip, eax, ebx, ecx)` at the start of every instruction and is
+    /// dumped once by `raise_fault` on the first user-mode read fault
+    /// of a low address — the investigation hook for the ld.so
+    /// null-deref. `RefCell` so the `&self` `raise_fault` can dump it.
+    pf_trace: core::cell::RefCell<Option<PfTrace>>,
+}
+
+/// Debug instruction-trace ring buffer (see `Cpu::pf_trace`).
+struct PfTrace {
+    ring: Vec<(u32, u32, u32, u32)>,
+    head: usize,
+    count: usize,
+    fired: bool,
+}
+
+impl PfTrace {
+    fn new(cap: usize) -> Self {
+        Self {
+            ring: vec![(0, 0, 0, 0); cap],
+            head: 0,
+            count: 0,
+            fired: false,
+        }
+    }
+    fn record(&mut self, entry: (u32, u32, u32, u32)) {
+        let cap = self.ring.len();
+        self.ring[self.head] = entry;
+        self.head = (self.head + 1) % cap;
+        self.count += 1;
+    }
 }
 
 /// Page-fault payload built by `translate()`. The `error_code` follows
@@ -428,7 +460,16 @@ impl Cpu {
             a20: true,
             bios_hook: None,
             seg_cache: [SegmentCache::default(); 6],
+            pf_trace: core::cell::RefCell::new(None),
         }
+    }
+
+    /// Enable the debug instruction-trace ring (see `pf_trace`). The
+    /// ring records the last `cap` instructions; on the first
+    /// user-mode read #PF of a low address it is dumped to stderr.
+    /// For investigating the ld.so null-deref; off by default.
+    pub fn enable_pf_trace(&self, cap: usize) {
+        *self.pf_trace.borrow_mut() = Some(PfTrace::new(cap));
     }
 
     /// Read the CPU's segment-override prefix. Exposed so the VM
@@ -1039,6 +1080,31 @@ impl Cpu {
     fn raise_fault(&self, addr: u32, error_code: u32) {
         if self.pending_fault.get().is_none() {
             self.pending_fault.set(Some(PageFault { addr, error_code }));
+        }
+        // Debug hook: on the first user-mode READ fault of a low
+        // address (the ld.so null-deref signature: CR2≈0, U=1, W=0),
+        // dump the instruction-trace ring once. No-op unless enabled.
+        if self.pf_trace.borrow().is_some() {
+            let user_read = error_code & 0b110 == 0b100; // U=1, W=0
+            let last_ip = self.last_op_ip;
+            if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
+                if !t.fired && user_read && addr < 0x1000 {
+                    t.fired = true;
+                    let cap = t.ring.len();
+                    let n = t.count.min(cap);
+                    let start = if t.count <= cap { 0 } else { t.head };
+                    eprintln!(
+                        "=== PF-TRACE: user read #PF addr={addr:#x} err={error_code:#x} \
+                         faulting_eip={last_ip:#x}; last {n} instrs (oldest first) ==="
+                    );
+                    for k in 0..n {
+                        let (eip, eax, ebx, ebp) = t.ring[(start + k) % cap];
+                        eprintln!(
+                            "  {k:4} eip={eip:#010x} eax={eax:#010x} ebx={ebx:#010x} ebp={ebp:#010x}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3436,6 +3502,30 @@ impl Cpu {
         // this instruction's memory accesses can rewind IP back here
         // when the fault is dispatched at the start of the next step.
         self.last_op_ip = op_ip;
+        // Record only USERSPACE instructions (eip < kernel base) so a
+        // long kernel excursion (interrupt/syscall handler) doesn't
+        // flush the ring of the userspace trail we care about. Tuple:
+        // (eip, eax, ebx, ebp).
+        if op_ip < 0xC000_0000 && self.pf_trace.borrow().is_some() {
+            let entry = (op_ip, self.read_r32(0), self.read_r32(3), self.read_r32(5));
+            if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
+                t.record(entry);
+            }
+        }
+        // Checkpoint GP registers + flags so a #PF mid-instruction can
+        // roll them back. Our continue-on-fault model lets a faulting
+        // memory read still write its (garbage 0) result to the
+        // destination register; for `mov eax,[eax]` (dest == address
+        // base) that clobbers eax, so the EIP-rewound retry computes a
+        // *different* (zero) address and double-faults at 0. Restoring
+        // the registers on a pending fault (see end of step) makes the
+        // retry re-run with pristine state, exactly as real hardware
+        // (a faulting instruction commits nothing). String/REP ops
+        // self-manage partial progress and are excluded below.
+        let reg_snap = self.regs;
+        let reg_high_snap = self.regs_high;
+        let flags_snap = self.flags;
+        let flags_high_snap = self.flags_high;
         let opcode = loop {
             let b = self.fetch_u8(mem);
             match b {
@@ -7800,6 +7890,23 @@ impl Cpu {
                     ip: op_ip,
                 });
             }
+        }
+        // If this instruction raised a #PF, roll its GP-register and
+        // flag changes back so the EIP-rewound retry re-runs from the
+        // pristine pre-instruction state (see the checkpoint above).
+        // String/REP ops (0xA4..0xAF and the F2/F3 string-loop prefix)
+        // commit completed iterations and do their own per-iteration
+        // SI/DI/flags rollback, so they opt out here.
+        if self.pending_fault.get().is_some()
+            && !matches!(
+                opcode,
+                0xA4 | 0xA5 | 0xA6 | 0xA7 | 0xAA | 0xAB | 0xAC | 0xAD | 0xAE | 0xAF | 0xF2 | 0xF3
+            )
+        {
+            self.regs = reg_snap;
+            self.regs_high = reg_high_snap;
+            self.flags = flags_snap;
+            self.flags_high = flags_high_snap;
         }
         Ok(())
     }

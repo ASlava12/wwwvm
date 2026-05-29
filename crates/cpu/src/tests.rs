@@ -3145,6 +3145,92 @@ fn pm_demand_paging_handler_irets_to_retry_the_faulting_load() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// Regression for the `mov eax,[eax]` fault-rollback bug (the ld.so
+/// dynamic-linking root cause): when the destination register IS the
+/// address-base register and the load faults, the faulting
+/// instruction must NOT commit a value to that register — otherwise
+/// the EIP-rewound retry computes a *different* address and faults
+/// again. /init's ld.so does exactly `mov eax,[eax]` on demand-paged
+/// pages. Here eax is pre-loaded with a not-present linear address;
+/// the load faults, the handler maps the page and IRETDs to retry,
+/// and the retry must re-read with eax still == the original address
+/// (yielding the sentinel), not a clobbered value.
+#[test]
+fn pm_demand_paging_mov_eax_from_eax_preserves_base_on_fault() {
+    let mut mem = Memory::new(0x0080_0000);
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+    // #PF gate → handler at 0x800.
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+    // PDE[0] = PSE identity [0,4M); PDE[1] not present (will fault).
+    mem.write_u32(0x0001_0000, 0x0000_0083);
+    // Sentinel at phys 0x400000 (linear 4M once PDE[1] installed).
+    mem.write_u32(0x0040_0000, 0xDEAD_BEEF);
+    // Handler that does NOT touch eax (unlike the POP EAX variant):
+    //   83 C4 04                         add esp, 4   (drop error code)
+    //   C7 05 04 00 01 00 83 00 40 00    mov [0x10004], 0x00400083
+    //   CF                               iretd
+    mem.write_slice(
+        0x0800,
+        &[
+            0x83, 0xC4, 0x04, 0xC7, 0x05, 0x04, 0x00, 0x01, 0x00, 0x83, 0x00, 0x40, 0x00, 0xCF,
+        ],
+    );
+    // Kernel:
+    //   B8 00 00 40 00   mov eax, 0x400000
+    //   8B 00            mov eax, [eax]      ; faults, retried
+    //   F4               hlt
+    mem.write_slice(
+        0x0010_0000,
+        &[0xB8, 0x00, 0x00, 0x40, 0x00, 0x8B, 0x00, 0xF4],
+    );
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.write_sreg(sreg::ES, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.cr3 = 0x0001_0000;
+    cpu.cr4 = 0x10;
+    cpu.cr0 = 0x8000_0001;
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "kernel must reach HLT after the retry");
+    // The retry re-ran `mov eax,[eax]` with eax preserved as
+    // 0x400000, so it read the now-present sentinel. Without the
+    // fault-rollback, eax would have been clobbered to 0 by the
+    // faulting load and the retry would read [0] instead.
+    assert_eq!(
+        cpu.read_r32(0),
+        0xDEAD_BEEF,
+        "eax must be preserved across the #PF so the retry re-reads [0x400000]"
+    );
+    assert!(cpu.pending_fault().is_none());
+}
+
 /// Interrupt gates clear IF on entry; trap gates leave IF as-is.
 /// Linux uses trap gates for #DB and #BP so a debugger probe
 /// doesn't silently disable IRQs while the handler runs.
