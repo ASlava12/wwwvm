@@ -562,6 +562,100 @@ fn build_cpio_with_libs(init_binary: &[u8], lib_files: &[(&str, &[u8])]) -> Vec<
     archive
 }
 
+/// Build a cpio with /init plus an arbitrary set of regular files at
+/// given paths (e.g. `bin/busybox`, `lib/libc.so.6`), auto-creating
+/// each file's single-level parent directory. Used to assemble a
+/// minimal rootfs for running a real dynamically-linked program: the
+/// /init stub `execve`s `/bin/busybox`, whose interpreter loads the
+/// libraries from `/lib`.
+fn build_cpio_tree(init_binary: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("proc", &[], 0o040_755, 0, 0));
+    // Create each unique single-level parent dir before its files.
+    let mut made = std::collections::BTreeSet::new();
+    for (path, _) in files {
+        if let Some(slash) = path.rfind('/') {
+            let dir = &path[..slash];
+            if made.insert(dir.to_string()) {
+                archive.extend_from_slice(&cpio_entry(dir, &[], 0o040_755, 0, 0));
+            }
+        }
+    }
+    for (path, bytes) in files {
+        archive.extend_from_slice(&cpio_entry(path, bytes, 0o100_755, 0, 0));
+    }
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
+/// Hand-assembled /init that `execve("/bin/busybox", ["busybox",
+/// "echo", "DYNLINK_OK"], [])`s — a tiny static syscall stub whose
+/// only job is to hand off to a real dynamically-linked program so
+/// the kernel + ld.so run it. On execve failure it prints
+/// `[EXECVE-FAIL]` and exits 1.
+fn build_init_execve_busybox() -> Vec<u8> {
+    let path: &[u8] = b"/bin/busybox\0";
+    let s_busybox: &[u8] = b"busybox\0";
+    let s_echo: &[u8] = b"echo\0";
+    let s_dyn: &[u8] = b"DYNLINK_OK\0";
+    let failmsg: &[u8] = b"[EXECVE-FAIL]\n";
+
+    let build_code =
+        |path_addr: u32, argv_addr: u32, envp_addr: u32, failmsg_addr: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(64);
+            // execve(path, argv, envp) — sys 11
+            out.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+            out.push(0xBB);
+            out.extend_from_slice(&path_addr.to_le_bytes());
+            out.push(0xB9);
+            out.extend_from_slice(&argv_addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&envp_addr.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // Only reached if execve failed: write [EXECVE-FAIL], exit(1).
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.push(0xB9);
+            out.extend_from_slice(&failmsg_addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&(failmsg.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(1)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out
+        };
+
+    let code_len = build_code(0, 0, 0, 0).len() as u32;
+    let base = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET;
+    let path_addr = base + code_len;
+    let s_busybox_addr = path_addr + path.len() as u32;
+    let s_echo_addr = s_busybox_addr + s_busybox.len() as u32;
+    let s_dyn_addr = s_echo_addr + s_echo.len() as u32;
+    let failmsg_addr = s_dyn_addr + s_dyn.len() as u32;
+    let argv_addr = failmsg_addr + failmsg.len() as u32;
+    let envp_addr = argv_addr + 16; // argv = 4 u32 (3 ptrs + NULL)
+    let code = build_code(path_addr, argv_addr, envp_addr, failmsg_addr);
+    // argv = [&"busybox", &"echo", &"DYNLINK_OK", NULL]; envp = [NULL].
+    let mut argv = Vec::with_capacity(16);
+    argv.extend_from_slice(&s_busybox_addr.to_le_bytes());
+    argv.extend_from_slice(&s_echo_addr.to_le_bytes());
+    argv.extend_from_slice(&s_dyn_addr.to_le_bytes());
+    argv.extend_from_slice(&0u32.to_le_bytes());
+    let envp = 0u32.to_le_bytes();
+    make_init_elf32_safe(
+        &code,
+        &[path, s_busybox, s_echo, s_dyn, failmsg, &argv, &envp],
+        7,
+    )
+}
+
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -9546,6 +9640,149 @@ fn linux_userspace_dynamic_binary_diag() {
     let tail = &cumulative[cumulative.len().saturating_sub(700)..];
     eprintln!("  --- last {} bytes of UART ---", tail.len());
     eprintln!("{}", String::from_utf8_lossy(tail));
+}
+
+/// Diagnostic: attempt a real DYNAMICALLY-linked program end to end.
+/// A tiny hand-assembled /init `execve`s `/bin/busybox` with argv
+/// `["busybox", "echo", "DYNLINK_OK"]`; the kernel loads busybox, its
+/// interpreter `/lib/ld-linux.so.2` mmaps libc/libm/libcrypt,
+/// relocates, and (if it all works) runs busybox's `echo` applet,
+/// which prints `DYNLINK_OK`.
+///
+/// STATUS (2026-05-29): NOT yet working — `ld.so` null-derefs during
+/// dynamic linking (`busybox[1]: segfault at 0 ip b7f21e9d`, faulting
+/// insn `mov eax,[eax]` with eax=0, in a relocation/list-walk loop).
+/// Static binaries run fine (`real_static_binary_milestone`); the
+/// dynamic path has a deeper bug — see the README blocker. This stays
+/// a diagnostic (ALWAYS PASSES, logs how far ld.so got) until fixed,
+/// so the --ignored regression sweep doesn't fail on a known gap.
+///
+/// busybox + the four libraries are read from `WWWVM_DYN_ROOTFS`
+/// (default `/tmp/wwwvm-linux/rootfs`); the test SKIPS if absent. See
+/// README build-deps for how to extract the Tinycore rootfs.
+#[test]
+#[ignore = "diagnostic: dynamic-linking attempt (known WIP); ~bounded"]
+fn linux_userspace_dynamic_exec_diag() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let root =
+        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
+    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (Some(busybox), Some(ld), Some(libc), Some(libm), Some(libcrypt)) = (
+        read_or_skip("bin/busybox"),
+        read_or_skip("lib/ld-linux.so.2"),
+        read_or_skip("lib/libc.so.6"),
+        read_or_skip("lib/libm.so.6"),
+        read_or_skip("lib/libcrypt.so.1"),
+    ) else {
+        return;
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let init = build_init_execve_busybox();
+    let cpio = build_cpio_tree(
+        &init,
+        &[
+            ("bin/busybox", &busybox),
+            ("lib/ld-linux.so.2", &ld),
+            ("lib/libc.so.6", &libc),
+            ("lib/libm.so.6", &libm),
+            ("lib/libcrypt.so.1", &libcrypt),
+        ],
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        if String::from_utf8_lossy(&cumulative).contains("DYNLINK_OK") {
+            found = true;
+            stop_reason = "found DYNLINK_OK".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== dynamic exec milestone ===");
+    eprintln!("  steps run: {steps}");
+    eprintln!("  stop reason: {stop_reason}");
+    eprintln!("  DYNLINK_OK seen: {found}");
+    for needle in [
+        "[EXECVE-FAIL]",
+        "error while loading shared libraries",
+        "segfault at",
+        "trap invalid opcode",
+        "Kernel panic",
+    ] {
+        if let Some(p) = text.find(needle) {
+            let endp = text[p..]
+                .find('\n')
+                .map(|n| p + n)
+                .unwrap_or((p + 120).min(text.len()));
+            eprintln!("  [{needle}] {:?}", &text[p..endp]);
+        }
+    }
+    if !found {
+        let tail = &cumulative[cumulative.len().saturating_sub(700)..];
+        eprintln!("  --- last {} bytes of UART ---", tail.len());
+        eprintln!("{}", String::from_utf8_lossy(tail));
+    }
+
+    // Diagnostic, not an assertion: dynamic linking is known-WIP (ld.so
+    // null-derefs during relocation). When `found` becomes true this can
+    // be promoted to an asserting milestone.
+    if found {
+        eprintln!("  ✓ DYNLINK_OK — dynamic linking works end to end!");
+    } else {
+        eprintln!("  ✗ dynamic linking did not complete (see README blocker)");
+    }
 }
 
 /// File-I/O round-trip milestone: /init creates a new file in
