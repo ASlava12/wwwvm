@@ -2959,6 +2959,74 @@ fn bios_int10_tty_handles_cr_lf() {
     assert_eq!(vm.read_mem_u8(BDA_CURSOR_ROW), 1);
 }
 
+/// AH=0x0E backspace (AL=0x08) saturating-decrements column —
+/// at col=0 it stays at 0 rather than wrapping back to col=79
+/// on the previous row. Catches a regression that swapped
+/// `col.saturating_sub(1)` for plain `col - 1` (which would
+/// underflow to `usize::MAX` and silently corrupt the BDA byte).
+#[test]
+fn bios_int10_tty_backspace_saturates_at_column_zero() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Write 'A' (col goes 0 → 1), backspace (1 → 0), backspace
+    // again at col=0 (must stay at 0, not underflow), HLT.
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x0E, // MOV AH, 0x0E
+            0xB0, b'A', 0xCD, 0x10, // print 'A' → col=1
+            0xB0, 0x08, 0xCD, 0x10, // backspace → col=0
+            0xB0, 0x08, 0xCD, 0x10, // backspace at col=0 → stays 0
+            0xF4,
+        ],
+    );
+    vm.boot();
+    let (_, _) = vm.run_steps(64);
+    assert_eq!(
+        vm.read_mem_u8(BDA_CURSOR_COL),
+        0,
+        "backspace at col=0 must saturate, not underflow"
+    );
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_ROW), 0);
+}
+
+/// AH=0x0E column wrap-around: filling all 80 columns of row 0
+/// must roll the cursor to (row=1, col=0) — the next char
+/// printed lands on row 1.
+#[test]
+fn bios_int10_tty_wraps_to_next_row_at_column_80() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    // Loop CX=80 times printing '.', then print 'Z'. The 80th '.'
+    // wraps col=80→0 row=0→1. The 'Z' then lands at (1, 0).
+    //   MOV AH, 0x0E
+    //   MOV CX, 80
+    // lp: MOV AL, '.'
+    //   INT 0x10
+    //   LOOP lp
+    //   MOV AL, 'Z'
+    //   INT 0x10
+    //   HLT
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x0E, // MOV AH, 0x0E
+            0xB9, 0x50, 0x00, // MOV CX, 80
+            0xB0, b'.', // MOV AL, '.'
+            0xCD, 0x10, // INT 0x10
+            0xE2, 0xFC, // LOOP -4
+            0xB0, b'Z', 0xCD, 0x10, // print 'Z'
+            0xF4,
+        ],
+    );
+    vm.boot();
+    let (_, _) = vm.run_steps(8192);
+    // 'Z' at row 1, col 0 → VGA offset (80*1+0)*2 = 160.
+    assert_eq!(vm.read_mem_u8(VGA_TEXT_BASE + 160), b'Z');
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_COL), 1);
+    assert_eq!(vm.read_mem_u8(BDA_CURSOR_ROW), 1);
+}
+
 #[test]
 fn boots_and_prints_banner() {
     let mut vm = Vm::new();
