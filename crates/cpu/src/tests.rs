@@ -9245,6 +9245,49 @@ fn shrd_r16_imm8_fills_high_from_source_low() {
     assert_eq!(cpu.regs[r16::AX], 0x8123);
 }
 
+/// SHRD must set CF to the last bit shifted out of the destination.
+/// Regression for the bug where the helper computed CF and then
+/// `flags_logic16` (called afterward) unconditionally cleared it, so
+/// CF was always 0 after any SHLD/SHRD.
+#[test]
+fn shrd_r16_sets_cf_to_last_bit_shifted_out() {
+    // AX=0x0001, BX=0x0000, SHRD AX, BX, 1.
+    // Bit 0 of the destination (=1) is the last bit shifted out -> CF=1.
+    // Result AX = 0 -> ZF=1.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x01, 0x00, // MOV AX, 0x0001
+            0xBB, 0x00, 0x00, // MOV BX, 0x0000
+            0x0F, 0xAC, 0xD8, 0x01, // SHRD AX, BX, 1
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x0000);
+    assert!(cpu.has(flag::ZF), "ZF set for zero result");
+    assert!(cpu.has(flag::CF), "SHRD must set CF to bit shifted out (1)");
+}
+
+/// SHLD must set CF to the last bit shifted out of the high end of the
+/// destination (companion regression to `shrd_r16_sets_cf...`).
+#[test]
+fn shld_r16_sets_cf_to_last_bit_shifted_out() {
+    // AX=0x8000, BX=0x0000, SHLD AX, BX, 1.
+    // Bit 15 of the destination (=1) is the last bit shifted out -> CF=1.
+    // combined = 0x8000_0000 << 1 -> top 16 = 0x0000, so AX=0, ZF=1.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x00, 0x80, // MOV AX, 0x8000
+            0xBB, 0x00, 0x00, // MOV BX, 0x0000
+            0x0F, 0xA4, 0xD8, 0x01, // SHLD AX, BX, 1
+            0xF4,
+        ],
+        12,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x0000);
+    assert!(cpu.has(flag::CF), "SHLD must set CF to bit shifted out (1)");
+}
+
 /// 0x0F 0xA2 — CPUID leaf 0.
 #[test]
 fn cpuid_leaf_0_returns_max_leaf_and_vendor_string() {

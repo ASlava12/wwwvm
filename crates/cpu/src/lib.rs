@@ -8520,9 +8520,11 @@ fn shld32(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
     let combined = ((dest as u64) << 32) | (src as u64);
     let shifted = combined.wrapping_shl(count as u32);
     let result = (shifted >> 32) as u32;
+    cpu.flags_logic32(result);
+    // CF = last bit shifted out of the destination. Must be set AFTER
+    // flags_logic, which unconditionally clears CF (and OF).
     let cf = (dest >> (32 - count)) & 1 != 0;
     cpu.set_flag(flag::CF, cf);
-    cpu.flags_logic32(result);
     cpu.write_rm32(rm, mem, result);
 }
 
@@ -8535,9 +8537,10 @@ fn shld16(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
     let combined = ((dest as u32) << 16) | (src as u32);
     let shifted = combined.wrapping_shl(count as u32);
     let result = (shifted >> 16) as u16;
+    cpu.flags_logic16(result);
+    // CF = last bit shifted out (set after flags_logic, which clears it).
     let cf = (dest >> (16 - count)) & 1 != 0;
     cpu.set_flag(flag::CF, cf);
-    cpu.flags_logic16(result);
     cpu.write_rm16(rm, mem, result);
 }
 
@@ -8551,9 +8554,10 @@ fn shrd32(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
     let combined = ((src as u64) << 32) | (dest as u64);
     let shifted = combined.wrapping_shr(count as u32);
     let result = shifted as u32;
+    cpu.flags_logic32(result);
+    // CF = last bit shifted out (set after flags_logic, which clears it).
     let cf = (dest >> (count - 1)) & 1 != 0;
     cpu.set_flag(flag::CF, cf);
-    cpu.flags_logic32(result);
     cpu.write_rm32(rm, mem, result);
 }
 
@@ -8566,9 +8570,10 @@ fn shrd16(cpu: &mut Cpu, rm: Rm, reg: u8, count: u8, mem: &mut Memory) {
     let combined = ((src as u32) << 16) | (dest as u32);
     let shifted = combined.wrapping_shr(count as u32);
     let result = shifted as u16;
+    cpu.flags_logic16(result);
+    // CF = last bit shifted out (set after flags_logic, which clears it).
     let cf = (dest >> (count - 1)) & 1 != 0;
     cpu.set_flag(flag::CF, cf);
-    cpu.flags_logic16(result);
     cpu.write_rm16(rm, mem, result);
 }
 
