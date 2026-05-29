@@ -2346,6 +2346,126 @@ fn build_initramfs_futex() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init creates a real thread with `clone(CLONE_VM)`
+/// — the kernel mechanism behind `pthread_create`. It mmap's a stack
+/// page, `clone`s a task that shares the address space, and the new
+/// task writes a sentinel into a *normal data global* (no MAP_SHARED
+/// needed — CLONE_VM means one address space). The parent busy-waits
+/// on that global, then reaps the child.
+///
+///   `[USERSPACE THREAD=<4 bytes>][USERSPACE END]`
+///
+/// The decisive property: the parent reads the sentinel
+/// (`0xABCDEF01`) the *cloned task* wrote to a shared global. Without
+/// CLONE_VM the child would get a copy and the parent would read 0.
+/// This pins shared-address-space thread creation: `clone` starting a
+/// task on a caller-supplied stack with eax=0, both tasks running in
+/// one mm. With TLS (`set_thread_area`) and futex already proven,
+/// this completes the core threading triad.
+fn build_initramfs_clone_thread() -> Vec<u8> {
+    let m_thread: &[u8] = b"[USERSPACE THREAD=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const SENTINEL: u32 = 0xABCD_EF01;
+    const SPIN_CAP: u32 = 0x0010_0000;
+
+    let build_code =
+        |m_thread_addr: u32, m_end_addr: u32, cstack_buf: u32, g_addr: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(224);
+            let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+                out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+                out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+                out.push(0xB9);
+                out.extend_from_slice(&addr.to_le_bytes());
+                out.push(0xBA);
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(&[0xCD, 0x80]);
+            };
+            // stack = mmap2(NULL, 0x1000, R|W, MAP_PRIVATE|ANON=0x22, -1, 0)
+            out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0x31, 0xDB]);
+            out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBE, 0x22, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]);
+            out.extend_from_slice(&[0x31, 0xED]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // child stack top = base + 0x1000 (stacks grow down)
+            out.extend_from_slice(&[0x05, 0x00, 0x10, 0x00, 0x00]); // add eax, 0x1000
+            out.push(0xA3); // mov ds:[cstack_buf], eax
+            out.extend_from_slice(&cstack_buf.to_le_bytes());
+            // clone(CLONE_VM=0x100, child_stack, ptid=0, tls=0, ctid=0)
+            // i386 reg order: ebx=flags, ecx=newsp, edx=ptid, esi=tls,
+            // edi=ctid.
+            out.extend_from_slice(&[0xB8, 0x78, 0x00, 0x00, 0x00]); // mov eax, 120 (clone)
+            out.extend_from_slice(&[0xBB, 0x00, 0x01, 0x00, 0x00]); // mov ebx, CLONE_VM
+            out.extend_from_slice(&[0x8B, 0x0D]); // mov ecx, ds:[cstack_buf]
+            out.extend_from_slice(&cstack_buf.to_le_bytes());
+            out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+            out.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi
+            out.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+            let jnz_at = out.len();
+            out.extend_from_slice(&[0x75, 0x00]); // jnz parent (patched)
+
+            // ===== CHILD (eax==0, running on child_stack) =====
+            // g = SENTINEL — visible to the parent via the shared mm.
+            out.extend_from_slice(&[0xC7, 0x05]); // mov dword ds:[g], imm32
+            out.extend_from_slice(&g_addr.to_le_bytes());
+            out.extend_from_slice(&SENTINEL.to_le_bytes());
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0) — per-task
+            out.extend_from_slice(&[0x31, 0xDB]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+
+            // ===== PARENT =====
+            let parent_start = out.len();
+            let disp = (parent_start - (jnz_at + 2)) as i32;
+            assert!(
+                (-128..=127).contains(&disp),
+                "child block too large for jnz disp8 (got {disp})"
+            );
+            out[jnz_at + 1] = disp as u8;
+            out.push(0xBD); // mov ebp, SPIN_CAP
+            out.extend_from_slice(&SPIN_CAP.to_le_bytes());
+            let spin = out.len();
+            out.push(0xA1); // mov eax, ds:[g]
+            out.extend_from_slice(&g_addr.to_le_bytes());
+            out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+            let jnz_got_at = out.len();
+            out.extend_from_slice(&[0x75, 0x00]); // jnz got (the child wrote g) (patched)
+            out.push(0x4D); // dec ebp
+            out.push(0x75); // jnz spin (backward)
+            let after = out.len() + 1;
+            out.push(((spin as i32) - (after as i32)) as u8);
+            let got = out.len();
+            out[jnz_got_at + 1] = (got - (jnz_got_at + 2)) as u8;
+            // waitpid(-1, NULL, 0)
+            out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+            out.extend_from_slice(&[0x31, 0xC9]);
+            out.extend_from_slice(&[0x31, 0xD2]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // emit THREAD=<g> END
+            w(m_thread_addr, m_thread.len() as u32, &mut out);
+            w(g_addr, 4, &mut out);
+            w(m_end_addr, m_end.len() as u32, &mut out);
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0)
+            out.extend_from_slice(&[0x31, 0xDB]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out
+        };
+
+    let code_len = build_code(0, 0, 0, 0).len() as u32;
+    let m_thread_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_end_addr = m_thread_addr + m_thread.len() as u32;
+    let cstack_buf = m_end_addr + m_end.len() as u32;
+    let g_addr = cstack_buf + 4;
+    let code = build_code(m_thread_addr, m_end_addr, cstack_buf, g_addr);
+    let z4 = [0u8; 4];
+    let binary = make_init_elf32_safe(&code, &[m_thread, m_end, &z4, &z4], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -8365,6 +8485,78 @@ fn linux_userspace_futex_milestone() {
         "parent's FUTEX_WAKE should report waking exactly 1 task (proving the \
          child was blocked in the futex wait-queue and got woken); got {wake:?}; {}",
         dump_uart_on_failure(&cumulative, "futex-wake")
+    );
+}
+
+/// Clone-thread milestone: /init `clone(CLONE_VM)`s a task onto an
+/// mmap'd stack; the new task writes a sentinel into a normal data
+/// global, the parent busy-waits on it and reaps the child. Asserts
+/// the parent read the sentinel — only possible if the two tasks
+/// share one address space (CLONE_VM). Pins shared-address-space
+/// thread creation, the `pthread_create` mechanism.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_clone_thread_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_clone_thread();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — clone(CLONE_VM) likely \
+             failed (the cloned task never ran, or didn't share the address \
+             space, so the parent spun out / waitpid deadlocked); {}",
+            dump_uart_on_failure(&cumulative, "clone-thread")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let g = stripped
+        .windows(18)
+        .position(|w| w == b"[USERSPACE THREAD=")
+        .and_then(|p| stripped.get(p + 18..p + 22))
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or_else(|| {
+            panic!(
+                "THREAD marker not found; {}",
+                dump_uart_on_failure(&cumulative, "clone-marker")
+            )
+        });
+    eprintln!("parent read shared global = {g:#010x} (cloned task wrote 0xABCDEF01)");
+    assert_eq!(
+        g,
+        0xABCD_EF01,
+        "parent should see the cloned task's write to the shared global; got \
+         {g:#010x} (zero ⇒ CLONE_VM didn't share the address space); {}",
+        dump_uart_on_failure(&cumulative, "clone-value")
     );
 }
 
