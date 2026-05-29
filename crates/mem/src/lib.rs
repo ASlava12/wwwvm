@@ -933,6 +933,38 @@ mod tests {
         );
     }
 
+    /// `resize` is only-grow: a larger `new_size` extends the
+    /// backing buffer with zero-filled bytes and preserves the
+    /// old contents at their addresses; a `new_size` ≤ current
+    /// length is a no-op (the caller's previous writes don't
+    /// disappear underneath them).
+    ///
+    /// Linux's bzImage loader calls this when `code32_start` sits
+    /// past the default RAM cap: the kernel image gets placed at
+    /// 0x100000 etc., and dropping any bytes < that address would
+    /// silently lose boot_params / cmdline / e820 state.
+    #[test]
+    fn resize_grows_and_preserves_existing_bytes() {
+        let mut m = Memory::new(16);
+        m.write_u8(5, 0xAA);
+        m.write_u8(15, 0xBB);
+        m.resize(64);
+        assert_eq!(m.size(), 64, "grew");
+        assert_eq!(m.read_u8(5), 0xAA, "low sentinel preserved");
+        assert_eq!(m.read_u8(15), 0xBB, "edge-of-old sentinel preserved");
+        assert_eq!(m.read_u8(16), 0, "new byte zero-filled");
+        assert_eq!(m.read_u8(63), 0, "new tail zero-filled");
+    }
+
+    #[test]
+    fn resize_smaller_is_no_op() {
+        let mut m = Memory::new(64);
+        m.write_u8(50, 0xCC);
+        m.resize(32);
+        assert_eq!(m.size(), 64, "size unchanged");
+        assert_eq!(m.read_u8(50), 0xCC, "byte past 'new size' still readable");
+    }
+
     /// Mirror of `tick_hpet_disabled_timer_does_not_fire_irq_on_…`:
     /// timer with INT_ENB_CNF (bit 2) SET but FSB_EN_CNF (bit 14)
     /// CLEAR must also not fire. The cfg gate requires *both*
