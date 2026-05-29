@@ -128,6 +128,13 @@
 //!     `do_filp_open` with O_CREAT, `sys_close` (never used
 //!     before), and cross-fd persistence via the page cache.
 //!
+//!   - `linux_userspace_stat_milestone` — file metadata: /init
+//!     creates `/probe` with 8 bytes, calls `sys_stat64`, reads
+//!     `st_size` (offset 44 in struct stat64 on i386), writes
+//!     it between `[USERSPACE STAT_SIZE=…][USERSPACE END]`.
+//!     Pins inode metadata via `cp_new_stat64` + `copy_to_user`,
+//!     and the kernel updating `i_size` after the write.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -505,6 +512,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let envp = build_initramfs_envp();
     let mmap = build_initramfs_mmap();
     let file_io = build_initramfs_file_io();
+    let stat = build_initramfs_stat();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -520,6 +528,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&envp[0..6], b"070701");
     assert_eq!(&mmap[0..6], b"070701");
     assert_eq!(&file_io[0..6], b"070701");
+    assert_eq!(&stat[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -536,6 +545,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-envp.cpio", &envp);
         let _ = std::fs::write("/tmp/wwwvm-mmap.cpio", &mmap);
         let _ = std::fs::write("/tmp/wwwvm-file-io.cpio", &file_io);
+        let _ = std::fs::write("/tmp/wwwvm-stat.cpio", &stat);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1570,6 +1580,141 @@ fn build_initramfs_file_io() -> Vec<u8> {
             &fd_zeros,
             &fd_zeros,
             &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates an 8-byte file `/probe`,
+/// calls `sys_stat64("/probe", &statbuf)` (syscall 195), and
+/// reads `st_size` (low 4 bytes at offset 44 in `struct stat64`
+/// on i386) back out. Writes the 4-byte size between
+/// `[USERSPACE STAT_SIZE=…][USERSPACE END]`. Test asserts the
+/// value equals 8 (the byte count we just wrote).
+///
+/// Pins:
+///   - `sys_stat64`: a syscall that fills a ~96-byte struct in
+///     userspace (kernel `cp_new_stat64` → `copy_to_user`). The
+///     file-io milestone already proved write/read through fds;
+///     stat tests the *inode metadata* path independently
+///   - i386 stat64 ABI: `st_size` lives at offset 44 in the
+///     struct. If the layout were wrong /init would read garbage
+///   - integration between write and stat: the kernel must
+///     update the inode's i_size after the write, otherwise
+///     stat reports stale 0 even though the bytes are in the
+///     page cache
+fn build_initramfs_stat() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let payload: &[u8] = b"TESTDATA"; // 8 bytes
+    let marker_pre: &[u8] = b"[USERSPACE STAT_SIZE=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      statbuf_addr: u32,
+                      size_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open(path, O_CREAT|O_WRONLY=0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]); // mov ecx, 0x41
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ds:[fd] = eax
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_write(fd, payload, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]); // mov eax, 6
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_stat64(path, &statbuf) — sys 195
+        out.extend_from_slice(&[0xB8, 0xC3, 0x00, 0x00, 0x00]); // mov eax, 195
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&statbuf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Read st_size low 4 bytes (offset 44 in struct stat64).
+        out.push(0xA1); // mov eax, ds:[statbuf+44]
+        out.extend_from_slice(&(statbuf_addr + 44).to_le_bytes());
+        // ds:[size_buf] = eax
+        out.push(0xA3);
+        out.extend_from_slice(&size_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, size_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&size_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let statbuf_addr = fd_addr + 4;
+    let size_buf_addr = statbuf_addr + 100; // generous: i386 struct stat64 is ~96 bytes
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        statbuf_addr,
+        size_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let statbuf_zeros = [0u8; 100];
+    let size_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &statbuf_zeros,
+            &size_zeros,
         ],
         7,
     );
@@ -3502,5 +3647,71 @@ fn linux_userspace_file_io_milestone() {
         "expected file round-trip to equal b\"TESTDATA\", got {:02X?}; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "file-io-wrong")
+    );
+}
+
+/// File metadata milestone: /init creates `/probe` with 8 bytes
+/// of "TESTDATA", then calls `sys_stat64("/probe", &statbuf)`
+/// (syscall 195) and reads `st_size` (offset 44, low 4 bytes)
+/// back out. Writes the size between
+/// `[USERSPACE STAT_SIZE=<4 bytes>][USERSPACE END]`. Test asserts
+/// the decoded value equals 8.
+///
+/// Pins the inode metadata path independently of read/write:
+/// stat fills a ~96-byte struct via `cp_new_stat64` →
+/// `copy_to_user`. Different code path than fd-based read.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_stat_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_stat();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE STAT_SIZE=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — stat64 may have returned \
+                 -errno or the struct layout offset is wrong; {}",
+                dump_uart_on_failure(&cumulative, "stat")
+            )
+        });
+    eprintln!("stat milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let size_off = pre_pos + marker_pre.len();
+    let size_bytes: [u8; 4] = cumulative[size_off..size_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let st_size = u32::from_le_bytes(size_bytes);
+    eprintln!("stat returned st_size = {st_size}");
+    assert_eq!(
+        st_size,
+        8,
+        "expected st_size = 8 (we wrote 'TESTDATA' = 8 bytes), got {st_size}; \
+         could be stat64 failed (st_size = 0 from initial zeros) or struct offset \
+         is wrong; {}",
+        dump_uart_on_failure(&cumulative, "stat-wrong")
     );
 }
