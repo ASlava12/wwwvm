@@ -201,6 +201,14 @@
 //!     SHRANK the file. The stat milestone only pins write
 //!     extending i_size; this one pins truncate shrinking it.
 //!
+//!   - `linux_userspace_chmod_milestone` — mode-bit
+//!     manipulation: /init creates `/probe` with mode 0o644,
+//!     calls `sys_chmod(path, 0o600)`, stats it, reads
+//!     `st_mode`. Test asserts the value equals
+//!     `S_IFREG | 0o600 = 0o100600`. Pins the kernel's
+//!     `setattr → notify_change` path that updates
+//!     `inode->i_mode` AND stat reflecting the change.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -588,6 +596,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let writev = build_initramfs_writev();
     let rename = build_initramfs_rename();
     let truncate = build_initramfs_truncate();
+    let chmod = build_initramfs_chmod();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -613,6 +622,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&writev[0..6], b"070701");
     assert_eq!(&rename[0..6], b"070701");
     assert_eq!(&truncate[0..6], b"070701");
+    assert_eq!(&chmod[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -639,6 +649,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-writev.cpio", &writev);
         let _ = std::fs::write("/tmp/wwwvm-rename.cpio", &rename);
         let _ = std::fs::write("/tmp/wwwvm-truncate.cpio", &truncate);
+        let _ = std::fs::write("/tmp/wwwvm-chmod.cpio", &chmod);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2672,6 +2683,122 @@ fn build_initramfs_rename() -> Vec<u8> {
             marker_post,
             &fd_zeros,
             &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/probe` with mode 0o644,
+/// then calls `sys_chmod("/probe", 0o600)` (syscall 15), stats
+/// it, and reads `st_mode` (4 bytes at offset 16 in struct
+/// stat64). Writes the mode between
+/// `[USERSPACE MODE=…][USERSPACE END]`. Test asserts mode
+/// equals `S_IFREG | 0o600 = 0o100600 = 0x81C0` — proves the
+/// kernel updated the inode's mode bits AND stat reflects the
+/// new value.
+fn build_initramfs_chmod() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let marker_pre: &[u8] = b"[USERSPACE MODE=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      statbuf_addr: u32,
+                      mode_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // fd = sys_open(path, O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_chmod(path, 0o600) — sys 15
+        out.extend_from_slice(&[0xB8, 0x0F, 0x00, 0x00, 0x00]); // mov eax, 15
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x80, 0x01, 0x00, 0x00]); // mov ecx, 0o600 = 0x180
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_stat64(path, &statbuf)
+        out.extend_from_slice(&[0xB8, 0xC3, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&statbuf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Read st_mode (4 bytes at offset 16 in struct stat64).
+        out.push(0xA1);
+        out.extend_from_slice(&(statbuf_addr + 16).to_le_bytes());
+        out.push(0xA3);
+        out.extend_from_slice(&mode_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, mode_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&mode_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_pre_addr = path_addr + path.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let statbuf_addr = fd_addr + 4;
+    let mode_buf_addr = statbuf_addr + 100;
+    let code = build_code(
+        path_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        statbuf_addr,
+        mode_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let statbuf_zeros = [0u8; 100];
+    let mode_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &statbuf_zeros,
+            &mode_zeros,
         ],
         7,
     );
@@ -5310,6 +5437,77 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_chmod` milestone: /init creates `/probe` with mode 0o644,
+/// chmod's to 0o600, stats it, reads `st_mode`. Test asserts the
+/// mode equals `S_IFREG | 0o600 = 0x81C0`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_chmod_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_chmod();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE MODE=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "chmod")
+            )
+        });
+    eprintln!("chmod milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let mode_off = pre_pos + marker_pre.len();
+    let mode_bytes: [u8; 4] = stripped[mode_off..mode_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let st_mode = u32::from_le_bytes(mode_bytes);
+    eprintln!("stat after chmod returned st_mode = 0o{st_mode:o} (0x{st_mode:04X})");
+    // S_IFREG = 0o100000 = 0x8000; 0o600 = 0x180
+    // Combined: 0o100600 = 0x81C0
+    assert_eq!(
+        st_mode,
+        0o100_600,
+        "expected st_mode = 0o100600 (S_IFREG | 0o600), got 0o{st_mode:o}; \
+         if it equals 0o100644, chmod didn't change the mode; {}",
+        dump_uart_on_failure(&cumulative, "chmod-wrong")
     );
 }
 
