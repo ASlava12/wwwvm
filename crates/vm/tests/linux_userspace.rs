@@ -263,6 +263,14 @@
 //!     marker appears. Pins sigaction storage + kill queuing +
 //!     kernel jumping to the handler.
 //!
+//!   - `linux_userspace_symlink_milestone` — symlink create +
+//!     read: /init `sys_symlink("/target", "/link")` then
+//!     `sys_readlink("/link", buf, 32)`. Test asserts
+//!     `sym_ret == 0`, `rl_ret == 7`, and the readlink buffer
+//!     equals `b"/target"`. Pins symlink inode creation
+//!     (S_IFLNK in tmpfs) AND readlink returning the link body
+//!     string + byte count (without following the link).
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -658,6 +666,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let sysinfo = build_initramfs_sysinfo();
     let mprotect = build_initramfs_mprotect();
     let signal = build_initramfs_signal();
+    let symlink = build_initramfs_symlink();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -691,6 +700,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&sysinfo[0..6], b"070701");
     assert_eq!(&mprotect[0..6], b"070701");
     assert_eq!(&signal[0..6], b"070701");
+    assert_eq!(&symlink[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -725,6 +735,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-sysinfo.cpio", &sysinfo);
         let _ = std::fs::write("/tmp/wwwvm-mprotect.cpio", &mprotect);
         let _ = std::fs::write("/tmp/wwwvm-signal.cpio", &signal);
+        let _ = std::fs::write("/tmp/wwwvm-symlink.cpio", &symlink);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -3446,6 +3457,126 @@ fn build_initramfs_signal() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[&sigact_bytes, &pid_zeros, main_marker, handler_marker],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates a symlink `/link` → `/target`
+/// via `sys_symlink("/target", "/link")` (syscall 83), then reads
+/// it back via `sys_readlink("/link", buf, 32)` (syscall 85).
+/// Emits the symlink return, the readlink return, and the first
+/// 7 bytes of the readlink buffer between markers:
+/// `[USERSPACE SYM=<4>RL=<4>LINK=<7>][USERSPACE END]`. Test
+/// asserts `sym_ret == 0`, `rl_ret == 7`, and the buffer equals
+/// `b"/target"`.
+///
+/// Pins:
+///   - sys_symlink: kernel creates a symlink inode whose body
+///     holds the target path string
+///   - sys_readlink: kernel reads the symlink body back into a
+///     user buffer (does NOT follow the link — returns the
+///     target string itself, and the byte count as eax)
+///   - the symlink-specific inode type (S_IFLNK) in tmpfs
+fn build_initramfs_symlink() -> Vec<u8> {
+    let target: &[u8] = b"/target\0";
+    let link: &[u8] = b"/link\0";
+    let marker_sym: &[u8] = b"[USERSPACE SYM=";
+    let marker_rl: &[u8] = b"RL=";
+    let marker_link: &[u8] = b"LINK=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |target_addr: u32,
+                      link_addr: u32,
+                      marker_sym_addr: u32,
+                      marker_rl_addr: u32,
+                      marker_link_addr: u32,
+                      marker_post_addr: u32,
+                      buf_addr: u32,
+                      sym_ret_addr: u32,
+                      rl_ret_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // sys_symlink(target, link) — sys 83. ebx = target (oldname),
+        // ecx = link (newname).
+        out.extend_from_slice(&[0xB8, 0x53, 0x00, 0x00, 0x00]); // mov eax, 83
+        out.push(0xBB);
+        out.extend_from_slice(&target_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&link_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[sym_ret], eax
+        out.extend_from_slice(&sym_ret_addr.to_le_bytes());
+        // sys_readlink(link, buf, 32) — sys 85
+        out.extend_from_slice(&[0xB8, 0x55, 0x00, 0x00, 0x00]); // mov eax, 85
+        out.push(0xBB);
+        out.extend_from_slice(&link_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x20, 0x00, 0x00, 0x00]); // mov edx, 32
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[rl_ret], eax
+        out.extend_from_slice(&rl_ret_addr.to_le_bytes());
+        // Helper to emit write(1, addr, len).
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        w(marker_sym_addr, marker_sym.len() as u32, &mut out);
+        w(sym_ret_addr, 4, &mut out);
+        w(marker_rl_addr, marker_rl.len() as u32, &mut out);
+        w(rl_ret_addr, 4, &mut out);
+        w(marker_link_addr, marker_link.len() as u32, &mut out);
+        w(buf_addr, 7, &mut out); // first 7 bytes of readlink result
+        w(marker_post_addr, marker_post.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let target_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let link_addr = target_addr + target.len() as u32;
+    let marker_sym_addr = link_addr + link.len() as u32;
+    let marker_rl_addr = marker_sym_addr + marker_sym.len() as u32;
+    let marker_link_addr = marker_rl_addr + marker_rl.len() as u32;
+    let marker_post_addr = marker_link_addr + marker_link.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let sym_ret_addr = buf_addr + 32;
+    let rl_ret_addr = sym_ret_addr + 4;
+    let code = build_code(
+        target_addr,
+        link_addr,
+        marker_sym_addr,
+        marker_rl_addr,
+        marker_link_addr,
+        marker_post_addr,
+        buf_addr,
+        sym_ret_addr,
+        rl_ret_addr,
+    );
+    let buf_zeros = [0u8; 32];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            target,
+            link,
+            marker_sym,
+            marker_rl,
+            marker_link,
+            marker_post,
+            &buf_zeros,
+            &ret_zeros,
+            &ret_zeros,
+        ],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -6520,6 +6651,112 @@ fn linux_userspace_fcntl_milestone() {
         "expected fd_flags = FD_CLOEXEC (1), got 0x{flags:08X}; if 0, F_SETFD \
          silently failed; if some other bit, kernel has additional fd flags; {}",
         dump_uart_on_failure(&cumulative, "fcntl-wrong")
+    );
+}
+
+/// `sys_symlink` + `sys_readlink` milestone: /init creates a
+/// symlink `/link` → `/target`, reads it back, prints the target.
+/// Test asserts the round-trip equals `b"/target"`. Pins symlink
+/// inode creation (S_IFLNK) AND readlink returning the body
+/// string (not following the link).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_symlink_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_symlink();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_sym: &[u8] = b"[USERSPACE SYM=";
+    let marker_rl: &[u8] = b"RL=";
+    let marker_link: &[u8] = b"LINK=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "symlink")
+            )
+        });
+    eprintln!("symlink milestone end marker after {steps} steps");
+
+    // Binary 4-byte returns may contain 0x0A → ONLCR-padded; strip.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let sym_pos = stripped
+        .windows(marker_sym.len())
+        .position(|w| w == marker_sym)
+        .expect("marker_sym");
+    let sym_off = sym_pos + marker_sym.len();
+    let sym_ret = u32::from_le_bytes(stripped[sym_off..sym_off + 4].try_into().unwrap());
+
+    let rl_pos = stripped
+        .windows(marker_rl.len())
+        .position(|w| w == marker_rl)
+        .expect("marker_rl");
+    let rl_off = rl_pos + marker_rl.len();
+    let rl_ret = u32::from_le_bytes(stripped[rl_off..rl_off + 4].try_into().unwrap());
+
+    let link_pos = stripped
+        .windows(marker_link.len())
+        .position(|w| w == marker_link)
+        .expect("marker_link");
+    let link_off = link_pos + marker_link.len();
+    let link_bytes: [u8; 7] = stripped[link_off..link_off + 7].try_into().unwrap();
+
+    eprintln!(
+        "sys_symlink ret = 0x{sym_ret:08X} ({}), sys_readlink ret = 0x{rl_ret:08X} ({}), \
+         link bytes = {:?}",
+        sym_ret as i32,
+        rl_ret as i32,
+        std::str::from_utf8(&link_bytes).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        sym_ret,
+        0,
+        "sys_symlink returned 0x{sym_ret:08X} ({}) — expected 0; {}",
+        sym_ret as i32,
+        dump_uart_on_failure(&cumulative, "symlink-sym-ret")
+    );
+    assert_eq!(
+        rl_ret,
+        7,
+        "sys_readlink returned 0x{rl_ret:08X} ({}) — expected 7 (len of \"/target\"); {}",
+        rl_ret as i32,
+        dump_uart_on_failure(&cumulative, "symlink-rl-ret")
+    );
+    assert_eq!(
+        &link_bytes,
+        b"/target",
+        "expected readlink content b\"/target\", got {:02X?}; {}",
+        link_bytes,
+        dump_uart_on_failure(&cumulative, "symlink-wrong")
     );
 }
 
