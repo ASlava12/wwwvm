@@ -5178,6 +5178,105 @@ fn build_initramfs_fork() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init forks a child that `exit(42)`s, then
+/// reaps it with `waitpid(-1, &status, 0)` and reports both the
+/// raw status word and waitpid's return (the child PID):
+/// `[USERSPACE WSTATUS=<4>WPID=<4>][USERSPACE END]`.
+///
+/// Pins child reaping end-to-end — beyond the fork milestone (which
+/// waits with `status=NULL` purely for ordering), this captures the
+/// child's exit status:
+///   * the kernel encodes a normal exit as `status = exit_code << 8`
+///     (so `WEXITSTATUS == 42`, `WIFEXITED` true),
+///   * `waitpid` `copy_to_user`s that word into a fresh user buffer,
+///   * `waitpid` returns the reaped child's PID.
+///
+/// The test asserts `WEXITSTATUS(status) == 42`, the WIFEXITED low
+/// bits are zero, and the returned PID is a real child (`> 1`).
+fn build_initramfs_wait_status() -> Vec<u8> {
+    let marker_ws: &[u8] = b"[USERSPACE WSTATUS=";
+    let marker_wpid: &[u8] = b"WPID=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+    const CHILD_EXIT_CODE: u8 = 42;
+
+    let build_code = |marker_ws_addr: u32,
+                      marker_wpid_addr: u32,
+                      marker_end_addr: u32,
+                      status_addr: u32,
+                      wpid_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // sys_fork — sys 2
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]); // jnz parent (patched below)
+                                              // child: exit(CHILD_EXIT_CODE)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+        out.extend_from_slice(&[0xBB, CHILD_EXIT_CODE, 0x00, 0x00, 0x00]); // mov ebx, 42
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // parent:
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+        // sys_waitpid(-1, &status, 0) — sys 7
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]); // mov eax, 7
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]); // mov ebx, -1
+        out.push(0xB9); // mov ecx, &status
+        out.extend_from_slice(&status_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (options=0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wpid], eax (waitpid return = child pid)
+        out.extend_from_slice(&wpid_addr.to_le_bytes());
+        // emit WSTATUS=<status> WPID=<pid> END
+        w(marker_ws_addr, marker_ws.len() as u32, &mut out);
+        w(status_addr, 4, &mut out);
+        w(marker_wpid_addr, marker_wpid.len() as u32, &mut out);
+        w(wpid_addr, 4, &mut out);
+        w(marker_end_addr, marker_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let marker_ws_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_wpid_addr = marker_ws_addr + marker_ws.len() as u32;
+    let marker_end_addr = marker_wpid_addr + marker_wpid.len() as u32;
+    let status_addr = marker_end_addr + marker_end.len() as u32;
+    let wpid_addr = status_addr + 4;
+    let code = build_code(
+        marker_ws_addr,
+        marker_wpid_addr,
+        marker_end_addr,
+        status_addr,
+        wpid_addr,
+    );
+    let zeros4 = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_ws, marker_wpid, marker_end, &zeros4, &zeros4],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio with TWO executables: /init (forks + has child
 /// execve /helper) and /helper (writes marker, exits). Proves
 /// the kernel's path-resolving execve(2) path: child must
@@ -6296,6 +6395,100 @@ fn linux_userspace_fork_milestone() {
         (2..0x8000_0000).contains(&parent_return),
         "expected parent's fork return in [2, 0x80000000), got {parent_return} (0x{parent_return:08X}); {}",
         dump_uart_on_failure(&cumulative, "fork-parent-bad")
+    );
+}
+
+/// Wait-status milestone: /init forks a child that `exit(42)`s and
+/// reaps it with `waitpid(-1, &status, 0)`, then reports the raw
+/// status word and waitpid's return. Asserts `WEXITSTATUS == 42`,
+/// `WIFEXITED` (status low 7 bits == 0), and a real child PID.
+/// Pins child exit-status propagation + the kernel's status-word
+/// `copy_to_user` — the piece the fork milestone leaves out by
+/// passing `status = NULL`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_wait_status_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_wait_status();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — fork/waitpid likely failed; {}",
+            dump_uart_on_failure(&cumulative, "wait-status")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let status = read_at(b"[USERSPACE WSTATUS=").unwrap_or_else(|| {
+        panic!(
+            "WSTATUS marker not found; {}",
+            dump_uart_on_failure(&cumulative, "wait-status-marker")
+        )
+    });
+    let wpid = read_at(b"WPID=").unwrap_or_else(|| {
+        panic!(
+            "WPID marker not found; {}",
+            dump_uart_on_failure(&cumulative, "wait-pid-marker")
+        )
+    });
+    eprintln!("waitpid returned pid={wpid}, raw status=0x{status:08x}");
+
+    // WIFEXITED: low 7 bits of status are 0 for a normal exit.
+    assert_eq!(
+        status & 0x7f,
+        0,
+        "expected a normal-exit status (WIFEXITED), got raw 0x{status:08x}; {}",
+        dump_uart_on_failure(&cumulative, "wait-not-exited")
+    );
+    // WEXITSTATUS: bits 8..16.
+    let exit_code = (status >> 8) & 0xff;
+    assert_eq!(
+        exit_code,
+        42,
+        "expected WEXITSTATUS == 42, got {exit_code} (raw 0x{status:08x}); {}",
+        dump_uart_on_failure(&cumulative, "wait-exitcode")
+    );
+    assert!(
+        (2..0x8000_0000).contains(&wpid),
+        "expected waitpid to return a real child PID (> 1), got {wpid}; {}",
+        dump_uart_on_failure(&cumulative, "wait-pid")
     );
 }
 
