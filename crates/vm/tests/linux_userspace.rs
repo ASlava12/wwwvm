@@ -848,6 +848,68 @@ fn linux_userspace_hello_with_uname_marker_milestone() {
     eprintln!("HELLO seen after {steps} steps (marker bytes not the trigger)");
 }
 
+/// Bisection probe: same as uname-then-write-buf but with a
+/// write of `marker_pre` ("[USERSPACE uname]: ") inserted at the
+/// very top — *before* sys_uname. Tests whether the
+/// marker-pre-BEFORE-uname ordering is the trigger of the
+/// original uname hang. If HELLO appears, ordering isn't the
+/// issue (it's something else in the original /init's structure).
+/// If HELLO never appears, the order IS the trigger — and we
+/// learn something genuinely weird is going on with the kernel's
+/// pre-exec scan of the /init binary.
+fn build_initramfs_marker_then_uname_then_buf_then_hello() -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let marker_pre: &[u8] = b"[USERSPACE uname]: ";
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+
+    let build_code = |marker_pre_addr: u32, msg_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len()) — the NEW line.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_uname(buf).
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 65).
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, msg, msg_len).
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(42).
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let msg_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = msg_addr + msg_len;
+    let code = build_code(marker_pre_addr, msg_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    let binary = make_init_elf32(&code, &[marker_pre, msg, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Bisection probe: /init does sys_uname → write sysname[0..65]
 /// → write HELLO → exit(42). Same structure as the original
 /// broken uname /init except for the marker_pre prefix write and
@@ -934,4 +996,44 @@ fn linux_userspace_uname_original_redux_milestone() {
         )
     });
     eprintln!("ORIGINAL uname /init NOW PASSES at {steps} steps — was non-deterministic");
+}
+
+/// Bisection probe: same as the working uname-then-write-buf-
+/// then-hello, but with a marker_pre write *before* sys_uname.
+/// Isolates whether marker_pre-before-uname is the trigger.
+#[test]
+#[ignore = "marker-before-uname ordering probe"]
+fn linux_userspace_marker_then_uname_then_buf_then_hello_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_marker_then_uname_then_buf_then_hello();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen — marker-before-uname IS the trigger; {}",
+            dump_uart_on_failure(&cumulative, "marker-then-uname")
+        )
+    });
+    eprintln!("HELLO seen after {steps} steps (marker-before-uname is fine)");
 }
