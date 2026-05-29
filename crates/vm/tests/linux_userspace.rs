@@ -3489,16 +3489,14 @@ fn build_initramfs_signal() -> Vec<u8> {
             out
         };
     // Handler code: write the HANDLER marker, then call
-    // sys_exit(0) directly. The kernel's sigreturn path is
-    // broken in our emulation (verified empirically: handler
-    // returning via `ret` triggers SIGSEGV in /init, exitcode=11
-    // — main never resumes). Skipping sigreturn entirely by
-    // exiting from inside the handler turns this from a
-    // round-trip signals test into a one-way signal-delivery
-    // test, which is still a useful pin: rt_sigaction stored
-    // the handler, kill queued the signal, kernel delivered to
-    // the handler's address. Sigreturn investigation can be
-    // its own milestone once we have a working baseline.
+    // sys_exit(0) directly. This keeps the test a minimal one-way
+    // signal-DELIVERY pin (rt_sigaction stored the handler, kill
+    // queued the signal, kernel jumped to the handler's address),
+    // independent of the sigreturn round-trip. The full round-trip
+    // — handler returning via `ret` → restorer → rt_sigreturn →
+    // resume — is covered separately by
+    // `linux_userspace_sigreturn_milestone`
+    // (`build_initramfs_signal_rt`).
     let handler_code_builder = |handler_marker_addr: u32| -> Vec<u8> {
         let mut out = Vec::with_capacity(32);
         out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
@@ -3557,6 +3555,238 @@ fn build_initramfs_signal() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[&sigact_bytes, &pid_zeros, main_marker, handler_marker],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Round-trip signal /init: identical to `build_initramfs_signal`
+/// except (a) the handler RETURNS via `ret` instead of exiting, and
+/// (b) `sa_flags` sets `SA_SIGINFO` so the kernel builds an
+/// rt_sigframe matching the `rt_sigreturn(173)` restorer. This
+/// exercises the full sigreturn path the one-way milestone skips:
+///   * kernel `setup_rt_frame` pushes the rt_sigframe (pretcode =
+///     `sa_restorer`, plus the saved sigcontext in `uc.uc_mcontext`)
+///     onto the user stack,
+///   * handler `ret` pops pretcode → jumps to the restorer stub,
+///   * restorer calls `sys_rt_sigreturn(173)`,
+///   * kernel restores the pre-signal context from the frame and
+///     resumes `main`, which writes `[USERSPACE DONE]`.
+///
+/// The `SA_SIGINFO` bit is load-bearing — see the long note at the
+/// `sa_flags` assignment below and on `linux_userspace_sigreturn_milestone`.
+fn build_initramfs_signal_rt() -> Vec<u8> {
+    let main_marker: &[u8] = b"[USERSPACE DONE]\n";
+    let handler_marker: &[u8] = b"[USERSPACE HANDLER]\n";
+
+    let main_code_builder =
+        |sigact_addr: u32, pid_buf_addr: u32, main_marker_addr: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(96);
+            // sys_rt_sigaction(SIGUSR1=10, &sigact, NULL, 8)
+            out.extend_from_slice(&[0xB8, 0xAE, 0x00, 0x00, 0x00]); // mov eax, 174
+            out.extend_from_slice(&[0xBB, 0x0A, 0x00, 0x00, 0x00]); // ebx = 10
+            out.push(0xB9);
+            out.extend_from_slice(&sigact_addr.to_le_bytes());
+            out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (oldact NULL)
+            out.extend_from_slice(&[0xBE, 0x08, 0x00, 0x00, 0x00]); // esi = 8 (sigsetsize)
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // sys_getpid
+            out.extend_from_slice(&[0xB8, 0x14, 0x00, 0x00, 0x00]); // mov eax, 20
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out.push(0xA3); // ds:[pid_buf] = eax
+            out.extend_from_slice(&pid_buf_addr.to_le_bytes());
+            // sys_kill(pid, SIGUSR1=10)
+            out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[pid_buf]
+            out.extend_from_slice(&pid_buf_addr.to_le_bytes());
+            out.extend_from_slice(&[0xB8, 0x25, 0x00, 0x00, 0x00]); // mov eax, 37
+            out.extend_from_slice(&[0xB9, 0x0A, 0x00, 0x00, 0x00]); // mov ecx, 10
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // After kill returns (handler ran + sigreturn'd, so main
+            // resumes HERE): write(1, main_marker, len)
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.push(0xB9);
+            out.extend_from_slice(&main_marker_addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&(main_marker.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // exit(0)
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0x31, 0xDB]);
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out
+        };
+    // Handler: write HANDLER marker, then `ret` (0xC3) — pops the
+    // kernel-pushed pretcode (= sa_restorer) and runs the restorer.
+    let handler_code_builder = |handler_marker_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&handler_marker_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(handler_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xC3); // ret -> restorer (via kernel-pushed pretcode)
+        out
+    };
+    // Restorer: sys_rt_sigreturn (syscall 173).
+    let restorer_code_builder = || -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&[0xB8, 0xAD, 0x00, 0x00, 0x00]); // mov eax, 173
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let main_len = main_code_builder(0, 0, 0).len() as u32;
+    let handler_len = handler_code_builder(0).len() as u32;
+    let restorer_len = restorer_code_builder().len() as u32;
+    let main_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET;
+    let handler_addr = main_addr + main_len;
+    let restorer_addr = handler_addr + handler_len;
+    let total_code_len = main_len + handler_len + restorer_len;
+    let sigact_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + total_code_len;
+    let pid_buf_addr = sigact_addr + 20;
+    let main_marker_addr = pid_buf_addr + 4;
+    let handler_marker_addr = main_marker_addr + main_marker.len() as u32;
+
+    let main = main_code_builder(sigact_addr, pid_buf_addr, main_marker_addr);
+    let handler = handler_code_builder(handler_marker_addr);
+    let restorer = restorer_code_builder();
+    let mut code = Vec::with_capacity(total_code_len as usize);
+    code.extend_from_slice(&main);
+    code.extend_from_slice(&handler);
+    code.extend_from_slice(&restorer);
+
+    let mut sigact_bytes = Vec::with_capacity(20);
+    sigact_bytes.extend_from_slice(&handler_addr.to_le_bytes());
+    // SA_RESTORER (0x0400_0000) | SA_SIGINFO (0x4). SA_SIGINFO is
+    // essential: it makes the kernel build an *rt_sigframe* (so the
+    // saved sigcontext lives inside uc.uc_mcontext) which is what our
+    // restorer's `rt_sigreturn(173)` reads. Without it the kernel
+    // builds a legacy `sigframe` (sigcontext directly after `sig`),
+    // and rt_sigreturn reads uc_mcontext from the wrong offset →
+    // restores a zero EIP/ESP → SIGSEGV. (That mismatch was the
+    // entire "sigreturn segfault" blocker — a frame-type/restorer
+    // mismatch in the test, not an emulator bug.)
+    sigact_bytes.extend_from_slice(&0x04000004u32.to_le_bytes());
+    sigact_bytes.extend_from_slice(&restorer_addr.to_le_bytes());
+    sigact_bytes.extend_from_slice(&[0u8; 8]); // sa_mask
+
+    let pid_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[&sigact_bytes, &pid_zeros, main_marker, handler_marker],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Signal /init that dumps the raw signal frame. The SIGUSR1
+/// handler captures its entry ESP (= the rt_sigframe base the
+/// kernel built) and `write`s 256 bytes of it to stdout between
+/// `[USERSPACE FRAME=` and `]` markers, then `exit(0)`s (skipping
+/// the broken sigreturn). The test decodes the frame to see what
+/// the kernel actually wrote: `pretcode` at +0 (should equal the
+/// restorer address), `sig` at +4 (should be 10), and — somewhere
+/// in the saved sigcontext — the pre-signal EIP/ESP. If those are
+/// zero, `setup_rt_frame`'s context save was dropped; if they hold
+/// real values, the bug is on the `rt_sigreturn` *restore* side.
+fn build_initramfs_signal_framedump() -> Vec<u8> {
+    let frame_marker: &[u8] = b"[USERSPACE FRAME=";
+    let post_marker: &[u8] = b"][USERSPACE END]\n";
+    const DUMP_LEN: u32 = 256;
+
+    let main_code_builder = |sigact_addr: u32, pid_buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        // sys_rt_sigaction(SIGUSR1=10, &sigact, NULL, 8)
+        out.extend_from_slice(&[0xB8, 0xAE, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x0A, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&sigact_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xBE, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_getpid
+        out.extend_from_slice(&[0xB8, 0x14, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&pid_buf_addr.to_le_bytes());
+        // sys_kill(pid, SIGUSR1=10)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&pid_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x25, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xB9, 0x0A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // If we ever return here, just exit(0).
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let handler_code_builder = |frame_marker_addr: u32, post_marker_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&[0x89, 0xE6]); // mov esi, esp (save frame base; survives int 0x80)
+                                              // write(1, frame_marker, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&frame_marker_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(frame_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, esi, DUMP_LEN) — the raw frame
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x89, 0xF1]); // mov ecx, esi
+        out.push(0xBA);
+        out.extend_from_slice(&DUMP_LEN.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, post_marker, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&post_marker_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(post_marker.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let main_len = main_code_builder(0, 0).len() as u32;
+    let handler_len = handler_code_builder(0, 0).len() as u32;
+    let main_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET;
+    let handler_addr = main_addr + main_len;
+    // A restorer is still needed for SA_RESTORER, even though the
+    // handler exits before using it.
+    let restorer_addr = handler_addr + handler_len;
+    let restorer = [0xB8u8, 0xAD, 0x00, 0x00, 0x00, 0xCD, 0x80]; // mov eax,173; int 0x80
+    let total_code_len = main_len + handler_len + restorer.len() as u32;
+    let sigact_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + total_code_len;
+    let pid_buf_addr = sigact_addr + 20;
+    let frame_marker_addr = pid_buf_addr + 4;
+    let post_marker_addr = frame_marker_addr + frame_marker.len() as u32;
+
+    let main = main_code_builder(sigact_addr, pid_buf_addr);
+    let handler = handler_code_builder(frame_marker_addr, post_marker_addr);
+    let mut code = Vec::with_capacity(total_code_len as usize);
+    code.extend_from_slice(&main);
+    code.extend_from_slice(&handler);
+    code.extend_from_slice(&restorer);
+
+    let mut sigact_bytes = Vec::with_capacity(20);
+    sigact_bytes.extend_from_slice(&handler_addr.to_le_bytes());
+    sigact_bytes.extend_from_slice(&0x04000000u32.to_le_bytes()); // SA_RESTORER
+    sigact_bytes.extend_from_slice(&restorer_addr.to_le_bytes());
+    sigact_bytes.extend_from_slice(&[0u8; 8]);
+    let pid_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[&sigact_bytes, &pid_zeros, frame_marker, post_marker],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -7080,6 +7310,197 @@ fn linux_userspace_signal_milestone() {
             )
         });
     eprintln!("HANDLER marker after {steps} steps — signal delivery confirmed");
+}
+
+/// Milestone: the full signal round-trip via `rt_sigreturn`.
+/// `build_initramfs_signal_rt` installs a SIGUSR1 handler with
+/// `SA_RESTORER | SA_SIGINFO`, sends itself the signal, and the
+/// handler RETURNS via `ret` (instead of exiting). That pops the
+/// kernel-pushed pretcode → runs the restorer → `rt_sigreturn(173)`
+/// → the kernel restores the pre-signal context from the
+/// rt_sigframe → `main` resumes past the kill, writes
+/// `[USERSPACE DONE]`, and exits cleanly.
+///
+/// What this pins beyond the one-way `signal_milestone`:
+///   * `setup_rt_frame` builds a correct rt_sigframe on the user
+///     stack (saved sigcontext inside `uc.uc_mcontext`),
+///   * the cross-ring `ret` → restorer transition,
+///   * `sys_rt_sigreturn` restoring EIP/ESP/EFLAGS/segregs and the
+///     GP registers, so userspace resumes exactly where the signal
+///     interrupted it.
+///
+/// History: this was long recorded as the "sys_rt_sigreturn
+/// segfaults" blocker. Root cause (found 2026-05-29 via a raw frame
+/// dump) was a test bug — the handler was registered without
+/// `SA_SIGINFO`, so the kernel built a *legacy* sigframe, but the
+/// restorer called `rt_sigreturn`, which reads the rt_sigframe
+/// layout from the wrong offset → zero EIP/ESP → SIGSEGV. Adding
+/// `SA_SIGINFO` (matching frame type to restorer) fixes it; the
+/// emulator's signal machinery was correct all along.
+#[test]
+#[ignore = "boots a real Linux bzImage; full signal round-trip; ~55s wall-clock"]
+fn linux_userspace_sigreturn_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_signal_rt();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let handler_marker: &[u8] = b"[USERSPACE HANDLER]";
+    let done_marker: &[u8] = b"[USERSPACE DONE]";
+    let mut cumulative = Vec::<u8>::new();
+    let handler_ran =
+        run_until_marker(&mut vm, handler_marker, 16_000_000_000, &mut cumulative).is_ok();
+    // After the handler returns, look for DONE (main resumed) — bound
+    // the failure case (SIGSEGV → no DONE) to a couple extra B steps.
+    let resumed = run_until_marker(&mut vm, done_marker, 2_000_000_000, &mut cumulative).is_ok();
+
+    let text = String::from_utf8_lossy(&cumulative);
+    let segv = text.contains("exitcode=0x0000000b");
+    let clean_exit = text.contains("exitcode=0x00000000");
+    eprintln!("=== sigreturn round-trip milestone ===");
+    eprintln!("  handler ran  = {handler_ran}");
+    eprintln!("  main resumed (DONE) = {resumed}");
+    eprintln!("  SIGSEGV (exitcode=0x0b) seen = {segv}");
+    eprintln!("  clean exit (exitcode=0) seen = {clean_exit}");
+    // The kernel (show_unhandled_signals=1 by default) prints the
+    // faulting ip/sp/error before killing init — that pins exactly
+    // where the sigreturn path dies.
+    for needle in [
+        "segfault at",
+        "trap ",
+        "general protection",
+        "BUG:",
+        "Code:",
+        "Kernel panic",
+    ] {
+        if let Some(p) = text.find(needle) {
+            let endp = text[p..]
+                .find('\n')
+                .map(|n| p + n)
+                .unwrap_or((p + 160).min(text.len()));
+            eprintln!("  [{needle}] {:?}", &text[p..endp]);
+        }
+    }
+
+    assert!(
+        handler_ran,
+        "signal was never delivered to the handler — {}",
+        dump_uart_on_failure(&cumulative, "sigreturn")
+    );
+    assert!(
+        !segv,
+        "the sigreturn path SIGSEGV'd (exitcode=0x0b) — rt_sigreturn restored \
+         a bad context. {}",
+        dump_uart_on_failure(&cumulative, "sigreturn")
+    );
+    assert!(
+        resumed,
+        "handler ran but `main` never resumed past the kill (no DONE marker) — \
+         rt_sigreturn did not return to the interrupted context. {}",
+        dump_uart_on_failure(&cumulative, "sigreturn")
+    );
+}
+
+/// Diagnostic that dumps the raw rt_sigframe the kernel built on the
+/// user stack (via `build_initramfs_signal_framedump`). Decodes
+/// `pretcode`/`sig`/pointers and scans every dword for non-zero
+/// values, so we can see whether `setup_rt_frame` actually saved the
+/// pre-signal registers or left the frame demand-zero. ALWAYS PASSES.
+#[test]
+#[ignore = "diagnostic: dumps the signal frame; ~55s wall-clock"]
+fn linux_userspace_sigframe_dump_diag() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_signal_framedump();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let reached = run_until_marker(&mut vm, end, 8_000_000_000, &mut cumulative).is_ok();
+    eprintln!("=== sigframe dump diagnostic (reached_end={reached}) ===");
+
+    // Strip ONLCR (\r\n -> \n) to undo the TTY's LF translation of
+    // any 0x0A bytes in the binary frame.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let m: &[u8] = b"[USERSPACE FRAME=";
+    let Some(p) = stripped.windows(m.len()).position(|w| w == m) else {
+        eprintln!("  FRAME marker not found");
+        return;
+    };
+    let frame_start = p + m.len();
+    // The frame ends at the post marker; clamp to 256.
+    let end_rel = stripped[frame_start..]
+        .windows(2)
+        .position(|w| w == b"][")
+        .unwrap_or(256)
+        .min(256);
+    let frame = &stripped[frame_start..frame_start + end_rel];
+    eprintln!("  captured {} frame bytes", frame.len());
+    // Decode the leading rt_sigframe fields.
+    let dw = |off: usize| -> Option<u32> {
+        frame
+            .get(off..off + 4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+    eprintln!("  pretcode (+0)  = {:#010x?}", dw(0));
+    eprintln!("  sig      (+4)  = {:?}", dw(4));
+    eprintln!("  pinfo    (+8)  = {:#010x?}", dw(8));
+    eprintln!("  puc      (+12) = {:#010x?}", dw(12));
+    // Dump all non-zero dwords with their offsets — the saved EIP
+    // (a 0x0804_80xx code address) and ESP (a stack address) should
+    // appear if setup_rt_frame populated the sigcontext.
+    eprint!("  non-zero dwords:");
+    let mut n = 0;
+    for off in (0..frame.len().saturating_sub(3)).step_by(4) {
+        if let Some(v) = dw(off) {
+            if v != 0 {
+                eprint!(" +{off}={v:#x}");
+                n += 1;
+            }
+        }
+    }
+    eprintln!();
+    eprintln!("  ({n} non-zero dwords of {} total)", frame.len() / 4);
 }
 
 /// `sys_mprotect` milestone: /init mmap's a page R+W, writes
