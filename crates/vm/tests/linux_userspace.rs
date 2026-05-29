@@ -304,6 +304,29 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
         let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
+        // Bisection-debug cpios for the {600, 602} stall — the
+        // failing minimal reproducer and the just-above-bad-set
+        // counter-example. Pair these with
+        // `WWWVM_DUMP_REGIONS=1` linux_boot runs to diff the
+        // per-EIP-region step histograms and find where the
+        // failing run diverges:
+        //
+        //   WWWVM_INITRD=/tmp/wwwvm-padded-600.cpio \
+        //   WWWVM_DUMP_REGIONS=1 cargo run --release --example \
+        //   linux_boot -p wwwvm-vm > /tmp/run-600.log
+        //
+        //   (same with padded-601 → /tmp/run-601.log)
+        //
+        //   diff <(grep "..  " /tmp/run-600.log) \
+        //        <(grep "..  " /tmp/run-601.log)
+        let _ = std::fs::write(
+            "/tmp/wwwvm-padded-600.cpio",
+            build_initramfs_hello_padded_to(600),
+        );
+        let _ = std::fs::write(
+            "/tmp/wwwvm-padded-601.cpio",
+            build_initramfs_hello_padded_to(601),
+        );
     }
 }
 
