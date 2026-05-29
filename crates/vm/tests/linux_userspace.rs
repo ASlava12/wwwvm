@@ -40,6 +40,16 @@
 //!     Asserts exactly `pid == 1` (any other value would mean
 //!     the kernel exec'd /init under a different task struct).
 //!
+//!   - `linux_userspace_gettimeofday_milestone` — sub-second
+//!     clock + struct-to-userspace: /init calls
+//!     `sys_gettimeofday(&tv, NULL)` (syscall 78), kernel
+//!     copy_to_user's the 8-byte `struct timeval`, /init writes
+//!     it bracketed by `[USERSPACE TV=]` markers. Test asserts
+//!     `tv_sec ∈ [2020-01-01, Y2038)` and `tv_usec < 1_000_000`.
+//!     Different mechanism than the time milestone — that one
+//!     proves the syscall ABI moves a u32 through eax, this one
+//!     proves the kernel's copy_to_user fills a user-side struct.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -312,17 +322,20 @@ fn init_cpio_archives_start_with_newc_magic() {
     let hello = build_initramfs_hello();
     let time = build_initramfs_time();
     let getpid = build_initramfs_getpid();
+    let gettimeofday = build_initramfs_gettimeofday();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
     assert_eq!(&time[0..6], b"070701");
     assert_eq!(&getpid[0..6], b"070701");
+    assert_eq!(&gettimeofday[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
         let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
         let _ = std::fs::write("/tmp/wwwvm-time.cpio", &time);
         let _ = std::fs::write("/tmp/wwwvm-getpid.cpio", &getpid);
+        let _ = std::fs::write("/tmp/wwwvm-gettimeofday.cpio", &gettimeofday);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -854,6 +867,87 @@ fn build_initramfs_getpid() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `sys_gettimeofday(&tv, NULL)`
+/// (syscall 78) and writes the kernel-filled 8-byte struct to
+/// stdout bracketed by markers. Unlike the time milestone (which
+/// only proves the kernel returns time_t in eax), this one
+/// exercises the *struct-to-userspace* path: the kernel must
+/// `copy_to_user` a `struct timeval { tv_sec; tv_usec }` into
+/// /init's writable data segment. Same write target as the
+/// proc/version reader, but for a kernel-synthesized struct.
+/// The microseconds field also pins sub-second resolution —
+/// `sys_time` rounds away anything finer than 1 s.
+fn build_initramfs_gettimeofday() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE TV=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_gettimeofday(tv=buf, tz=NULL) — sys 78. Kernel
+        // copy_to_user's `struct timeval` (8 bytes: sec, usec)
+        // into buf. eax=0 on success.
+        out.extend_from_slice(&[0xB8, 0x4E, 0x00, 0x00, 0x00]); // mov eax, 78
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes()); // ebx = &tv
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (tz = NULL)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 8)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // edx = 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 8]; // struct timeval = 8 bytes
+                              // Tail-pad dodges a NEW bad-set hit found 2026-05-29: this
+                              // builder, before the pad, produced an /init of exactly 213
+                              // bytes — and that size triggers the same kernel-stalls-in-
+                              // pata_legacy-probe symptom as the {600, 602} bisection
+                              // (full kernel boot, "Trying to unpack rootfs image as
+                              // initramfs..." appears, then nothing — no "Run /init",
+                              // no userspace, budget exhausts at 8.7 min). The original
+                              // bisection only swept sizes 588..608, so it missed that
+                              // the bad set extends much further. With this 12-byte
+                              // tail pad the binary is 225 bytes and the test passes
+                              // in ~52 s. The blocker note in README has the wider
+                              // diagnosis. The bytes are unreferenced by /init code.
+    let tail_pad = [0u8; 12];
+    let binary = make_init_elf32(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros, &tail_pad],
+        7, // R | W | X — kernel copy_to_user writes timeval into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -1183,5 +1277,92 @@ fn linux_userspace_getpid_milestone() {
         1,
         "sys_getpid returned {pid} (expected 1 — /init is PID 1); {}",
         dump_uart_on_failure(&cumulative, "getpid-wrong")
+    );
+}
+
+/// Sub-second-clock milestone: /init calls
+/// `sys_gettimeofday(&tv, NULL)` (syscall 78), and the kernel
+/// fills an 8-byte `struct timeval` in /init's data segment.
+/// /init writes the raw 8 bytes between `[USERSPACE TV=]` and
+/// `[USERSPACE END]` markers; the test decodes
+/// `(tv_sec, tv_usec) = (u32_le, u32_le)` and asserts both
+/// fields are in plausible ranges (sec in the same window as
+/// the time milestone, usec strictly < 1_000_000).
+///
+/// What's new vs `linux_userspace_time_milestone`:
+///   - struct-to-userspace path (kernel `copy_to_user`s
+///     into the buf, vs returning a u32 in eax)
+///   - sub-second resolution — `sys_time` rounds away
+///     anything finer than 1 s; gettimeofday returns
+///     microseconds, so a non-zero `usec` proves the
+///     kernel's internal clock is actually finer-grained
+///     than 1 Hz, not just snapped to it.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_gettimeofday_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_gettimeofday();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE TV=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "gettimeofday")
+            )
+        });
+    eprintln!("sys_gettimeofday userspace milestone seen after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let t_off = pre_pos + marker_pre.len();
+    let sec_bytes: [u8; 4] = cumulative[t_off..t_off + 4]
+        .try_into()
+        .expect("4 bytes for tv_sec");
+    let usec_bytes: [u8; 4] = cumulative[t_off + 4..t_off + 8]
+        .try_into()
+        .expect("4 bytes for tv_usec");
+    let tv_sec = u32::from_le_bytes(sec_bytes);
+    let tv_usec = u32::from_le_bytes(usec_bytes);
+    eprintln!("sys_gettimeofday returned tv_sec = {tv_sec}, tv_usec = {tv_usec}");
+
+    // Same bounds as the time milestone: kernel sets clock to
+    // 2020-01-01 at boot, Y2038 is the i386 wall.
+    const RTC_CMOS_FLOOR: u32 = 1_577_836_800;
+    const Y2038_CEIL: u32 = 0x7FFF_FFFF;
+    assert!(
+        (RTC_CMOS_FLOOR..Y2038_CEIL).contains(&tv_sec),
+        "tv_sec = {tv_sec} (0x{tv_sec:08X}); expected [{RTC_CMOS_FLOOR}, {Y2038_CEIL}); {}",
+        dump_uart_on_failure(&cumulative, "gettimeofday-sec")
+    );
+    // tv_usec ∈ [0, 1_000_000) by `gettimeofday(2)` contract.
+    // Anything outside this range means either the kernel left
+    // the field uninitialized (e.g. wrote only tv_sec then
+    // failed) or the copy_to_user wrote into the wrong slot.
+    assert!(
+        tv_usec < 1_000_000,
+        "tv_usec = {tv_usec} (0x{tv_usec:08X}); expected < 1_000_000; {}",
+        dump_uart_on_failure(&cumulative, "gettimeofday-usec")
     );
 }
