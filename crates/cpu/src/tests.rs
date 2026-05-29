@@ -1938,6 +1938,46 @@ fn aaa_adjusts_unpacked_bcd_carry() {
     assert!(cpu.has(flag::CF));
 }
 
+/// ADD must set AF (auxiliary carry) on a carry out of bit 3.
+/// Regression: flags_add* never computed AF.
+#[test]
+fn add_sets_auxiliary_carry_on_bit3_carry() {
+    // 0x0F + 0x01 = 0x10: carry out of bit 3 -> AF=1.
+    let (cpu, _, _) = run_payload(&[0xB0, 0x0F, 0x04, 0x01, 0xF4], 8);
+    assert_eq!(cpu.read_r8(0), 0x10);
+    assert!(cpu.has(flag::AF), "AF must be set after 0x0F + 0x01");
+}
+
+/// ADD must CLEAR AF when there is no carry out of bit 3 (guards
+/// against an always-set AF).
+#[test]
+fn add_clears_auxiliary_carry_without_bit3_carry() {
+    // 0x01 + 0x01 = 0x02: no carry out of bit 3 -> AF=0.
+    let (cpu, _, _) = run_payload(&[0xB0, 0x01, 0x04, 0x01, 0xF4], 8);
+    assert!(!cpu.has(flag::AF), "AF must be clear after 0x01 + 0x01");
+}
+
+/// SUB must set AF on a borrow out of bit 3.
+#[test]
+fn sub_sets_auxiliary_carry_on_bit3_borrow() {
+    // 0x10 - 0x01 = 0x0F: borrow out of bit 3 -> AF=1.
+    let (cpu, _, _) = run_payload(&[0xB0, 0x10, 0x2C, 0x01, 0xF4], 8);
+    assert_eq!(cpu.read_r8(0), 0x0F);
+    assert!(cpu.has(flag::AF), "AF must be set after 0x10 - 0x01");
+}
+
+/// DAA must honor the AF produced by a preceding ADD even when the
+/// low-nibble check does NOT fire. 0x08 + 0x08 = 0x10: low nibble is 0
+/// (DAA's `(AL & 0x0F) > 9` is false), but the bit-3 carry sets AF=1,
+/// so DAA must still add 6 -> 0x16. Strong end-to-end pin that ADD
+/// feeds a correct AF into the BCD-adjust path (fails when AF is never
+/// computed: DAA would leave AL=0x10).
+#[test]
+fn daa_uses_auxiliary_carry_from_preceding_add() {
+    let (cpu, _, _) = run_payload(&[0xB0, 0x08, 0x04, 0x08, 0x27, 0xF4], 8);
+    assert_eq!(cpu.read_r8(0), 0x16, "DAA must honor AF set by ADD");
+}
+
 #[test]
 fn aam_splits_al_into_ah_al() {
     // MOV AL, 23 ; AAM (base 10) → AH=2, AL=3

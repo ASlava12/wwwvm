@@ -42,6 +42,9 @@ pub enum CpuError {
 pub mod flag {
     pub const CF: u16 = 1 << 0;
     pub const PF: u16 = 1 << 2;
+    /// Auxiliary carry — carry/borrow out of bit 3. Used by the BCD
+    /// adjust instructions (DAA/DAS/AAA/AAS) and exposed via LAHF/PUSHF.
+    pub const AF: u16 = 1 << 4;
     pub const ZF: u16 = 1 << 6;
     pub const SF: u16 = 1 << 7;
     pub const IF: u16 = 1 << 9;
@@ -1905,6 +1908,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x80 != 0);
         self.set_flag(flag::PF, (result.count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ result) & (b ^ result) & 0x80) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     fn flags_add16(&mut self, a: u16, b: u16, cin: u16, result: u16) {
@@ -1914,6 +1918,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x8000 != 0);
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ result) & (b ^ result) & 0x8000) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     fn flags_add32(&mut self, a: u32, b: u32, cin: u32, result: u32) {
@@ -1923,6 +1928,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x8000_0000 != 0);
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ result) & (b ^ result) & 0x8000_0000) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     fn flags_sub8(&mut self, a: u8, b: u8, bin: u8, result: u8) {
@@ -1932,6 +1938,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x80 != 0);
         self.set_flag(flag::PF, (result.count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x80) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     fn flags_sub16(&mut self, a: u16, b: u16, bin: u16, result: u16) {
@@ -1941,6 +1948,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x8000 != 0);
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x8000) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     fn flags_sub32(&mut self, a: u32, b: u32, bin: u32, result: u32) {
@@ -1950,6 +1958,7 @@ impl Cpu {
         self.set_flag(flag::SF, result & 0x8000_0000 != 0);
         self.set_flag(flag::PF, ((result as u8).count_ones() & 1) == 0);
         self.set_flag(flag::OF, ((a ^ b) & (a ^ result) & 0x8000_0000) != 0);
+        self.set_flag(flag::AF, ((a ^ b ^ result) & 0x10) != 0);
     }
 
     /// Decode a 16-bit ModR/M effective address. `mode` must be 0b00,
