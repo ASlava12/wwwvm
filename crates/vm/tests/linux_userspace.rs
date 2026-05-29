@@ -1087,15 +1087,40 @@ fn linux_userspace_marker_then_uname_then_buf_then_hello_with_exit_0_milestone()
     eprintln!("HELLO seen after {steps} steps (exit(0) is fine — bug is in marker_post)");
 }
 
-/// Final-bisection probe. Build the same /init as the working
-/// `linux_userspace_marker_then_uname_then_buf_then_hello`, but
-/// replace the HELLO msg ("HELLO FROM USERSPACE\n", 21 bytes)
-/// with the failing marker_post ("\n[USERSPACE END]\n", 17 bytes).
-/// Since /init still also writes HELLO in the marker_then_uname
-/// version, we need a marker the test SEARCH for that's
-/// guaranteed to be in the output. Use a marker prefix WRAPPER:
-/// /init writes `[BISECT] HELLO`, then the failing msg, then
-/// exits. The test searches for `[BISECT] HELLO`.
+/// Tunable /init for the uname-hang bisection. /init writes
+/// `[BISECT] HELLO\n` (the marker the test searches for),
+/// then `sys_uname(buf)`, `write(1, buf, 65)`, the caller-
+/// supplied `msg`, then `exit(42)`.
+///
+/// Bisection result (10 ignored probes across `b67d7cb` ..
+/// `40c3b38`):
+///
+/// | msg.len() | /init binary | works? |
+/// |-----------|--------------|--------|
+/// |     5     |     588      |   ✓    |
+/// |    17     |     600      |   ✗    |
+/// |    19     |     602      |   ✗    |
+/// |    21     |     604      |   ✓    |
+/// |    22     |     605      |   ✓    |
+///
+/// **Bad range: /init binary size 600..=602 bytes (possibly 603,
+/// not tested).** No other property — content, syscall order,
+/// exit code, leading byte, the `[USERSPACE END]` substring —
+/// affects the outcome.
+///
+/// In the failing case the kernel never reaches /init exec
+/// (still stuck in pata_legacy probe at 16 B steps), so something
+/// in early init reacts to a SPECIFIC SIZE of the /init binary
+/// inside the initramfs. Working theories: kernel slow path for
+/// specific filesz; our emulator's TLB/IRQ delivery hitting a
+/// content-dependent slow path; or `irq_pending`-style poll
+/// timing.
+///
+/// None of the user-facing /init's land in this size range —
+/// hello is 139, proc_version is 417, the working uname-then-
+/// hello is ~444. The original failing uname /init was 547
+/// bytes; the trigger was just that its single msg-length
+/// happened to push the binary to exactly 600.
 fn build_initramfs_bisect_with_msg(msg: &'static [u8]) -> Vec<u8> {
     const UTSNAME_LEN: u32 = 390;
     let marker_pre: &[u8] = b"[BISECT] HELLO\n";
