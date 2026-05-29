@@ -9737,21 +9737,27 @@ fn linux_userspace_real_static_binary_milestone() {
     );
 }
 
-/// Diagnostic: boot a DYNAMICALLY-linked i386 binary as /init,
-/// forcing the full `ld.so` path. The kernel execs /init, sees its
-/// PT_INTERP=/lib/ld-linux.so.2, loads that interpreter, which then
-/// mmaps libc.so.6 to satisfy DT_NEEDED, relocates, and jumps to the
-/// program. We use Tinycore's `rotdash` (1.7 KB, needs only libc) as
-/// the minimal case. Files come from `WWWVM_DYN_ROOTFS` (default
-/// `/tmp/wwwvm-linux/rootfs`, the extracted Tinycore rootfs); the
-/// test SKIPS if absent. ALWAYS PASSES — it reports how far the
-/// dynamic linker got (reached /init, ld.so output, any program
-/// output, a CpuError on an unimplemented instruction, a segfault)
-/// so the next tick knows exactly what (if anything) ld.so needs that
-/// the emulator/kernel path is missing.
+/// Milestone: SINGLE-LIBRARY dynamic linking runs end to end. Boots
+/// a real DYNAMICALLY-linked i386 binary as /init, forcing the full
+/// `ld.so` path: the kernel execs /init, sees PT_INTERP=
+/// /lib/ld-linux.so.2, loads that interpreter, which mmaps libc.so.6
+/// (the sole DT_NEEDED), applies relocations, and jumps to the
+/// program's `_start` → glibc CRT → `main`. Uses Tinycore's `rotdash`
+/// (1.7 KB, needs only libc); files come from `WWWVM_DYN_ROOTFS`
+/// (default `/tmp/wwwvm-linux/rootfs`); SKIPS if absent.
+///
+/// Asserts the binary ran to a NORMAL exit (WIFEXITED — low 7 status
+/// bits zero, i.e. not killed by a signal) with NO segfault and NO
+/// "error while loading shared libraries". rotdash chooses exit code
+/// 1 (it's a tty progress-spinner with no controlling tty here), so
+/// we assert WIFEXITED rather than a specific code. This proves the
+/// dynamic loader + relocation + libc load path work for the
+/// single-library case. (Multi-library — busybox needing
+/// libc+libm+libcrypt — hits a separate kernel firmware far-call;
+/// see the README dynamic-linking blocker.)
 #[test]
-#[ignore = "diagnostic: boots a dynamically-linked glibc binary via ld.so; ~bounded"]
-fn linux_userspace_dynamic_binary_diag() {
+#[ignore = "requires WWWVM_DYN_ROOTFS (rotdash + libc); ~55s"]
+fn linux_userspace_dynamic_single_lib_milestone() {
     let kpath =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
     let kbytes = match std::fs::read(&kpath) {
@@ -9796,65 +9802,61 @@ fn linux_userspace_dynamic_binary_diag() {
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
 
+    // Run until the binary exits (init exiting panics the kernel —
+    // the marker carries rotdash's exit status). Bounded so a failure
+    // doesn't run into the post-panic reboot stub.
+    let exit_marker: &[u8] = b"Attempted to kill init! exitcode=";
     let mut cumulative = Vec::<u8>::new();
-    let chunk = 10_000_000u32;
-    let budget = 8_000_000_000u64;
-    let mut steps = 0u64;
-    let stop_reason: String;
-    loop {
-        let (s, stop) = vm.run_steps_idle_aware(chunk);
-        steps += s as u64;
-        let out = vm.drain_output();
-        if !out.is_empty() {
-            cumulative.extend_from_slice(&out);
-        }
-        match stop {
-            wwwvm_vm::Stop::CpuError(e) => {
-                stop_reason = format!("CpuError: {e}");
-                break;
-            }
-            wwwvm_vm::Stop::Halted => {
-                stop_reason = "Halted".to_string();
-                break;
-            }
-            wwwvm_vm::Stop::StepBudget => {
-                if steps >= budget {
-                    stop_reason = "step budget exhausted".to_string();
-                    break;
-                }
-            }
-        }
-    }
+    run_until_marker(&mut vm, exit_marker, 8_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "rotdash never exited — ld.so/libc load+relocate+run failed; {}",
+            dump_uart_on_failure(&cumulative, "dynamic-single-lib")
+        )
+    });
 
     let text = String::from_utf8_lossy(&cumulative);
-    eprintln!("=== dynamic /init diagnostic ===");
-    eprintln!("  steps run: {steps}");
-    eprintln!("  stop reason: {stop_reason}");
+    let reached = text.contains("Run /init as init process");
+    let segfault = text.contains("segfault at");
+    let lib_err = text.contains("error while loading shared libraries");
+    // Parse the exit status from "...exitcode=0xNNNNNNNN".
+    let exitcode = text
+        .find("exitcode=0x")
+        .and_then(|p| u32::from_str_radix(text.get(p + 11..p + 19)?, 16).ok());
     eprintln!(
-        "  reached /init exec: {}",
-        text.contains("Run /init as init process")
+        "single-lib dynamic: reached_init={reached} segfault={segfault} \
+         lib_err={lib_err} exitcode={exitcode:#x?}"
     );
-    for needle in [
-        "Run /init as init process",
-        "segfault at",
-        "trap invalid opcode",
-        "trap ",
-        "Kernel panic",
-        "exitcode=",
-        "error while loading shared libraries",
-        "not found",
-    ] {
-        if let Some(p) = text.find(needle) {
-            let endp = text[p..]
-                .find('\n')
-                .map(|n| p + n)
-                .unwrap_or((p + 120).min(text.len()));
-            eprintln!("  [{needle}] {:?}", &text[p..endp]);
-        }
-    }
-    let tail = &cumulative[cumulative.len().saturating_sub(700)..];
-    eprintln!("  --- last {} bytes of UART ---", tail.len());
-    eprintln!("{}", String::from_utf8_lossy(tail));
+
+    assert!(
+        reached,
+        "kernel never exec'd /init; {}",
+        dump_uart_on_failure(&cumulative, "dyn-single-exec")
+    );
+    assert!(
+        !lib_err,
+        "ld.so reported 'error while loading shared libraries' — libc didn't \
+         load; {}",
+        dump_uart_on_failure(&cumulative, "dyn-single-liberr")
+    );
+    assert!(
+        !segfault,
+        "the dynamically-linked binary segfaulted — ld.so relocation/run path \
+         broke; {}",
+        dump_uart_on_failure(&cumulative, "dyn-single-segv")
+    );
+    let code = exitcode.unwrap_or_else(|| {
+        panic!(
+            "could not parse the init exit status; {}",
+            dump_uart_on_failure(&cumulative, "dyn-single-code")
+        )
+    });
+    assert_eq!(
+        code & 0x7f,
+        0,
+        "the binary should have exited normally (WIFEXITED), not been killed by \
+         a signal; raw status {code:#010x}; {}",
+        dump_uart_on_failure(&cumulative, "dyn-single-wifexited")
+    );
 }
 
 /// Diagnostic: attempt a real DYNAMICALLY-linked program end to end.
