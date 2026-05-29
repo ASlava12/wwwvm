@@ -25,6 +25,10 @@
 //! Env vars (alphabetical):
 //!   WWWVM_DUMP_AT_PG=path     dump 16 MiB phys at CR0.PG=1 transition
 //!   WWWVM_DUMP_AT_STOP=path   dump full RAM at the final stop
+//!   WWWVM_DUMP_REGIONS=1      print per-1-MiB-EIP-region step
+//!                             histogram at end. Diff two runs to
+//!                             find where execution diverges
+//!                             (e.g. for the {600, 602} bisection).
 //!   WWWVM_DUMP_UART=path      stream every UART byte to this file
 //!                             (independent of WWWVM_QUIET — quiet
 //!                             silences stdout, dump captures bytes)
@@ -203,6 +207,17 @@ fn main() {
     let mut last_eip_region: Option<u32> = None;
     let mut last_eip_sample = 0u32;
     let mut stuck_chunks = 0u32;
+    // Per-region step histogram for the {600, 602}-stall debug pass.
+    // Each chunk attributes its `s` steps to the EIP region we
+    // ENTERED the chunk in (an approximation — the kernel may
+    // bounce through multiple regions inside a chunk, but at
+    // 10M steps/chunk most kernel-internal phases stay put long
+    // enough that the start-of-chunk sample is representative).
+    // WWWVM_DUMP_REGIONS=1 prints the histogram at the final
+    // stop; diffing two runs (size-600 vs size-601 /init's) shows
+    // *where* the kernel diverges.
+    let dump_regions = env::var_os("WWWVM_DUMP_REGIONS").is_some();
+    let mut region_steps: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     // WWWVM_STOP_AT_FIRST_PF=1: replace the coarse chunk loop with
     // a fine 100-step loop that halts on the first observable #PF
     // (CR2 transition from 0 to non-zero) so we can dump physical
@@ -261,8 +276,13 @@ fn main() {
         // instruction that retired into the transition.
         let pre_eip = vm.cpu().ip;
         let _ = pre_eip;
+        // Attribute this chunk's steps to the region we ENTERED
+        // it in (start-of-chunk EIP). Cheap; doesn't affect the
+        // hot loop unless WWWVM_DUMP_REGIONS=1 dumps at end.
+        let chunk_region = pre_eip & 0xFFF0_0000;
         let (s, st) = vm.run_steps_idle_aware(chunk);
         steps += s as u64;
+        *region_steps.entry(chunk_region).or_insert(0) += s as u64;
         if trace_esp_align && pg_on {
             let esp = vm.cpu().read_r32(4);
             let aligned = esp & 3 == 0;
@@ -549,6 +569,15 @@ fn main() {
         elapsed.as_secs_f64(),
         stop
     );
+
+    if dump_regions {
+        println!("\nEIP-region step histogram (each region = 1 MiB, by start-of-chunk EIP):");
+        let total = region_steps.values().sum::<u64>().max(1);
+        for (region, count) in &region_steps {
+            let pct = (*count as f64) * 100.0 / (total as f64);
+            println!("  {region:08X}..  {count:>14}  ({pct:5.2}%)",);
+        }
+    }
 
     let cs = cpu.sregs[wwwvm_cpu::sreg::CS];
     let eip = cpu.ip;
