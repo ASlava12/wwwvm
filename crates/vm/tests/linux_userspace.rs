@@ -858,6 +858,10 @@ fn linux_userspace_hello_with_uname_marker_milestone() {
 /// learn something genuinely weird is going on with the kernel's
 /// pre-exec scan of the /init binary.
 fn build_initramfs_marker_then_uname_then_buf_then_hello() -> Vec<u8> {
+    build_initramfs_marker_then_uname_then_buf_then_hello_inner(42)
+}
+
+fn build_initramfs_marker_then_uname_then_buf_then_hello_inner(exit_code: u8) -> Vec<u8> {
     const UTSNAME_LEN: u32 = 390;
     let marker_pre: &[u8] = b"[USERSPACE uname]: ";
     let msg: &[u8] = b"HELLO FROM USERSPACE\n";
@@ -893,9 +897,10 @@ fn build_initramfs_marker_then_uname_then_buf_then_hello() -> Vec<u8> {
         out.push(0xBA);
         out.extend_from_slice(&msg_len.to_le_bytes());
         out.extend_from_slice(&[0xCD, 0x80]);
-        // exit(42).
+        // exit(exit_code).
         out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&(exit_code as u32).to_le_bytes());
         out.extend_from_slice(&[0xCD, 0x80]);
         out
     };
@@ -1036,4 +1041,48 @@ fn linux_userspace_marker_then_uname_then_buf_then_hello_milestone() {
         )
     });
     eprintln!("HELLO seen after {steps} steps (marker-before-uname is fine)");
+}
+
+/// Same as the marker-then-uname probe but with `exit(0)` instead
+/// of `exit(42)`. The asm byte difference is just one immediate
+/// (`0x2A` → `0x00`), and the syscall is never reached at runtime
+/// because /init doesn't get exec'd in the failing case. So if
+/// this single-byte change flips the test from passing to
+/// hanging, the trigger is the byte sequence `BB 00 00 00 00 CD
+/// 80` somewhere being scanned by the kernel.
+#[test]
+#[ignore = "exit-code byte probe"]
+fn linux_userspace_marker_then_uname_then_buf_then_hello_with_exit_0_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_marker_then_uname_then_buf_then_hello_inner(0);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen with exit(0) — single immediate-byte flip IS the trigger; {}",
+            dump_uart_on_failure(&cumulative, "marker-then-uname-exit0")
+        )
+    });
+    eprintln!("HELLO seen after {steps} steps (exit(0) is fine — bug is in marker_post)");
 }
