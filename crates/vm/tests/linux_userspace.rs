@@ -1252,3 +1252,43 @@ fn linux_userspace_bisect_alphabet_msg_milestone() {
         "[BISECT] HELLO seen after {steps} steps (substring `[USERSPACE END]` WAS the trigger)"
     );
 }
+
+/// We know msg=17 hangs and msg=21 works. Try msg=5 to see if
+/// it's "small msg" vs "specific length 17" vs "some range of
+/// lengths". Hello /init has body-msg of 21 too but with no
+/// marker_pre or buf — that already worked. This isolates msg
+/// length while holding /init's overall structure identical to
+/// the failing 17-byte probe.
+#[test]
+#[ignore = "msg-length-5 bisection"]
+fn linux_userspace_bisect_msg_len_5_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_bisect_with_msg(b"ABCDE");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, b"[BISECT] HELLO", 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "msg-5 also hangs — the binary size range around 600 is bad; {}",
+                dump_uart_on_failure(&cumulative, "bisect-msg-5")
+            )
+        });
+    eprintln!(
+        "[BISECT] HELLO seen after {steps} steps (msg=5 works; trigger is specific to msg ≥~17)"
+    );
+}
