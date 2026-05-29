@@ -5,19 +5,29 @@
 //!     WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz \
 //!     cargo test --release -- --ignored linux_userspace_milestone
 //!
-//! The test is `#[ignore]` because it depends on a vmlinuz file
-//! we don't ship (Tinycore Core ISO `boot/vmlinuz`, 5.85 MB). One
-//! run is ~52 seconds wall-clock — the test bails the moment
-//! HELLO shows up, vs. the linux_boot example which intentionally
+//! The tests are `#[ignore]` because they depend on a vmlinuz file
+//! we don't ship (Tinycore Core ISO `boot/vmlinuz`, 5.85 MB). Each
+//! run is ~52 seconds wall-clock — the test bails the moment its
+//! marker shows up, vs. the linux_boot example which intentionally
 //! runs the full 16 B-step budget for diagnostics and clocks
-//! ~10 min. Even at 55 seconds, this isn't something to put in
-//! the default sweep.
+//! ~10 min. Even at 52 seconds, these aren't in the default sweep.
 //!
-//! What it locks in: the kernel runs all the way through
-//! `driver_init` + `do_initcalls`, mounts our minimal initramfs,
-//! exec's PID 1 = /init, and /init's `write(1, "HELLO FROM
-//! USERSPACE\n", 21)` reaches the host UART tx_buffer via the full
-//! syscall path (cross-ring + tty_write + THRE IRQ).
+//! Two milestones live in this file:
+//!
+//!   - `linux_userspace_milestone` — kernel runs all the way
+//!     through `driver_init` + `do_initcalls`, mounts our minimal
+//!     initramfs, exec's PID 1 = /init, /init writes "HELLO FROM
+//!     USERSPACE\n" via sys_write + THRE IRQ, then exit(42). Two-
+//!     stage check pins both ends: HELLO + the kernel panic
+//!     `exitcode=0x00002a00` that follows /init's exit.
+//!
+//!   - `linux_userspace_proc_version_milestone` — wider syscall
+//!     surface: /init also mounts procfs (5-arg sys_mount through
+//!     int 0x80), opens /proc/version, reads it, prints with a
+//!     unique `[USERSPACE /proc/version]:` prefix. Pins mount +
+//!     open + read + the kernel-side copy_to_user end-to-end.
+//!
+//! Both run in parallel under `cargo test -- --ignored`.
 
 use wwwvm_vm::Vm;
 
