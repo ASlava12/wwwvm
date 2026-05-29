@@ -25,6 +25,9 @@
 //! Env vars (alphabetical):
 //!   WWWVM_DUMP_AT_PG=path     dump 16 MiB phys at CR0.PG=1 transition
 //!   WWWVM_DUMP_AT_STOP=path   dump full RAM at the final stop
+//!   WWWVM_DUMP_UART=path      stream every UART byte to this file
+//!                             (independent of WWWVM_QUIET — quiet
+//!                             silences stdout, dump captures bytes)
 //!   WWWVM_INIT_INPUT=Q        builtin-initrd echo mode: queue this byte
 //!                             once /init's "echo " marker hits UART
 //!   WWWVM_INITRD=path         load a raw or gzipped cpio as the ramdisk
@@ -173,6 +176,18 @@ fn main() {
     // EIP/CR0/CR2/IF transition log. The transition diagnostics
     // stay on because they're rare (once per state change).
     let quiet = env::var_os("WWWVM_QUIET").is_some();
+    // WWWVM_DUMP_UART=path streams every byte the kernel pushes to
+    // the UART to that file (appended). Independent of WWWVM_QUIET:
+    // the quiet flag silences stdout, the dump path captures bytes
+    // for post-run inspection. Open-once at start so we don't pay
+    // a syscall per chunk.
+    let mut uart_dump = env::var("WWWVM_DUMP_UART").ok().and_then(|p| {
+        std::fs::File::create(&p)
+            .map_err(|e| {
+                eprintln!("WWWVM_DUMP_UART create {p}: {e}");
+            })
+            .ok()
+    });
 
     // Step in chunks so we can watch EIP / CR0.PG / CS transitions.
     let t0 = Instant::now();
@@ -507,6 +522,11 @@ fn main() {
                         vm.send_input(&[b, b'\n']);
                         println!("[{:>10}] pushed {:#04X} + 0x0A to UART rx queue", steps, b);
                         pending_echo = None;
+                    }
+                }
+                if let Some(f) = uart_dump.as_mut() {
+                    if let Err(e) = f.write_all(&out) {
+                        eprintln!("WWWVM_DUMP_UART write: {e}");
                     }
                 }
                 if !quiet {
