@@ -894,6 +894,27 @@ mod tests {
         );
     }
 
+    /// ICR delivery-mode gate: a self-targeted ICR write with a
+    /// non-fixed delivery mode (NMI=100, INIT=101, SIPI=110,
+    /// SMI=010) must NOT queue at the LVT vector — those modes
+    /// have special architectural handling we don't model. Only
+    /// `delivery_mode == 0` (fixed) earns vector delivery. A
+    /// regression dropping the `delivery_mode == 0` AND would have
+    /// `apic_send_IPI` for an INIT cross-CPU wake-up queue at the
+    /// vector field instead of being handled as INIT — wrong
+    /// semantics, silently.
+    #[test]
+    fn icr_self_ipi_with_non_fixed_delivery_does_not_queue_local_irq() {
+        let mut m = Memory::new(64);
+        // Vector 0x66, shorthand=01 (self), delivery_mode=100 (NMI).
+        let icr_lo: u32 = 0x66 | (0b100 << 8) | (0b01 << 18);
+        m.write_u32(LAPIC_BASE + 0x300, icr_lo);
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "delivery_mode != 0 (fixed) must not queue at the vector field"
+        );
+    }
+
     /// SVR gate also covers self-IPI delivery — Linux's apic_init
     /// can issue an ICR write before fully enabling SVR if the
     /// firmware left state weird, and our gate must catch that
