@@ -12,7 +12,7 @@
 //! runs the full 16 B-step budget for diagnostics and clocks
 //! ~10 min. Even at 52 seconds, these aren't in the default sweep.
 //!
-//! Two milestones live in this file:
+//! Production milestones (always passing when run with `--ignored`):
 //!
 //!   - `linux_userspace_milestone` — kernel runs all the way
 //!     through `driver_init` + `do_initcalls`, mounts our minimal
@@ -27,7 +27,17 @@
 //!     unique `[USERSPACE /proc/version]:` prefix. Pins mount +
 //!     open + read + the kernel-side copy_to_user end-to-end.
 //!
-//! Both run in parallel under `cargo test -- --ignored`.
+//! Bisection probes (also `#[ignore]`, used to characterize the
+//! /init-binary-size {600, 602} stall — see
+//! `build_initramfs_hello_padded_to` doc-block for the table):
+//!
+//!   - `linux_userspace_hello_padded_to_600_milestone` (hangs)
+//!   - `linux_userspace_hello_padded_to_601_milestone` (passes)
+//!   - `linux_userspace_hello_padded_to_608_milestone` (passes)
+//!
+//! The production milestones run in parallel under
+//! `cargo test -- --ignored`. The probes can be re-run
+//! individually by name as evidence for the bisection result.
 
 use wwwvm_vm::Vm;
 
