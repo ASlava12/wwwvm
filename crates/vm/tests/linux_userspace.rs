@@ -6845,6 +6845,67 @@ fn build_initramfs_clock_gettime() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init queries its four credentials via the 32-bit
+/// id syscalls — `getuid32` (199), `geteuid32` (201), `getgid32` (200),
+/// `getegid32` (202) — storing each `eax` into a 16-byte buffer, then
+/// dumps the buffer between `[USERSPACE ID=` and `]\n[USERSPACE END]\n`.
+/// /init runs as the init process (root), so all four must read back 0.
+/// Pins the kernel's credential (cred_struct) path through `int 0x80`
+/// for the syscalls every `id`/`ps`/privilege-checking program calls.
+fn build_initramfs_getid() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE ID=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // For each id syscall: mov eax, NNN ; int 0x80 ; mov [buf+off], eax.
+        for (i, sysno) in [199u32, 201, 200, 202].iter().enumerate() {
+            out.push(0xB8); // mov eax, imm32
+            out.extend_from_slice(&sysno.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+            out.push(0xA3); // mov ds:[moffs32], eax
+            out.extend_from_slice(&(buf_addr + (i as u32) * 4).to_le_bytes());
+        }
+        // write(1, buf, 16)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x10, 0x00, 0x00, 0x00]); // edx = 16
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 16]; // four u32 results
+    let binary = make_init_elf32_safe(&code, &[marker_pre, marker_post, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_fork` (syscall 2) and then
 /// — in BOTH parent and child — writes `[USERSPACE FORK ret=`
 /// followed by its own 4-byte `eax`, then `][USERSPACE END]\n`.
@@ -8122,6 +8183,75 @@ fn linux_userspace_clock_gettime_milestone() {
          ts2=({sec2}.{nsec2:09}); {}",
         dump_uart_on_failure(&cumulative, "clock_gettime-monotonic")
     );
+}
+
+/// Credentials milestone: /init reads its uid/euid/gid/egid via the
+/// 32-bit id syscalls (getuid32/geteuid32/getgid32/getegid32) and dumps
+/// the four return values. As the init process (root) all four must be
+/// 0. Pins the kernel credential path through `int 0x80` for the
+/// syscalls every privilege-aware program (`id`, `ps`, shells) calls.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_getid_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_getid();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE ID=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "getid")
+            )
+        });
+    eprintln!("sys_getid userspace milestone seen after {steps} steps");
+
+    // Undo ONLCR before slicing the raw 16-byte dump (all-zero here, but
+    // keep the path robust if a value is unexpectedly nonzero).
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let off = pre_pos + marker_pre.len();
+    let dw = |o: usize| -> u32 {
+        u32::from_le_bytes(stripped[off + o..off + o + 4].try_into().expect("4 bytes"))
+    };
+    let (uid, euid, gid, egid) = (dw(0), dw(4), dw(8), dw(12));
+    eprintln!("credentials: uid={uid} euid={euid} gid={gid} egid={egid}");
+    assert_eq!(uid, 0, "init runs as root: uid must be 0");
+    assert_eq!(euid, 0, "euid must be 0");
+    assert_eq!(gid, 0, "gid must be 0");
+    assert_eq!(egid, 0, "egid must be 0");
 }
 
 /// Process-creation milestone: /init calls `sys_fork` (syscall 2),
