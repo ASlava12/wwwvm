@@ -105,9 +105,12 @@ API из JS:
 - `calculator_demo` — `byte²` через MUL, decimal-форматирование через
   divide-by-10 + push/pop.
 
-Snapshot v2 ≈ 1 MiB + ~200 байт: header `WWWVM\x00` + 36-байтный CPU
-image + 1 МБ memory dump + length-prefixed device-state секция.
-`restore` принимает и v1 (без device state, backward compat), и v2.
+Snapshot v14 для 1 MiB Vm ≈ 1 MiB + ~5 KiB: 16-байтный header
+`WWWVM\x00` + ~300-байтный CPU image (включая FPU/SSE/SYSENTER/DR0..7) +
+RAM dump + 4 KiB LAPIC scratch + 1 KiB HPET scratch + 12 байт HPET
+per-timer period + length-prefixed device-state блок. `restore`
+принимает все версии v1..v14 (v1 — без device state; промежуточные —
+с дефолтами для полей, добавленных позже).
 
 ### Bridge в JS (`crates/wasm`)
 
