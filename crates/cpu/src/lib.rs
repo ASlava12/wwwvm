@@ -4765,6 +4765,24 @@ impl Cpu {
                 }
             }
 
+            // ARPL r/m16, r16 — adjust requested privilege level. If the
+            // destination selector's RPL (low 2 bits) is less than the
+            // source's, raise it to match and set ZF; otherwise leave the
+            // destination unchanged and clear ZF. Only ZF is affected.
+            // (In 32-bit this is ARPL; the 64-bit MOVSXD reuse does not
+            // apply to this i386 core.)
+            0x63 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let dst = self.read_rm16(rm, mem);
+                let src = self.read_r16(reg);
+                if (dst & 3) < (src & 3) {
+                    self.write_rm16(rm, mem, (dst & !3) | (src & 3));
+                    self.set_flag(flag::ZF, true);
+                } else {
+                    self.set_flag(flag::ZF, false);
+                }
+            }
+
             // IMUL r, r/m, imm (80186+ three-operand form).
             //   0x69 — imm16 (0x66: imm32)
             //   0x6B — imm8 sign-extended to operand width

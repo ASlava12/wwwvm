@@ -9469,6 +9469,44 @@ fn movsx_r16_rm16_preserves_upper_half_under_0x66() {
     );
 }
 
+/// ARPL (0x63) raises the destination selector's RPL to the source's
+/// when it is lower, setting ZF; otherwise it leaves the destination
+/// alone and clears ZF. Regression: the one-byte 0x63 was undecoded
+/// (CpuError::Unimplemented), which would crash the VM.
+#[test]
+fn arpl_raises_rpl_and_sets_zf() {
+    // 63 D8 = ARPL AX, BX (mod=11 reg=BX rm=AX). AX RPL=0 < BX RPL=3.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x08, 0x00, // MOV AX, 0x0008 (RPL 0)
+            0xBB, 0x03, 0x00, // MOV BX, 0x0003 (RPL 3)
+            0x63, 0xD8, // ARPL AX, BX
+            0xF4,
+        ],
+        8,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x000B, "AX RPL raised to 3");
+    assert!(cpu.has(flag::ZF), "ZF set when RPL was adjusted");
+}
+
+/// ARPL leaves the destination unchanged and clears ZF when its RPL is
+/// already >= the source's.
+#[test]
+fn arpl_noop_clears_zf_when_rpl_already_high() {
+    // AX RPL=3 >= BX RPL=1 -> no change, ZF=0.
+    let (cpu, _, _) = run_payload(
+        &[
+            0xB8, 0x0B, 0x00, // MOV AX, 0x000B (RPL 3)
+            0xBB, 0x09, 0x00, // MOV BX, 0x0009 (RPL 1)
+            0x63, 0xD8, // ARPL AX, BX
+            0xF4,
+        ],
+        8,
+    );
+    assert_eq!(cpu.regs[r16::AX], 0x000B, "AX unchanged");
+    assert!(!cpu.has(flag::ZF), "ZF clear when no adjustment");
+}
+
 /// LMSW must not clear CR0.PE (it cannot return the CPU to real mode),
 /// while still loading the other low CR0 bits from its operand.
 /// Regression: LMSW reloaded all of bits 0-3, dropping PE to 0.
