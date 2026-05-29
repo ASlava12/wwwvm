@@ -2466,6 +2466,147 @@ fn build_initramfs_clone_thread() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init exercises the AF_UNIX socket layer:
+/// `socketpair(AF_UNIX, SOCK_STREAM, 0, &sv)` (the direct i386
+/// syscall 360), then `write(sv[0], "SOCK", 4)` and
+/// `read(sv[1], buf, 4)`, reporting every return plus the bytes:
+///
+///   `[USERSPACE SPR=<4>S0=<4>S1=<4>WR=<4>RD=<4>BUF=<4>][USERSPACE END]`
+///
+/// This is the first test to touch the kernel socket subsystem
+/// (`net/socket.c` + `net/unix/af_unix.c`) — an entirely separate
+/// layer from pipes/files. A connected AF_UNIX stream pair is the
+/// IPC backbone of D-Bus, X11, systemd, etc. The test asserts the
+/// pair allocated two distinct fds, both transfers returned 4, and
+/// the bytes read back equal what was written (`"SOCK"`).
+fn build_initramfs_socketpair() -> Vec<u8> {
+    let msg: &[u8] = b"SOCK";
+    let m_sp: &[u8] = b"[USERSPACE SPR=";
+    let m_s0: &[u8] = b"S0=";
+    let m_s1: &[u8] = b"S1=";
+    let m_wr: &[u8] = b"WR=";
+    let m_rd: &[u8] = b"RD=";
+    let m_buf: &[u8] = b"BUF=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |msg_addr: u32,
+                      m_sp_addr: u32,
+                      m_s0_addr: u32,
+                      m_s1_addr: u32,
+                      m_wr_addr: u32,
+                      m_rd_addr: u32,
+                      m_buf_addr: u32,
+                      m_end_addr: u32,
+                      sv_addr: u32,
+                      buf_addr: u32,
+                      sp_ret_addr: u32,
+                      wr_ret_addr: u32,
+                      rd_ret_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(384);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // socketpair(AF_UNIX=1, SOCK_STREAM=1, 0, &sv) — sys 360
+        out.extend_from_slice(&[0xB8, 0x68, 0x01, 0x00, 0x00]); // mov eax, 360
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, AF_UNIX
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, SOCK_STREAM
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (protocol 0)
+        out.push(0xBE); // mov esi, &sv
+        out.extend_from_slice(&sv_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[sp_ret], eax
+        out.extend_from_slice(&sp_ret_addr.to_le_bytes());
+        // write(sv[0], msg, 4)
+        out.push(0xA1); // mov eax, ds:[sv]
+        out.extend_from_slice(&sv_addr.to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]); // mov edx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wr_ret], eax
+        out.extend_from_slice(&wr_ret_addr.to_le_bytes());
+        // read(sv[1], buf, 4)
+        out.push(0xA1); // mov eax, ds:[sv+4]
+        out.extend_from_slice(&(sv_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]); // mov edx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[rd_ret], eax
+        out.extend_from_slice(&rd_ret_addr.to_le_bytes());
+        // emit everything
+        w(m_sp_addr, m_sp.len() as u32, &mut out);
+        w(sp_ret_addr, 4, &mut out);
+        w(m_s0_addr, m_s0.len() as u32, &mut out);
+        w(sv_addr, 4, &mut out);
+        w(m_s1_addr, m_s1.len() as u32, &mut out);
+        w(sv_addr + 4, 4, &mut out);
+        w(m_wr_addr, m_wr.len() as u32, &mut out);
+        w(wr_ret_addr, 4, &mut out);
+        w(m_rd_addr, m_rd.len() as u32, &mut out);
+        w(rd_ret_addr, 4, &mut out);
+        w(m_buf_addr, m_buf.len() as u32, &mut out);
+        w(buf_addr, 4, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_sp_addr = msg_addr + msg.len() as u32;
+    let m_s0_addr = m_sp_addr + m_sp.len() as u32;
+    let m_s1_addr = m_s0_addr + m_s0.len() as u32;
+    let m_wr_addr = m_s1_addr + m_s1.len() as u32;
+    let m_rd_addr = m_wr_addr + m_wr.len() as u32;
+    let m_buf_addr = m_rd_addr + m_rd.len() as u32;
+    let m_end_addr = m_buf_addr + m_buf.len() as u32;
+    let sv_addr = m_end_addr + m_end.len() as u32;
+    let buf_addr = sv_addr + 8;
+    let sp_ret_addr = buf_addr + 4;
+    let wr_ret_addr = sp_ret_addr + 4;
+    let rd_ret_addr = wr_ret_addr + 4;
+    let code = build_code(
+        msg_addr,
+        m_sp_addr,
+        m_s0_addr,
+        m_s1_addr,
+        m_wr_addr,
+        m_rd_addr,
+        m_buf_addr,
+        m_end_addr,
+        sv_addr,
+        buf_addr,
+        sp_ret_addr,
+        wr_ret_addr,
+        rd_ret_addr,
+    );
+    let sv_zeros = [0u8; 8];
+    let z4 = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            msg, m_sp, m_s0, m_s1, m_wr, m_rd, m_buf, m_end, &sv_zeros, &z4, &z4, &z4, &z4,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -8557,6 +8698,104 @@ fn linux_userspace_clone_thread_milestone() {
         "parent should see the cloned task's write to the shared global; got \
          {g:#010x} (zero ⇒ CLONE_VM didn't share the address space); {}",
         dump_uart_on_failure(&cumulative, "clone-value")
+    );
+}
+
+/// AF_UNIX socketpair milestone: /init `socketpair(AF_UNIX,
+/// SOCK_STREAM, 0, &sv)`, writes "SOCK" on `sv[0]`, reads it from
+/// `sv[1]`. Asserts socketpair returned 0, the two fds are distinct
+/// and ≥ 3, both transfers returned 4, and the bytes round-tripped.
+/// First test to touch the kernel socket subsystem (af_unix) — the
+/// IPC backbone of D-Bus/X11/systemd.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_socketpair_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_socketpair();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — socketpair likely returned \
+             -errno (af_unix unsupported) or the read blocked; {}",
+            dump_uart_on_failure(&cumulative, "socketpair")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_at = |marker: &[u8]| -> Option<i32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| i32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let spr = read_at(b"[USERSPACE SPR=");
+    let s0 = read_at(b"S0=");
+    let s1 = read_at(b"S1=");
+    let wr = read_at(b"WR=");
+    let rd = read_at(b"RD=");
+    let buf = stripped
+        .windows(4)
+        .position(|w| w == b"BUF=")
+        .and_then(|p| stripped.get(p + 4..p + 8))
+        .map(|s| s.to_vec());
+    eprintln!(
+        "socketpair ret={spr:?} fds=[{s0:?},{s1:?}] write={wr:?} read={rd:?} buf={:?}",
+        buf.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+
+    assert_eq!(
+        spr,
+        Some(0),
+        "socketpair should return 0; got {spr:?}; {}",
+        dump_uart_on_failure(&cumulative, "spr")
+    );
+    let s0 = s0.expect("S0 marker");
+    let s1 = s1.expect("S1 marker");
+    assert!(
+        s0 >= 3 && s1 >= 3 && s0 != s1,
+        "socketpair should yield two distinct fds ≥ 3; got [{s0}, {s1}]"
+    );
+    assert_eq!(wr, Some(4), "write should return 4; got {wr:?}");
+    assert_eq!(rd, Some(4), "read should return 4; got {rd:?}");
+    assert_eq!(
+        buf.as_deref(),
+        Some(&b"SOCK"[..]),
+        "bytes read from the AF_UNIX socket should equal \"SOCK\"; got {:?}; {}",
+        buf.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned()),
+        dump_uart_on_failure(&cumulative, "sock-bytes")
     );
 }
 
