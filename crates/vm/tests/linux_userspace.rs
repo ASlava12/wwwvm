@@ -178,11 +178,21 @@ fn build_initramfs_hello() -> Vec<u8> {
 /// `init_cpio_archives_start_with_newc_magic` as a sanity-check
 /// input, AND it's the canonical reproducer for the boot stall
 /// we bisected to "/init binary size 600..=602 bytes" across
-/// `b67d7cb`..`a25f98e` (10 ignored probes). The exact mechanism
-/// is still unknown — kernel never reaches /init exec, stuck in
-/// pata_legacy probe at 16 B steps. Future debug pass needs
-/// host-side cpu.step instrumentation to find where execution
-/// diverges from the working hello /init.
+/// `b67d7cb`..`a25f98e` (10 ignored probes).
+///
+/// Binary-size math:
+///   ELF+PHDR (84) + code (90, 5 syscalls × ~22 bytes) +
+///   marker_pre (19) + marker_post (17) + buf_zeros (390) = 600.
+/// Exactly the low end of the bad range — that's why it hangs.
+///
+/// The exact mechanism is still unknown — kernel never reaches
+/// /init exec, stuck in pata_legacy probe at 16 B steps. Future
+/// debug pass needs host-side cpu.step instrumentation to find
+/// where execution diverges from the working hello /init. A
+/// faster reproducer would be hello /init padded to exactly 600
+/// bytes (84 + 34 + 21 + 461 = 600), avoiding the buf_zeros and
+/// the extra syscalls — but writing it requires re-running a
+/// 9-minute integration test, which the next debug pass can do.
 fn build_initramfs_uname() -> Vec<u8> {
     const UTSNAME_LEN: u32 = 390;
     let marker_pre: &[u8] = b"[USERSPACE uname]: ";
