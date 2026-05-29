@@ -21,6 +21,56 @@
 
 use wwwvm_vm::Vm;
 
+/// One cpio newc entry: 6-byte `070701` magic + 13 8-byte ASCII
+/// hex fields + name + NUL padded to 4, then the data padded to
+/// 4. Shared between every `build_initramfs_*` so a regression in
+/// the header layout shows up in *both* milestones at once.
+fn cpio_entry(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
+    let namesize = name.len() as u32 + 1;
+    let filesize = data.len() as u32;
+    let fields = [
+        0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
+    ];
+    let mut hdr = Vec::with_capacity(110);
+    hdr.extend_from_slice(b"070701");
+    for f in fields {
+        hdr.extend_from_slice(format!("{f:08X}").as_bytes());
+    }
+    hdr.extend_from_slice(name.as_bytes());
+    hdr.push(0);
+    while hdr.len() & 3 != 0 {
+        hdr.push(0);
+    }
+    let mut out = hdr;
+    out.extend_from_slice(data);
+    while out.len() & 3 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// Assemble the cpio archive: /init (regular ELF), /dev (dir),
+/// /dev/console (CHR 5:1 so Linux's `console_on_rootfs` can
+/// open it), and an optional /proc directory (only the procfs-
+/// reader variant needs it as a mount point). Trailing block-
+/// alignment to 512 bytes — the kernel's initramfs unpacker
+/// stops at TRAILER!!! and ignores the padding, but tools like
+/// `cpio -t` get unhappy without it.
+fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    if proc_dir {
+        archive.extend_from_slice(&cpio_entry("proc", &[], 0o040_755, 0, 0));
+    }
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -84,38 +134,7 @@ fn build_initramfs_hello() -> Vec<u8> {
     binary.extend_from_slice(&phdr);
     binary.extend_from_slice(&body);
 
-    fn cpio(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
-        let namesize = name.len() as u32 + 1;
-        let filesize = data.len() as u32;
-        let fields = [
-            0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
-        ];
-        let mut hdr = Vec::with_capacity(110);
-        hdr.extend_from_slice(b"070701");
-        for f in fields {
-            hdr.extend_from_slice(format!("{f:08X}").as_bytes());
-        }
-        hdr.extend_from_slice(name.as_bytes());
-        hdr.push(0);
-        while hdr.len() & 3 != 0 {
-            hdr.push(0);
-        }
-        let mut out = hdr;
-        out.extend_from_slice(data);
-        while out.len() & 3 != 0 {
-            out.push(0);
-        }
-        out
-    }
-    let mut archive = Vec::new();
-    archive.extend_from_slice(&cpio("init", &binary, 0o100_755, 0, 0));
-    archive.extend_from_slice(&cpio("dev", &[], 0o040_755, 0, 0));
-    archive.extend_from_slice(&cpio("dev/console", &[], 0o020_600, 5, 1));
-    archive.extend_from_slice(&cpio("TRAILER!!!", &[], 0, 0, 0));
-    while archive.len() & 511 != 0 {
-        archive.push(0);
-    }
-    archive
+    build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
 /// Build a cpio whose /init mounts procfs at /proc and reads
@@ -259,39 +278,7 @@ fn build_initramfs_proc_version() -> Vec<u8> {
     binary.extend_from_slice(&phdr);
     binary.extend_from_slice(&body);
 
-    fn cpio(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
-        let namesize = name.len() as u32 + 1;
-        let filesize = data.len() as u32;
-        let fields = [
-            0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
-        ];
-        let mut hdr = Vec::with_capacity(110);
-        hdr.extend_from_slice(b"070701");
-        for f in fields {
-            hdr.extend_from_slice(format!("{f:08X}").as_bytes());
-        }
-        hdr.extend_from_slice(name.as_bytes());
-        hdr.push(0);
-        while hdr.len() & 3 != 0 {
-            hdr.push(0);
-        }
-        let mut out = hdr;
-        out.extend_from_slice(data);
-        while out.len() & 3 != 0 {
-            out.push(0);
-        }
-        out
-    }
-    let mut archive = Vec::new();
-    archive.extend_from_slice(&cpio("init", &binary, 0o100_755, 0, 0));
-    archive.extend_from_slice(&cpio("dev", &[], 0o040_755, 0, 0));
-    archive.extend_from_slice(&cpio("dev/console", &[], 0o020_600, 5, 1));
-    archive.extend_from_slice(&cpio("proc", &[], 0o040_755, 0, 0));
-    archive.extend_from_slice(&cpio("TRAILER!!!", &[], 0, 0, 0));
-    while archive.len() & 511 != 0 {
-        archive.push(0);
-    }
-    archive
+    build_cpio_archive(&binary, /* proc_dir */ true)
 }
 
 /// Drive the boot for up to `step_budget` instructions, draining
