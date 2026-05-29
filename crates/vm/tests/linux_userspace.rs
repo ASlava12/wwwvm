@@ -172,6 +172,50 @@ fn build_initramfs_hello() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Hybrid /init for the syscall-isolation experiment: same hello
+/// asm but with a `sys_uname(buf)` call inserted *before* the
+/// HELLO write. If this prints HELLO at the regular 1.9 B step
+/// count, sys_uname (syscall 122) itself is fine and the uname
+/// hang is in the return-value handling or post-uname asm. If
+/// HELLO never appears, sys_uname is the trigger and the next
+/// debug step shifts to the kernel-side syscall path.
+fn build_initramfs_uname_then_hello() -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+
+    let build_code = |msg_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        // sys_uname(buf) — sys 122.
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]); // mov eax, 122
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes()); // mov ebx, buf_addr
+        out.extend_from_slice(&[0xCD, 0x80]); // int 0x80
+                                              // write(1, msg, msg_len) — the regular hello tail.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(42).
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let buf_addr = msg_addr + msg_len;
+    let code = build_code(msg_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    // RWX because sys_uname's copy_to_user writes 390 bytes into buf.
+    let binary = make_init_elf32(&code, &[msg, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Variant of `build_initramfs_hello` with `pad_bytes` of trailing
 /// zeros appended to the /init body. Outcome of the
 /// size-isolation experiment (`d22718e` test landed, ran 52 s):
@@ -634,4 +678,49 @@ fn linux_userspace_hello_padded_milestone() {
         )
     });
     eprintln!("padded HELLO seen after {steps} steps (binary size NOT the issue)");
+}
+
+/// Syscall-isolation experiment (companion to `d22718e`'s size
+/// probe). /init calls `sys_uname(buf)` *first*, then writes
+/// HELLO and exits. The original uname builder put the syscall
+/// *between* a marker_pre write and the HELLO bytes — if HELLO
+/// here shows up at the regular 1.9 B step count, sys_uname
+/// itself is fine and the uname hang is in the marker_pre+uname
+/// ordering or the post-uname asm. If HELLO never appears,
+/// sys_uname is the trigger.
+#[test]
+#[ignore = "syscall-isolation probe for the uname hang; ~52 s if it works"]
+fn linux_userspace_uname_then_hello_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_uname_then_hello();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen with sys_uname-first /init — sys_uname IS the trigger; {}",
+            dump_uart_on_failure(&cumulative, "uname-then-hello")
+        )
+    });
+    eprintln!("uname-then-HELLO seen after {steps} steps (sys_uname is fine)");
 }
