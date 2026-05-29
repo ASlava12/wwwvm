@@ -244,7 +244,10 @@ pub struct Cpu {
     /// boot test: dead flat, no win — confirmed empirically that
     /// the hot fetch path doesn't bounce across page boundaries
     /// often enough to matter, so the 1-slot version stays.)
-    /// Cleared on CR3 reload, INVLPG, CR0.PG toggle, write_sreg(CS)
+    /// Cleared on CR3 reload, INVLPG, any CR0 write (covers PG
+    /// toggle for fetch invariants, and CR0.WP toggle for the
+    /// `write_tlb` permission invariants — the dispatch funnels
+    /// all CR0 writes through the same invalidator), write_sreg(CS)
     /// (CPL transition may change U/S semantics), and CPU reset.
     /// The tuple is `(linear_page, phys_frame_after_a20, a20_state)`
     /// — a20 state is carried so a direct `cpu.a20 = …` poke (as
