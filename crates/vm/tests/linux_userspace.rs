@@ -1329,3 +1329,37 @@ fn linux_userspace_bisect_msg_len_19_milestone() {
         "[BISECT] HELLO seen after {steps} steps (msg=19 works; bad range is around 17 only)"
     );
 }
+
+/// msg=21 works, msg=19 hangs. Test msg=22 to see if the bad
+/// range extends upward through 21+ or stops at 20.
+#[test]
+#[ignore = "msg-length-22 bisection"]
+fn linux_userspace_bisect_msg_len_22_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_bisect_with_msg(b"ABCDEFGHIJKLMNOPQRSTUV");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, b"[BISECT] HELLO", 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "msg-22 hangs — bad range extends beyond 21; {}",
+                dump_uart_on_failure(&cumulative, "bisect-msg-22")
+            )
+        });
+    eprintln!("[BISECT] HELLO seen after {steps} steps (msg=22 works; bad range is 17..=20)");
+}
