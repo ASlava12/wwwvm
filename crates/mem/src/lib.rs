@@ -744,6 +744,72 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// Self-IPI through the ICR low register (write to 0x303
+    /// completes the dword) must queue the IRQ at the vector
+    /// encoded in ICR[7:0]. This is the exact path Linux's
+    /// `apic_test_irq` uses to validate the LAPIC delivers IRQs;
+    /// if it doesn't fire, the kernel disables the APIC and
+    /// falls back to the legacy PIC. ICR layout:
+    ///   bits 7:0   vector
+    ///   bits 10:8  delivery mode (0 = fixed)
+    ///   bits 19:18 destination shorthand (01 = self, 10 = all-inc-self)
+    #[test]
+    fn icr_self_ipi_with_fixed_delivery_queues_local_irq() {
+        let mut m = Memory::new(64);
+        // Vector 0x33, fixed delivery, self-targeted shorthand=01.
+        let icr_lo: u32 = 0x33 | (0b01 << 18);
+        m.write_u32(LAPIC_BASE + 0x300, icr_lo);
+        assert_eq!(
+            m.take_pending_lapic_irq(),
+            Some(0x33),
+            "self-IPI must queue at the vector field"
+        );
+    }
+
+    /// All-including-self IPI shorthand (bits 19:18 = 10) — our
+    /// single-CPU model handles "all" the same way as "self".
+    #[test]
+    fn icr_all_inc_self_ipi_with_fixed_delivery_queues_local_irq() {
+        let mut m = Memory::new(64);
+        let icr_lo: u32 = 0x77 | (0b10 << 18);
+        m.write_u32(LAPIC_BASE + 0x300, icr_lo);
+        assert_eq!(m.take_pending_lapic_irq(), Some(0x77));
+    }
+
+    /// ICR write with destination-targeted shorthand (bits 19:18
+    /// = 00) is for IPIs aimed at *another* CPU. Our single-CPU
+    /// model can never satisfy such a destination, so we must NOT
+    /// queue. A regression that loosened the self-target check
+    /// would have any kernel-issued IPI fire locally — spam.
+    #[test]
+    fn icr_destination_targeted_ipi_does_not_queue_local_irq() {
+        let mut m = Memory::new(64);
+        let icr_lo: u32 = 0x44; // shorthand=00, delivery=0
+        m.write_u32(LAPIC_BASE + 0x300, icr_lo);
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "destination-targeted IPI must not deliver locally on a single-CPU model"
+        );
+    }
+
+    /// SVR gate also covers self-IPI delivery — Linux's apic_init
+    /// can issue an ICR write before fully enabling SVR if the
+    /// firmware left state weird, and our gate must catch that
+    /// rather than queue a pre-init IRQ. Negative companion to
+    /// `icr_self_ipi_with_fixed_delivery_queues_local_irq`.
+    #[test]
+    fn icr_self_ipi_does_not_queue_when_svr_disabled() {
+        let mut m = Memory::new(64);
+        // Clear SVR enable bit.
+        m.write_u32(LAPIC_BASE + 0xF0, 0);
+        let icr_lo: u32 = 0x55 | (0b01 << 18);
+        m.write_u32(LAPIC_BASE + 0x300, icr_lo);
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "SVR=disabled must suppress self-IPI delivery"
+        );
+    }
+
     /// HPET main counter must freeze when ENABLE_CNF (General
     /// Configuration register, offset 0x010 bit 0) is clear.
     /// Linux relies on this for HPET pause-during-resume — without
