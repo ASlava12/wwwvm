@@ -394,6 +394,51 @@ fn linux_userspace_hello_padded_to_600_milestone() {
     );
 }
 
+/// Probe whether /init binary size 601 (the only untested point
+/// in the bad range — 600 and 602 are confirmed-hanging) is also
+/// bad. If this hangs, the entire 600..=602 range is direct
+/// evidence; if it passes, the bug is sparse and 601 is a "gap"
+/// in the bad range — which would be a wild new finding.
+#[test]
+#[ignore = "601-byte boundary probe; ~52 s pass or ~9 min hang"]
+fn linux_userspace_hello_padded_to_601_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hello_padded_to(601);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen at /init=601 — entire 600..=602 range is now direct evidence; {}",
+            dump_uart_on_failure(&cumulative, "hello-601")
+        )
+    });
+    eprintln!(
+        "HELLO seen at {steps} steps — /init=601 PASSES (bad range is sparse: 600 and 602 hang, \
+         601 works — wild new finding, bisection needs follow-up)"
+    );
+}
+
 /// Pin `build_initramfs_uname` as the canonical reproducer of the
 /// /init-binary-size-600 stall: extract the /init filesize from
 /// the cpio header (field 6 of the 13 ASCII-hex fields after the
