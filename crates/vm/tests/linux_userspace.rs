@@ -6773,6 +6773,78 @@ fn build_initramfs_gettimeofday() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `sys_clock_gettime(CLOCK_MONOTONIC,
+/// &ts)` (syscall 265) TWICE into two adjacent 8-byte `struct
+/// timespec` slots, then dumps both (16 raw bytes) between
+/// `[USERSPACE CT=` and `]\n[USERSPACE END]\n`. Unlike
+/// `gettimeofday` (wall clock), this pins the MONOTONIC clock: the
+/// test checks each `tv_nsec` is normalized (< 1e9), the clock is
+/// running (not all-zero — would mean `-ENOSYS` left the buffer
+/// untouched), and the second sample is `>=` the first (the defining
+/// monotonic property). `struct timespec` on i386 is 8 bytes
+/// (`tv_sec` 4 + `tv_nsec` 4).
+fn build_initramfs_clock_gettime() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE CT=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_clock_gettime(CLOCK_MONOTONIC=1, &buf[0]) — sys 265.
+        out.extend_from_slice(&[0xB8, 0x09, 0x01, 0x00, 0x00]); // mov eax, 265
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (CLOCK_MONOTONIC)
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes()); // ecx = &ts1
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_clock_gettime(CLOCK_MONOTONIC=1, &buf[8]) — second sample.
+        out.extend_from_slice(&[0xB8, 0x09, 0x01, 0x00, 0x00]); // mov eax, 265
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&(buf_addr + 8).to_le_bytes()); // ecx = &ts2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 16)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x10, 0x00, 0x00, 0x00]); // edx = 16
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 16]; // two struct timespec = 2 * 8 bytes
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros],
+        7, // R | W | X — kernel copy_to_user writes timespec into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_fork` (syscall 2) and then
 /// — in BOTH parent and child — writes `[USERSPACE FORK ret=`
 /// followed by its own 4-byte `eax`, then `][USERSPACE END]\n`.
@@ -7953,6 +8025,102 @@ fn linux_userspace_gettimeofday_milestone() {
         tv_usec < 1_000_000,
         "tv_usec = {tv_usec} (0x{tv_usec:08X}); expected < 1_000_000; {}",
         dump_uart_on_failure(&cumulative, "gettimeofday-usec")
+    );
+}
+
+/// `sys_clock_gettime(CLOCK_MONOTONIC)` milestone. /init samples the
+/// monotonic clock twice (syscall 265) and dumps both 8-byte
+/// `struct timespec`s. The test asserts:
+///
+///   - each `tv_nsec` ∈ [0, 1e9) — a normalized timespec (catches a
+///     copy_to_user into the wrong slot or an unnormalized clock)
+///   - the clock is running: the first sample is not all-zero (a
+///     zero pair would mean `-ENOSYS` left the user buffer untouched)
+///   - the second sample is `>=` the first — the defining property
+///     of `CLOCK_MONOTONIC` (catches a clock that returns garbage or
+///     runs backwards)
+///
+/// This complements `gettimeofday_milestone` (wall clock / realtime)
+/// by pinning the monotonic clocksource path through `int 0x80`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_clock_gettime_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_clock_gettime();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE CT=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "clock_gettime")
+            )
+        });
+    eprintln!("sys_clock_gettime userspace milestone seen after {steps} steps");
+
+    // Undo the TTY's ONLCR (\r\n -> \n) so any 0x0A byte inside the
+    // raw timespec dump is recovered before we slice it out.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let off = pre_pos + marker_pre.len();
+    let dw = |o: usize| -> u32 {
+        u32::from_le_bytes(stripped[off + o..off + o + 4].try_into().expect("4 bytes"))
+    };
+    let (sec1, nsec1) = (dw(0), dw(4));
+    let (sec2, nsec2) = (dw(8), dw(12));
+    eprintln!("clock_gettime MONOTONIC: ts1=({sec1}.{nsec1:09}) ts2=({sec2}.{nsec2:09})");
+
+    assert!(
+        nsec1 < 1_000_000_000 && nsec2 < 1_000_000_000,
+        "tv_nsec must be normalized (< 1e9): nsec1={nsec1} nsec2={nsec2}; {}",
+        dump_uart_on_failure(&cumulative, "clock_gettime-nsec")
+    );
+    assert!(
+        sec1 != 0 || nsec1 != 0,
+        "monotonic clock read as all-zero — clock_gettime likely returned \
+         -ENOSYS and left the buffer untouched; {}",
+        dump_uart_on_failure(&cumulative, "clock_gettime-zero")
+    );
+    // ts2 >= ts1 as a (sec, nsec) pair.
+    let monotonic = (sec2, nsec2) >= (sec1, nsec1);
+    assert!(
+        monotonic,
+        "CLOCK_MONOTONIC went backwards: ts1=({sec1}.{nsec1:09}) > \
+         ts2=({sec2}.{nsec2:09}); {}",
+        dump_uart_on_failure(&cumulative, "clock_gettime-monotonic")
     );
 }
 

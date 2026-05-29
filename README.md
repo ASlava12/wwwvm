@@ -30,7 +30,11 @@ exec'а — пинит полный wall-clock путь до userspace. Четв
 `linux_userspace_gettimeofday_milestone` — /init зовёт
 `sys_gettimeofday(&tv, NULL)`, ядро `copy_to_user`-ит struct timeval
 (sec+usec) в /init's буфер; тест проверяет sec в нужном окне и
-usec < 1M (sub-second clock + struct-write путь). Шестой —
+usec < 1M (sub-second clock + struct-write путь). Парный
+`linux_userspace_clock_gettime_milestone` пинает `sys_clock_gettime`
+(265) с CLOCK_MONOTONIC: два сэмпла подряд, тест ассертит
+нормализованный tv_nsec (< 1e9), ненулевые часы (не -ENOSYS) и
+ts2 ≥ ts1 (свойство монотонности). Шестой —
 `linux_userspace_fork_milestone` — /init зовёт `sys_fork`, обa
 процесса пишут свой `eax` в UART, тест проверяет что один сequence
 содержит 0 (child contract) а другой — реальный child PID
