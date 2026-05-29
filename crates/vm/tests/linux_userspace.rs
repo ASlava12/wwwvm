@@ -369,7 +369,7 @@ fn build_initramfs_hello_padded_to_lands_at_target_size() {
 }
 
 #[test]
-#[ignore = "faster /init=600 reproducer — confirms minimal repro"]
+#[ignore = "/init=600 minimal reproducer (hangs per `4c68139`); ~9 min"]
 fn linux_userspace_hello_padded_to_600_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
@@ -462,7 +462,7 @@ fn linux_userspace_hello_padded_to_608_milestone() {
 /// evidence; if it passes, the bug is sparse and 601 is a "gap"
 /// in the bad range — which would be a wild new finding.
 #[test]
-#[ignore = "601-byte boundary probe; ~52 s pass or ~9 min hang"]
+#[ignore = "601-byte boundary probe (passes per `01bc97a`); ~52 s"]
 fn linux_userspace_hello_padded_to_601_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
