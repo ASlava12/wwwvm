@@ -76,6 +76,16 @@
 //!     post-fork-only fast path), and a second mm-swap that
 //!     follows the first.
 //!
+//!   - `linux_userspace_brk_milestone` — process memory layout:
+//!     /init calls `sys_brk(0)` (syscall 45, ebx=0 = query),
+//!     writes the returned program break between
+//!     `[USERSPACE BRK=]` markers. Test asserts the value lands
+//!     in `[INIT_LOAD_ADDR, 0xC0000000)` (above /init's load
+//!     address, below the kernel split) and is page-aligned.
+//!     Pins `mm->brk` initialization — the kernel sets it to
+//!     the end of the data segment, rounded up to a page, when
+//!     it sets up the new process's mm.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -447,6 +457,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let fork = build_initramfs_fork();
     let execve = build_initramfs_execve();
     let execve_chain = build_initramfs_execve_chain();
+    let brk = build_initramfs_brk();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -456,6 +467,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&fork[0..6], b"070701");
     assert_eq!(&execve[0..6], b"070701");
     assert_eq!(&execve_chain[0..6], b"070701");
+    assert_eq!(&brk[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -466,6 +478,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-fork.cpio", &fork);
         let _ = std::fs::write("/tmp/wwwvm-execve.cpio", &execve);
         let _ = std::fs::write("/tmp/wwwvm-execve-chain.cpio", &execve_chain);
+        let _ = std::fs::write("/tmp/wwwvm-brk.cpio", &brk);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1042,6 +1055,73 @@ fn build_initramfs_getpid() -> Vec<u8> {
         &code,
         &[marker_pre, marker_post, &buf_zeros],
         7, // R | W | X — /init writes pid into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init calls `sys_brk(0)` (syscall 45,
+/// ebx=0 = query) and writes the returned program break
+/// bracketed by `[USERSPACE BRK=]` markers. Same shape as the
+/// time/getpid milestones (no-arg-ish syscall returning a u32 →
+/// MOV moffs32, EAX → write 4 bytes) but pins a different kernel
+/// subsystem: process memory layout. The returned break must be
+/// at or above /init's binary end (LOAD_ADDR + binary length,
+/// rounded up to a page) — anything else means the kernel
+/// didn't set up `mm->brk` for the process.
+fn build_initramfs_brk() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE BRK=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_brk(0) — sys 45. ebx=0 means "query current break".
+        // Returns the current break address in eax (32-bit on i386).
+        out.extend_from_slice(&[0xB8, 0x2D, 0x00, 0x00, 0x00]); // mov eax, 45
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf_addr], eax
+        out.push(0xA3);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // write(1, buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros],
+        7, // R | W | X — /init writes brk into buf
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
@@ -2192,5 +2272,86 @@ fn linux_userspace_execve_chain_milestone() {
             .any(|w| w == marker_h2_failed),
         "saw H2_EXEC_FAILED but also OK — impossible without two children; {}",
         dump_uart_on_failure(&cumulative, "execve-chain-h2-fail")
+    );
+}
+
+/// Process-memory-layout milestone: /init calls `sys_brk(0)`
+/// (syscall 45, ebx=0 query), and the test asserts the returned
+/// program break is at or above /init's binary end. Same shape
+/// as the time/getpid milestones (4-byte buffer between markers)
+/// but pins a different kernel subsystem: the per-process
+/// `mm->brk` is initialized to the end of the ELF data segment,
+/// rounded up to a page. Any value below /init's binary end
+/// would mean the kernel didn't set up the heap pointer at all
+/// — anything finer than "page-aligned at or above" we leave
+/// to a future heap-extend milestone.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_brk_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_brk();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE BRK=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "brk")
+            )
+        });
+    eprintln!("sys_brk userspace milestone seen after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let b_off = pre_pos + marker_pre.len();
+    let b_bytes: [u8; 4] = cumulative[b_off..b_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let brk = u32::from_le_bytes(b_bytes);
+    eprintln!("sys_brk returned brk = 0x{brk:08X}");
+
+    // /init loads at INIT_LOAD_ADDR (0x08048000). The kernel sets
+    // mm->brk to the end of the bss/data segment, rounded up to
+    // a page (4 KiB on i386). So brk must be at or above
+    // LOAD_ADDR + binary_len, and below the kernel split
+    // (0xC0000000 on stock i386).
+    const KERNEL_BASE: u32 = 0xC000_0000;
+    assert!(
+        brk >= INIT_LOAD_ADDR,
+        "sys_brk returned 0x{brk:08X} (below /init's load address 0x{INIT_LOAD_ADDR:08X}); {}",
+        dump_uart_on_failure(&cumulative, "brk-low")
+    );
+    assert!(
+        brk < KERNEL_BASE,
+        "sys_brk returned 0x{brk:08X} (above kernel base 0x{KERNEL_BASE:08X}); {}",
+        dump_uart_on_failure(&cumulative, "brk-high")
+    );
+    assert_eq!(
+        brk & 0xFFF,
+        0,
+        "sys_brk returned 0x{brk:08X} — not page-aligned (low 12 bits = {:#X}); {}",
+        brk & 0xFFF,
+        dump_uart_on_failure(&cumulative, "brk-unaligned")
     );
 }
