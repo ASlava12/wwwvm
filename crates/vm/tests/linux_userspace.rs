@@ -139,8 +139,10 @@ fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
     // through, so the warning lives here.
     if (600..=602).contains(&init_binary.len()) && cfg!(debug_assertions) {
         eprintln!(
-            "build_cpio_archive: WARNING — /init binary length {} is in the \
-             known bad range 600..=602. Boot will stall in pata_legacy probe.",
+            "build_cpio_archive: WARNING — /init binary length {} lies in the \
+             known bad range 600..=602 (sizes 600 and 602 confirmed-hanging in \
+             `4c68139`; 601 untested but extrapolated). Boot likely stalls in \
+             pata_legacy probe — see build_initramfs_hello_padded_to_600.",
             init_binary.len()
         );
     }
