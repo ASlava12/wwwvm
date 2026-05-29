@@ -243,7 +243,9 @@ pub struct Cpu {
     /// (We measured a 2-entry direct-mapped variant on the Linux
     /// boot test: dead flat, no win — confirmed empirically that
     /// the hot fetch path doesn't bounce across page boundaries
-    /// often enough to matter, so the 1-slot version stays.)
+    /// often enough to matter, so the 1-slot version stays.
+    /// See `134ad50` for the null-result diff if a future
+    /// contributor wants to re-attempt.)
     /// Cleared on CR3 reload, INVLPG, any CR0 write (covers PG
     /// toggle for fetch invariants, and CR0.WP toggle for the
     /// `write_tlb` permission invariants — the dispatch funnels
