@@ -21,6 +21,23 @@
 //! marker shows up — typically at ~1.9 B steps for hello mode.
 //! The example always exhausts the full budget so its diagnostic
 //! prints can show what happens *after* the milestone too.
+//!
+//! Env vars (alphabetical):
+//!   WWWVM_DUMP_AT_PG=path     dump 16 MiB phys at CR0.PG=1 transition
+//!   WWWVM_DUMP_AT_STOP=path   dump full RAM at the final stop
+//!   WWWVM_INIT_INPUT=Q        builtin-initrd echo mode: queue this byte
+//!                             once /init's "echo " marker hits UART
+//!   WWWVM_INITRD=path         load a raw or gzipped cpio as the ramdisk
+//!   WWWVM_INITRD_BUILTIN=1    use the inline 136-byte ELF /init instead
+//!   WWWVM_KERNEL=path         override the default vmlinuz path
+//!   WWWVM_QUIET=1             suppress the per-chunk UART-pushed dump
+//!                             (transition diagnostics stay on)
+//!   WWWVM_STOP_AT_CR2=0xADDR  halt the moment CR2 latches this address
+//!   WWWVM_STOP_AT_EIP=0xADDR  halt the moment EIP enters this address
+//!   WWWVM_STOP_AT_FIRST_EXC=1 halt at the first dispatched exception
+//!   WWWVM_STOP_AT_FIRST_PF=1  halt at the first #PF
+//!   WWWVM_STOP_AT_PANIC=1     halt when EIP enters the kernel panic()
+//!   WWWVM_TRACE_ESP_ALIGN=1   single-step + log ESP-align transitions
 
 use std::env;
 use std::fs;
