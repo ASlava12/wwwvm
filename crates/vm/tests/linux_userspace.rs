@@ -7065,6 +7065,97 @@ fn build_initramfs_ioctl() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `_newselect` (syscall 142) polling the
+/// console (fd 1) for WRITABILITY with a zero timeout. A serial console
+/// is always ready to accept output, so select must return 1 with fd 1's
+/// bit still set in writefds. The 4-byte return value and the first
+/// dword of writefds are dumped between `[USERSPACE SEL=` and
+/// `]\n[USERSPACE END]\n`. Pins the kernel poll/select path (tty
+/// poll → POLLOUT) used by every event-loop / I/O-multiplexing program.
+fn build_initramfs_select() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE SEL=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    // buf: [0..4) select ret, [4..8) writefds word0 after the call.
+    let build_code = |marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      wfds_addr: u32,
+                      tv_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(176);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // _newselect(nfds=2, readfds=NULL, writefds=&wfds, exceptfds=NULL, timeout=&tv)
+        out.extend_from_slice(&[0xB8, 0x8E, 0x00, 0x00, 0x00]); // mov eax, 142
+        out.extend_from_slice(&[0xBB, 0x02, 0x00, 0x00, 0x00]); // mov ebx, 2 (nfds)
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (readfds NULL)
+        out.push(0xBA);
+        out.extend_from_slice(&wfds_addr.to_le_bytes()); // edx = &writefds
+        out.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi (exceptfds NULL)
+        out.push(0xBF);
+        out.extend_from_slice(&tv_addr.to_le_bytes()); // edi = &timeout
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[buf+0], eax (ret)
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // copy writefds word0 into buf+4
+        out.push(0xA1); // mov eax, ds:[wfds]
+        out.extend_from_slice(&wfds_addr.to_le_bytes());
+        out.push(0xA3); // mov ds:[buf+4], eax
+        out.extend_from_slice(&(buf_addr + 4).to_le_bytes());
+        // write(1, buf, 8)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // edx = 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let wfds_addr = marker_post_addr + marker_post.len() as u32;
+    let tv_addr = wfds_addr + 16; // fd_set space (only word0 used)
+    let buf_addr = tv_addr + 8; // after struct timeval
+    let code = build_code(
+        marker_pre_addr,
+        marker_post_addr,
+        wfds_addr,
+        tv_addr,
+        buf_addr,
+    );
+    let mut wfds = vec![0u8; 16];
+    wfds[0] = 0x02; // fd 1 -> bit 1
+    let tv_zeros = [0u8; 8]; // {0,0} -> poll, return immediately
+    let buf_zeros = [0u8; 8];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_post, &wfds, &tv_zeros, &buf_zeros],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_fork` (syscall 2) and then
 /// — in BOTH parent and child — writes `[USERSPACE FORK ret=`
 /// followed by its own 4-byte `eax`, then `][USERSPACE END]\n`.
@@ -8555,6 +8646,82 @@ fn linux_userspace_ioctl_tcgets_milestone() {
         "TCGETS on the console must succeed (fd 0 is a tty); -ENOTTY=-25 \
          would mean fd 0 is not a tty; {}",
         dump_uart_on_failure(&cumulative, "ioctl-ret")
+    );
+}
+
+/// select milestone: /init `_newselect`s the console (fd 1) for write
+/// readiness with a zero timeout. A serial console always accepts
+/// output, so select returns 1 with fd 1's bit set in writefds. Asserts
+/// ret == 1 and writefds bit 1 survives. Pins the kernel poll/select
+/// path (tty poll → POLLOUT) used by every I/O-multiplexing program.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_select_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_select();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE SEL=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "select")
+            )
+        });
+    eprintln!("sys__newselect userspace milestone seen after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let off = pre_pos + marker_pre.len();
+    let dw = |o: usize| -> u32 {
+        u32::from_le_bytes(stripped[off + o..off + o + 4].try_into().expect("4 bytes"))
+    };
+    let ret = dw(0) as i32;
+    let wfds = dw(4);
+    eprintln!("_newselect ret={ret} writefds.word0={wfds:#010x}");
+    assert_eq!(
+        ret,
+        1,
+        "select must report exactly one ready fd (console writable); {}",
+        dump_uart_on_failure(&cumulative, "select-ret")
+    );
+    assert_eq!(
+        wfds & 0x02,
+        0x02,
+        "fd 1's bit must survive in writefds (it is the ready fd); {}",
+        dump_uart_on_failure(&cumulative, "select-wfds")
     );
 }
 
