@@ -720,4 +720,34 @@ mod tests {
             "expected ~6 PIT edges, got {edges}"
         );
     }
+
+    /// Unmapped I/O ports read as 0xFF — the ISA-bus pull-up
+    /// behavior that Linux's `inb_p` probing relies on to
+    /// distinguish a present device (returns its data byte) from
+    /// an empty bus (returns 0xFF). A regression that returned 0
+    /// for unmapped reads would make every device "look present"
+    /// to a probe that looks at the high nibble.
+    #[test]
+    fn unmapped_port_read_returns_0xff_isa_pullup_default() {
+        let mut bus = IoBus::new();
+        // 0x0080 is the BIOS POST-code port — we don't model it.
+        // 0x0378 is LPT1 — we don't model it either.
+        // Both should read 0xFF.
+        assert_eq!(bus.read(0x0080), 0xFF, "POST port unmapped");
+        assert_eq!(bus.read(0x0378), 0xFF, "LPT1 unmapped");
+    }
+
+    /// Writes to unmapped ports are silently dropped — matches
+    /// real hardware (nothing latches the byte). Distinct from
+    /// returning a sentinel; this just asserts we don't panic.
+    #[test]
+    fn unmapped_port_write_is_silently_dropped() {
+        let mut bus = IoBus::new();
+        bus.write(0x0080, 0xAB); // BIOS POST code, no slot
+        bus.write(0x0378, 0xCD); // LPT1, no slot
+                                 // No assertion on state — we just need to NOT panic.
+                                 // The follow-up reads still return the unmapped sentinel.
+        assert_eq!(bus.read(0x0080), 0xFF);
+        assert_eq!(bus.read(0x0378), 0xFF);
+    }
 }
