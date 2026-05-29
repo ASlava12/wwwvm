@@ -474,6 +474,72 @@ mod tests {
         }
     }
 
+    /// snapshot/restore must round-trip the in-flight read state
+    /// — the kernel's READ SECTORS command leaves the buffer half-
+    /// drained between successive `in 0x1F0` reads, and a
+    /// snapshot taken at that point must resume with the same
+    /// remaining bytes at the same position. Without it, the
+    /// guest's next read would see fresh sector data shifted by
+    /// the lost offset, silently corrupting block I/O.
+    #[test]
+    fn snapshot_round_trip_preserves_in_flight_read_state() {
+        let mut ata = Ata::new();
+        let mut img = Vec::with_capacity(SECTOR_SIZE * 2);
+        img.extend_from_slice(&[0x77; SECTOR_SIZE]);
+        img.extend_from_slice(&[0x88; SECTOR_SIZE]);
+        ata.disk.load(&img);
+        // Issue READ SECTORS for 2 sectors, then drain 100 bytes
+        // — leaves status=DRQ, pos=100, buf=2*SECTOR_SIZE.
+        ata.write(0x1F2, 2);
+        ata.write(0x1F3, 0);
+        ata.write(0x1F4, 0);
+        ata.write(0x1F5, 0);
+        ata.write(0x1F6, 0x40);
+        ata.write(0x1F7, CMD_READ_SECTORS);
+        for _ in 0..100 {
+            let _ = ata.read(0x1F0);
+        }
+        // Snapshot mid-drain.
+        let mut buf = Vec::new();
+        ata.snapshot_into(&mut buf);
+        // Header is 20 bytes + 2*512 = 1044 total.
+        assert_eq!(buf.len(), 20 + SECTOR_SIZE * 2);
+
+        let mut ata2 = Ata::new();
+        ata2.disk.load(&img);
+        let consumed = ata2.restore(&buf).expect("restore");
+        assert_eq!(consumed, buf.len());
+        // The original drained 100 bytes of sector 0 (all 0x77),
+        // so the resumed controller should hand back the
+        // remaining 412 bytes of 0x77 followed by 512 bytes of
+        // 0x88 — matching what the snapshot side would have
+        // produced if no snapshot had happened.
+        for i in 0..(SECTOR_SIZE - 100) {
+            assert_eq!(ata2.read(0x1F0), 0x77, "remaining sector 0 byte {i}");
+        }
+        for i in 0..SECTOR_SIZE {
+            assert_eq!(ata2.read(0x1F0), 0x88, "sector 1 byte {i}");
+        }
+        // Buffer fully drained → DRQ clears, like the un-snapshotted
+        // path.
+        assert!(ata2.status & STATUS_DRQ == 0);
+    }
+
+    /// restore must reject malformed inputs rather than panic.
+    /// Two failure modes: header too short (<20 bytes), and
+    /// header claims more buf bytes than payload contains.
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let mut ata = Ata::new();
+        assert!(ata.restore(&[0u8; 19]).is_err(), "header truncated");
+        // Valid 20-byte header claiming buf_len=1000, but the
+        // payload has only 4 bytes of buf data.
+        let mut bad = vec![0u8; 20];
+        bad[16..20].copy_from_slice(&1000u32.to_le_bytes());
+        bad.extend_from_slice(&[0; 4]);
+        assert!(ata.restore(&bad).is_err(), "buf truncated");
+    }
+
     #[test]
     fn inw_pattern_drains_two_bytes_per_pair_via_1f0_and_1f1() {
         // Mimic what our CPU's `IN AX, DX` decomposes into: two
