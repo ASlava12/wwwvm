@@ -371,8 +371,9 @@ fn linux_userspace_hello_padded_to_600_milestone() {
         )
     });
     eprintln!(
-        "HELLO seen at {steps} steps — minimal /init=600 boots fast, the \
-         bug is more subtle than just binary size"
+        "HELLO seen at {steps} steps — /init=600 boots fast on this run; \
+         the size-trigger has been fixed or our emulator state changed \
+         (was confirmed-hanging in `4c68139`'s test run)"
     );
 }
 
