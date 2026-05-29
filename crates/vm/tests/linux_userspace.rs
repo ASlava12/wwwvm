@@ -1178,3 +1178,39 @@ fn linux_userspace_bisect_msg_is_marker_post_milestone() {
         });
     eprintln!("[BISECT] HELLO seen after {steps} steps (msg=marker_post is fine)");
 }
+
+/// Now we know `\n[USERSPACE END]\n` triggers the hang. Bisect
+/// against the leading `\n`: try `.[USERSPACE END]\n` (17 bytes,
+/// same length, just replace the leading `\n` with `.`). If
+/// THIS passes, the leading `\n` is part of the trigger.
+#[test]
+#[ignore = "leading-\\n bisection"]
+fn linux_userspace_bisect_no_leading_newline_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_bisect_with_msg(b".[USERSPACE END]\n");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, b"[BISECT] HELLO", 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "still hanging without leading \\n; trigger is in `[USERSPACE END]` substring; {}",
+                dump_uart_on_failure(&cumulative, "bisect-no-newline")
+            )
+        });
+    eprintln!("[BISECT] HELLO seen after {steps} steps (leading \\n WAS the trigger)");
+}
