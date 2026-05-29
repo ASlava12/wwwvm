@@ -195,7 +195,7 @@ fn build_initramfs_hello() -> Vec<u8> {
 /// `init_cpio_archives_start_with_newc_magic` as a sanity-check
 /// input, AND it's a canonical reproducer for the boot stall.
 ///
-/// Bisection result (10 probes `b67d7cb`..`a25f98e`, then
+/// Bisection result (15-probe sweep `d22718e`..`a25f98e`, then
 /// `4c68139` + `d6fd05f`):
 ///
 ///   | /init size | works? |
