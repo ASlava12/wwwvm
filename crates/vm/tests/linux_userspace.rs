@@ -240,6 +240,12 @@
 //!     descriptor table entry — distinct from open-file flags
 //!     (O_CREAT etc.) that live in the file struct itself.
 //!
+//!   - `linux_userspace_sysinfo_milestone` — system info: /init
+//!     calls `sys_sysinfo(&buf)`, reads `uptime` (first field of
+//!     the 64-byte struct). Test asserts the value is positive.
+//!     Pins the kernel's sysinfo path that fills uptime + load
+//!     averages + memory totals + procs count via copy_to_user.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -632,6 +638,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let access = build_initramfs_access();
     let statfs = build_initramfs_statfs();
     let fcntl = build_initramfs_fcntl();
+    let sysinfo = build_initramfs_sysinfo();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -662,6 +669,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&access[0..6], b"070701");
     assert_eq!(&statfs[0..6], b"070701");
     assert_eq!(&fcntl[0..6], b"070701");
+    assert_eq!(&sysinfo[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -693,6 +701,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-access.cpio", &access);
         let _ = std::fs::write("/tmp/wwwvm-statfs.cpio", &statfs);
         let _ = std::fs::write("/tmp/wwwvm-fcntl.cpio", &fcntl);
+        let _ = std::fs::write("/tmp/wwwvm-sysinfo.cpio", &sysinfo);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -3083,6 +3092,79 @@ fn build_initramfs_fcntl() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[path, marker_pre, marker_post, &fd_zeros, &flags_zeros],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init calls `sys_sysinfo(&buf)` (syscall
+/// 116) and reads `uptime` (first field, 4 bytes) of struct
+/// sysinfo back out. Writes the 4-byte uptime between
+/// `[USERSPACE UPTIME=…][USERSPACE END]`. Test asserts the value
+/// is positive — proves the kernel filled the sysinfo struct
+/// AND that its internal uptime counter has advanced past boot.
+fn build_initramfs_sysinfo() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE UPTIME=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      buf_addr: u32,
+                      uptime_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // sys_sysinfo(&buf) — sys 116
+        out.extend_from_slice(&[0xB8, 0x74, 0x00, 0x00, 0x00]); // mov eax, 116
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov eax, ds:[buf+0] (uptime) → ds:[uptime_buf]
+        out.push(0xA1);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.push(0xA3);
+        out.extend_from_slice(&uptime_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, uptime_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&uptime_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    // struct sysinfo is 64 bytes on i386
+    let uptime_buf_addr = buf_addr + 64;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr, uptime_buf_addr);
+    let buf_zeros = [0u8; 64];
+    let uptime_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros, &uptime_zeros],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -5894,6 +5976,73 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_sysinfo` milestone: /init calls `sys_sysinfo(&buf)`,
+/// reads `uptime` (first field, 4 bytes). Test asserts uptime
+/// is positive. Pins the kernel's sysinfo path — fills the
+/// 64-byte struct with uptime + load + memory + procs.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_sysinfo_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_sysinfo();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE UPTIME=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "sysinfo")
+            )
+        });
+    eprintln!("sysinfo milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let up_off = pre_pos + marker_pre.len();
+    let uptime = u32::from_le_bytes(stripped[up_off..up_off + 4].try_into().unwrap());
+    eprintln!("sysinfo returned uptime = {uptime} seconds");
+    assert!(
+        uptime > 0,
+        "expected uptime > 0 (kernel has been running for at least 1 second), \
+         got {uptime}; if 0, sysinfo silently failed or kernel time hasn't \
+         advanced; {}",
+        dump_uart_on_failure(&cumulative, "sysinfo-zero")
     );
 }
 
