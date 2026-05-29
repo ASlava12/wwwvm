@@ -177,6 +177,14 @@
 //!     TTY's `0x0D` and shifting the decoded value. Reusable
 //!     pattern for any future binary-data milestone.
 //!
+//!   - `linux_userspace_writev_milestone` — vectored I/O: /init
+//!     calls `sys_writev` (syscall 146) with a 2-element
+//!     `iovec[]` whose entries together spell
+//!     `[USERSPACE WRITEV=AB][USERSPACE END]\n`. Test asserts
+//!     the concatenated string appears in UART. Pins the
+//!     kernel's iovec walker — every prior write milestone used
+//!     a single contiguous buffer.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -561,6 +569,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let mkdir = build_initramfs_mkdir();
     let chdir = build_initramfs_chdir();
     let nanosleep = build_initramfs_nanosleep();
+    let writev = build_initramfs_writev();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -583,6 +592,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&mkdir[0..6], b"070701");
     assert_eq!(&chdir[0..6], b"070701");
     assert_eq!(&nanosleep[0..6], b"070701");
+    assert_eq!(&writev[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -606,6 +616,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-mkdir.cpio", &mkdir);
         let _ = std::fs::write("/tmp/wwwvm-chdir.cpio", &chdir);
         let _ = std::fs::write("/tmp/wwwvm-nanosleep.cpio", &nanosleep);
+        let _ = std::fs::write("/tmp/wwwvm-writev.cpio", &writev);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2449,6 +2460,57 @@ fn build_initramfs_nanosleep() -> Vec<u8> {
         ],
         7,
     );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init calls `sys_writev` (syscall 146)
+/// with a 2-element `iovec[]` to atomically write two memory
+/// regions to stdout in one syscall. /init's data segment
+/// contains both strings plus a manually-laid-out iov array
+/// where each entry is `{base_ptr (4 bytes), len (4 bytes)}` for
+/// an 8-byte struct on i386. Result in UART:
+///
+///   `[USERSPACE WRITEV=A` (from vec1) + `B][USERSPACE END]\n` (vec2)
+///
+/// Test asserts the combined string appears. Pins `sys_writev`:
+/// the kernel reads the iovec array out of /init's memory, walks
+/// each entry, and concatenates their contents into the fd. The
+/// existing write milestones only ever passed a single buffer.
+fn build_initramfs_writev() -> Vec<u8> {
+    let vec1: &[u8] = b"[USERSPACE WRITEV=A"; // 19 bytes
+    let vec2: &[u8] = b"B][USERSPACE END]\n"; // 18 bytes
+
+    let build_code = |iov_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        // sys_writev(fd=1, iov=iov_addr, iovcnt=2) — sys 146
+        out.extend_from_slice(&[0xB8, 0x92, 0x00, 0x00, 0x00]); // mov eax, 146
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&iov_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x02, 0x00, 0x00, 0x00]); // mov edx, 2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0).len() as u32;
+    let iov_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let vec1_addr = iov_addr + 16; // 2 iovecs × 8 bytes
+    let vec2_addr = vec1_addr + vec1.len() as u32;
+    let code = build_code(iov_addr);
+
+    // Build iov_array bytes: [{vec1_addr, vec1.len()},
+    //                        {vec2_addr, vec2.len()}]
+    let mut iov_bytes = Vec::with_capacity(16);
+    iov_bytes.extend_from_slice(&vec1_addr.to_le_bytes());
+    iov_bytes.extend_from_slice(&(vec1.len() as u32).to_le_bytes());
+    iov_bytes.extend_from_slice(&vec2_addr.to_le_bytes());
+    iov_bytes.extend_from_slice(&(vec2.len() as u32).to_le_bytes());
+
+    let binary = make_init_elf32_safe(&code, &[&iov_bytes, vec1, vec2], 7);
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
@@ -4951,6 +5013,48 @@ fn linux_userspace_mkdir_milestone() {
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
     );
+}
+
+/// Vectored I/O milestone: /init calls `sys_writev` (syscall 146)
+/// with two iovec entries that together spell
+/// `[USERSPACE WRITEV=AB][USERSPACE END]\n`. Test asserts the
+/// concatenated string appears in UART. Pins the kernel's
+/// iovec-walking write path: until now every write milestone
+/// used a single contiguous buffer.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_writev_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_writev();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let needle: &[u8] = b"[USERSPACE WRITEV=AB][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps =
+        run_until_marker(&mut vm, needle, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+            panic!(
+                "concatenated writev output not seen in 16 B steps — sys_writev may \
+                 have returned -errno or split the iovecs differently; {}",
+                dump_uart_on_failure(&cumulative, "writev")
+            )
+        });
+    eprintln!("writev milestone full string seen after {steps} steps");
 }
 
 /// Timer + scheduler milestone: /init samples `sys_time` before
