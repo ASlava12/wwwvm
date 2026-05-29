@@ -294,6 +294,61 @@ fn push_writes_below_sp_lifo() {
     assert_eq!(cpu.regs[r16::BX], 0xAAAA);
 }
 
+/// PUSH ES under the 0x66 (32-bit operand size) prefix must
+/// decrement ESP by 4 and write the selector zero-extended to a
+/// dword. The load-bearing comment in `cpu/lib.rs` calls this out
+/// as the path Linux's kernel-entry uses when saving DS/ES/FS/GS
+/// onto the kernel stack: without 4-byte decrement, ESP gets
+/// misaligned by 2 bytes per push and subsequent stack reads land
+/// at wrong offsets.
+#[test]
+fn push_segment_register_under_32bit_operand_decrements_esp_by_4() {
+    // MOV AX, 0x1234
+    // MOV ES, AX
+    // 0x66 prefix + PUSH ES (op=0x06)
+    // HLT
+    let (cpu, mem, _) = run_payload(
+        &[
+            0xB8, 0x34, 0x12, // mov ax, 0x1234
+            0x8E, 0xC0, // mov es, ax
+            0x66, 0x06, // push es (32-bit operand size)
+            0xF4, // hlt
+        ],
+        16,
+    );
+    // SP started at 0x7C00; 32-bit push decrements by 4 → 0x7BFC.
+    assert_eq!(
+        cpu.regs[r16::SP],
+        0x7BFC,
+        "32-bit PUSH ES must decrement SP by 4, not 2"
+    );
+    // Zero-extended ES (0x1234) lands at SS:SP. SS=0 in real mode.
+    let pushed = mem.read_u32(0x7BFC);
+    assert_eq!(
+        pushed, 0x0000_1234,
+        "PUSH ES must store the selector zero-extended to 32 bits"
+    );
+}
+
+/// Sibling test: without the 0x66 prefix, PUSH ES decrements SP
+/// by 2 and writes a 16-bit value — the regular 16-bit-mode path.
+/// Catches a regression that always took the 32-bit path.
+#[test]
+fn push_segment_register_default_16bit_decrements_esp_by_2() {
+    let (cpu, mem, _) = run_payload(
+        &[
+            0xB8, 0x34, 0x12, // mov ax, 0x1234
+            0x8E, 0xC0, // mov es, ax
+            0x06, // push es (16-bit, no prefix)
+            0xF4, // hlt
+        ],
+        16,
+    );
+    assert_eq!(cpu.regs[r16::SP], 0x7BFE, "16-bit PUSH ES decrements by 2");
+    let pushed = mem.read_u16(0x7BFE);
+    assert_eq!(pushed, 0x1234);
+}
+
 #[test]
 fn push_imm8_sign_extends_to_16_bits() {
     // PUSH 0xFF (imm8) → on the stack as 0xFFFF
