@@ -840,6 +840,117 @@ fn div_by_zero_vectors_through_ivt_de() {
     assert_eq!(mem.read_u16(0x7BFA), 0x7C04);
 }
 
+/// IDIV r/m8 of AX=i16::MIN by -1 must raise #DE (the true quotient
+/// +32768 doesn't fit a signed byte), NOT panic with "attempt to divide
+/// with overflow" in debug/test builds. Regression for the native
+/// `ax / v` evaluated before the range guard.
+#[test]
+fn idiv_rm8_int_min_div_neg_one_raises_de_not_panic() {
+    let mut mem = Memory::new(0x10_0000);
+    // IVT[0] (#DE) = 0:0x7C40.
+    mem.write_u8(0, 0x40);
+    mem.write_u8(1, 0x7C);
+    mem.write_u8(2, 0);
+    mem.write_u8(3, 0);
+    // MOV AX,0x8000 ; MOV BH,0xFF ; IDIV BH (F6 /7, rm=BH) ; HLT
+    mem.write_slice(0x7C00, &[0xB8, 0x00, 0x80, 0xB7, 0xFF, 0xF6, 0xFF, 0xF4]);
+    // #DE handler: MOV CL,0xDE ; HLT.
+    mem.write_slice(0x7C40, &[0xB1, 0xDE, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(1), 0xDE, "#DE handler must run (CL sentinel)");
+    assert_eq!(
+        cpu.regs[r16::AX],
+        0x8000,
+        "faulting IDIV must not write AL/AH"
+    );
+}
+
+/// IDIV r/m16 of DX:AX=i32::MIN by -1 must raise #DE, not panic.
+#[test]
+fn idiv_rm16_int_min_div_neg_one_raises_de_not_panic() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u8(0, 0x40);
+    mem.write_u8(1, 0x7C);
+    mem.write_u8(2, 0);
+    mem.write_u8(3, 0);
+    // MOV DX,0x8000 ; XOR AX,AX ; MOV DI,0xFFFF ; IDIV DI (F7 /7) ; HLT
+    // DX:AX = 0x8000_0000 = i32::MIN.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xBA, 0x00, 0x80, 0x31, 0xC0, 0xBF, 0xFF, 0xFF, 0xF7, 0xFF, 0xF4,
+        ],
+    );
+    mem.write_slice(0x7C40, &[0xB1, 0xDE, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(1), 0xDE, "#DE handler must run");
+    assert_eq!(cpu.regs[r16::DX], 0x8000, "faulting IDIV must not write DX");
+    assert_eq!(cpu.regs[r16::AX], 0x0000, "faulting IDIV must not write AX");
+}
+
+/// IDIV r/m32 of EDX:EAX=i64::MIN by -1 must raise #DE, not panic.
+#[test]
+fn idiv_rm32_int_min_div_neg_one_raises_de_not_panic() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u8(0, 0x40);
+    mem.write_u8(1, 0x7C);
+    mem.write_u8(2, 0);
+    mem.write_u8(3, 0);
+    // 66-prefixed (32-bit operands in real mode):
+    //   MOV EDX,0x80000000 ; XOR EAX,EAX ; MOV EDI,0xFFFFFFFF ; IDIV EDI ; HLT
+    // EDX:EAX = i64::MIN.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x80, // MOV EDX, 0x80000000
+            0x66, 0x31, 0xC0, // XOR EAX, EAX
+            0x66, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, // MOV EDI, 0xFFFFFFFF
+            0x66, 0xF7, 0xFF, // IDIV EDI
+            0xF4, // HLT
+        ],
+    );
+    mem.write_slice(0x7C40, &[0xB1, 0xDE, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(cpu.read_r8(1), 0xDE, "#DE handler must run");
+    assert_eq!(
+        cpu.read_r32(2),
+        0x8000_0000,
+        "faulting IDIV must not write EDX"
+    );
+    assert_eq!(
+        cpu.read_r32(0),
+        0x0000_0000,
+        "faulting IDIV must not write EAX"
+    );
+}
+
 #[test]
 fn es_segment_override_redirects_memory_load() {
     // Place 0xCC at ES:0x0100 (since ES=0 after reset, linear=0x0100)

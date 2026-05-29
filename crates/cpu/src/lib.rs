@@ -4257,7 +4257,13 @@ impl Cpu {
                             return Ok(());
                         }
                         let ax = self.regs[r16::AX] as i16;
-                        let q = ax / v;
+                        // checked_div catches AX = i16::MIN / -1 (the true
+                        // quotient +32768 doesn't fit) and raises #DE
+                        // instead of panicking on the native overflow.
+                        let Some(q) = ax.checked_div(v) else {
+                            self.raise_de(op_ip, mem);
+                            return Ok(());
+                        };
                         let r = ax % v;
                         if !(-128..=127).contains(&q) {
                             self.raise_de(op_ip, mem);
@@ -4349,7 +4355,12 @@ impl Cpu {
                             let dividend = (((self.read_r32(2) as u64) << 32)
                                 | self.read_r32(0) as u64)
                                 as i64;
-                            let q = dividend / v;
+                            // checked_div catches EDX:EAX = i64::MIN / -1
+                            // (quotient overflow) -> #DE, not a panic.
+                            let Some(q) = dividend.checked_div(v) else {
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
+                            };
                             let r = dividend % v;
                             if !(i32::MIN as i64..=i32::MAX as i64).contains(&q) {
                                 self.raise_de(op_ip, mem);
@@ -4435,7 +4446,12 @@ impl Cpu {
                             let dividend = (((self.regs[r16::DX] as u32) << 16)
                                 | self.regs[r16::AX] as u32)
                                 as i32;
-                            let q = dividend / v;
+                            // checked_div catches DX:AX = i32::MIN / -1
+                            // (quotient overflow) -> #DE, not a panic.
+                            let Some(q) = dividend.checked_div(v) else {
+                                self.raise_de(op_ip, mem);
+                                return Ok(());
+                            };
                             let r = dividend % v;
                             if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
                                 self.raise_de(op_ip, mem);
