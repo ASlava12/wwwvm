@@ -39,6 +39,16 @@
 //!   WWWVM_KERNEL=path         override the default vmlinuz path
 //!   WWWVM_QUIET=1             suppress the per-chunk UART-pushed dump
 //!                             (transition diagnostics stay on)
+//!   WWWVM_STEP_BUDGET=N       override the 16 B (16 × 10⁹) default
+//!                             step budget. N is plain decimal; useful
+//!                             to cap the run just past a known
+//!                             milestone so post-stop dumps reflect
+//!                             *that* state (e.g. set to 2_000_000_000
+//!                             to catch HELLO mode pre-panic, instead
+//!                             of running to budget and washing the
+//!                             diagnostic out across 9 B post-panic
+//!                             steps). Underscores are NOT accepted —
+//!                             use plain "2000000000".
 //!   WWWVM_STOP_AT_CR2=0xADDR  halt the moment CR2 latches this address
 //!   WWWVM_STOP_AT_EIP=0xADDR  halt the moment EIP enters this address
 //!   WWWVM_STOP_AT_FIRST_EXC=1 halt at the first dispatched exception
@@ -53,7 +63,7 @@ use std::time::Instant;
 use wwwvm_vm::{Stop, Vm};
 
 const RAM_SIZE: usize = 256 * 1024 * 1024;
-const STEP_BUDGET: u64 = 16_000_000_000;
+const STEP_BUDGET_DEFAULT: u64 = 16_000_000_000;
 
 fn main() {
     let path = env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
@@ -194,6 +204,17 @@ fn main() {
     });
 
     // Step in chunks so we can watch EIP / CR0.PG / CS transitions.
+    // WWWVM_STEP_BUDGET=N overrides the 16 B default; useful for
+    // capping a run just past a known milestone (e.g. 2_000_000_000
+    // catches HELLO mode pre-panic instead of letting 9 B post-panic
+    // steps wash out the diagnostic).
+    let step_budget = env::var("WWWVM_STEP_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(STEP_BUDGET_DEFAULT);
+    if step_budget != STEP_BUDGET_DEFAULT {
+        println!("step budget: {step_budget} (overridden from {STEP_BUDGET_DEFAULT} default)");
+    }
     let t0 = Instant::now();
     let mut steps = 0u64;
     let chunk = 10_000_000u32;
@@ -261,7 +282,7 @@ fn main() {
     let stop_at_cr2 = env::var("WWWVM_STOP_AT_CR2")
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    while steps < STEP_BUDGET {
+    while steps < step_budget {
         let pg_on = vm.cpu().cr0 & (1 << 31) != 0;
         let chunk = if pg_on && (stop_at_panic || stop_at_eip.is_some() || stop_at_cr2.is_some()) {
             1
