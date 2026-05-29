@@ -350,7 +350,7 @@ right vector slot (UART is IRQ 4 → vector 0x0C, keyboard is IRQ 1 →
 vector 0x09), unmask the corresponding bit in the PIC IMR, and EOI at
 the end of the handler. See the `pit_timer_drives_irq0_handler_through_vm`
 and `uart_rx_drives_irq4_handler_through_vm` integration tests in
-`crates/vm/src/lib.rs` for fully worked references.
+`crates/vm/src/tests.rs` for fully worked references.
 
 ## Interrupts in two more sentences
 
