@@ -1677,6 +1677,27 @@ impl Cpu {
         }
     }
 
+    /// Set the FPREM/FPREM1 condition codes from the integer quotient
+    /// `q`. The reduction completes in one step here, so C2 is cleared
+    /// ("complete"), and the low three quotient bits are exposed per
+    /// the Intel SDM mapping: C0←bit2, C3←bit1, C1←bit0. Code that
+    /// does argument reduction (glibc's fmod/remainder, range-reduce
+    /// loops) reads these to reconstruct the quotient modulo 8.
+    fn fpu_set_prem_cc(&mut self, q: f64) {
+        // Clear C3 | C2 | C1 | C0; C2 stays 0 = reduction complete.
+        self.fpu_sw &= !0x4700;
+        let qi = q.abs() as i64 as u64; // saturating; NaN/inf → 0
+        if qi & 0b001 != 0 {
+            self.fpu_sw |= 0x0200; // C1 ← quotient bit 0
+        }
+        if qi & 0b010 != 0 {
+            self.fpu_sw |= 0x4000; // C3 ← quotient bit 1
+        }
+        if qi & 0b100 != 0 {
+            self.fpu_sw |= 0x0100; // C0 ← quotient bit 2
+        }
+    }
+
     /// Decode an 80-bit x87 extended-precision value (the `m80`/long
     /// double format) into f64. `mantissa` is the 64-bit explicit
     /// significand (integer bit in bit 63); `se` is the 16-bit
@@ -1698,9 +1719,25 @@ impl Cpu {
         if exp == 0 && mantissa == 0 {
             return sign * 0.0;
         }
-        // value = mantissa * 2^(exp - 16383 - 63). Out-of-f64-range
-        // exponents saturate to ±inf, matching a real demotion.
-        sign * (mantissa as f64) * 2f64.powi(exp - 16383 - 63)
+        // value = mantissa * 2^(exp - 16383 - 63). Apply the power in
+        // bounded chunks folded into the mantissa, so the 2^k factor
+        // never underflows (or overflows) to 0 / ±inf *independently*
+        // of the ~2^63 mantissa — which would wrongly zero small
+        // subnormal long doubles (k very negative) or saturate large
+        // ones early. The running product tracks the true magnitude
+        // and only underflows to 0 when the real value is < f64 min,
+        // matching a real demotion (and out-of-range still → ±inf).
+        let mut r = mantissa as f64;
+        let mut k = exp - 16383 - 63;
+        while k < -512 {
+            r *= 2f64.powi(-512);
+            k += 512;
+        }
+        while k > 512 {
+            r *= 2f64.powi(512);
+            k -= 512;
+        }
+        sign * r * 2f64.powi(k)
     }
 
     /// Encode an f64 into the 80-bit x87 extended format, returning
@@ -3554,12 +3591,19 @@ impl Cpu {
                 // EIP to re-execute this op after the handler. Without
                 // restoring SI/DI, the retry would operate on the *next*
                 // element and skip the faulting one. Snapshot + restore.
+                // Flags are snapshotted too: CMPS/SCAS compute EFLAGS
+                // from the (short-circuited-to-0) faulting read before
+                // step() dispatches the #PF, so without this the #PF
+                // frame would carry architecturally-wrong EFLAGS (real
+                // x86 leaves them untouched on a faulting string op).
                 let esi_snap = self.read_r32(r16::SI as u8);
                 let edi_snap = self.read_r32(r16::DI as u8);
+                let flags_snap = self.flags;
                 self.step_string(opcode, mem);
                 if self.pending_fault.get().is_some() {
                     self.write_r32(r16::SI as u8, esi_snap);
                     self.write_r32(r16::DI as u8, edi_snap);
+                    self.flags = flags_snap;
                 }
             }
 
@@ -3672,8 +3716,16 @@ impl Cpu {
                         // the whole transfer (the pipe2-fds-not-populated
                         // bug). step_string advances SI/DI internally, so
                         // we capture them here and restore on fault.
+                        // Flags too: a faulting REPE CMPS / REPNE SCAS
+                        // computes EFLAGS from the short-circuited read
+                        // before the fault dispatches; restoring them
+                        // keeps the #PF frame's EFLAGS architecturally
+                        // correct (and the fault `break` below happens
+                        // before the ZF check, so a bogus ZF could never
+                        // terminate the REP early anyway).
                         let esi_snap = self.read_r32(r16::SI as u8);
                         let edi_snap = self.read_r32(r16::DI as u8);
+                        let flags_snap = self.flags;
                         if is_io {
                             self.step_string_io(inner, mem, io);
                         } else if !self.step_string(inner, mem) {
@@ -3686,6 +3738,7 @@ impl Cpu {
                         if self.pending_fault.get().is_some() {
                             self.write_r32(r16::SI as u8, esi_snap);
                             self.write_r32(r16::DI as u8, edi_snap);
+                            self.flags = flags_snap;
                             break;
                         }
                         if self.addr_size_32 {
@@ -7498,7 +7551,7 @@ impl Cpu {
                             let st1 = self.fpu_st(1);
                             let q = (st0 / st1).trunc();
                             self.fpu_set_st(0, st0 - st1 * q);
-                            self.fpu_sw &= !0x0400;
+                            self.fpu_set_prem_cc(q);
                         }
                         // FPREM1 — IEEE-754 partial remainder (round-to-
                         // nearest quotient). Same single-step completion.
@@ -7507,7 +7560,7 @@ impl Cpu {
                             let st1 = self.fpu_st(1);
                             let q = (st0 / st1).round_ties_even();
                             self.fpu_set_st(0, st0 - st1 * q);
-                            self.fpu_sw &= !0x0400;
+                            self.fpu_set_prem_cc(q);
                         }
                         // FDECSTP / FINCSTP — rotate TOP without touching
                         // register contents.

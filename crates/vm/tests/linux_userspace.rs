@@ -5201,9 +5201,11 @@ fn build_initramfs_pipe_rt() -> Vec<u8> {
         out.extend_from_slice(&p2_ret_addr.to_le_bytes());
         // Emit fds IMMEDIATELY after pipe2 (before any write), so
         // F0/F1 reflect exactly what pipe2 populated, isolated from
-        // any later effect. (Finding: they read [0,0] — pipe2
-        // returns 0 but doesn't copy the fd pair to userspace on
-        // the Tinycore 15.x kernel.)
+        // any later effect. Before the REP-string #PF rollback fix
+        // (commit 253e751) these read [0,0] because pipe2's
+        // copy_to_user landed nothing on the fresh fds page; with the
+        // fix they hold the real fd pair (read end ≥3, write end =
+        // read+1) — see linux_userspace_pipe_milestone for the guard.
         w(m_p2_addr, m_p2.len() as u32, &mut out);
         w(p2_ret_addr, 4, &mut out);
         w(m_f0_addr, m_f0.len() as u32, &mut out);

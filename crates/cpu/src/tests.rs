@@ -6580,22 +6580,37 @@ fn fpu_fsincos() {
 }
 
 /// FPTAN: ST(0)=tan, then push 1.0 (so ST(0)=1.0, ST(1)=tan). We
-/// FSTP the 1.0 first, then the tan.
+/// FSTP the 1.0 first, then the tan. Uses π/3 (tan = √3 ≠ 1) so the
+/// pushed constant and the tan result are distinguishable — pinning
+/// both the push order and the actual tan value (an angle like π/4
+/// where tan==1 cannot detect a wrong function or a missing push).
 #[test]
 fn fpu_fptan() {
     use std::f64::consts::PI;
-    let r = run_fpu(&[PI / 4.0], &[0xD9, 0xF2], 2);
+    let r = run_fpu(&[PI / 3.0], &[0xD9, 0xF2], 2);
     assert!(fpu_close(r[0], 1.0), "FPTAN pushed {} (want 1.0)", r[0]);
-    assert!(fpu_close(r[1], 1.0), "tan(π/4) = {}, want 1.0", r[1]);
+    assert!(
+        fpu_close(r[1], (PI / 3.0).tan()),
+        "tan(π/3) = {}, want {}",
+        r[1],
+        (PI / 3.0).tan()
+    );
 }
 
 /// FPATAN: atan2(ST(1), ST(0)). With inputs [a, b] loaded so ST(1)=a,
-/// ST(0)=b → atan2(a, b). atan2(1, 1) = π/4.
+/// ST(0)=b → atan2(a, b). Uses ASYMMETRIC inputs so a swapped-operand
+/// implementation (atan2(ST0,ST1)) would fail: atan2(1,0)=π/2 while
+/// the swap gives atan2(0,1)=0; plus a quadrant case atan2(0,-1)=π
+/// that single-argument atan cannot produce.
 #[test]
 fn fpu_fpatan() {
     use std::f64::consts::PI;
-    let r = run_fpu(&[1.0, 1.0], &[0xD9, 0xF3], 1)[0];
-    assert!(fpu_close(r, PI / 4.0), "FPATAN(1,1) = {r}, want π/4");
+    let r = run_fpu(&[1.0, 0.0], &[0xD9, 0xF3], 1)[0]; // atan2(1, 0)
+    assert!(fpu_close(r, PI / 2.0), "FPATAN(1,0) = {r}, want π/2");
+    let r2 = run_fpu(&[0.0, -1.0], &[0xD9, 0xF3], 1)[0]; // atan2(0, -1)
+    assert!(fpu_close(r2, PI), "FPATAN(0,-1) = {r2}, want π");
+    let r3 = run_fpu(&[1.0, 1.0], &[0xD9, 0xF3], 1)[0]; // atan2(1, 1)
+    assert!(fpu_close(r3, PI / 4.0), "FPATAN(1,1) = {r3}, want π/4");
 }
 
 /// F2XM1: 2^x - 1. 2^3 - 1 = 7.
@@ -6722,13 +6737,35 @@ fn fpu_m80_roundtrip() {
         -1e-10,
         std::f64::consts::PI,
         1234.5678,
+        // Tiny normals — these exercise the decode-scale path that a
+        // naive `mantissa * 2f64.powi(exp-16383-63)` would zero out by
+        // underflowing the 2^k factor before the multiply.
+        1e-300,
+        -3.5e-310,
+        f64::MIN_POSITIVE, // smallest normal (~2.2e-308)
+        // Subnormals.
+        f64::from_bits(1), // smallest positive subnormal (~5e-324)
+        f64::from_bits(0x000f_ffff_ffff_ffff), // largest subnormal
+        -f64::from_bits(0x0008_0000_0000_0000),
+        // Large finite + the f64 extremes.
+        1e300,
+        f64::MAX,
+        f64::MIN,
     ] {
         let r = roundtrip(v);
-        assert_eq!(r.to_bits(), v.to_bits(), "m80 round-trip of {v} → {r}");
+        assert_eq!(r.to_bits(), v.to_bits(), "m80 round-trip of {v:e} → {r:e}");
     }
     // Negative zero must keep its sign through the round-trip.
     let nz = roundtrip(-0.0);
     assert!(nz == 0.0 && nz.is_sign_negative(), "−0.0 round-trip → {nz}");
+    // Infinities and NaN round-trip (NaN compared as a NaN, not bits,
+    // since the quiet-bit canonicalization may differ).
+    assert_eq!(roundtrip(f64::INFINITY), f64::INFINITY);
+    assert_eq!(roundtrip(f64::NEG_INFINITY), f64::NEG_INFINITY);
+    assert!(
+        roundtrip(f64::NAN).is_nan(),
+        "NaN should round-trip to a NaN"
+    );
 }
 
 /// FLD m80 decodes canonical extended-precision bit patterns: the
@@ -6771,6 +6808,92 @@ fn fpu_m80_decode_patterns() {
     assert_eq!(load_m80(0x8000_0000_0000_0000, 0xFFFF), f64::NEG_INFINITY);
     // NaN (exp all ones, non-zero fraction).
     assert!(load_m80(0xC000_0000_0000_0000, 0x7FFF).is_nan());
+}
+
+/// FSIN clears the C2 status bit ("argument reduced"). To prove the
+/// clear is *active* (not just that C2 happens to be 0), we first
+/// dirty C2 with `FTST` on a NaN (an unordered compare sets C3/C2/C0),
+/// snapshot the status, then run FSIN and snapshot again. The first
+/// read must have C2 set; the second must have it clear.
+#[test]
+fn fpu_fsin_clears_c2() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, f64::NAN);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, // FLD m64 [0x600] = NaN
+            0xD9, 0xE4, // FTST (compare NaN vs 0 → unordered, sets C2)
+            0xDF, 0xE0, // FNSTSW AX
+            0xA3, 0x50, 0x06, // mov [0x650], ax  (status BEFORE)
+            0xD9, 0xFE, // FSIN (clears C2)
+            0xDF, 0xE0, // FNSTSW AX
+            0xA3, 0x52, 0x06, // mov [0x652], ax  (status AFTER)
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    let before = mem.read_u16(0x650);
+    let after = mem.read_u16(0x652);
+    assert_ne!(
+        before & 0x0400,
+        0,
+        "FTST(NaN) should have set C2; sw={before:#06x}"
+    );
+    assert_eq!(after & 0x0400, 0, "FSIN should clear C2; sw={after:#06x}");
+}
+
+/// FPREM exposes the low three quotient bits in the condition codes
+/// (Intel SDM: C0←q bit2, C3←q bit1, C1←q bit0) and clears C2. For
+/// 11 mod 2 the truncated quotient is 5 = 0b101, so C0 and C1 are
+/// set, C3 and C2 clear. The remainder is 1.
+#[test]
+fn fpu_fprem_quotient_bits() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 2.0); // divisor → ST(1)
+    fpu_w64(&mut mem, 0x608, 11.0); // dividend → ST(0)
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, // FLD m64 [0x600] = 2
+            0xDD, 0x06, 0x08, 0x06, // FLD m64 [0x608] = 11 (ST0=11, ST1=2)
+            0xD9, 0xF8, // FPREM → ST0 = 1, quotient = 5
+            0xDF, 0xE0, // FNSTSW AX
+            0xA3, 0x50, 0x06, // mov [0x650], ax
+            0xDD, 0x1E, 0x58, 0x06, // FSTP m64 [0x658] = remainder
+            0xF4, // HLT
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(fpu_r64(&mem, 0x658), 1.0, "11 mod 2 should be 1");
+    let sw = mem.read_u16(0x650);
+    // quotient 5 = 0b101: C0 (bit2)=1, C3 (bit1)=0, C1 (bit0)=1, C2=0.
+    assert_ne!(sw & 0x0100, 0, "C0 should be set (q bit2); sw={sw:#06x}");
+    assert_ne!(sw & 0x0200, 0, "C1 should be set (q bit0); sw={sw:#06x}");
+    assert_eq!(sw & 0x4000, 0, "C3 should be clear (q bit1); sw={sw:#06x}");
+    assert_eq!(
+        sw & 0x0400,
+        0,
+        "C2 should be clear (complete); sw={sw:#06x}"
+    );
 }
 
 /// FPU compare → branch: `if (a > b)` on floats. FCOMP sets the
