@@ -284,6 +284,12 @@
 //!     Distinct from symlink: a hard link is a second dentry to
 //!     the SAME inode (shared data blocks), not a separate inode.
 //!
+//!   - `linux_userspace_getdents_milestone` — `sys_getdents64`
+//!     (220): /init mkdir's `/d`, creates `/d/ZZMARKER`, opens
+//!     `/d` and enumerates it. Test asserts the returned byte
+//!     count > 0 and the dirent buffer contains `b"ZZMARKER"`.
+//!     Pins directory enumeration — the `ls`/`readdir` primitive.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -747,6 +753,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let symlink = build_initramfs_symlink();
     let uname_safe = build_initramfs_uname_safe();
     let hardlink = build_initramfs_hardlink();
+    let getdents = build_initramfs_getdents();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -783,6 +790,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&symlink[0..6], b"070701");
     assert_eq!(&uname_safe[0..6], b"070701");
     assert_eq!(&hardlink[0..6], b"070701");
+    assert_eq!(&getdents[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -820,6 +828,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-symlink.cpio", &symlink);
         let _ = std::fs::write("/tmp/wwwvm-uname-safe.cpio", &uname_safe);
         let _ = std::fs::write("/tmp/wwwvm-hardlink.cpio", &hardlink);
+        let _ = std::fs::write("/tmp/wwwvm-getdents.cpio", &getdents);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -3806,6 +3815,170 @@ fn build_initramfs_hardlink() -> Vec<u8> {
             marker_post,
             &fd_zeros,
             &ret_zeros,
+            &buf_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init enumerates a directory:
+///
+///   sys_mkdir("/d", 0o755)
+///   fd = open("/d/ZZMARKER", O_CREAT|O_WRONLY, 0o644); close(fd)
+///   dirfd = open("/d", O_RDONLY|O_DIRECTORY)
+///   n = sys_getdents64(dirfd, buf, 512)   ; syscall 220
+///   close(dirfd)
+///   write `[USERSPACE DENTS=<n:4>BUF=` + buf[0..n] + `][USERSPACE END]\n`
+///
+/// The kernel fills `buf` with `struct linux_dirent64` records
+/// (`{u64 d_ino, s64 d_off, u16 d_reclen, u8 d_type, char d_name[]}`),
+/// one per entry — ".", "..", and "ZZMARKER". The test asserts
+/// `n > 0` and that the byte string `b"ZZMARKER"` appears in the
+/// dumped buffer (the NUL-terminated d_name of our created file).
+///
+/// Pins directory enumeration end-to-end: the kernel walks the
+/// dir inode's children and serializes their dirent records into
+/// a user buffer — the primitive every `ls`/`readdir` needs.
+fn build_initramfs_getdents() -> Vec<u8> {
+    let dir_path: &[u8] = b"/d\0";
+    let file_path: &[u8] = b"/d/ZZMARKER\0";
+    let marker_pre: &[u8] = b"[USERSPACE DENTS=";
+    let marker_mid: &[u8] = b"BUF=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |dir_path_addr: u32,
+                      file_path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      n_buf_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(320);
+        // sys_mkdir("/d", 0o755) — sys 39
+        out.extend_from_slice(&[0xB8, 0x27, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&dir_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0xED, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd = open("/d/ZZMARKER", O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&file_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // dirfd = open("/d", O_RDONLY|O_DIRECTORY=0x10000)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&dir_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x00, 0x00, 0x01, 0x00]); // mov ecx, 0x10000
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[fd] = dirfd
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // n = sys_getdents64(dirfd, buf, 512) — sys 220
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0xDC, 0x00, 0x00, 0x00]); // mov eax, 220
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x00, 0x02, 0x00, 0x00]); // mov edx, 512
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[n_buf] = eax (byte count)
+        out.extend_from_slice(&n_buf_addr.to_le_bytes());
+        // close(dirfd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, n_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&n_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, n)  — edx = ds:[n_buf]
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0x8B, 0x15]); // mov edx, ds:[n_buf]
+        out.extend_from_slice(&n_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let dir_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let file_path_addr = dir_path_addr + dir_path.len() as u32;
+    let marker_pre_addr = file_path_addr + file_path.len() as u32;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_post_addr = marker_mid_addr + marker_mid.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let n_buf_addr = fd_addr + 4;
+    let buf_addr = n_buf_addr + 4;
+    let code = build_code(
+        dir_path_addr,
+        file_path_addr,
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_post_addr,
+        fd_addr,
+        n_buf_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let n_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 512];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            dir_path,
+            file_path,
+            marker_pre,
+            marker_mid,
+            marker_post,
+            &fd_zeros,
+            &n_zeros,
             &buf_zeros,
         ],
         7,
@@ -7127,6 +7300,88 @@ fn linux_userspace_hardlink_milestone() {
         "expected content via /b = b\"HARDLINK\" (shared inode), got {:02X?}; {}",
         data,
         dump_uart_on_failure(&cumulative, "hardlink-wrong")
+    );
+}
+
+/// `sys_getdents64` milestone: /init mkdir's `/d`, creates
+/// `/d/ZZMARKER`, opens `/d` and calls getdents64. Test asserts
+/// the returned byte count > 0 and the dirent buffer contains the
+/// byte string `b"ZZMARKER"` (the d_name of the created file).
+/// Pins directory enumeration — the primitive `ls`/`readdir` need.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_getdents_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_getdents();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE DENTS=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — getdents64 or the dir \
+                 open may have failed; {}",
+                dump_uart_on_failure(&cumulative, "getdents")
+            )
+        });
+    eprintln!("getdents milestone end marker after {steps} steps");
+
+    // The dirent buffer is binary (d_ino/d_off may contain 0x0A
+    // that the kernel TTY ONLCR-pads). Strip `\r\n` → `\n` so the
+    // 4-byte count decodes correctly. The "ZZMARKER" filename has
+    // no 0x0A, so it survives intact and is searchable in either
+    // form; we search the stripped buffer for consistency.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let n_off = pre_pos + marker_pre.len();
+    let n = u32::from_le_bytes(stripped[n_off..n_off + 4].try_into().unwrap());
+    let has_name = stripped.windows(8).any(|w| w == b"ZZMARKER")
+        || cumulative.windows(8).any(|w| w == b"ZZMARKER");
+    eprintln!("getdents64 returned n = {n} bytes; ZZMARKER present = {has_name}");
+    assert!(
+        (n as i32) > 0,
+        "expected getdents64 to return a positive byte count, got {} ({}); {}",
+        n,
+        n as i32,
+        dump_uart_on_failure(&cumulative, "getdents-count")
+    );
+    assert!(
+        has_name,
+        "expected the dirent buffer to contain the filename b\"ZZMARKER\" (n={n}); \
+         directory enumeration didn't surface the created entry; {}",
+        dump_uart_on_failure(&cumulative, "getdents-name")
     );
 }
 
