@@ -155,4 +155,40 @@ mod tests {
             assert_eq!(pci.read(0xCFC + i), 0xFF);
         }
     }
+
+    /// snapshot/restore must round-trip the latched 32-bit address
+    /// register so a snapshot taken mid-config-cycle resumes at
+    /// the same probe address. Without it, the kernel issues a
+    /// data-port read post-restore and we return 0xFFFFFFFF for
+    /// what the kernel thought was a different register — silently
+    /// wrong sub-system behavior. Companion to the CMOS/PIC/UART/
+    /// keyboard round-trip tests in this series.
+    #[test]
+    fn snapshot_round_trip_preserves_latched_address() {
+        let mut pci = Pci::new();
+        let want: u32 = 0x8000_4321;
+        for i in 0..4u16 {
+            pci.write(0xCF8 + i, (want >> (i * 8)) as u8);
+        }
+        let mut buf = Vec::new();
+        pci.snapshot_into(&mut buf);
+        assert_eq!(buf.len(), 4);
+
+        let mut pci2 = Pci::new();
+        let consumed = pci2.restore(&buf).expect("restore");
+        assert_eq!(consumed, 4);
+        let mut got = 0u32;
+        for i in 0..4u16 {
+            got |= (pci2.read(0xCF8 + i) as u32) << (i * 8);
+        }
+        assert_eq!(got, want);
+    }
+
+    /// restore must reject a truncated blob rather than panic.
+    /// 4-byte address takes exactly 4 bytes; any less is corruption.
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let mut pci = Pci::new();
+        assert!(pci.restore(&[0u8; 3]).is_err());
+    }
 }
