@@ -243,4 +243,55 @@ mod tests {
         assert_eq!(u.read(Uart::COM1_BASE), b'a');
         assert_eq!(u.read(Uart::COM1_BASE + 2), 0x02);
     }
+
+    /// snapshot/restore must round-trip IER (which IRQs the kernel
+    /// expects) and both buffers (TX bytes the host hasn't drained
+    /// yet, plus RX bytes the guest hasn't read). A regression in
+    /// any of the three would silently corrupt boot-resume:
+    ///   - IER: kernel handlers fire at wrong times
+    ///   - TX: host loses un-drained guest output
+    ///   - RX: guest sees a quiet UART after wake-up
+    #[test]
+    fn snapshot_round_trip_preserves_ier_and_both_buffers() {
+        let mut u = Uart::com1();
+        u.write(Uart::COM1_BASE + 1, 0x03); // IER = RDA + THRE
+        u.write(Uart::COM1_BASE, b'H'); // TX collects bytes
+        u.write(Uart::COM1_BASE, b'i');
+        u.push_rx(b"yo!"); // RX from the host
+
+        let mut buf = Vec::new();
+        u.snapshot_into(&mut buf);
+        // Format: IER(1) + tx_len(4) + tx_bytes(2) + rx_len(4) + rx(3) = 14
+        assert_eq!(buf.len(), 14);
+
+        let mut u2 = Uart::com1();
+        let consumed = u2.restore(&buf).expect("restore");
+        assert_eq!(consumed, 14);
+
+        // IER survived — IRQ still latches RDA/THRE.
+        assert!(u2.irq_pending());
+        // TX buffer survived; drain_tx returns exactly what was
+        // collected pre-snapshot.
+        assert_eq!(u2.drain_tx(), b"Hi");
+        // RX buffer survived in FIFO order — three pops drain it.
+        assert_eq!(u2.read(Uart::COM1_BASE), b'y');
+        assert_eq!(u2.read(Uart::COM1_BASE), b'o');
+        assert_eq!(u2.read(Uart::COM1_BASE), b'!');
+    }
+
+    /// restore must reject malformed inputs rather than panic.
+    /// Three failure modes: <5 bytes header (IER + tx_len missing);
+    /// tx_len says more bytes follow than payload contains;
+    /// rx_len same kind of overflow.
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let mut u = Uart::com1();
+        assert!(u.restore(&[0u8; 4]).is_err(), "header truncated");
+        // IER=0, tx_len=10, only 2 bytes follow — overflow.
+        let bad_tx = [0u8, 10, 0, 0, 0, 1, 2];
+        assert!(u.restore(&bad_tx).is_err(), "tx truncated");
+        // Valid header + 0-byte tx + rx_len=5 + only 2 rx bytes — overflow.
+        let bad_rx = [0u8, 0, 0, 0, 0, 5, 0, 0, 0, 1, 2];
+        assert!(u.restore(&bad_rx).is_err(), "rx truncated");
+    }
 }
