@@ -254,6 +254,29 @@ fn init_cpio_archives_start_with_newc_magic() {
     }
 }
 
+/// Pin `build_initramfs_uname` as the canonical reproducer of the
+/// /init-binary-size-600 stall: extract the /init filesize from
+/// the cpio header (field 6 of the 13 ASCII-hex fields after the
+/// 6-byte magic) and assert it lands inside the bad range we
+/// bisected. If a future refactor accidentally changes the code
+/// layout enough to push the binary out of 600..=602, the
+/// "canonical reproducer" loses its bug-reproducing property and
+/// this test fails — prompting a re-bisection.
+#[test]
+fn build_initramfs_uname_lands_in_the_bad_binary_size_range() {
+    let cpio = build_initramfs_uname();
+    // cpio newc header: 6-byte magic + 13 8-byte ASCII-hex fields.
+    // Field 6 (0-indexed) is c_filesize.
+    let filesize_field = std::str::from_utf8(&cpio[6 + 6 * 8..6 + 7 * 8]).unwrap();
+    let init_size = u32::from_str_radix(filesize_field, 16).unwrap();
+    assert!(
+        (600..=602).contains(&init_size),
+        "build_initramfs_uname produced /init of size {init_size}; \
+         expected in 600..=602 (the known-bad range from the bisection \
+         that lives in this builder's doc-block)"
+    );
+}
+
 /// Build a cpio whose /init mounts procfs at /proc and reads
 /// /proc/version, printing it to stdout bracketed by a unique
 /// marker so the test can distinguish it from the kernel's own
