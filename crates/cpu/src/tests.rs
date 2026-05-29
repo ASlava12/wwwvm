@@ -6683,6 +6683,96 @@ fn fpu_chained_identity() {
     );
 }
 
+/// FLD m80 / FSTP m80 round-trip: an f64 stored as 80-bit extended
+/// and reloaded must come back bit-identical (f80 strictly contains
+/// f64). Program: FLD m64 [0x600] ; FSTP m80 [0x620] ; FLD m80
+/// [0x620] ; FSTP m64 [0x640] ; HLT.
+#[test]
+fn fpu_m80_roundtrip() {
+    fn roundtrip(v: f64) -> f64 {
+        let mut mem = Memory::new(0x10_0000);
+        fpu_w64(&mut mem, 0x600, v);
+        mem.write_slice(
+            0x7C00,
+            &[
+                0xDD, 0x06, 0x00, 0x06, // FLD m64 [0x600]
+                0xDB, 0x3E, 0x20, 0x06, // FSTP m80 [0x620]
+                0xDB, 0x2E, 0x20, 0x06, // FLD m80 [0x620]
+                0xDD, 0x1E, 0x40, 0x06, // FSTP m64 [0x640]
+                0xF4, // HLT
+            ],
+        );
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..24 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert!(cpu.halted);
+        fpu_r64(&mem, 0x640)
+    }
+    for &v in &[
+        1.0,
+        -2.5,
+        0.0,
+        1e10,
+        -1e-10,
+        std::f64::consts::PI,
+        1234.5678,
+    ] {
+        let r = roundtrip(v);
+        assert_eq!(r.to_bits(), v.to_bits(), "m80 round-trip of {v} → {r}");
+    }
+    // Negative zero must keep its sign through the round-trip.
+    let nz = roundtrip(-0.0);
+    assert!(nz == 0.0 && nz.is_sign_negative(), "−0.0 round-trip → {nz}");
+}
+
+/// FLD m80 decodes canonical extended-precision bit patterns: the
+/// integer-bit-set significand 0x8000_0000_0000_0000 with biased
+/// exponent gives exact powers/values. 1.0 = (0x8000…, exp 0x3FFF).
+#[test]
+fn fpu_m80_decode_patterns() {
+    fn load_m80(mant: u64, se: u16) -> f64 {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_u32(0x620, mant as u32);
+        mem.write_u32(0x624, (mant >> 32) as u32);
+        mem.write_u16(0x628, se);
+        mem.write_slice(
+            0x7C00,
+            &[
+                0xDB, 0x2E, 0x20, 0x06, // FLD m80 [0x620]
+                0xDD, 0x1E, 0x40, 0x06, // FSTP m64 [0x640]
+                0xF4, // HLT
+            ],
+        );
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..16 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        assert!(cpu.halted);
+        fpu_r64(&mem, 0x640)
+    }
+    // 1.0, 2.0, 0.5, -1.0 in 80-bit extended.
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0x3FFF), 1.0);
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0x4000), 2.0);
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0x3FFE), 0.5);
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0xBFFF), -1.0);
+    // +∞ (exp all ones, fraction zero, integer bit set).
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0x7FFF), f64::INFINITY);
+    assert_eq!(load_m80(0x8000_0000_0000_0000, 0xFFFF), f64::NEG_INFINITY);
+    // NaN (exp all ones, non-zero fraction).
+    assert!(load_m80(0xC000_0000_0000_0000, 0x7FFF).is_nan());
+}
+
 /// FPU compare → branch: `if (a > b)` on floats. FCOMP sets the
 /// C0/C2/C3 condition bits, FNSTSW AX copies the status word to AX,
 /// SAHF moves C0→CF / C3→ZF, and JA branches when above. This is

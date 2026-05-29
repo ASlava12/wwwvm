@@ -1677,6 +1677,71 @@ impl Cpu {
         }
     }
 
+    /// Decode an 80-bit x87 extended-precision value (the `m80`/long
+    /// double format) into f64. `mantissa` is the 64-bit explicit
+    /// significand (integer bit in bit 63); `se` is the 16-bit
+    /// sign+exponent word (bit 15 = sign, bits 0..14 = exponent,
+    /// bias 16383). We store the x87 stack as f64, so this is lossy
+    /// for the extra 11 mantissa bits — but functional, which beats
+    /// erroring on every `FLD m80` glibc's libm emits.
+    fn f80_to_f64(mantissa: u64, se: u16) -> f64 {
+        let sign = if se & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = (se & 0x7fff) as i32;
+        if exp == 0x7fff {
+            // Inf (fraction bits zero) or NaN.
+            return if mantissa & 0x7fff_ffff_ffff_ffff == 0 {
+                sign * f64::INFINITY
+            } else {
+                f64::NAN
+            };
+        }
+        if exp == 0 && mantissa == 0 {
+            return sign * 0.0;
+        }
+        // value = mantissa * 2^(exp - 16383 - 63). Out-of-f64-range
+        // exponents saturate to ±inf, matching a real demotion.
+        sign * (mantissa as f64) * 2f64.powi(exp - 16383 - 63)
+    }
+
+    /// Encode an f64 into the 80-bit x87 extended format, returning
+    /// (mantissa, sign+exponent). The inverse of `f80_to_f64`; the
+    /// stored value is exact for any f64 (f80 strictly contains f64).
+    fn f64_to_f80(v: f64) -> (u64, u16) {
+        let bits = v.to_bits();
+        let sign16 = if bits >> 63 != 0 { 0x8000u16 } else { 0 };
+        let exp = ((bits >> 52) & 0x7ff) as i32;
+        let frac = bits & 0x000f_ffff_ffff_ffff; // 52-bit fraction
+        if exp == 0x7ff {
+            // Inf → integer bit only; NaN → quiet NaN pattern.
+            let mant = if frac == 0 {
+                0x8000_0000_0000_0000
+            } else {
+                0xC000_0000_0000_0000
+            };
+            return (mant, sign16 | 0x7fff);
+        }
+        if exp == 0 && frac == 0 {
+            return (0, sign16); // ±0
+        }
+        let (frac53, unbiased) = if exp == 0 {
+            // Subnormal f64: normalize the fraction up to a leading 1.
+            let mut f = frac;
+            let mut e = -1022i32;
+            while f & 0x0010_0000_0000_0000 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            (f & 0x000f_ffff_ffff_ffff, e)
+        } else {
+            (frac, exp - 1023)
+        };
+        // Explicit integer bit (bit 63) plus the 52-bit fraction
+        // left-justified into bits 62..11.
+        let mantissa = 0x8000_0000_0000_0000u64 | (frac53 << 11);
+        let se = sign16 | (((unbiased + 16383) as u16) & 0x7fff);
+        (mantissa, se)
+    }
+
     /// Fetch the direct memory offset that follows a `moffs`-form MOV
     /// (0xA0..0xA3). 16-bit under the default address size, 32-bit
     /// when the 0x67 prefix set `addr_size_32`.
@@ -7260,6 +7325,24 @@ impl Cpu {
                         3 => {
                             let v = self.fpu_pop();
                             self.mem_write_u32(mem, addr, (v as i32) as u32);
+                        }
+                        // FLD m80 — load an 80-bit extended-precision
+                        // value (long double) and push it (demoted to
+                        // our f64 stack representation).
+                        5 => {
+                            let lo = self.mem_read_u32(mem, addr) as u64;
+                            let hi = self.mem_read_u32(mem, addr + 4) as u64;
+                            let se = self.mem_read_u16(mem, addr + 8);
+                            self.fpu_push(Self::f80_to_f64(lo | (hi << 32), se));
+                        }
+                        // FSTP m80 — pop ST(0) and store it as an
+                        // 80-bit extended value (10 bytes).
+                        7 => {
+                            let v = self.fpu_pop();
+                            let (mant, se) = Self::f64_to_f80(v);
+                            self.mem_write_u32(mem, addr, mant as u32);
+                            self.mem_write_u32(mem, addr + 4, (mant >> 32) as u32);
+                            self.mem_write_u16(mem, addr + 8, se);
                         }
                         _ => {
                             return Err(CpuError::Unimplemented {
