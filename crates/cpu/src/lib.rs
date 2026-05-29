@@ -905,15 +905,13 @@ impl Cpu {
     // A=0 to estimate page activity; on our boot path no reclaim
     // ever runs (we hit the kernel-init → /init → exit panic chain
     // long before kswapd activates), so the user-visible difference
-    // is zero. A previous attempt to support A/D via deferred
-    // writeback (a 1-slot Cell flushed at step start) regressed three
-    // page-table unit tests: a user-mode `MOV [pde]` would land 4
-    // bytes of user data, then the next step's flush would overwrite
-    // those bytes with the *pre-write* PDE OR'd with A/D bits,
-    // silently undoing the write. The fix would be a per-write
-    // same-word check that drops the pending update, which works
-    // but is fragile and doesn't actually buy anything on a real
-    // workload. Tracking the work item in commit messages instead.
+    // is zero. The deferred-writeback attempt that motivated this
+    // decision (1-slot Cell flushed at step start) regressed three
+    // page-table unit tests by clobbering user data writes; see
+    // `c893f2f` for the post-mortem. A per-write same-word filter
+    // would unbreak those tests but is fragile and brings no
+    // workload-level win — leaving A/D unsupported is the load-
+    // bearing call.
     fn translate_inner(&self, mem: &Memory, linear: u32, access: Access) -> u32 {
         let phys = if self.cr0 & 0x8000_0000 == 0 {
             linear
