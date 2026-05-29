@@ -4888,6 +4888,128 @@ fn build_initramfs_read_stdin() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init exercises `sys_poll` on a pipe: it makes
+/// a pipe, writes one byte into it (so the read end becomes
+/// readable), then `poll([{fd: read_end, events: POLLIN}], 1,
+/// timeout=0)` and emits the poll return plus the raw 8-byte
+/// `pollfd` struct:
+/// `[USERSPACE POLL=<4>PFD=<8>][USERSPACE END]`.
+///
+/// Pins the readiness-notification path:
+///   * `poll` `copy_from_user`s the pollfd array (reads `events`),
+///   * the kernel's pipe `->poll` reports POLLIN because a byte is
+///     buffered,
+///   * `poll` `copy_to_user`s `revents` back into the (fresh) user
+///     struct and returns the count of ready fds.
+///
+/// The test asserts `poll` returns 1 and `revents & POLLIN` is set.
+fn build_initramfs_poll_pipe() -> Vec<u8> {
+    let msg: &[u8] = b"X";
+    let m_poll: &[u8] = b"[USERSPACE POLL=";
+    let m_pfd: &[u8] = b"PFD=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |m_poll_addr: u32,
+                      m_pfd_addr: u32,
+                      m_end_addr: u32,
+                      msg_addr: u32,
+                      fds_addr: u32,
+                      pollfd_addr: u32,
+                      pollret_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // pipe2(&fds, 0) — sys 331
+        out.extend_from_slice(&[0xB8, 0x4B, 0x01, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(fds[1], msg, 1) — make the read end readable
+        out.push(0xA1); // mov eax, ds:[fds+4]
+        out.extend_from_slice(&(fds_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // pollfd.fd = fds[0]
+        out.push(0xA1); // mov eax, ds:[fds]
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.push(0xA3); // mov ds:[pollfd], eax
+        out.extend_from_slice(&pollfd_addr.to_le_bytes());
+        // pollfd.events = POLLIN(1), pollfd.revents = 0
+        // (one 32-bit store: low16 = events, high16 = revents).
+        out.extend_from_slice(&[0xC7, 0x05]); // mov dword ds:[pollfd+4], imm32
+        out.extend_from_slice(&(pollfd_addr + 4).to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        // poll(&pollfd, 1, 0) — sys 168
+        out.extend_from_slice(&[0xB8, 0xA8, 0x00, 0x00, 0x00]); // mov eax, 168
+        out.push(0xBB);
+        out.extend_from_slice(&pollfd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1 (nfds)
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (timeout=0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[pollret], eax
+        out.extend_from_slice(&pollret_addr.to_le_bytes());
+        // emit POLL=<ret> PFD=<8-byte struct> END
+        w(m_poll_addr, m_poll.len() as u32, &mut out);
+        w(pollret_addr, 4, &mut out);
+        w(m_pfd_addr, m_pfd.len() as u32, &mut out);
+        w(pollfd_addr, 8, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let m_poll_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_pfd_addr = m_poll_addr + m_poll.len() as u32;
+    let m_end_addr = m_pfd_addr + m_pfd.len() as u32;
+    let msg_addr = m_end_addr + m_end.len() as u32;
+    let fds_addr = msg_addr + msg.len() as u32;
+    let pollfd_addr = fds_addr + 8;
+    let pollret_addr = pollfd_addr + 8;
+    let code = build_code(
+        m_poll_addr,
+        m_pfd_addr,
+        m_end_addr,
+        msg_addr,
+        fds_addr,
+        pollfd_addr,
+        pollret_addr,
+    );
+    let fds_zeros = [0u8; 8];
+    let pollfd_zeros = [0u8; 8];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            m_poll,
+            m_pfd,
+            m_end,
+            msg,
+            &fds_zeros,
+            &pollfd_zeros,
+            &ret_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Diagnostic /init for the prior `sys_pipe`-broken blocker
 /// investigation: calls `sys_pipe2(&fds, 0)` then writes eax +
 /// fd slots without touching the pipe further. Kept around as
@@ -9142,6 +9264,104 @@ fn linux_userspace_pipe_milestone() {
         "the bytes read back from the pipe should be \"PIPE\"; got {:?}",
         buf.as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+}
+
+/// Milestone: `sys_poll` readiness on a pipe. `/init` makes a pipe,
+/// writes one byte into it, then polls the read end for POLLIN with
+/// a zero timeout and reports `poll`'s return and the raw pollfd
+/// struct. Asserts `poll` returns 1 and `revents & POLLIN` is set.
+/// Pins the poll syscall + pollfd copy-in/copy-out + the kernel's
+/// pipe readiness reporting — the foundation of every event loop
+/// and shell `select`/`poll`.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_poll_pipe_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_poll_pipe();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — pipe/poll likely failed; {}",
+            dump_uart_on_failure(&cumulative, "poll-pipe")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let find_after = |marker: &[u8]| -> Option<usize> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .map(|p| p + marker.len())
+    };
+
+    let poll_ret = find_after(b"[USERSPACE POLL=")
+        .and_then(|o| stripped.get(o..o + 4))
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as i32)
+        .unwrap_or_else(|| {
+            panic!(
+                "POLL marker not found; {}",
+                dump_uart_on_failure(&cumulative, "poll-marker")
+            )
+        });
+    let pfd_off = find_after(b"PFD=").unwrap_or_else(|| {
+        panic!(
+            "PFD marker not found; {}",
+            dump_uart_on_failure(&cumulative, "pfd-marker")
+        )
+    });
+    let pfd = stripped
+        .get(pfd_off..pfd_off + 8)
+        .expect("8 bytes of pollfd after PFD=");
+    let fd = i32::from_le_bytes(pfd[0..4].try_into().unwrap());
+    let events = u16::from_le_bytes(pfd[4..6].try_into().unwrap());
+    let revents = u16::from_le_bytes(pfd[6..8].try_into().unwrap());
+    eprintln!("poll ret={poll_ret}, pollfd{{fd={fd}, events={events:#x}, revents={revents:#x}}}");
+
+    const POLLIN: u16 = 0x0001;
+    assert_eq!(
+        poll_ret,
+        1,
+        "poll should report exactly 1 ready fd (the readable pipe), got {poll_ret}; {}",
+        dump_uart_on_failure(&cumulative, "poll-ret")
+    );
+    assert_eq!(
+        events, POLLIN,
+        "events should be unchanged (POLLIN); got {events:#x}"
+    );
+    assert!(
+        revents & POLLIN != 0,
+        "revents should have POLLIN set (the pipe has a buffered byte), got {revents:#x}; {}",
+        dump_uart_on_failure(&cumulative, "poll-revents")
     );
 }
 
