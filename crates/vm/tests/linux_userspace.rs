@@ -405,6 +405,52 @@ fn linux_userspace_hello_padded_to_600_milestone() {
     );
 }
 
+/// Test the "mod 8" hypothesis. Observed: {600 mod 8 = 0, 602
+/// mod 8 = 2} hang; {601, 604, 605} all have mod 8 ∉ {0, 2} and
+/// pass. /init at size 608 (= 8 × 76, mod 8 = 0) tests whether
+/// the bad set is "N mod 8 ∈ {0, 2}" or just the singletons
+/// {600, 602}.
+#[test]
+#[ignore = "mod-8 hypothesis probe (size 608); ~52 s or ~9 min"]
+fn linux_userspace_hello_padded_to_608_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hello_padded_to(608);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "/init=608 HANGS — mod-8 hypothesis holds! Bad set is much wider \
+             than {{600, 602}}: every size with N mod 8 ∈ {{0, 2}}; {}",
+            dump_uart_on_failure(&cumulative, "hello-608")
+        )
+    });
+    eprintln!(
+        "/init=608 passes at {steps} steps — mod-8 hypothesis WRONG; \
+         bad set really is just {{600, 602}} (or similar tiny set)"
+    );
+}
+
 /// Probe whether /init binary size 601 (the only untested point
 /// in the bad range — 600 and 602 are confirmed-hanging) is also
 /// bad. If this hangs, the entire 600..=602 range is direct
