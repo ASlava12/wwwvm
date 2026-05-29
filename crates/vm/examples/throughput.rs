@@ -41,7 +41,11 @@ fn main() {
     } else {
         "release"
     };
-    println!("build:           {mode}");
+    // Throughput varies a lot by host arch — Rust codegen does
+    // very different things with our dispatch chains on x86_64 vs
+    // aarch64 — so print the target so a comparison across hosts
+    // doesn't accidentally compare different builds.
+    println!("build:           {mode} ({})", std::env::consts::ARCH);
     println!("instructions:    {steps}");
     println!("wall time:       {elapsed:.3?}");
     println!("throughput:      {ips} inst/sec ({mips:.2} MIPS)");
