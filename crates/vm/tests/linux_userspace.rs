@@ -276,6 +276,30 @@ fn build_initramfs_proc_version() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ true)
 }
 
+/// Pretty-print a marker-search failure: dump the *full* UART
+/// stream to a stable path under `/tmp` (the same directory the
+/// vmlinuz already lives in) so a debugger can grep it without
+/// re-running, and inline the last 4 KiB into the panic message
+/// for at-a-glance triage. 2 KiB turned out to be too small for
+/// debugging the `uname` /init attempt — the kernel printed
+/// 8 KiB+ of SCSI/PATA probe traffic between the last useful
+/// marker and the budget expiry. 4 KiB inline + full file dump
+/// covers both shallow and deep diagnosis without spamming the
+/// terminal indefinitely.
+fn dump_uart_on_failure(cumulative: &[u8], slug: &str) -> String {
+    let path = format!("/tmp/wwwvm-userspace-{slug}-failure.bin");
+    let footer = match std::fs::write(&path, cumulative) {
+        Ok(()) => format!(" (full {} bytes also dumped to {})", cumulative.len(), path),
+        Err(_) => String::new(),
+    };
+    let tail_start = cumulative.len().saturating_sub(4096);
+    format!(
+        "last 4 KiB of UART output{}:\n{}",
+        footer,
+        String::from_utf8_lossy(&cumulative[tail_start..])
+    )
+}
+
 /// Drive the boot for up to `step_budget` instructions, draining
 /// UART output in 100M-step chunks, appending it to `cumulative`,
 /// and looking for `needle` anywhere in the cumulative output.
@@ -357,11 +381,9 @@ fn linux_userspace_milestone() {
         &mut cumulative,
     )
     .unwrap_or_else(|()| {
-        let tail_start = cumulative.len().saturating_sub(1024);
         panic!(
-            "HELLO FROM USERSPACE not seen in 16 B steps; \
-             last 1 KiB of UART output:\n{}",
-            String::from_utf8_lossy(&cumulative[tail_start..])
+            "HELLO FROM USERSPACE not seen in 16 B steps; {}",
+            dump_uart_on_failure(&cumulative, "hello")
         )
     });
     eprintln!("HELLO FROM USERSPACE found after {hello_steps} steps");
@@ -379,11 +401,10 @@ fn linux_userspace_milestone() {
         &mut cumulative,
     )
     .unwrap_or_else(|()| {
-        let tail_start = cumulative.len().saturating_sub(1024);
         panic!(
             "kernel panic line `exitcode=0x00002a00` not seen in \
-             +4 B steps after HELLO; last 1 KiB of UART:\n{}",
-            String::from_utf8_lossy(&cumulative[tail_start..])
+             +4 B steps after HELLO; {}",
+            dump_uart_on_failure(&cumulative, "panic-exitcode")
         )
     });
     eprintln!("panic exit code seen after {panic_steps} additional steps");
@@ -427,11 +448,9 @@ fn linux_userspace_proc_version_milestone() {
         &mut cumulative,
     )
     .unwrap_or_else(|()| {
-        let tail_start = cumulative.len().saturating_sub(2048);
         panic!(
-            "[USERSPACE /proc/version]: Linux version` marker not seen in 16 B steps; \
-             last 2 KiB of UART output:\n{}",
-            String::from_utf8_lossy(&cumulative[tail_start..])
+            "[USERSPACE /proc/version]: Linux version` marker not seen in 16 B steps; {}",
+            dump_uart_on_failure(&cumulative, "proc-version")
         )
     });
     eprintln!("/proc/version userspace read seen after {steps} steps");
