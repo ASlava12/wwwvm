@@ -150,6 +150,13 @@ fn main() {
     vm.start_protected_mode_at(bz.code32_start);
     println!("entered PM at 0x{:08X}", bz.code32_start);
 
+    // WWWVM_QUIET=1 suppresses the noisy per-chunk "UART pushed N
+    // bytes:" dump. Useful when the actual UART stream is being
+    // piped elsewhere and the example's running just for its
+    // EIP/CR0/CR2/IF transition log. The transition diagnostics
+    // stay on because they're rare (once per state change).
+    let quiet = env::var_os("WWWVM_QUIET").is_some();
+
     // Step in chunks so we can watch EIP / CR0.PG / CS transitions.
     let t0 = Instant::now();
     let mut steps = 0u64;
@@ -485,12 +492,14 @@ fn main() {
                         pending_echo = None;
                     }
                 }
-                println!(
-                    "[{:>10}] UART pushed {} bytes: {:?}",
-                    steps,
-                    out.len(),
-                    String::from_utf8_lossy(&out)
-                );
+                if !quiet {
+                    println!(
+                        "[{:>10}] UART pushed {} bytes: {:?}",
+                        steps,
+                        out.len(),
+                        String::from_utf8_lossy(&out)
+                    );
+                }
             }
         }
     }
