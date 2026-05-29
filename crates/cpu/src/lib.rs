@@ -7239,13 +7239,19 @@ impl Cpu {
                             self.write_r16(reg, v as u16);
                         }
                     }
-                    // MOVZX r32, r/m16 — 0x0F 0xB7. Zero-extends a
-                    // word into a dword. (16-bit dest with 0x66 would
-                    // be a no-op MOV; we treat reg as r32 always.)
+                    // MOVZX r16/32, r/m16 — 0x0F 0xB7. Zero-extend a
+                    // word. Under 0x66 (op_size_32 == false) the dest is
+                    // r16, which must write only the low 16 bits and
+                    // PRESERVE the upper half of the 32-bit register
+                    // (behaves like MOV r16, r/m16); else dest is r32.
                     0xB7 => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_rm16(rm, mem);
-                        self.write_r32(reg, v as u32);
+                        if self.op_size_32 {
+                            self.write_r32(reg, v as u32);
+                        } else {
+                            self.write_r16(reg, v);
+                        }
                     }
                     // MOVSX r16/32, r/m8 — 0x0F 0xBE. Sign-extend.
                     0xBE => {
@@ -7257,11 +7263,19 @@ impl Cpu {
                             self.write_r16(reg, v as i16 as u16);
                         }
                     }
-                    // MOVSX r32, r/m16 — 0x0F 0xBF.
+                    // MOVSX r16/32, r/m16 — 0x0F 0xBF. Under 0x66
+                    // (op_size_32 == false) the dest is r16 and source is
+                    // r/m16, so this is effectively MOV r16, r/m16: write
+                    // only the low 16 bits, preserving the upper half;
+                    // else sign-extend the word into the 32-bit dest.
                     0xBF => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_rm16(rm, mem) as i16;
-                        self.write_r32(reg, v as i32 as u32);
+                        if self.op_size_32 {
+                            self.write_r32(reg, v as i32 as u32);
+                        } else {
+                            self.write_r16(reg, v as u16);
+                        }
                     }
 
                     // SETcc r/m8 — 0x0F 0x90..0x9F. Writes 1 to the

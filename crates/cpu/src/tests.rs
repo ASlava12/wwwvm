@@ -9268,6 +9268,56 @@ fn shrd_r16_sets_cf_to_last_bit_shifted_out() {
     assert!(cpu.has(flag::CF), "SHRD must set CF to bit shifted out (1)");
 }
 
+/// MOVZX r16, r/m16 (0x66 0F B7 in 32-bit code) must write only the
+/// 16-bit destination and preserve the upper half of the 32-bit
+/// register. Regression: the handler always wrote the full r32, zeroing
+/// the upper half.
+#[test]
+fn movzx_r16_rm16_preserves_upper_half_under_0x66() {
+    let mut mem = Memory::new(0x10_0000);
+    // 66 0F B7 C3 = MOVZX AX, BX (modrm C3: reg=000 AX, rm=011 BX) ; HLT
+    mem.write_slice(0x7C00, &[0x66, 0x0F, 0xB7, 0xC3, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true; // 0x66 then selects 16-bit operands
+    cpu.ip = 0x7C00;
+    cpu.write_r32(r16::BX as u8, 0x1234_5678);
+    cpu.write_r32(r16::AX as u8, 0xAAAA_BBBB);
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    assert_eq!(cpu.regs[r16::AX], 0x5678, "AX = BX low word");
+    assert_eq!(
+        cpu.read_r32(r16::AX as u8),
+        0xAAAA_5678,
+        "upper half of EAX must be preserved by MOVZX r16,r/m16"
+    );
+}
+
+/// MOVSX r16, r/m16 (0x66 0F BF in 32-bit code) is effectively
+/// MOV r16, r/m16: write only the low 16 bits, preserve the upper half.
+/// Regression: the handler sign-extended into the full r32, overwriting
+/// the upper half with the sign bit.
+#[test]
+fn movsx_r16_rm16_preserves_upper_half_under_0x66() {
+    let mut mem = Memory::new(0x10_0000);
+    // 66 0F BF C3 = MOVSX AX, BX ; HLT
+    mem.write_slice(0x7C00, &[0x66, 0x0F, 0xBF, 0xC3, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true;
+    cpu.ip = 0x7C00;
+    cpu.write_r32(r16::BX as u8, 0x1234_8000); // low word 0x8000 (sign bit set)
+    cpu.write_r32(r16::AX as u8, 0xAAAA_BBBB);
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    assert_eq!(cpu.regs[r16::AX], 0x8000, "AX = BX low word");
+    assert_eq!(
+        cpu.read_r32(r16::AX as u8),
+        0xAAAA_8000,
+        "upper half of EAX must be preserved (not sign-filled) by MOVSX r16,r/m16"
+    );
+}
+
 /// LOOP must decrement and test the FULL ECX when the address size is
 /// 32-bit (Intel SDM uses the address-size attribute to pick the count
 /// register). Regression for the bug where it always used the low 16-bit
