@@ -891,3 +891,47 @@ fn linux_userspace_uname_then_write_buf_then_hello_milestone() {
     });
     eprintln!("HELLO seen after {steps} steps (write of utsname bytes is fine)");
 }
+
+/// Re-run the ORIGINAL failing uname /init now that we've
+/// eliminated size, sys_uname, marker bytes, and the post-uname
+/// buf write as candidates. If this STILL hangs deterministically,
+/// the trigger must be in the marker_pre-before-uname ordering,
+/// the marker_post wrap-up, or exit(0). If it now passes, the
+/// original failure was non-deterministic and the bug was
+/// timing-related all along.
+#[test]
+#[ignore = "rerun the original uname /init to test determinism"]
+fn linux_userspace_uname_original_redux_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_uname();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"[USERSPACE uname]: Linux",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "ORIGINAL uname /init STILL hangs (deterministic); {}",
+            dump_uart_on_failure(&cumulative, "uname-redux")
+        )
+    });
+    eprintln!("ORIGINAL uname /init NOW PASSES at {steps} steps — was non-deterministic");
+}
