@@ -172,6 +172,55 @@ fn build_initramfs_hello() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Bisection probe: /init calls sys_uname, then writes the
+/// utsname's sysname[0..65] AND a HELLO marker. Tests whether
+/// writing the kernel-supplied utsname bytes (which start with
+/// "Linux" + NULs) is the trigger. The HELLO needle is what the
+/// test searches for; the sysname write is just exercised
+/// before it so we can see if it disrupts the kernel boot path.
+fn build_initramfs_uname_then_write_buf_then_hello() -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+
+    let build_code = |msg_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        // sys_uname(buf).
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 65) — print sysname slot.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x41, 0x00, 0x00, 0x00]); // edx = 65
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, msg, msg_len) — the HELLO marker.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(42).
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let buf_addr = msg_addr + msg_len;
+    let code = build_code(msg_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    let binary = make_init_elf32(&code, &[msg, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Bisection probe: hello /init whose message is uname's
 /// marker_pre concatenated to HELLO. If HELLO appears at
 /// 1.9 B steps, the marker bytes themselves aren't the
@@ -797,4 +846,48 @@ fn linux_userspace_hello_with_uname_marker_milestone() {
         )
     });
     eprintln!("HELLO seen after {steps} steps (marker bytes not the trigger)");
+}
+
+/// Bisection probe: /init does sys_uname → write sysname[0..65]
+/// → write HELLO → exit(42). Same structure as the original
+/// broken uname /init except for the marker_pre prefix write and
+/// the marker_post wrap-up write. If HELLO appears, the
+/// write(buf, 65) of kernel-supplied utsname bytes is fine and
+/// the trigger is in the prefix/suffix wrap. If HELLO never
+/// appears, the write of the utsname bytes is the trigger.
+#[test]
+#[ignore = "buf-write probe for the uname hang"]
+fn linux_userspace_uname_then_write_buf_then_hello_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_uname_then_write_buf_then_hello();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen — write(buf, 65) IS the trigger; {}",
+            dump_uart_on_failure(&cumulative, "uname-buf-hello")
+        )
+    });
+    eprintln!("HELLO seen after {steps} steps (write of utsname bytes is fine)");
 }
