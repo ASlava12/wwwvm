@@ -172,6 +172,43 @@ fn build_initramfs_hello() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Variant of `build_initramfs_hello` with `pad_bytes` of trailing
+/// zeros appended to the /init body. Used by the size-isolation
+/// experiment: if a hello /init padded to ~uname's 600-byte size
+/// still boots to userspace fast (matching the regular hello
+/// milestone's 52 s), then uname's hang is *not* a binary-size
+/// effect and the bug lives in the asm or kernel-side
+/// interaction. If padded-hello hangs the same way uname does,
+/// the size IS the trigger and the next debug step shifts to
+/// kernel-side (initramfs unpacker timing, exec loader probe).
+fn build_initramfs_hello_padded(pad_bytes: usize) -> Vec<u8> {
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+    let build_code = |msg_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let code_len = build_code(0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let code = build_code(msg_addr);
+    let pad = vec![0u8; pad_bytes];
+    // Same as hello but with `pad` appended after the msg —
+    // bloats the PT_LOAD's filesz without changing the
+    // executable bytes.
+    let binary = make_init_elf32(&code, &[msg, &pad], 5);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_uname` and prints the
 /// sysname[0..65] slot bracketed by a unique marker. Last tick's
 /// integration test with this builder hung in mid-kernel boot
@@ -543,4 +580,54 @@ fn linux_userspace_proc_version_milestone() {
         )
     });
     eprintln!("/proc/version userspace read seen after {steps} steps");
+}
+
+/// Size-isolation experiment: hello-mode /init padded to ~uname's
+/// total body size (~520 zero bytes appended). If this boots fast
+/// (matching the regular hello milestone), the uname hang is *not*
+/// a binary-size effect and the bug lives in the asm or kernel-
+/// side interaction. If it hangs the same way, size IS the
+/// trigger and the next debug step shifts to kernel-side.
+///
+/// Step budget is the same 16 B as the regular hello milestone —
+/// we want it to either bail fast at HELLO or fail loudly with
+/// the full UART dump.
+#[test]
+#[ignore = "size-isolation probe for the uname hang; ~52 s if it works"]
+fn linux_userspace_hello_padded_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    // Pad to ~520 bytes — close enough to uname's 547-byte body
+    // to isolate the size effect without exactly matching (the
+    // point is "around the same size", not "byte-identical").
+    let cpio = build_initramfs_hello_padded(520);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen in 16 B steps with padded /init — size IS the trigger; {}",
+            dump_uart_on_failure(&cumulative, "hello-padded")
+        )
+    });
+    eprintln!("padded HELLO seen after {steps} steps (binary size NOT the issue)");
 }
