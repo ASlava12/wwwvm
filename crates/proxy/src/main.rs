@@ -257,4 +257,48 @@ mod tests {
         let a = allow(&["Example.COM:443"]);
         assert!(a.permits("example.com", 443));
     }
+
+    /// Multiple comma-separated entries should compose with OR
+    /// semantics: a host that matches *any* entry is allowed. A
+    /// regression collapsing the split (single entry of the whole
+    /// joined string) would deny everything except the exact
+    /// "a:80,b:443" hostname — silently breaking the multi-host
+    /// allowlist users configure.
+    #[test]
+    fn multiple_entries_compose_or() {
+        let a = allow(&["example.com:443", "localhost:8080"]);
+        assert!(a.permits("example.com", 443));
+        assert!(a.permits("localhost", 8080));
+        assert!(!a.permits("example.com", 8080), "wrong port");
+        assert!(!a.permits("localhost", 443), "wrong port");
+        assert!(!a.permits("other.com", 443), "host not in list");
+    }
+
+    /// Whitespace around entries is trimmed — the parser uses
+    /// `s.trim()`. Users naturally write `"a:80, b:443"` with a
+    /// space after the comma; if the trim drops, `" b:443"`
+    /// would never match `"b"` and the second host silently
+    /// becomes inaccessible.
+    #[test]
+    fn whitespace_around_entries_is_trimmed() {
+        let a = allow(&["  example.com:443  ", "\tlocalhost:8080"]);
+        assert!(a.permits("example.com", 443));
+        assert!(a.permits("localhost", 8080));
+    }
+
+    /// A host entry with no `:port` portion ("example.com" with
+    /// no colon at all) goes to the `port: None` branch — meaning
+    /// "any port on this host". Distinct from `host:*` which uses
+    /// `rsplit_once(':')` + literal `*`. Both should reach the
+    /// same `port.is_none_or(...)` outcome. Pins the no-colon
+    /// path so a regression that flipped it to "port 0 required"
+    /// surfaces here.
+    #[test]
+    fn host_without_colon_allows_any_port() {
+        let a = allow(&["example.com"]);
+        assert!(a.permits("example.com", 80));
+        assert!(a.permits("example.com", 443));
+        assert!(a.permits("example.com", 31337));
+        assert!(!a.permits("other.com", 80));
+    }
 }
