@@ -5757,7 +5757,18 @@ impl Cpu {
                                     return Ok(());
                                 }
                                 let v = self.read_rm16(rm, mem);
-                                self.cr0 = (self.cr0 & !0xF) | (v as u32 & 0xF);
+                                // LMSW loads CR0 bits 0-3 (PE/MP/EM/TS)
+                                // from the operand but CANNOT clear PE —
+                                // once in protected mode it stays set
+                                // (Intel SDM: LMSW can't return to real
+                                // mode). Lock an already-set PE.
+                                // LMSW loads CR0 bits 0-3 (PE/MP/EM/TS)
+                                // from the operand but CANNOT clear PE —
+                                // once in protected mode it stays set
+                                // (Intel SDM: LMSW can't return to real
+                                // mode). Lock an already-set PE.
+                                let pe_locked = self.cr0 & 1;
+                                self.cr0 = (self.cr0 & !0xF) | (v as u32 & 0xF) | pe_locked;
                                 return Ok(());
                             }
                             _ => {}

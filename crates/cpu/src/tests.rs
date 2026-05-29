@@ -9469,6 +9469,26 @@ fn movsx_r16_rm16_preserves_upper_half_under_0x66() {
     );
 }
 
+/// LMSW must not clear CR0.PE (it cannot return the CPU to real mode),
+/// while still loading the other low CR0 bits from its operand.
+/// Regression: LMSW reloaded all of bits 0-3, dropping PE to 0.
+#[test]
+fn lmsw_cannot_clear_cr0_pe() {
+    let mut mem = Memory::new(0x10_0000);
+    // 0F 01 F0 = LMSW AX (mod=11 reg=6 rm=0) ; HLT
+    mem.write_slice(0x7C00, &[0x0F, 0x01, 0xF0, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE set (protected mode); CS=0 -> CPL=0
+    cpu.regs[r16::AX] = 0x000A; // operand: MP|TS set, PE bit = 0
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    // PE must stay set; MP|TS loaded from operand -> low nibble 0x0B.
+    assert_eq!(cpu.cr0 & 1, 1, "LMSW must not clear CR0.PE");
+    assert_eq!(cpu.cr0 & 0xF, 0x0B, "MP|TS loaded, PE preserved");
+}
+
 /// A 32-bit direct far CALL (0x9A) must push a dword CS (zero-extended)
 /// and the full 32-bit return EIP — an 8-byte frame — not a 16-bit
 /// word pair. Regression: 0x9A always used push16.
