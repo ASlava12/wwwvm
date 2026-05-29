@@ -721,6 +721,30 @@ mod tests {
         );
     }
 
+    /// Port 0x61 falls inside the keyboard's claimed range
+    /// (0x60..=0x63) but is logically a PIT/PPI register: Linux's
+    /// TSC-via-PIT calibration polls bit 5 (channel-2 OUT) here.
+    /// The IoBus dispatch must steer this port to the PIT
+    /// explicitly before the keyboard catches it. A regression
+    /// that dropped the explicit dispatch would have ch2 polling
+    /// return 0 (keyboard's default for unsupported ports), and
+    /// the calibration loop in start_kernel would spin forever.
+    #[test]
+    fn iobus_port_61_dispatches_to_pit_not_keyboard() {
+        let mut bus = IoBus::new();
+        // Write port 0x61 with gate2=1, speaker2=1 — must land
+        // in the PIT (sets gate2 and speaker2 flags), NOT the
+        // keyboard (which silently drops writes to its range).
+        bus.write(0x61, 0x03);
+        assert!(bus.pit.gate2, "gate2 latched on the PIT");
+        assert!(bus.pit.speaker2, "speaker2 latched on the PIT");
+        // Read port 0x61 — must come from the PIT's read_port_61
+        // (which composes gate2 + speaker2 + ch2_out into bit 5).
+        // gate2=1 + speaker2=1 reflects back the bits we just wrote.
+        let read = bus.read(0x61);
+        assert_eq!(read & 0x03, 0x03, "PIT read_port_61 reflects the bits");
+    }
+
     /// Unmapped I/O ports read as 0xFF — the ISA-bus pull-up
     /// behavior that Linux's `inb_p` probing relies on to
     /// distinguish a present device (returns its data byte) from
