@@ -416,7 +416,7 @@ fn linux_userspace_hello_padded_to_600_milestone() {
 /// the bad set is "N mod 8 ∈ {0, 2}" or just the singletons
 /// {600, 602}.
 #[test]
-#[ignore = "mod-8 hypothesis probe (size 608); ~52 s or ~9 min"]
+#[ignore = "mod-8 counter-example (size 608 passes per `a915ec3`); ~52 s"]
 fn linux_userspace_hello_padded_to_608_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
