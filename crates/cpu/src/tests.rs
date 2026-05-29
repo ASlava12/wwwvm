@@ -1978,6 +1978,77 @@ fn write_sreg_in_protected_mode_loads_descriptor_from_gdt() {
     assert_eq!(cpu.linear_seg(sreg::DS, 0x100), 0x0010_0100);
 }
 
+/// CS load latches the D bit (granularity byte 6 bit 6 = 0x40)
+/// into `code_size_32`. Without this a 32-bit kernel running in
+/// a flat code segment would still decode instructions as 16-bit
+/// by default — the very condition the D bit exists to flip.
+/// The hello/proc_version Linux boot tests exercise this end-
+/// to-end (the kernel reloads CS post-PE-on with D=1 set), but
+/// this unit test pins the latch path directly so a regression
+/// here surfaces in milliseconds instead of 52 s.
+#[test]
+fn write_sreg_cs_load_latches_d_bit_into_code_size_32() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // CR0.PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    let mut mem = Memory::new(0x10_0000);
+    // GDT[1] = ring-0 code segment, base 0, limit 0xFFFFF, D=1, G=1.
+    // The granularity byte (offset 6) holds limit[19:16] in bits 0..3
+    // and flags (G, D, L, AVL) in bits 4..7. D bit is bit 6 = 0x40.
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit 15:0
+            0x00, 0x00, // base 15:0
+            0x00, // base 23:16
+            0x9A, // access (code, ring 0, P=1)
+            0xCF, // flags=G(0x80)|D(0x40)|0xF=0xCF — limit hi 0xF + G + D
+            0x00, // base 31:24
+        ],
+    );
+    // Reset to a known state then load CS.
+    cpu.code_size_32 = false;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    assert!(
+        cpu.code_size_32,
+        "CS load with D=1 must flip code_size_32 to true"
+    );
+}
+
+/// Negative companion: CS load with D=0 (16-bit code segment)
+/// must NOT set code_size_32. A regression that always set the
+/// flag would make a kernel-mode call gate to a 16-bit V86
+/// segment still decode as 32-bit — invalid path.
+#[test]
+fn write_sreg_cs_load_with_d_zero_keeps_code_size_16() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    let mut mem = Memory::new(0x10_0000);
+    // Same code segment but D=0 (and G=0 — pure 16-bit).
+    mem.write_slice(
+        0x0508,
+        &[
+            0xFF, 0xFF, // limit
+            0x00, 0x00, //
+            0x00, 0x9A, // code, ring 0
+            0x00, // limit-hi=0 + flags=0 (G=0 D=0)
+            0x00, //
+        ],
+    );
+    // Pre-set to true so we know the load actually CLEARED it.
+    cpu.code_size_32 = true;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    assert!(
+        !cpu.code_size_32,
+        "CS load with D=0 must clear code_size_32 back to false"
+    );
+}
+
 /// Granularity bit (G=1) shifts limit left by 12 and fills the low
 /// 12 with ones — turning 0xFFFFF into 0xFFFF_FFFF (a 4 GiB segment).
 #[test]
