@@ -7317,6 +7317,119 @@ impl Cpu {
                             let v = self.fpu_st(0);
                             self.fpu_set_st(0, v.round_ties_even());
                         }
+                        // ---- Transcendentals (D9 F0..FF) ----
+                        // These set/clear C2 (status bit 10, 0x0400): C2=1
+                        // means the argument was out of the hardware
+                        // reduction range (|x| >= 2^63) and the op was a
+                        // no-op. We compute in f64 over the full range, so
+                        // we always clear C2 to signal "reduced/complete".
+                        //
+                        // FSIN — ST(0) = sin(ST(0)).
+                        0xFE => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.sin());
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FCOS — ST(0) = cos(ST(0)).
+                        0xFF => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.cos());
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FSINCOS — ST(0) = sin(ST(0)); push cos(ST(0))
+                        // (so afterwards ST(1)=sin, ST(0)=cos).
+                        0xFB => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.sin());
+                            self.fpu_push(v.cos());
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FPTAN — ST(0) = tan(ST(0)); push 1.0 (the x87
+                        // convention so a following FDIV yields cot, etc.).
+                        0xF2 => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.tan());
+                            self.fpu_push(1.0);
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FPATAN — ST(1) = atan2(ST(1), ST(0)); pop. Result
+                        // (the angle) ends up in ST(0).
+                        0xF3 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            self.fpu_pop();
+                            self.fpu_set_st(0, st1.atan2(st0));
+                        }
+                        // F2XM1 — ST(0) = 2^ST(0) - 1 (defined for
+                        // ST(0) in [-1, 1]; we evaluate everywhere).
+                        0xF0 => {
+                            let v = self.fpu_st(0);
+                            self.fpu_set_st(0, v.exp2() - 1.0);
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FYL2X — ST(1) = ST(1) * log2(ST(0)); pop. Result
+                        // in ST(0).
+                        0xF1 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            self.fpu_pop();
+                            self.fpu_set_st(0, st1 * st0.log2());
+                        }
+                        // FYL2XP1 — ST(1) = ST(1) * log2(ST(0)+1); pop.
+                        // Uses ln_1p for accuracy near ST(0)=0.
+                        0xF9 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            self.fpu_pop();
+                            self.fpu_set_st(0, st1 * (st0.ln_1p() / std::f64::consts::LN_2));
+                        }
+                        // FSCALE — ST(0) = ST(0) * 2^trunc(ST(1)).
+                        0xFD => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            self.fpu_set_st(0, st0 * st1.trunc().exp2());
+                        }
+                        // FXTRACT — split ST(0) into exponent and
+                        // significand: ST(0) = unbiased exponent (as a
+                        // float), then push the significand (in [1, 2)).
+                        0xF4 => {
+                            let v = self.fpu_st(0);
+                            if v == 0.0 || !v.is_finite() {
+                                // Mirror x87: exponent of 0 is -inf; of
+                                // inf/nan, the value passes through.
+                                let exp = if v == 0.0 { f64::NEG_INFINITY } else { v };
+                                self.fpu_set_st(0, exp);
+                                self.fpu_push(v);
+                            } else {
+                                let exp = v.abs().log2().floor();
+                                let sig = v / exp.exp2();
+                                self.fpu_set_st(0, exp);
+                                self.fpu_push(sig);
+                            }
+                        }
+                        // FPREM — partial remainder ST(0) mod ST(1),
+                        // truncated quotient. We complete in one step, so
+                        // clear C2 (the "incomplete reduction" flag).
+                        0xF8 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            let q = (st0 / st1).trunc();
+                            self.fpu_set_st(0, st0 - st1 * q);
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FPREM1 — IEEE-754 partial remainder (round-to-
+                        // nearest quotient). Same single-step completion.
+                        0xF5 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            let q = (st0 / st1).round_ties_even();
+                            self.fpu_set_st(0, st0 - st1 * q);
+                            self.fpu_sw &= !0x0400;
+                        }
+                        // FDECSTP / FINCSTP — rotate TOP without touching
+                        // register contents.
+                        0xF6 => self.fpu_top = self.fpu_top.wrapping_sub(1) & 7,
+                        0xF7 => self.fpu_top = self.fpu_top.wrapping_add(1) & 7,
                         // D9 C8+i — FXCH ST(i): swap ST(0) and ST(i).
                         0xC8..=0xCF => {
                             let i = modrm & 0x07;

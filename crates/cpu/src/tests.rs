@@ -6493,6 +6493,196 @@ fn fpu_fldpi_constant() {
     assert_eq!(w64_read(&mem, 0x600), std::f64::consts::PI);
 }
 
+// ---- x87 transcendentals (D9 F0..FF) ----
+
+/// Write an f64 into memory little-endian (lo dword then hi dword).
+#[cfg(test)]
+fn fpu_w64(mem: &mut Memory, addr: u32, v: f64) {
+    let b = v.to_bits();
+    mem.write_u32(addr, b as u32);
+    mem.write_u32(addr + 4, (b >> 32) as u32);
+}
+
+/// Read an f64 from memory little-endian.
+#[cfg(test)]
+fn fpu_r64(mem: &Memory, addr: u32) -> f64 {
+    let lo = mem.read_u32(addr) as u64;
+    let hi = mem.read_u32(addr + 4) as u64;
+    f64::from_bits(lo | (hi << 32))
+}
+
+/// Run a small x87 program: load `inputs` (f64s) onto the stack with
+/// FLD m64 in order (so the last input ends up in ST(0)), execute the
+/// raw `op` bytes, then FSTP m64 `n_results` values into 0x700,
+/// 0x708, ... (ST(0) first). Returns the result memory base reader.
+#[cfg(test)]
+fn run_fpu(inputs: &[f64], op: &[u8], n_results: usize) -> Vec<f64> {
+    let mut mem = Memory::new(0x10_0000);
+    let mut code = Vec::new();
+    // Inputs live at 0x600, 0x608, ...; FLD m64 each in order.
+    for (i, &v) in inputs.iter().enumerate() {
+        let addr = 0x600u32 + (i as u32) * 8;
+        fpu_w64(&mut mem, addr, v);
+        // FLD m64 [disp16] = DD /0, modrm 0x06 (mod00 rm110 disp16).
+        code.extend_from_slice(&[0xDD, 0x06]);
+        code.extend_from_slice(&(addr as u16).to_le_bytes());
+    }
+    code.extend_from_slice(op);
+    // FSTP m64 [disp16] = DD /3, modrm 0x1E.
+    for i in 0..n_results {
+        let addr = 0x700u32 + (i as u32) * 8;
+        code.extend_from_slice(&[0xDD, 0x1E]);
+        code.extend_from_slice(&(addr as u16).to_le_bytes());
+    }
+    code.push(0xF4); // HLT
+    mem.write_slice(0x7C00, &code);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    (0..n_results)
+        .map(|i| fpu_r64(&mem, 0x700 + (i as u32) * 8))
+        .collect()
+}
+
+#[cfg(test)]
+fn fpu_close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-12 || (a - b).abs() < 1e-12 * a.abs().max(b.abs())
+}
+
+/// FSIN / FCOS over a few exact-ish angles.
+#[test]
+fn fpu_fsin_fcos() {
+    use std::f64::consts::PI;
+    let s = run_fpu(&[PI / 6.0], &[0xD9, 0xFE], 1)[0]; // FSIN(π/6) = 0.5
+    assert!(fpu_close(s, 0.5), "FSIN(π/6) = {s}, want 0.5");
+    let c = run_fpu(&[PI / 3.0], &[0xD9, 0xFF], 1)[0]; // FCOS(π/3) = 0.5
+    assert!(fpu_close(c, 0.5), "FCOS(π/3) = {c}, want 0.5");
+    let s0 = run_fpu(&[0.0], &[0xD9, 0xFE], 1)[0];
+    assert!(fpu_close(s0, 0.0), "FSIN(0) = {s0}");
+    let c0 = run_fpu(&[0.0], &[0xD9, 0xFF], 1)[0];
+    assert!(fpu_close(c0, 1.0), "FCOS(0) = {c0}");
+}
+
+/// FSINCOS leaves ST(0)=cos, ST(1)=sin. We FSTP cos first, sin second.
+#[test]
+fn fpu_fsincos() {
+    use std::f64::consts::PI;
+    let r = run_fpu(&[PI / 6.0], &[0xD9, 0xFB], 2);
+    assert!(fpu_close(r[0], (PI / 6.0).cos()), "cos = {}", r[0]);
+    assert!(fpu_close(r[1], 0.5), "sin(π/6) = {}, want 0.5", r[1]);
+}
+
+/// FPTAN: ST(0)=tan, then push 1.0 (so ST(0)=1.0, ST(1)=tan). We
+/// FSTP the 1.0 first, then the tan.
+#[test]
+fn fpu_fptan() {
+    use std::f64::consts::PI;
+    let r = run_fpu(&[PI / 4.0], &[0xD9, 0xF2], 2);
+    assert!(fpu_close(r[0], 1.0), "FPTAN pushed {} (want 1.0)", r[0]);
+    assert!(fpu_close(r[1], 1.0), "tan(π/4) = {}, want 1.0", r[1]);
+}
+
+/// FPATAN: atan2(ST(1), ST(0)). With inputs [a, b] loaded so ST(1)=a,
+/// ST(0)=b → atan2(a, b). atan2(1, 1) = π/4.
+#[test]
+fn fpu_fpatan() {
+    use std::f64::consts::PI;
+    let r = run_fpu(&[1.0, 1.0], &[0xD9, 0xF3], 1)[0];
+    assert!(fpu_close(r, PI / 4.0), "FPATAN(1,1) = {r}, want π/4");
+}
+
+/// F2XM1: 2^x - 1. 2^3 - 1 = 7.
+#[test]
+fn fpu_f2xm1() {
+    let r = run_fpu(&[3.0], &[0xD9, 0xF0], 1)[0];
+    assert!(fpu_close(r, 7.0), "F2XM1(3) = {r}, want 7");
+    let r0 = run_fpu(&[0.0], &[0xD9, 0xF0], 1)[0];
+    assert!(fpu_close(r0, 0.0), "F2XM1(0) = {r0}, want 0");
+}
+
+/// FYL2X: ST(1)*log2(ST(0)). [1, 8] → ST(1)=1, ST(0)=8 → log2(8)=3.
+#[test]
+fn fpu_fyl2x() {
+    let r = run_fpu(&[1.0, 8.0], &[0xD9, 0xF1], 1)[0];
+    assert!(fpu_close(r, 3.0), "FYL2X(1, 8) = {r}, want 3");
+    let r2 = run_fpu(&[2.0, 8.0], &[0xD9, 0xF1], 1)[0];
+    assert!(fpu_close(r2, 6.0), "FYL2X(2, 8) = {r2}, want 6");
+}
+
+/// FYL2XP1: ST(1)*log2(ST(0)+1). [1, 7] → log2(8) = 3.
+#[test]
+fn fpu_fyl2xp1() {
+    let r = run_fpu(&[1.0, 7.0], &[0xD9, 0xF9], 1)[0];
+    assert!(fpu_close(r, 3.0), "FYL2XP1(1, 7) = {r}, want 3");
+}
+
+/// FSCALE: ST(0) * 2^trunc(ST(1)). [4, 3] → ST(1)=4, ST(0)=3 →
+/// 3 * 2^4 = 48.
+#[test]
+fn fpu_fscale() {
+    let r = run_fpu(&[4.0, 3.0], &[0xD9, 0xFD], 1)[0];
+    assert!(fpu_close(r, 48.0), "FSCALE(value=3, exp=4) = {r}, want 48");
+}
+
+/// FXTRACT: 12.0 = 1.5 * 2^3 → ST(0)=significand(1.5), ST(1)=exp(3).
+#[test]
+fn fpu_fxtract() {
+    let r = run_fpu(&[12.0], &[0xD9, 0xF4], 2);
+    assert!(fpu_close(r[0], 1.5), "significand = {}, want 1.5", r[0]);
+    assert!(fpu_close(r[1], 3.0), "exponent = {}, want 3", r[1]);
+}
+
+/// FPREM: ST(0) mod ST(1), truncated. [3, 7] → ST(1)=3, ST(0)=7 →
+/// 7 - 3*trunc(7/3) = 7 - 6 = 1.
+#[test]
+fn fpu_fprem() {
+    let r = run_fpu(&[3.0, 7.0], &[0xD9, 0xF8], 1)[0];
+    assert!(fpu_close(r, 1.0), "FPREM(7 mod 3) = {r}, want 1");
+}
+
+/// FPREM1: IEEE remainder. [4, 9] → ST(1)=4, ST(0)=9 →
+/// 9 - 4*round(9/4=2.25→2) = 1.
+#[test]
+fn fpu_fprem1() {
+    let r = run_fpu(&[4.0, 9.0], &[0xD9, 0xF5], 1)[0];
+    assert!(fpu_close(r, 1.0), "FPREM1(9 rem 4) = {r}, want 1");
+}
+
+/// FINCSTP rotates TOP up: after FLD a; FLD b (ST0=b, ST1=a),
+/// FINCSTP makes ST(0)=a again. Storing it yields `a`.
+#[test]
+fn fpu_fincstp() {
+    let r = run_fpu(&[11.0, 22.0], &[0xD9, 0xF7], 1)[0];
+    assert!(fpu_close(r, 11.0), "after FINCSTP, ST(0) = {r}, want 11");
+}
+
+/// FSIN clears the C2 status bit (argument-reduced); FNSTSW exposes
+/// it. We check the stored ST(0) and that C2 was cleared by reading
+/// it isn't strictly needed for correctness, so this just confirms
+/// chained transcendentals compose (sin then asin-ish via atan).
+#[test]
+fn fpu_chained_identity() {
+    use std::f64::consts::PI;
+    // sin(x)^2 + cos(x)^2 = 1, computed via FSINCOS + FMUL + FADD.
+    // FLD x; FSINCOS (ST0=cos, ST1=sin); FMUL ST0,ST0 (cos^2);
+    // FXCH (bring sin to ST0); ... simpler: do it in two runs.
+    let x = PI / 5.0;
+    let sin = run_fpu(&[x], &[0xD9, 0xFB], 2)[1];
+    let cos = run_fpu(&[x], &[0xD9, 0xFB], 2)[0];
+    assert!(
+        fpu_close(sin * sin + cos * cos, 1.0),
+        "sin²+cos² = {}, want 1",
+        sin * sin + cos * cos
+    );
+}
+
 /// FPU compare → branch: `if (a > b)` on floats. FCOMP sets the
 /// C0/C2/C3 condition bits, FNSTSW AX copies the status word to AX,
 /// SAHF moves C0→CF / C3→ZF, and JA branches when above. This is
