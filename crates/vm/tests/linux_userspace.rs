@@ -279,6 +279,15 @@ fn init_cpio_archives_start_with_newc_magic() {
 /// /init that exhibits the bug — anyone instrumenting the
 /// kernel can use it instead of the larger uname /init.
 fn build_initramfs_hello_padded_to_600() -> Vec<u8> {
+    build_initramfs_hello_padded_to(600)
+}
+
+/// Tunable variant: hello asm + msg + zero pad to `target_size`
+/// bytes total. Used by `build_initramfs_hello_padded_to_600`
+/// (the minimal failing reproducer) and could be used by future
+/// boundary-probes (target_size=596 to test just below the bad
+/// range, target_size=608 to test just above, etc).
+fn build_initramfs_hello_padded_to(target_size: usize) -> Vec<u8> {
     let msg: &[u8] = b"HELLO FROM USERSPACE\n";
     let msg_len = msg.len() as u32;
     let build_code = |msg_addr: u32| -> Vec<u8> {
@@ -298,14 +307,32 @@ fn build_initramfs_hello_padded_to_600() -> Vec<u8> {
     let code_len = build_code(0).len() as u32;
     let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
     let code = build_code(msg_addr);
-    // Target binary 600 bytes:
-    //   84 (ELF+PHDR) + code_len + msg_len + pad = 600
-    //   pad = 600 - 84 - code_len - msg_len
-    let pad_len = 600 - 84 - code_len as usize - msg_len as usize;
+    let pad_len = target_size - 84 - code_len as usize - msg_len as usize;
     let pad = vec![0u8; pad_len];
     let binary = make_init_elf32(&code, &[msg, &pad], 5);
-    debug_assert_eq!(binary.len(), 600, "should land at exactly 600 bytes");
+    assert_eq!(
+        binary.len(),
+        target_size,
+        "should land at exactly {target_size} bytes"
+    );
     build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Quick unit test: the tunable padded-hello builder produces
+/// binaries of the requested size, decoded from the cpio header.
+/// Pinned across three points: 596 (just below the bad range),
+/// 600 (the minimal failing reproducer), 604 (just above).
+#[test]
+fn build_initramfs_hello_padded_to_lands_at_target_size() {
+    for target in [596usize, 600, 604, 612] {
+        let cpio = build_initramfs_hello_padded_to(target);
+        let filesize_field = std::str::from_utf8(&cpio[6 + 6 * 8..6 + 7 * 8]).unwrap();
+        let init_size = usize::from_str_radix(filesize_field, 16).unwrap();
+        assert_eq!(
+            init_size, target,
+            "padded-hello target={target}: cpio reports /init size {init_size}"
+        );
+    }
 }
 
 #[test]
