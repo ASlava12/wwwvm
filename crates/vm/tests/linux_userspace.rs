@@ -120,6 +120,14 @@
 //!     brk extends the heap region contiguous with the data
 //!     segment. glibc's malloc uses both.
 //!
+//!   - `linux_userspace_file_io_milestone` — file-create round-
+//!     trip: /init opens "/test_file" with O_CREAT|O_WRONLY,
+//!     writes "TESTDATA", closes, reopens read-only, reads it
+//!     back, and writes `[USERSPACE FILE=<8 bytes>][USERSPACE END]`.
+//!     Pins writable initramfs (tmpfs), inode creation through
+//!     `do_filp_open` with O_CREAT, `sys_close` (never used
+//!     before), and cross-fd persistence via the page cache.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -496,6 +504,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let argv = build_initramfs_argv();
     let envp = build_initramfs_envp();
     let mmap = build_initramfs_mmap();
+    let file_io = build_initramfs_file_io();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -510,6 +519,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&argv[0..6], b"070701");
     assert_eq!(&envp[0..6], b"070701");
     assert_eq!(&mmap[0..6], b"070701");
+    assert_eq!(&file_io[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -525,6 +535,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-argv.cpio", &argv);
         let _ = std::fs::write("/tmp/wwwvm-envp.cpio", &envp);
         let _ = std::fs::write("/tmp/wwwvm-mmap.cpio", &mmap);
+        let _ = std::fs::write("/tmp/wwwvm-file-io.cpio", &file_io);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1404,6 +1415,162 @@ fn build_initramfs_mmap() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[marker_pre, marker_mid, marker_end, &buf_zeros, &buf_val],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates a new file in initramfs,
+/// writes 8 bytes to it, closes, reopens read-only, reads the
+/// 8 bytes back, and prints them between markers:
+///
+///   `[USERSPACE FILE=<8 bytes>][USERSPACE END]`
+///
+/// Sequence:
+///
+///   fd1 = sys_open("/test_file", O_CREAT|O_WRONLY, 0o644)
+///   sys_write(fd1, "TESTDATA", 8)
+///   sys_close(fd1)
+///   fd2 = sys_open("/test_file", O_RDONLY, 0)
+///   sys_read(fd2, buf, 8)
+///   sys_close(fd2)
+///   ... write markers + buf + exit
+///
+/// Pins:
+///   - writable initramfs (rootfs is tmpfs by default; this
+///     verifies the kernel can create + write + read files in
+///     the rootfs the cpio unpacker set up)
+///   - inode creation through `do_filp_open` with O_CREAT —
+///     until now only existing files (/proc/version, /helper)
+///     were opened
+///   - sys_close: never previously exercised; tests that fd
+///     teardown doesn't leak or corrupt
+///   - cross-fd persistence: data written through one fd
+///     becomes readable through a different fd opened to the
+///     same path (tmpfs page cache works)
+fn build_initramfs_file_io() -> Vec<u8> {
+    let path: &[u8] = b"/test_file\0";
+    let payload: &[u8] = b"TESTDATA";
+    let marker_pre: &[u8] = b"[USERSPACE FILE=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    // Each fd is saved to memory between syscalls so it can be
+    // reused after eax gets clobbered by the next syscall number.
+    let build_code = |path_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd1_addr: u32,
+                      fd2_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd1 = sys_open(path, O_CREAT|O_WRONLY = 0x41, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]); // mov ecx, 0x41
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]); // mov edx, 0o644 = 0x1A4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ds:[fd1] = eax
+        out.push(0xA3);
+        out.extend_from_slice(&fd1_addr.to_le_bytes());
+        // sys_write(fd1, payload, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd1]
+        out.extend_from_slice(&fd1_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd1)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd1_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]); // mov eax, 6
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fd2 = sys_open(path, O_RDONLY = 0, 0)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (O_RDONLY)
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ds:[fd2] = eax
+        out.push(0xA3);
+        out.extend_from_slice(&fd2_addr.to_le_bytes());
+        // sys_read(fd2, buf, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd2_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // mov edx, 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd2)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd2_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 8)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let payload_addr = path_addr + path.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd1_addr = marker_post_addr + marker_post.len() as u32;
+    let fd2_addr = fd1_addr + 4;
+    let buf_addr = fd2_addr + 4;
+    let code = build_code(
+        path_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd1_addr,
+        fd2_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 8];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            payload,
+            marker_pre,
+            marker_post,
+            &fd_zeros,
+            &fd_zeros,
+            &buf_zeros,
+        ],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -3267,5 +3434,73 @@ fn linux_userspace_mmap_milestone() {
         "expected byte read back to equal sentinel 0x42, got 0x{val_byte:02X} — \
          either the page isn't backed by RAM or writes aren't persisting; {}",
         dump_uart_on_failure(&cumulative, "mmap-byte")
+    );
+}
+
+/// File-I/O round-trip milestone: /init creates a new file in
+/// initramfs (`/test_file`) with `open(O_CREAT|O_WRONLY, 0o644)`,
+/// writes `b"TESTDATA"` to it, closes, reopens read-only, reads
+/// the 8 bytes back, prints them between
+/// `[USERSPACE FILE=…][USERSPACE END]`. Test asserts the round-
+/// tripped bytes equal `b"TESTDATA"`. Pins:
+///   - writable initramfs (tmpfs-backed rootfs)
+///   - `do_filp_open` with O_CREAT — every prior open() in tests
+///     used existing files (/proc/version, /helper)
+///   - `sys_close` — never previously exercised
+///   - cross-fd persistence via tmpfs page cache
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_file_io_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_file_io();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE FILE=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — open(O_CREAT) may have \
+                 returned -EROFS / -EPERM, or write/read failed silently; {}",
+                dump_uart_on_failure(&cumulative, "file-io")
+            )
+        });
+    eprintln!("file_io milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let buf_start = pre_pos + marker_pre.len();
+    let file_bytes: [u8; 8] = cumulative[buf_start..buf_start + 8]
+        .try_into()
+        .expect("8 bytes between markers");
+    eprintln!(
+        "file content round-tripped: {:?}",
+        std::str::from_utf8(&file_bytes).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        &file_bytes,
+        b"TESTDATA",
+        "expected file round-trip to equal b\"TESTDATA\", got {:02X?}; {}",
+        file_bytes,
+        dump_uart_on_failure(&cumulative, "file-io-wrong")
     );
 }
