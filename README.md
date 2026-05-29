@@ -137,8 +137,10 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v14.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
---locked`. Throughput ≈ 110 MIPS release (см. `cargo run --example
-throughput -p wwwvm-vm --release`). Tutorial-anchor тесты в
+--locked`. Throughput release ≈ 60–110 MIPS зависит от хоста
+(x86_64 быстрее aarch64; пример печатает арку, чтобы цифры не
+сравнивались случайно: `cargo run --example throughput -p wwwvm-vm
+--release`). Tutorial-anchor тесты в
 `crates/vm/tests/tutorial_examples.rs` пин-fиксируют hex-байты из
 `docs/HAND_ASSEMBLY.md` — любое смещение между документацией и
 поведением VM ловит CI.
