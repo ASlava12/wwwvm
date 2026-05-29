@@ -286,6 +286,18 @@ commit `milestone: Linux 6.12 boots to userspace`.
 THRE), потом — kernel panic с `exitcode=0x00002a00` (sys_exit +
 panic-on-init-exit). Оба маркера обычно попадают в один drain,
 поэтому overhead второго чека ≈ 0с — итого те же ~52 секунды.
+
+Рядом — second milestone в том же файле:
+`linux_userspace_proc_version_milestone`. /init монтирует procfs
+через `sys_mount("proc", "/proc", "proc", 0, 0)` (5-аргументный
+syscall через int 0x80!), открывает `/proc/version`, читает в
+128-байтный буфер, печатает с уникальным префиксом `[USERSPACE
+/proc/version]:` (чтобы не путать с кернел-printk'ом самого
+boot-баннера), и `exit(0)`. Пять разных syscall'ов (mount, open,
+read, write, exit) через cross-ring trampoline, и kernel
+действительно отдаёт `Linux version 6.12...` из procfs в
+user-space. Ещё ~52 секунды wall-clock, идёт параллельно с
+основным milestone'ом.
 Запуск: `WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz cargo test
 --release --test linux_userspace -- --ignored`. Если файла нет —
 тест silently skip'ается; на CI без vmlinuz просто пропустит.

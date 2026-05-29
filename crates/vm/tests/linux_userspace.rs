@@ -118,6 +118,182 @@ fn build_initramfs_hello() -> Vec<u8> {
     archive
 }
 
+/// Build a cpio whose /init mounts procfs at /proc and reads
+/// /proc/version, printing it to stdout bracketed by a unique
+/// marker so the test can distinguish it from the kernel's own
+/// `Linux version ...` boot banner. The /init binary structure
+/// mirrors `build_initramfs_hello`: ELF + PT_LOAD covering code +
+/// embedded data + scratch buffer. Wider syscall surface (mount,
+/// open, read, write, exit) than hello-mode — the extra syscalls
+/// validate that the cross-ring trampoline (int 0x80) handles a
+/// 5-argument syscall (mount) end-to-end. The cpio archive also
+/// has a /proc directory entry so procfs has a mount point.
+fn build_initramfs_proc_version() -> Vec<u8> {
+    const LOAD_ADDR: u32 = 0x0804_8000;
+    const ELF_HEADER_LEN: u32 = 52;
+    const PHDR_LEN: u32 = 32;
+    const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
+    const BUF_LEN: u32 = 128;
+    let marker_pre: &[u8] = b"[USERSPACE /proc/version]: ";
+    let marker_post: &[u8] = b"\n[USERSPACE END]\n";
+    let proc_str: &[u8] = b"proc\0";
+    let slash_proc: &[u8] = b"/proc\0";
+    let version_path: &[u8] = b"/proc/version\0";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      proc_addr: u32,
+                      slash_proc_addr: u32,
+                      version_path_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_mount("proc", "/proc", "proc", 0, 0) — sys 21
+        out.extend_from_slice(&[0xB8, 0x15, 0x00, 0x00, 0x00]); // mov eax, 21
+        out.push(0xBB);
+        out.extend_from_slice(&proc_addr.to_le_bytes()); // ebx = source
+        out.push(0xB9);
+        out.extend_from_slice(&slash_proc_addr.to_le_bytes()); // ecx = target
+        out.push(0xBA);
+        out.extend_from_slice(&proc_addr.to_le_bytes()); // edx = fstype
+        out.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi
+        out.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_open(version_path, O_RDONLY, 0) — sys 5
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]); // mov eax, 5
+        out.push(0xBB);
+        out.extend_from_slice(&version_path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ebx, eax — save fd
+        out.extend_from_slice(&[0x89, 0xC3]);
+        // sys_read(fd, buf, BUF_LEN) — sys 3
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&BUF_LEN.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov edx, eax — save nbytes
+        out.extend_from_slice(&[0x89, 0xC2]);
+        // write(1, buf, nbytes)
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0) — sys 1
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let proc_addr = marker_post_addr + marker_post.len() as u32;
+    let slash_proc_addr = proc_addr + proc_str.len() as u32;
+    let version_path_addr = slash_proc_addr + slash_proc.len() as u32;
+    let buf_addr = version_path_addr + version_path.len() as u32;
+    let mut body = build_code(
+        marker_pre_addr,
+        marker_post_addr,
+        proc_addr,
+        slash_proc_addr,
+        version_path_addr,
+        buf_addr,
+    );
+    body.extend_from_slice(marker_pre);
+    body.extend_from_slice(marker_post);
+    body.extend_from_slice(proc_str);
+    body.extend_from_slice(slash_proc);
+    body.extend_from_slice(version_path);
+    body.extend(std::iter::repeat_n(0u8, BUF_LEN as usize));
+    let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
+
+    let mut elf: Vec<u8> = Vec::with_capacity(52);
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 1, 1, 1, 0]);
+    elf.extend_from_slice(&[0u8; 8]);
+    elf.extend_from_slice(&2u16.to_le_bytes());
+    elf.extend_from_slice(&3u16.to_le_bytes());
+    elf.extend_from_slice(&1u32.to_le_bytes());
+    elf.extend_from_slice(&(LOAD_ADDR + ENTRY_OFFSET).to_le_bytes());
+    elf.extend_from_slice(&ELF_HEADER_LEN.to_le_bytes());
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    elf.extend_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes());
+    elf.extend_from_slice(&(PHDR_LEN as u16).to_le_bytes());
+    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
+    elf.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut phdr: Vec<u8> = Vec::with_capacity(32);
+    phdr.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    phdr.extend_from_slice(&0u32.to_le_bytes());
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
+    phdr.extend_from_slice(&filesz.to_le_bytes());
+    phdr.extend_from_slice(&filesz.to_le_bytes());
+    phdr.extend_from_slice(&7u32.to_le_bytes()); // R | W | X — buf needs W
+    phdr.extend_from_slice(&0x1000u32.to_le_bytes());
+
+    let mut binary = elf;
+    binary.extend_from_slice(&phdr);
+    binary.extend_from_slice(&body);
+
+    fn cpio(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
+        let namesize = name.len() as u32 + 1;
+        let filesize = data.len() as u32;
+        let fields = [
+            0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
+        ];
+        let mut hdr = Vec::with_capacity(110);
+        hdr.extend_from_slice(b"070701");
+        for f in fields {
+            hdr.extend_from_slice(format!("{f:08X}").as_bytes());
+        }
+        hdr.extend_from_slice(name.as_bytes());
+        hdr.push(0);
+        while hdr.len() & 3 != 0 {
+            hdr.push(0);
+        }
+        let mut out = hdr;
+        out.extend_from_slice(data);
+        while out.len() & 3 != 0 {
+            out.push(0);
+        }
+        out
+    }
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio("init", &binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio("proc", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
 /// Drive the boot for up to `step_budget` instructions, draining
 /// UART output in 100M-step chunks, appending it to `cumulative`,
 /// and looking for `needle` anywhere in the cumulative output.
@@ -229,4 +405,52 @@ fn linux_userspace_milestone() {
         )
     });
     eprintln!("panic exit code seen after {panic_steps} additional steps");
+}
+
+/// Wider-syscall-surface milestone: /init mounts procfs, opens
+/// /proc/version, reads it, and prints it bracketed by markers.
+/// Pins five distinct syscalls — mount (5-arg!), open, read,
+/// write, exit — across the cross-ring trampoline. The kernel
+/// itself prints `Linux version 6.12...` early in boot, so the
+/// userspace search uses the `[USERSPACE /proc/version]:`
+/// prefix to disambiguate (only /init writes that string).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_proc_version_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_proc_version();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"[USERSPACE /proc/version]: Linux version",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        let tail_start = cumulative.len().saturating_sub(2048);
+        panic!(
+            "[USERSPACE /proc/version]: Linux version` marker not seen in 16 B steps; \
+             last 2 KiB of UART output:\n{}",
+            String::from_utf8_lossy(&cumulative[tail_start..])
+        )
+    });
+    eprintln!("/proc/version userspace read seen after {steps} steps");
 }
