@@ -536,6 +536,32 @@ fn build_cpio_archive_with_two_helpers(
     archive
 }
 
+/// Build a cpio with /init plus shared libraries under /lib — the
+/// initramfs shape a *dynamically-linked* /init needs. The kernel
+/// execs /init, sees its `PT_INTERP` (`/lib/ld-linux.so.2`), loads
+/// that interpreter, and the interpreter then opens + mmaps the
+/// `lib_files` to satisfy the binary's `DT_NEEDED` libraries.
+/// `lib_files` are `(basename, bytes)` placed at `/lib/<basename>`.
+fn build_cpio_with_libs(init_binary: &[u8], lib_files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("proc", &[], 0o040_755, 0, 0));
+    if !lib_files.is_empty() {
+        archive.extend_from_slice(&cpio_entry("lib", &[], 0o040_755, 0, 0));
+        for (name, bytes) in lib_files {
+            let path = format!("lib/{name}");
+            archive.extend_from_slice(&cpio_entry(&path, bytes, 0o100_755, 0, 0));
+        }
+    }
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -9400,6 +9426,126 @@ fn linux_userspace_real_static_binary_milestone() {
          init panic) — it likely crashed mid-run; {}",
         dump_uart_on_failure(&cumulative, "real-static-exit")
     );
+}
+
+/// Diagnostic: boot a DYNAMICALLY-linked i386 binary as /init,
+/// forcing the full `ld.so` path. The kernel execs /init, sees its
+/// PT_INTERP=/lib/ld-linux.so.2, loads that interpreter, which then
+/// mmaps libc.so.6 to satisfy DT_NEEDED, relocates, and jumps to the
+/// program. We use Tinycore's `rotdash` (1.7 KB, needs only libc) as
+/// the minimal case. Files come from `WWWVM_DYN_ROOTFS` (default
+/// `/tmp/wwwvm-linux/rootfs`, the extracted Tinycore rootfs); the
+/// test SKIPS if absent. ALWAYS PASSES — it reports how far the
+/// dynamic linker got (reached /init, ld.so output, any program
+/// output, a CpuError on an unimplemented instruction, a segfault)
+/// so the next tick knows exactly what (if anything) ld.so needs that
+/// the emulator/kernel path is missing.
+#[test]
+#[ignore = "diagnostic: boots a dynamically-linked glibc binary via ld.so; ~bounded"]
+fn linux_userspace_dynamic_binary_diag() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let root =
+        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
+    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (Some(initbin), Some(ld), Some(libc)) = (
+        read_or_skip("usr/bin/rotdash"),
+        read_or_skip("lib/ld-linux.so.2"),
+        read_or_skip("lib/libc.so.6"),
+    ) else {
+        return;
+    };
+    eprintln!(
+        "dynamic /init = rotdash ({} B), ld.so {} B, libc {} B",
+        initbin.len(),
+        ld.len(),
+        libc.len()
+    );
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_cpio_with_libs(&initbin, &[("ld-linux.so.2", &ld), ("libc.so.6", &libc)]);
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 8_000_000_000u64;
+    let mut steps = 0u64;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== dynamic /init diagnostic ===");
+    eprintln!("  steps run: {steps}");
+    eprintln!("  stop reason: {stop_reason}");
+    eprintln!(
+        "  reached /init exec: {}",
+        text.contains("Run /init as init process")
+    );
+    for needle in [
+        "Run /init as init process",
+        "segfault at",
+        "trap invalid opcode",
+        "trap ",
+        "Kernel panic",
+        "exitcode=",
+        "error while loading shared libraries",
+        "not found",
+    ] {
+        if let Some(p) = text.find(needle) {
+            let endp = text[p..]
+                .find('\n')
+                .map(|n| p + n)
+                .unwrap_or((p + 120).min(text.len()));
+            eprintln!("  [{needle}] {:?}", &text[p..endp]);
+        }
+    }
+    let tail = &cumulative[cumulative.len().saturating_sub(700)..];
+    eprintln!("  --- last {} bytes of UART ---", tail.len());
+    eprintln!("{}", String::from_utf8_lossy(tail));
 }
 
 /// File-I/O round-trip milestone: /init creates a new file in
