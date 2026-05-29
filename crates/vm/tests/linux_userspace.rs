@@ -4574,6 +4574,90 @@ fn build_initramfs_pipe_rt() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// /init that exercises the stdin read path: emits a "blocking on
+/// read" marker, calls `read(0, buf, 4)` (which blocks until the
+/// host injects input via `send_input`), then emits the read's
+/// return value and the bytes that landed in `buf`. This is the
+/// symmetric counterpart to the write path and the regression
+/// probe for the REP-string #PF rollback fix on the *delivery*
+/// side: `read`'s `copy_to_user` writes into `buf`, which sits on
+/// a fresh demand-zero page, so the first write faults exactly
+/// like `pipe2`'s fd-pair copy did.
+fn build_initramfs_read_stdin() -> Vec<u8> {
+    let m_q: &[u8] = b"[USERSPACE Q]\n"; // "blocking on read now — send input"
+    let m_rc: &[u8] = b"RC=";
+    let m_got: &[u8] = b"GOT=";
+    let m_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |m_q_addr: u32,
+                      m_rc_addr: u32,
+                      m_got_addr: u32,
+                      m_post_addr: u32,
+                      buf_addr: u32,
+                      rd_ret_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9); // mov ecx, addr
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA); // mov edx, len
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // write(1, m_q, len) — signal we're about to block in read
+        w(m_q_addr, m_q.len() as u32, &mut out);
+        // read(0, buf, 4) — sys 3, fd 0, buf, 4 bytes; blocks until
+        // the host send_input()s a line.
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3 (read)
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (fd 0)
+        out.push(0xB9); // mov ecx, buf_addr
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]); // mov edx, 4
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[rd_ret], eax
+        out.extend_from_slice(&rd_ret_addr.to_le_bytes());
+        // RC=<rd_ret>
+        w(m_rc_addr, m_rc.len() as u32, &mut out);
+        w(rd_ret_addr, 4, &mut out);
+        // GOT=<buf>
+        w(m_got_addr, m_got.len() as u32, &mut out);
+        w(buf_addr, 4, &mut out);
+        // END
+        w(m_post_addr, m_post.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let m_q_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_rc_addr = m_q_addr + m_q.len() as u32;
+    let m_got_addr = m_rc_addr + m_rc.len() as u32;
+    let m_post_addr = m_got_addr + m_got.len() as u32;
+    let buf_addr = m_post_addr + m_post.len() as u32;
+    let rd_ret_addr = buf_addr + 4;
+    let code = build_code(
+        m_q_addr,
+        m_rc_addr,
+        m_got_addr,
+        m_post_addr,
+        buf_addr,
+        rd_ret_addr,
+    );
+    let buf_zeros = [0u8; 4];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[m_q, m_rc, m_got, m_post, &buf_zeros, &ret_zeros],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Diagnostic /init for the prior `sys_pipe`-broken blocker
 /// investigation: calls `sys_pipe2(&fds, 0)` then writes eax +
 /// fd slots without touching the pipe further. Kept around as
@@ -8443,6 +8527,124 @@ fn linux_userspace_pipe_milestone() {
         Some(&b"PIPE"[..]),
         "the bytes read back from the pipe should be \"PIPE\"; got {:?}",
         buf.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+}
+
+/// Milestone: the stdin-read delivery path. `/init` emits a
+/// "blocking on read" marker, calls `read(0, buf, 4)` (which blocks
+/// until the host injects input), then emits the read's return
+/// value and the bytes that landed in `buf`. The test waits for the
+/// block marker, `send_input`s a line, and asserts the bytes arrive.
+///
+/// This is the symmetric counterpart to `linux_userspace_pipe_milestone`
+/// and the second regression guard for the REP-string page-fault
+/// rollback fix (`crates/cpu/src/lib.rs`): `read`'s `copy_to_user`
+/// writes the input into `buf`, which sits on a fresh demand-zero
+/// page, so the first write faults exactly like `pipe2`'s fd-pair
+/// copy did. Before the fix this delivered nothing — the byte was
+/// echoed by the TTY (so the UART rx → ISR → ldisc path worked) but
+/// `buf` stayed zero-initialised. See the README blocker note
+/// ("sys_read(stdin) delivery", marked FIXED).
+#[test]
+#[ignore = "boots a real Linux bzImage + injects input; ~55s wall-clock"]
+fn linux_userspace_read_stdin_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_read_stdin();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let q: &[u8] = b"[USERSPACE Q]\r\n";
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    // Stage 1: run until /init signals it's about to block in read.
+    let blocked = run_until_marker(&mut vm, q, 6_000_000_000, &mut cumulative).is_ok();
+    eprintln!("=== stdin-read milestone ===");
+    eprintln!("  reached read-block marker = {blocked}");
+    assert!(
+        blocked,
+        "/init never reached the read-block marker — it didn't get to the \
+         read syscall"
+    );
+    // Stage 2: inject a 4-printable-char line. Canonical /dev/console
+    // returns the line on the newline; read(buf, 4) takes "KICK".
+    vm.send_input(b"KICK\n");
+    let reached_end = run_until_marker(&mut vm, end, 6_000_000_000, &mut cumulative).is_ok();
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_u32 = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+    eprintln!("  reached end marker = {reached_end}");
+    eprintln!(
+        "  read() ret (RC=) = {:?}",
+        read_u32(b"RC=").map(|v| v as i32)
+    );
+    if let Some(p) = stripped.windows(4).position(|w| w == b"GOT=") {
+        if let Some(s) = stripped.get(p + 4..p + 8) {
+            eprintln!("  buf (GOT=) bytes = {:02X?}", s);
+            eprintln!("  buf (GOT=) str   = {:?}", String::from_utf8_lossy(s));
+        }
+    }
+    if let Some(p) = stripped.windows(13).position(|w| w == b"[USERSPACE Q]") {
+        let endp = (p + 80).min(stripped.len());
+        eprintln!(
+            "  raw stripped[Q..] str = {:?}",
+            String::from_utf8_lossy(&stripped[p..endp])
+        );
+    }
+
+    assert!(
+        reached_end,
+        "did not reach the end marker after injecting input — read() never \
+         returned (input not delivered to the blocked reader)"
+    );
+    let rc = read_u32(b"RC=").map(|v| v as i32);
+    assert_eq!(
+        rc,
+        Some(4),
+        "read(0, buf, 4) should return 4 after \"KICK\\n\" was injected; got {rc:?}"
+    );
+    let got = stripped
+        .windows(4)
+        .position(|w| w == b"GOT=")
+        .and_then(|p| stripped.get(p + 4..p + 8))
+        .map(|s| s.to_vec());
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"KICK"[..]),
+        "the injected bytes should land in the user buffer; got {:?} \
+         (all-zero here is the copy_to_user-drops-on-fresh-page regression)",
+        got.as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
     );
 }
