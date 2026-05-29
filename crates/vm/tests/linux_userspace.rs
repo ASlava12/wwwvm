@@ -34,7 +34,7 @@ use wwwvm_vm::Vm;
 /// One cpio newc entry: 6-byte `070701` magic + 13 8-byte ASCII
 /// hex fields + name + NUL padded to 4, then the data padded to
 /// 4. Shared between every `build_initramfs_*` so a regression in
-/// the header layout shows up in *both* milestones at once.
+/// the header layout shows up across the whole test file at once.
 fn cpio_entry(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
     let namesize = name.len() as u32 + 1;
     let filesize = data.len() as u32;
