@@ -217,6 +217,13 @@
 //!     `real_parent` pointing at swapper or kthreadd, the
 //!     test would see 0 or 2 instead of 1.
 //!
+//!   - `linux_userspace_access_milestone` — path existence
+//!     check, both success and failure: /init creates
+//!     `/probe`, calls `sys_access(F_OK)` (expect 0), unlinks,
+//!     calls again (expect -ENOENT = 0xFFFFFFFE). Test asserts
+//!     the pair. First test that pairs the success and
+//!     failure-on-purpose return paths in one shot.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -606,6 +613,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let truncate = build_initramfs_truncate();
     let chmod = build_initramfs_chmod();
     let getppid_in_child = build_initramfs_getppid_in_child();
+    let access = build_initramfs_access();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -633,6 +641,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&truncate[0..6], b"070701");
     assert_eq!(&chmod[0..6], b"070701");
     assert_eq!(&getppid_in_child[0..6], b"070701");
+    assert_eq!(&access[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -661,6 +670,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-truncate.cpio", &truncate);
         let _ = std::fs::write("/tmp/wwwvm-chmod.cpio", &chmod);
         let _ = std::fs::write("/tmp/wwwvm-getppid-in-child.cpio", &getppid_in_child);
+        let _ = std::fs::write("/tmp/wwwvm-access.cpio", &access);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2810,6 +2820,143 @@ fn build_initramfs_chmod() -> Vec<u8> {
             &fd_zeros,
             &statbuf_zeros,
             &mode_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/probe`, calls
+/// `sys_access("/probe", F_OK=0)` (syscall 33) — should return 0
+/// since the file exists. Then unlinks `/probe` and accesses
+/// again — should return -ENOENT. /init writes both returns
+/// between `[USERSPACE PRE=…POST=…][USERSPACE END]`. Test
+/// asserts PRE=0 and POST=0xFFFFFFFE (-2 sign-extended).
+fn build_initramfs_access() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let marker_pre: &[u8] = b"[USERSPACE PRE=";
+    let marker_mid: &[u8] = b"POST=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      fd_addr: u32,
+                      pre_buf_addr: u32,
+                      post_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open(path, O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_access(path, F_OK=0) — sys 33
+        out.extend_from_slice(&[0xB8, 0x21, 0x00, 0x00, 0x00]); // mov eax, 33
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (F_OK)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[pre_buf], eax
+        out.extend_from_slice(&pre_buf_addr.to_le_bytes());
+        // sys_unlink(path) — sys 10
+        out.extend_from_slice(&[0xB8, 0x0A, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_access(path, F_OK) — should now return -ENOENT
+        out.extend_from_slice(&[0xB8, 0x21, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[post_buf], eax
+        out.extend_from_slice(&post_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, pre_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&pre_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, post_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&post_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_pre_addr = path_addr + path.len() as u32;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let fd_addr = marker_end_addr + marker_end.len() as u32;
+    let pre_buf_addr = fd_addr + 4;
+    let post_buf_addr = pre_buf_addr + 4;
+    let code = build_code(
+        path_addr,
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        fd_addr,
+        pre_buf_addr,
+        post_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let pre_zeros = [0u8; 4];
+    let post_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            marker_pre,
+            marker_mid,
+            marker_end,
+            &fd_zeros,
+            &pre_zeros,
+            &post_zeros,
         ],
         7,
     );
@@ -5533,6 +5680,91 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_access` milestone: /init creates `/probe`, accesses it
+/// (expect 0), unlinks, accesses again (expect -ENOENT), prints
+/// both returns. Pairs the success and failure return paths of
+/// the path-based existence check.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_access_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_access();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE PRE=";
+    let marker_mid: &[u8] = b"POST=";
+    let marker_end_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "access")
+            )
+        });
+    eprintln!("access milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let pre_off = pre_pos + marker_pre.len();
+    let pre = u32::from_le_bytes(stripped[pre_off..pre_off + 4].try_into().unwrap());
+
+    let mid_pos = stripped
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid");
+    let post_off = mid_pos + marker_mid.len();
+    let post = u32::from_le_bytes(stripped[post_off..post_off + 4].try_into().unwrap());
+
+    eprintln!(
+        "access pre = 0x{pre:08X} ({}), post = 0x{post:08X} ({})",
+        pre as i32, post as i32
+    );
+    assert_eq!(
+        pre,
+        0,
+        "expected access(/probe, F_OK) = 0 (file exists), got 0x{pre:08X}; {}",
+        dump_uart_on_failure(&cumulative, "access-pre-nonzero")
+    );
+    assert_eq!(
+        post,
+        0xFFFF_FFFE,
+        "expected access after unlink = -ENOENT (0xFFFFFFFE), got 0x{post:08X}; \
+         if it equals 0, unlink failed and the file still exists; {}",
+        dump_uart_on_failure(&cumulative, "access-post-wrong")
     );
 }
 
