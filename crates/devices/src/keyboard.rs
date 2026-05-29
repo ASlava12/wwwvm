@@ -248,4 +248,42 @@ mod tests {
         assert_eq!(kbd.read(Keyboard::DATA_PORT), 0x55);
         assert_eq!(kbd.read(Keyboard::DATA_PORT), 0x1E);
     }
+
+    /// snapshot/restore must round-trip the scan-code queue in FIFO
+    /// order. A snapshot taken with unread keystrokes pending must
+    /// resume with those keystrokes still queued — the kernel's
+    /// keyboard handler is edge-triggered and won't notice a quiet
+    /// queue reset.
+    #[test]
+    fn snapshot_round_trip_preserves_scancode_queue_in_order() {
+        let mut kbd = Keyboard::new();
+        kbd.push_scancode(0x1E); // 'a' make
+        kbd.push_scancode(0x9E); // 'a' break
+        kbd.push_scancode(0x1C); // 'enter' make
+
+        let mut buf = Vec::new();
+        kbd.snapshot_into(&mut buf);
+        let mut kbd2 = Keyboard::new();
+        let consumed = kbd2.restore(&buf).expect("restore");
+        assert_eq!(consumed, 4 + 3, "header + 3 codes");
+
+        // Drain in FIFO order — the restore-side queue must be
+        // an exact replay of the snapshot-side.
+        assert_eq!(kbd2.read(Keyboard::DATA_PORT), 0x1E);
+        assert_eq!(kbd2.read(Keyboard::DATA_PORT), 0x9E);
+        assert_eq!(kbd2.read(Keyboard::DATA_PORT), 0x1C);
+        assert_eq!(kbd2.read(Keyboard::DATA_PORT), 0);
+    }
+
+    /// restore must reject malformed inputs rather than panic on
+    /// the slice access. Two failure modes: <4 bytes (length
+    /// header missing) and header-claims-more-than-payload.
+    #[test]
+    fn restore_rejects_truncated_blob() {
+        let mut kbd = Keyboard::new();
+        assert!(kbd.restore(&[0u8; 3]).is_err(), "truncated header");
+        // Header says 10 bytes follow, only 2 are present.
+        let bad = [10u8, 0, 0, 0, 1, 2];
+        assert!(kbd.restore(&bad).is_err(), "truncated queue");
+    }
 }
