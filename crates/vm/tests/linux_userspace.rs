@@ -1854,6 +1854,142 @@ fn build_initramfs_file_mmap() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init writes a tiny machine-code function to a
+/// file, maps it `PROT_READ|PROT_EXEC` (MAP_PRIVATE), and `CALL`s
+/// into the mapping — proving the emulator can *fetch and execute*
+/// instructions from a demand-faulted file-backed page.
+///
+/// The mapped "function" is the 3 bytes `CD 80 C3` (`int 0x80; ret`)
+/// — a bare syscall trampoline. /init sets the syscall registers
+/// (eax=write, ebx=1, ecx=marker, edx=len) and `CALL`s the mapping;
+/// the mapped code runs the syscall (writing `[USERSPACE XMAP]`) and
+/// `ret`s back. Keeping the data in /init's own pages sidesteps
+/// i386's lack of RIP-relative addressing — the mapped page only has
+/// to be *fetched and run*, which is the point.
+///
+/// Output: `[USERSPACE FMAP=<4 addr>][USERSPACE XMAP]\n[USERSPACE END]`.
+/// The first call's instruction fetch faults the file page in via
+/// the exec path — exactly how `ld.so` runs shared-object text. The
+/// test asserts a valid page-aligned address and that the XMAP
+/// marker (emitted *by the mapped code*) appears.
+fn build_initramfs_exec_mmap() -> Vec<u8> {
+    let path: &[u8] = b"/code\0";
+    let codepayload: &[u8] = &[0xCD, 0x80, 0xC3]; // int 0x80 ; ret
+    let marker_fmap: &[u8] = b"[USERSPACE FMAP=";
+    let marker_x: &[u8] = b"[USERSPACE XMAP]\n";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      code_addr: u32,
+                      marker_fmap_addr: u32,
+                      marker_x_addr: u32,
+                      marker_end_addr: u32,
+                      fd_addr: u32,
+                      addr_buf: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // fd = open(path, O_CREAT|O_RDWR = 0x42, 0o755)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x42, 0x00, 0x00, 0x00]); // O_CREAT|O_RDWR
+        out.extend_from_slice(&[0xBA, 0xED, 0x01, 0x00, 0x00]); // 0o755
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[fd], eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // write(fd, codepayload, 3)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&code_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(codepayload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // addr = mmap2(NULL, 0x1000, PROT_READ|PROT_EXEC=5, MAP_PRIVATE=2, fd, 0)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0x05, 0x00, 0x00, 0x00]); // PROT_READ|PROT_EXEC
+        out.extend_from_slice(&[0xBE, 0x02, 0x00, 0x00, 0x00]); // MAP_PRIVATE
+        out.extend_from_slice(&[0x8B, 0x3D]); // mov edi, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xED]); // pgoff=0
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[addr_buf], eax
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        // close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // emit FMAP=<addr> before the call (so a bad addr is still
+        // visible if the call faults).
+        w(marker_fmap_addr, marker_fmap.len() as u32, &mut out);
+        w(addr_buf, 4, &mut out);
+        // Set up write(1, marker_x, len), then CALL the mapped code.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9); // mov ecx, marker_x
+        out.extend_from_slice(&marker_x_addr.to_le_bytes());
+        out.push(0xBA); // mov edx, len
+        out.extend_from_slice(&(marker_x.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0x8B, 0x3D]); // mov edi, ds:[addr_buf]
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xFF, 0xD7]); // call edi → mapped [int 0x80; ret]
+                                              // emit END (from /init's own code)
+        w(marker_end_addr, marker_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let code_addr = path_addr + path.len() as u32;
+    let marker_fmap_addr = code_addr + codepayload.len() as u32;
+    let marker_x_addr = marker_fmap_addr + marker_fmap.len() as u32;
+    let marker_end_addr = marker_x_addr + marker_x.len() as u32;
+    let fd_addr = marker_end_addr + marker_end.len() as u32;
+    let addr_buf = fd_addr + 4;
+    let code = build_code(
+        path_addr,
+        code_addr,
+        marker_fmap_addr,
+        marker_x_addr,
+        marker_end_addr,
+        fd_addr,
+        addr_buf,
+    );
+    let fd_zeros = [0u8; 4];
+    let addr_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path,
+            codepayload,
+            marker_fmap,
+            marker_x,
+            marker_end,
+            &fd_zeros,
+            &addr_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -7552,6 +7688,95 @@ fn linux_userspace_file_mmap_milestone() {
          \"MAPDATA8\"; got {:?} (all-zero ⇒ the file page wasn't faulted in); {}",
         String::from_utf8_lossy(&data),
         dump_uart_on_failure(&cumulative, "file-mmap-bytes")
+    );
+}
+
+/// Executable file-backed mmap milestone: /init writes a 3-byte
+/// function (`int 0x80; ret`) to a file, maps it PROT_READ|PROT_EXEC,
+/// and CALLs into the mapping. The mapped code — running from a
+/// demand-faulted file page — executes the write syscall (emitting
+/// `[USERSPACE XMAP]`) and returns. Asserts the mapping address is a
+/// valid page-aligned userspace pointer and the XMAP marker (emitted
+/// *by the mapped code*) appears, proving instruction fetch + execute
+/// from a file-backed exec mapping — the mechanism `ld.so` uses to
+/// run shared-object text.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_exec_mmap_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_exec_mmap();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — the CALL into the exec \
+             mapping likely faulted (exec mapping unsupported or page not faulted \
+             in); {}",
+            dump_uart_on_failure(&cumulative, "exec-mmap")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let addr = stripped
+        .windows(16)
+        .position(|w| w == b"[USERSPACE FMAP=")
+        .and_then(|p| stripped.get(p + 16..p + 20))
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or_else(|| {
+            panic!(
+                "FMAP marker not found; {}",
+                dump_uart_on_failure(&cumulative, "exec-mmap-addr")
+            )
+        });
+    let ran = stripped.windows(16).any(|w| w == b"[USERSPACE XMAP]");
+    eprintln!("exec mmap addr = 0x{addr:08X}, mapped code ran (XMAP) = {ran}");
+
+    const KERNEL_BASE: u32 = 0xC000_0000;
+    assert!(
+        (INIT_LOAD_ADDR..KERNEL_BASE).contains(&addr),
+        "exec mmap addr 0x{addr:08X} outside userspace range (mmap likely \
+         returned -errno); {}",
+        dump_uart_on_failure(&cumulative, "exec-mmap-range")
+    );
+    assert_eq!(
+        addr & 0xFFF,
+        0,
+        "exec mmap addr 0x{addr:08X} not page-aligned"
+    );
+    assert!(
+        ran,
+        "the XMAP marker (emitted by code executing from the file-backed exec \
+         mapping) never appeared — instruction fetch from the mapped page \
+         failed; {}",
+        dump_uart_on_failure(&cumulative, "exec-mmap-ran")
     );
 }
 
