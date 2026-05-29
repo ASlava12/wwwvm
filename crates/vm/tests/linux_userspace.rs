@@ -401,27 +401,24 @@ const INIT_LOAD_ADDR: u32 = 0x0804_8000;
 /// address space — ELF + PHDR sit before it.
 const INIT_ENTRY_OFFSET: u32 = 52 + 32;
 
-/// /init binary sizes that trigger the
+/// /init binary sizes that once triggered the
 /// "stalls-in-pata_legacy-probe, kernel never reaches /init exec"
-/// boot bug. The 17-probe bisection around 600 found {600, 602};
-/// adding `gettimeofday_milestone` on 2026-05-29 surfaced 213
-/// (same symptoms, very different size — so the bad set is wider
-/// than the bisection's 588..608 window suggested). Treat this
-/// list as a non-exhaustive lower bound; landing at a previously
-/// untested size means another 8-minute discovery if it's also
-/// bad. The blocker note in README has the full diagnosis.
-const KNOWN_BAD_INIT_SIZES: &[usize] = &[213, 600, 602];
+/// boot bug ({213, 600, 602} on the older kernel). RESOLVED as of
+/// 2026-05-30: on the current Tinycore 15.x kernel (with the recent
+/// CPU fixes) all three boot cleanly to HELLO at 2.1 B steps — see
+/// `linux_userspace_bad_init_sizes_diag` (the regression guard) and
+/// the README. Kept as an (empty) list so `make_init_elf32_safe`
+/// stays a stable no-op passthrough for its many callers; if a future
+/// size ever regresses, add it here and the dodge re-engages.
+const KNOWN_BAD_INIT_SIZES: &[usize] = &[];
 
-/// Wrap `make_init_elf32` with a known-bad-size dodge for
-/// production milestones. If the raw ELF lands at a size in
-/// `KNOWN_BAD_INIT_SIZES`, append 4 zero bytes as an extra data
-/// segment so PHDR's `p_filesz` and the cpio's `c_filesize`
-/// grow together (the bug seems to depend on `c_filesize` in
-/// the unpacker, but keeping both in sync hedges against the
-/// alternative). Bisection probes and `build_initramfs_uname`
-/// (which intentionally hangs at 600) call `make_init_elf32`
-/// directly to preserve their specific sizes; everything else
-/// should funnel through this.
+/// Wrap `make_init_elf32` with a known-bad-size dodge. As of
+/// 2026-05-30 `KNOWN_BAD_INIT_SIZES` is empty (the boot stall is
+/// resolved — see its doc), so this is currently a transparent
+/// passthrough; it stays the canonical entry point so the dodge can
+/// be re-armed instantly if a size ever regresses. If a size in the
+/// list is hit, it appends 4 zero bytes as an extra data segment so
+/// PHDR's `p_filesz` and the cpio's `c_filesize` grow together.
 fn make_init_elf32_safe(code: &[u8], data_segments: &[&[u8]], pt_flags: u32) -> Vec<u8> {
     let binary = make_init_elf32(code, data_segments, pt_flags);
     if !KNOWN_BAD_INIT_SIZES.contains(&binary.len()) {
@@ -454,24 +451,11 @@ fn make_init_elf32_safe(code: &[u8], data_segments: &[&[u8]], pt_flags: u32) -> 
 /// stops at TRAILER!!! and ignores the padding, but tools like
 /// `cpio -t` get unhappy without it.
 fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
-    // Heads-up for future contributors: /init binaries of size
-    // 600..=602 hit a kernel boot stall — see
-    // `build_initramfs_hello_padded_to_600`'s doc-block for the
-    // bisection summary. If a new builder accidentally lands a
-    // binary in that range, the matching ignored milestone will
-    // hang ~9 minutes when run with --ignored. The bug isn't in
-    // this helper, but the helper is the chokepoint everyone goes
-    // through, so the warning lives here.
-    if matches!(init_binary.len(), 600 | 602) && cfg!(debug_assertions) {
-        eprintln!(
-            "build_cpio_archive: WARNING — /init binary length {} is a known-bad \
-             size. The bad set after 17 probes is exactly {{600, 602}} — sparse \
-             and non-modular (601 works, 604 works, 608 works, only 600 and 602 \
-             hang). Boot stalls in pata_legacy probe — see \
-             build_initramfs_hello_padded_to_600.",
-            init_binary.len()
-        );
-    }
+    // Historical note: /init sizes {213, 600, 602} once stalled the
+    // boot in the pata_legacy probe. RESOLVED 2026-05-30 on Tinycore
+    // 15.x — all three boot cleanly now (see
+    // `linux_userspace_bad_init_sizes_diag`), so the old warning here
+    // was removed.
     let mut archive = Vec::new();
     archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
     archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
@@ -991,44 +975,31 @@ fn init_cpio_archives_start_with_newc_magic() {
 /// this dodge; if the wrapper regresses, every production
 /// milestone could silently start hanging again.
 #[test]
-fn make_init_elf32_safe_dodges_known_bad_sizes() {
-    // Construct a code segment that lands at each known-bad size.
-    // The bare ELF+PHDR is 84 bytes, so a `code` of `N - 84` bytes
-    // (with empty `data_segments`) produces a binary of exactly N.
-    for &bad in KNOWN_BAD_INIT_SIZES {
-        let code = vec![0x90u8; bad - 84];
+fn make_init_elf32_safe_passthrough_and_dodge_machinery() {
+    // The boot stall is resolved (2026-05-30), so KNOWN_BAD_INIT_SIZES
+    // is empty and `_safe` is a transparent passthrough. Verify both:
+    // the list is empty, and `_safe` returns `make_init_elf32`
+    // byte-for-byte for a representative input (and for the formerly
+    // bad sizes 213/600/602, which must now pass through untouched).
+    assert!(
+        KNOWN_BAD_INIT_SIZES.is_empty(),
+        "boot stall resolved → the bad-size list should be empty; if a size \
+         regressed and was re-added, update this test and the dodge expectations"
+    );
+    for size in [213usize, 217, 600, 602] {
+        let code = vec![0x90u8; size - 84];
         let raw = make_init_elf32(&code, &[], 5);
         assert_eq!(
             raw.len(),
-            bad,
-            "raw make_init_elf32 should land at exactly {bad} for this construction",
+            size,
+            "construction should land at exactly {size}"
         );
         let safe = make_init_elf32_safe(&code, &[], 5);
-        assert_ne!(
-            safe.len(),
-            bad,
-            "make_init_elf32_safe should dodge bad size {bad}",
-        );
-        assert!(
-            !KNOWN_BAD_INIT_SIZES.contains(&safe.len()),
-            "make_init_elf32_safe dodge landed at another bad size {} \
-             (came from {bad}); widen the pad or the BAD list",
-            safe.len(),
+        assert_eq!(
+            safe, raw,
+            "with the dodge retired, _safe must equal make_init_elf32 for size {size}"
         );
     }
-    // A confirmed-good size (217 — the gettimeofday production
-    // milestone's actual binary size after its own safe dodge)
-    // must be returned untouched.
-    let code = vec![0x90u8; 217 - 84];
-    let raw = make_init_elf32(&code, &[], 5);
-    assert_eq!(raw.len(), 217);
-    let safe = make_init_elf32_safe(&code, &[], 5);
-    assert_eq!(
-        safe.len(),
-        217,
-        "good size 217 should pass through untouched, got {}",
-        safe.len(),
-    );
 }
 
 /// Hello /init padded to exactly 600 bytes — the **minimal**
@@ -1142,6 +1113,51 @@ fn linux_userspace_hello_padded_to_600_milestone() {
          the size-trigger has been fixed or our emulator state changed \
          (was confirmed-hanging in `4c68139`'s test run)"
     );
+}
+
+/// Diagnostic: do the historically-bad /init sizes {213, 600, 602}
+/// still stall the boot? Each is built RAW (no size dodge) and booted
+/// to the HELLO marker with a bounded budget. The stall was first
+/// characterized on an older kernel; this confirms whether the
+/// current Tinycore 15.x kernel + recent CPU fixes (reg-rollback,
+/// far-call width) have resolved it — in which case the
+/// KNOWN_BAD_INIT_SIZES dodge can be retired. ALWAYS PASSES; logs
+/// per-size pass/fail.
+#[test]
+#[ignore = "diagnostic: re-test the bad-init-size boot stall; ~3 boots"]
+fn linux_userspace_bad_init_sizes_diag() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    eprintln!("=== bad-init-size re-test ===");
+    for size in [213usize, 600, 602] {
+        let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+        let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+        vm.set_kernel_cmdline(
+            "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+             debug loglevel=8 ignore_loglevel",
+        );
+        let cpio = build_initramfs_hello_padded_to(size);
+        vm.set_ramdisk(&cpio).expect("set_ramdisk");
+        vm.start_protected_mode_at(bz.code32_start);
+        let mut cumulative = Vec::<u8>::new();
+        let r = run_until_marker(
+            &mut vm,
+            b"HELLO FROM USERSPACE",
+            6_000_000_000,
+            &mut cumulative,
+        );
+        match r {
+            Ok(steps) => eprintln!("  size {size}: BOOTS ✓ (HELLO at {steps} steps)"),
+            Err(()) => eprintln!("  size {size}: STALL ✗ (no HELLO in 6B steps)"),
+        }
+    }
 }
 
 /// Test the "mod 8" hypothesis. Observed: {600 mod 8 = 0, 602
