@@ -140,9 +140,10 @@ fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
     if matches!(init_binary.len(), 600 | 602) && cfg!(debug_assertions) {
         eprintln!(
             "build_cpio_archive: WARNING — /init binary length {} is a known-bad \
-             size. The bad set is sparse: 600 and 602 hang the kernel boot \
-             (confirmed in `4c68139`, `d6fd05f`); 601 works (`d6fd05f`). Boot \
-             stalls in pata_legacy probe — see build_initramfs_hello_padded_to_600.",
+             size. The bad set after 17 probes is exactly {{600, 602}} — sparse \
+             and non-modular (601 works, 604 works, 608 works, only 600 and 602 \
+             hang). Boot stalls in pata_legacy probe — see \
+             build_initramfs_hello_padded_to_600.",
             init_binary.len()
         );
     }
@@ -195,19 +196,23 @@ fn build_initramfs_hello() -> Vec<u8> {
 /// `init_cpio_archives_start_with_newc_magic` as a sanity-check
 /// input, AND it's a canonical reproducer for the boot stall.
 ///
-/// Bisection result (15-probe sweep `d22718e`..`a25f98e`, then
-/// `4c68139` + `d6fd05f`):
+/// Bisection result (17-probe sweep `d22718e`..`74dedf3`):
 ///
-///   | /init size | works? |
-///   |------------|--------|
-///   | 588        |  ✓     |
-///   | 600        |  ✗     |
-///   | 601        |  ✓     |
-///   | 602        |  ✗     |
-///   | 604+       |  ✓     |
+///   | /init size | mod 8 | works? |
+///   |------------|-------|--------|
+///   | 588        |   4   |  ✓     |
+///   | 600        |   0   |  ✗     |
+///   | 601        |   1   |  ✓     |
+///   | 602        |   2   |  ✗     |
+///   | 604        |   4   |  ✓     |
+///   | 605        |   5   |  ✓     |
+///   | 608        |   0   |  ✓     |
 ///
-/// **The bad SET is {600, 602} — sparse, not a range.** This
-/// builder lands at exactly 600.
+/// **The bad SET is just {600, 602} — sparse, NOT modular.**
+/// The mod-8 hypothesis (`74dedf3`) was refuted by /init=608
+/// (mod 8 = 0, same as 600) passing. So something genuinely
+/// specific to those two adjacent-ish sizes, not a 3-bit
+/// pattern. This builder lands at exactly 600.
 ///
 /// Binary-size math:
 ///   ELF+PHDR (84) + code (90, 5 syscalls × ~22 bytes) +
