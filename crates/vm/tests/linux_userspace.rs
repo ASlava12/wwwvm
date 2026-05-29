@@ -49,6 +49,68 @@ fn cpio_entry(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) ->
     out
 }
 
+/// Pack `code` + `data_segments` into a tiny i386 ELF32 ET_EXEC
+/// with a single PT_LOAD whose `p_flags` the caller picks
+/// (`5` = R+X for read-only `/init`s, `7` = RWX when the body
+/// includes a buf the kernel `copy_to_user`s into). Entry point
+/// is right after the ELF header + program header — the first
+/// byte of `code`. `data_segments` are concatenated in order
+/// after `code`; the caller is responsible for laying out
+/// `code` so its absolute references match the segment order.
+fn make_init_elf32(code: &[u8], data_segments: &[&[u8]], pt_flags: u32) -> Vec<u8> {
+    const ELF_HEADER_LEN: u32 = 52;
+    const PHDR_LEN: u32 = 32;
+    const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
+    const LOAD_ADDR: u32 = 0x0804_8000;
+    let mut body =
+        Vec::with_capacity(code.len() + data_segments.iter().map(|s| s.len()).sum::<usize>());
+    body.extend_from_slice(code);
+    for s in data_segments {
+        body.extend_from_slice(s);
+    }
+    let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
+
+    let mut elf: Vec<u8> = Vec::with_capacity(52);
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 1, 1, 1, 0]);
+    elf.extend_from_slice(&[0u8; 8]);
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    elf.extend_from_slice(&3u16.to_le_bytes()); // e_machine = EM_386
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&(LOAD_ADDR + ENTRY_OFFSET).to_le_bytes()); // e_entry
+    elf.extend_from_slice(&ELF_HEADER_LEN.to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&(PHDR_LEN as u16).to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+
+    let mut phdr: Vec<u8> = Vec::with_capacity(32);
+    phdr.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    phdr.extend_from_slice(&0u32.to_le_bytes()); // p_offset
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_vaddr
+    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_paddr
+    phdr.extend_from_slice(&filesz.to_le_bytes()); // p_filesz
+    phdr.extend_from_slice(&filesz.to_le_bytes()); // p_memsz
+    phdr.extend_from_slice(&pt_flags.to_le_bytes()); // p_flags (5 = R+X, 7 = RWX)
+    phdr.extend_from_slice(&0x1000u32.to_le_bytes()); // p_align
+
+    let mut binary = elf;
+    binary.extend_from_slice(&phdr);
+    binary.extend_from_slice(&body);
+    binary
+}
+
+/// Load address used by `make_init_elf32`. Both /init variants
+/// reference data segments by absolute address, computed from
+/// this base + ELF/PHDR header sizes + code length.
+const INIT_LOAD_ADDR: u32 = 0x0804_8000;
+/// First byte of `code` lives here in the loaded binary's
+/// address space — ELF + PHDR sit before it.
+const INIT_ENTRY_OFFSET: u32 = 52 + 32;
+
 /// Assemble the cpio archive: /init (regular ELF), /dev (dir),
 /// /dev/console (CHR 5:1 so Linux's `console_on_rootfs` can
 /// open it), and an optional /proc directory (only the procfs-
@@ -76,10 +138,6 @@ fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
 /// Inlined here so the test stays self-contained (no example
 /// dependency from a `tests/` integration file).
 fn build_initramfs_hello() -> Vec<u8> {
-    const LOAD_ADDR: u32 = 0x0804_8000;
-    const ELF_HEADER_LEN: u32 = 52;
-    const PHDR_LEN: u32 = 32;
-    const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
     let msg: &[u8] = b"HELLO FROM USERSPACE\n";
     let msg_len = msg.len() as u32;
 
@@ -98,42 +156,9 @@ fn build_initramfs_hello() -> Vec<u8> {
         out
     };
     let code_len = build_code(0).len() as u32;
-    let msg_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
-    let mut body = build_code(msg_addr);
-    body.extend_from_slice(msg);
-    let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
-
-    let mut elf: Vec<u8> = Vec::with_capacity(52);
-    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 1, 1, 1, 0]);
-    elf.extend_from_slice(&[0u8; 8]);
-    elf.extend_from_slice(&2u16.to_le_bytes());
-    elf.extend_from_slice(&3u16.to_le_bytes());
-    elf.extend_from_slice(&1u32.to_le_bytes());
-    elf.extend_from_slice(&(LOAD_ADDR + ENTRY_OFFSET).to_le_bytes());
-    elf.extend_from_slice(&ELF_HEADER_LEN.to_le_bytes());
-    elf.extend_from_slice(&0u32.to_le_bytes());
-    elf.extend_from_slice(&0u32.to_le_bytes());
-    elf.extend_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes());
-    elf.extend_from_slice(&(PHDR_LEN as u16).to_le_bytes());
-    elf.extend_from_slice(&1u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-
-    let mut phdr: Vec<u8> = Vec::with_capacity(32);
-    phdr.extend_from_slice(&1u32.to_le_bytes());
-    phdr.extend_from_slice(&0u32.to_le_bytes());
-    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
-    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
-    phdr.extend_from_slice(&filesz.to_le_bytes());
-    phdr.extend_from_slice(&filesz.to_le_bytes());
-    phdr.extend_from_slice(&5u32.to_le_bytes());
-    phdr.extend_from_slice(&0x1000u32.to_le_bytes());
-
-    let mut binary = elf;
-    binary.extend_from_slice(&phdr);
-    binary.extend_from_slice(&body);
-
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let code = build_code(msg_addr);
+    let binary = make_init_elf32(&code, &[msg], 5);
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
@@ -148,10 +173,6 @@ fn build_initramfs_hello() -> Vec<u8> {
 /// 5-argument syscall (mount) end-to-end. The cpio archive also
 /// has a /proc directory entry so procfs has a mount point.
 fn build_initramfs_proc_version() -> Vec<u8> {
-    const LOAD_ADDR: u32 = 0x0804_8000;
-    const ELF_HEADER_LEN: u32 = 52;
-    const PHDR_LEN: u32 = 32;
-    const ENTRY_OFFSET: u32 = ELF_HEADER_LEN + PHDR_LEN;
     const BUF_LEN: u32 = 128;
     let marker_pre: &[u8] = b"[USERSPACE /proc/version]: ";
     let marker_post: &[u8] = b"\n[USERSPACE END]\n";
@@ -225,13 +246,13 @@ fn build_initramfs_proc_version() -> Vec<u8> {
         out
     };
     let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
-    let marker_pre_addr = LOAD_ADDR + ENTRY_OFFSET + code_len;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
     let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
     let proc_addr = marker_post_addr + marker_post.len() as u32;
     let slash_proc_addr = proc_addr + proc_str.len() as u32;
     let version_path_addr = slash_proc_addr + slash_proc.len() as u32;
     let buf_addr = version_path_addr + version_path.len() as u32;
-    let mut body = build_code(
+    let code = build_code(
         marker_pre_addr,
         marker_post_addr,
         proc_addr,
@@ -239,45 +260,19 @@ fn build_initramfs_proc_version() -> Vec<u8> {
         version_path_addr,
         buf_addr,
     );
-    body.extend_from_slice(marker_pre);
-    body.extend_from_slice(marker_post);
-    body.extend_from_slice(proc_str);
-    body.extend_from_slice(slash_proc);
-    body.extend_from_slice(version_path);
-    body.extend(std::iter::repeat_n(0u8, BUF_LEN as usize));
-    let filesz = ELF_HEADER_LEN + PHDR_LEN + body.len() as u32;
-
-    let mut elf: Vec<u8> = Vec::with_capacity(52);
-    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 1, 1, 1, 0]);
-    elf.extend_from_slice(&[0u8; 8]);
-    elf.extend_from_slice(&2u16.to_le_bytes());
-    elf.extend_from_slice(&3u16.to_le_bytes());
-    elf.extend_from_slice(&1u32.to_le_bytes());
-    elf.extend_from_slice(&(LOAD_ADDR + ENTRY_OFFSET).to_le_bytes());
-    elf.extend_from_slice(&ELF_HEADER_LEN.to_le_bytes());
-    elf.extend_from_slice(&0u32.to_le_bytes());
-    elf.extend_from_slice(&0u32.to_le_bytes());
-    elf.extend_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes());
-    elf.extend_from_slice(&(PHDR_LEN as u16).to_le_bytes());
-    elf.extend_from_slice(&1u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-    elf.extend_from_slice(&0u16.to_le_bytes());
-
-    let mut phdr: Vec<u8> = Vec::with_capacity(32);
-    phdr.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-    phdr.extend_from_slice(&0u32.to_le_bytes());
-    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
-    phdr.extend_from_slice(&LOAD_ADDR.to_le_bytes());
-    phdr.extend_from_slice(&filesz.to_le_bytes());
-    phdr.extend_from_slice(&filesz.to_le_bytes());
-    phdr.extend_from_slice(&7u32.to_le_bytes()); // R | W | X — buf needs W
-    phdr.extend_from_slice(&0x1000u32.to_le_bytes());
-
-    let mut binary = elf;
-    binary.extend_from_slice(&phdr);
-    binary.extend_from_slice(&body);
-
+    let buf_zeros = vec![0u8; BUF_LEN as usize];
+    let binary = make_init_elf32(
+        &code,
+        &[
+            marker_pre,
+            marker_post,
+            proc_str,
+            slash_proc,
+            version_path,
+            &buf_zeros,
+        ],
+        7, // R | W | X — kernel copy_to_user writes into buf
+    );
     build_cpio_archive(&binary, /* proc_dir */ true)
 }
 
