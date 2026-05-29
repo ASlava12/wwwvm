@@ -2607,6 +2607,177 @@ fn build_initramfs_socketpair() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init drives the `epoll` readiness subsystem:
+/// it pipes a byte to make a read end ready, then
+/// `epoll_create1` → `epoll_ctl(ADD, pipe_read, {EPOLLIN, cookie})`
+/// → `epoll_wait`, reporting each return plus the readied event's
+/// `events` mask and 64-bit `data` cookie:
+///
+///   `[USERSPACE EPC=<4>CTL=<4>WAIT=<4>EVT=<4>DAT=<8>][USERSPACE END]`
+///
+/// This exercises a new kernel subsystem (`fs/eventpoll.c`) and the
+/// packed 12-byte `struct epoll_event` (u32 events + u64 data, no
+/// padding on x86). The decisive proof is the 64-bit `data` cookie
+/// (`0x0000CAFEDEADBEEF`) round-tripping: it is stored inside the
+/// kernel by `epoll_ctl` and copied back out by `epoll_wait`, so a
+/// match proves the registration + readiness-report path end to end.
+/// epoll is the foundation of every modern event loop (nginx, Node).
+fn build_initramfs_epoll() -> Vec<u8> {
+    let msg: &[u8] = b"E";
+    let m_epc: &[u8] = b"[USERSPACE EPC=";
+    let m_ctl: &[u8] = b"CTL=";
+    let m_wait: &[u8] = b"WAIT=";
+    let m_evt: &[u8] = b"EVT=";
+    let m_dat: &[u8] = b"DAT=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const COOKIE: u64 = 0x0000_CAFE_DEAD_BEEF;
+
+    #[allow(clippy::too_many_arguments)]
+    let build_code = |msg_addr: u32,
+                      m_epc_addr: u32,
+                      m_ctl_addr: u32,
+                      m_wait_addr: u32,
+                      m_evt_addr: u32,
+                      m_dat_addr: u32,
+                      m_end_addr: u32,
+                      fds_addr: u32,
+                      ev_in_addr: u32,
+                      ev_out_addr: u32,
+                      ep_buf: u32,
+                      ctl_ret: u32,
+                      wait_ret: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(384);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // pipe2(&fds, 0)
+        out.extend_from_slice(&[0xB8, 0x4B, 0x01, 0x00, 0x00]); // mov eax, 331
+        out.push(0xBB);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(fds[1], msg, 1) — make the read end EPOLLIN-ready
+        out.push(0xA1);
+        out.extend_from_slice(&(fds_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ep = epoll_create1(0) — sys 329
+        out.extend_from_slice(&[0xB8, 0x49, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[ep_buf], eax
+        out.extend_from_slice(&ep_buf.to_le_bytes());
+        // epoll_ctl(ep, EPOLL_CTL_ADD=1, fds[0], &ev_in) — sys 255
+        out.extend_from_slice(&[0xB8, 0xFF, 0x00, 0x00, 0x00]); // mov eax, 255
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[ep_buf]
+        out.extend_from_slice(&ep_buf.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, EPOLL_CTL_ADD
+        out.extend_from_slice(&[0x8B, 0x15]); // mov edx, ds:[fds] (fds[0])
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.push(0xBE); // mov esi, &ev_in
+        out.extend_from_slice(&ev_in_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[ctl_ret], eax
+        out.extend_from_slice(&ctl_ret.to_le_bytes());
+        // epoll_wait(ep, &ev_out, 1, 0) — sys 256
+        out.extend_from_slice(&[0xB8, 0x00, 0x01, 0x00, 0x00]); // mov eax, 256
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[ep_buf]
+        out.extend_from_slice(&ep_buf.to_le_bytes());
+        out.push(0xB9); // mov ecx, &ev_out
+        out.extend_from_slice(&ev_out_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (maxevents)
+        out.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi (timeout 0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[wait_ret], eax
+        out.extend_from_slice(&wait_ret.to_le_bytes());
+        // emit EPC CTL WAIT EVT(events @ ev_out+0) DAT(data @ ev_out+4) END
+        w(m_epc_addr, m_epc.len() as u32, &mut out);
+        w(ep_buf, 4, &mut out);
+        w(m_ctl_addr, m_ctl.len() as u32, &mut out);
+        w(ctl_ret, 4, &mut out);
+        w(m_wait_addr, m_wait.len() as u32, &mut out);
+        w(wait_ret, 4, &mut out);
+        w(m_evt_addr, m_evt.len() as u32, &mut out);
+        w(ev_out_addr, 4, &mut out);
+        w(m_dat_addr, m_dat.len() as u32, &mut out);
+        w(ev_out_addr + 4, 8, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_epc_addr = msg_addr + msg.len() as u32;
+    let m_ctl_addr = m_epc_addr + m_epc.len() as u32;
+    let m_wait_addr = m_ctl_addr + m_ctl.len() as u32;
+    let m_evt_addr = m_wait_addr + m_wait.len() as u32;
+    let m_dat_addr = m_evt_addr + m_evt.len() as u32;
+    let m_end_addr = m_dat_addr + m_dat.len() as u32;
+    let fds_addr = m_end_addr + m_end.len() as u32;
+    let ev_in_addr = fds_addr + 8;
+    let ev_out_addr = ev_in_addr + 12; // packed struct epoll_event = 12 bytes
+    let ep_buf = ev_out_addr + 12;
+    let ctl_ret = ep_buf + 4;
+    let wait_ret = ctl_ret + 4;
+    let code = build_code(
+        msg_addr,
+        m_epc_addr,
+        m_ctl_addr,
+        m_wait_addr,
+        m_evt_addr,
+        m_dat_addr,
+        m_end_addr,
+        fds_addr,
+        ev_in_addr,
+        ev_out_addr,
+        ep_buf,
+        ctl_ret,
+        wait_ret,
+    );
+    // ev_in: events=EPOLLIN(1) at +0, data=COOKIE at +4 (packed).
+    let mut ev_in = Vec::with_capacity(12);
+    ev_in.extend_from_slice(&1u32.to_le_bytes());
+    ev_in.extend_from_slice(&COOKIE.to_le_bytes());
+    let fds_zeros = [0u8; 8];
+    let ev_out_zeros = [0u8; 12];
+    let z4 = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            msg,
+            m_epc,
+            m_ctl,
+            m_wait,
+            m_evt,
+            m_dat,
+            m_end,
+            &fds_zeros,
+            &ev_in,
+            &ev_out_zeros,
+            &z4,
+            &z4,
+            &z4,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -8796,6 +8967,103 @@ fn linux_userspace_socketpair_milestone() {
         buf.as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned()),
         dump_uart_on_failure(&cumulative, "sock-bytes")
+    );
+}
+
+/// epoll milestone: /init makes a pipe readable, registers its read
+/// end with `epoll_ctl(ADD, {EPOLLIN, cookie})`, and `epoll_wait`s.
+/// Asserts the wait reported 1 ready fd, the events mask has EPOLLIN,
+/// and — decisively — the 64-bit `data` cookie (0x0000CAFEDEADBEEF)
+/// round-tripped from registration through the kernel back out, which
+/// proves the eventpoll registration + readiness-report path. epoll
+/// is the engine of every modern event loop.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_epoll_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_epoll();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — epoll_create/ctl/wait \
+             likely returned -errno or the wait blocked; {}",
+            dump_uart_on_failure(&cumulative, "epoll")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let u32_at = |marker: &[u8]| -> Option<u32> {
+        stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .and_then(|p| stripped.get(p + marker.len()..p + marker.len() + 4))
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+
+    let epc = u32_at(b"[USERSPACE EPC=").map(|v| v as i32);
+    let ctl = u32_at(b"CTL=").map(|v| v as i32);
+    let wait = u32_at(b"WAIT=").map(|v| v as i32);
+    let evt = u32_at(b"EVT=");
+    let dat = stripped
+        .windows(4)
+        .position(|w| w == b"DAT=")
+        .and_then(|p| stripped.get(p + 4..p + 12))
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+    eprintln!("epoll: create={epc:?} ctl={ctl:?} wait={wait:?} events={evt:#x?} data={dat:#x?}");
+
+    assert!(
+        epc.map(|v| v >= 0).unwrap_or(false),
+        "epoll_create1 should return a valid fd; got {epc:?}; {}",
+        dump_uart_on_failure(&cumulative, "epoll-create")
+    );
+    assert_eq!(ctl, Some(0), "epoll_ctl(ADD) should return 0; got {ctl:?}");
+    assert_eq!(
+        wait,
+        Some(1),
+        "epoll_wait should report exactly 1 ready fd; got {wait:?}; {}",
+        dump_uart_on_failure(&cumulative, "epoll-wait")
+    );
+    const EPOLLIN: u32 = 0x001;
+    assert_eq!(
+        evt.map(|e| e & EPOLLIN),
+        Some(EPOLLIN),
+        "the ready event should have EPOLLIN set; got {evt:#x?}"
+    );
+    assert_eq!(
+        dat,
+        Some(0x0000_CAFE_DEAD_BEEF),
+        "the 64-bit data cookie should round-trip through the kernel; got \
+         {dat:#x?}; {}",
+        dump_uart_on_failure(&cumulative, "epoll-cookie")
     );
 }
 
