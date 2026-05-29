@@ -2201,6 +2201,25 @@ fn set_kernel_cmdline_writes_string_and_updates_ptr() {
 /// A cmdline longer than the 2 KiB slot is truncated rather than
 /// overflowing into adjacent setup-header / kernel territory.
 #[test]
+fn set_kernel_cmdline_with_empty_string_writes_null_terminator() {
+    // Empty cmdline must still leave a NUL at 0x90800 and update
+    // cmd_line_ptr — the kernel's setup probes for a non-zero
+    // cmd_line_ptr to decide whether to look at all, and a
+    // missing terminator on an empty string would read whatever
+    // junk was at 0x90801 as the first command-line byte.
+    let mut vm = Vm::new();
+    // Poison the cmdline region so we can prove the NUL got written.
+    vm.mem.write_u8(0x9_0800, 0xFF);
+    vm.set_kernel_cmdline("");
+    assert_eq!(vm.mem().read_u8(0x9_0800), 0, "NUL at the cmdline start");
+    assert_eq!(
+        vm.mem().read_u32(0x9_0228),
+        0x9_0800,
+        "cmd_line_ptr still points at the cmdline buffer"
+    );
+}
+
+#[test]
 fn set_kernel_cmdline_truncates_overlong_input() {
     let mut vm = Vm::new();
     let long = "x".repeat(3000);
