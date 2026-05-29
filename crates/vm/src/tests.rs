@@ -3917,6 +3917,32 @@ fn restore_rejects_truncated_blob() {
     }
 }
 
+/// `restore` into a Vm whose RAM size differs from the snapshot's
+/// rejects with `TooSmall` rather than silently truncating or
+/// extending. The snapshot embeds RAM bytes 1:1; restoring a
+/// 1 MiB snapshot into a 2 MiB Vm runs out of bytes before
+/// reaching the RAM region's expected end (the layout length
+/// pre-check fires first, before `restore_full`'s defense-in-
+/// depth size check would). Without the loud error the larger
+/// Vm would resume with an uninitialized tail half — a bug
+/// magnet during silent backups.
+///
+/// `MemorySizeMismatch` is technically also a `SnapshotError`
+/// variant; in practice the upstream `TooSmall` check at the
+/// layout level fires first and `restore_full`'s sibling check
+/// is defense-in-depth only, which is why both directions land
+/// in the same `TooSmall` arm here.
+#[test]
+fn restore_rejects_when_target_vm_ram_size_is_larger() {
+    let vm = Vm::with_ram_size(0x0010_0000); // 1 MiB
+    let snap = vm.snapshot();
+    let mut vm2 = Vm::with_ram_size(0x0020_0000); // 2 MiB
+    match vm2.restore(&snap).unwrap_err() {
+        snapshot::SnapshotError::TooSmall { .. } => {}
+        other => panic!("expected TooSmall, got {other}"),
+    }
+}
+
 /// Divide-by-zero now raises #DE through IVT[0] instead of
 /// surfacing as `Stop::CpuError`. Confirms the VM-side view: a
 /// handler set up via the IVT actually runs and the VM ends
