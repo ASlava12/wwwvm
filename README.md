@@ -258,8 +258,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**572 теста** зелёные (mem 30 + devices 77 + cpu 320 + vm 128 +
-tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v14.
+**587 тестов** зелёные (mem 30 + devices 77 + cpu 335 + vm 128 +
+tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
 --locked`. Throughput release ≈ 60–110 MIPS зависит от хоста
@@ -1156,7 +1156,7 @@ milestone'ы re-verified зелёными на Tinycore 15.x kernel'е при
 cargo test --workspace
 ```
 
-Должно вывести 572 пройденных теста на текущий момент. CI
+Должно вывести 587 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
