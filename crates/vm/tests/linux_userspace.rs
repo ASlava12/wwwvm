@@ -27,6 +27,13 @@
 //!     unique `[USERSPACE /proc/version]:` prefix. Pins mount +
 //!     open + read + the kernel-side copy_to_user end-to-end.
 //!
+//!   - `linux_userspace_time_milestone` — clock primitive:
+//!     /init calls `sys_time(NULL)` (syscall 13), writes the
+//!     returned 32-bit time_t bracketed by `[USERSPACE TIME=]`
+//!     markers, and the test decodes the 4 bytes from cumulative
+//!     UART output. Pins CMOS RTC read → kernel timekeeping →
+//!     sys_time → cross-ring trampoline → userspace decode.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -297,13 +304,16 @@ fn init_cpio_archives_start_with_newc_magic() {
     let uname = build_initramfs_uname();
     let proc_version = build_initramfs_proc_version();
     let hello = build_initramfs_hello();
+    let time = build_initramfs_time();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
+    assert_eq!(&time[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
         let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
+        let _ = std::fs::write("/tmp/wwwvm-time.cpio", &time);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -696,6 +706,79 @@ fn build_initramfs_proc_version() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ true)
 }
 
+/// Build a cpio whose /init calls `sys_time(NULL)` (syscall 13,
+/// i.e. `sys_time32` on i386), stores the returned 32-bit time_t
+/// in a buffer, and writes the buffer to stdout bracketed by a
+/// pair of unique markers. Exercises a syscall the existing
+/// milestones don't (hello + proc/version cover write, exit,
+/// mount, open, read — but no clock primitive) and proves the
+/// kernel's wall-clock subsystem (CMOS RTC read at early boot
+/// then jiffies updates) surfaces through the int 0x80 trampoline
+/// in a form userspace can decode. The trailing
+/// `[USERSPACE END]` marker exists so the test can wait until
+/// the entire 4-byte time_t has been flushed to UART before
+/// trying to decode it (without it the marker_pre and partial
+/// time bytes could be in cumulative while the rest sits in
+/// the in-flight chunk).
+fn build_initramfs_time() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE TIME=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_time(NULL) — sys 13. Returns time_t in eax.
+        out.extend_from_slice(&[0xB8, 0x0D, 0x00, 0x00, 0x00]); // mov eax, 13
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (tloc = NULL)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf_addr], eax — A3 = MOV moffs32, EAX. Stores
+        // the 32-bit time_t in the writable data segment so the
+        // next write(2) can pick it up; needs RWX p_flags.
+        out.push(0xA3);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // write(1, buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros],
+        7, // R | W | X — /init writes time_t into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -874,4 +957,91 @@ fn linux_userspace_proc_version_milestone() {
         )
     });
     eprintln!("/proc/version userspace read seen after {steps} steps");
+}
+
+/// Clock-primitive milestone: /init calls `sys_time(NULL)`,
+/// stores the returned time_t in a writable buffer, and writes
+/// `[USERSPACE TIME=<4-byte-le-t>]\n[USERSPACE END]\n` to UART.
+/// Proves the kernel's wall-clock subsystem (CMOS RTC pulled at
+/// boot + jiffies updates) reaches userspace through int 0x80.
+/// Two-stage check: first wait for the `[USERSPACE END]` marker
+/// (which guarantees marker_pre + 4-byte t + marker_post are all
+/// in `cumulative`), then locate marker_pre and decode the
+/// trailing 4 bytes as little-endian u32. Asserts the value is
+/// neither 0 (kernel returned a zero clock — RTC not read) nor
+/// -1 (syscall returned an errno — handler broken).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_time_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_time();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE TIME=";
+    // /init writes `]\n[USERSPACE END]\n` but the kernel's TTY
+    // line discipline ONLCR-translates every `\n` to `\r\n`
+    // before it hits UART. The bytes the test sees in
+    // `cumulative` are the kernel-emitted form, so the search
+    // needle includes the `\r`. (Empirically confirmed from
+    // /tmp/wwwvm-userspace-time-failure.bin: `5d 0d 0a 5b ...`).
+    // marker_pre stays `\n`-free so its match is unaffected.
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "time")
+            )
+        });
+    eprintln!("sys_time userspace milestone seen after {steps} steps");
+
+    // Locate marker_pre and the 4-byte time_t that follows. We
+    // know marker_post landed in `cumulative`, so marker_pre and
+    // its 4-byte payload must be earlier in the same buffer.
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let t_off = pre_pos + marker_pre.len();
+    let t_bytes: [u8; 4] = cumulative[t_off..t_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let time_t = u32::from_le_bytes(t_bytes);
+    eprintln!("sys_time returned time_t = {time_t} (0x{time_t:08X})");
+    // The kernel's rtc_cmos initializes the system clock to
+    // 2020-01-01T00:00:00 UTC = 1577836800 (printed in the
+    // boot log as `rtc_cmos rtc_cmos: setting system clock to
+    // 2020-01-01T00:00:00 UTC (1577836800)`). By the time /init
+    // runs the clock has advanced a few seconds via jiffies, so
+    // observed time_t is consistently `1577836800 + k` for small
+    // k (e.g. 9 on the first green run). Assert `>= 2020-01-01`
+    // and `< 2038-01-19` (i386 sys_time32 hard wall) so the
+    // test catches both an under-initialized clock (0, partial
+    // RTC read) and a sign-extended errno that happens to land
+    // in a plausible-looking range.
+    const RTC_CMOS_FLOOR: u32 = 1_577_836_800; // 2020-01-01 UTC
+    const Y2038_CEIL: u32 = 0x7FFF_FFFF; // i386 sys_time32 wraps here
+    assert!(
+        (RTC_CMOS_FLOOR..Y2038_CEIL).contains(&time_t),
+        "sys_time returned {time_t} (0x{time_t:08X}); expected \
+         [{RTC_CMOS_FLOOR}, {Y2038_CEIL}); {}",
+        dump_uart_on_failure(&cumulative, "time-range")
+    );
 }
