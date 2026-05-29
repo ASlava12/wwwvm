@@ -229,9 +229,11 @@ spinlock через LOCK CMPXCHG + PAUSE):
   `start_protected_mode_at` (skip real-mode trampoline; honors
   boot protocol §4.1: ESI=0x90000, EBP/EDI/EBX=0, IF clear,
   ESP=0x7C00), `load_pm_demo` (bundled synthetic bzImage что
-  печатает "Hello from PM!" в UART). Снапшот v12 round-trip'ит
+  печатает "Hello from PM!" в UART). Снапшот v14 round-trip'ит
   всё состояние CPU (включая code_size_32, misc_enable, tsc_aux,
-  DR0..7) + RAM + LAPIC + HPET scratch buffers + devices.
+  DR0..7) + RAM + LAPIC + HPET scratch buffers + HPET per-timer
+  periods (v13) + PIT channel-2 reload/counter/gate (v14) +
+  devices.
 - **PCI** (порты 0xCF8/0xCFC, Mechanism #1): пустая шина — все
   чтения окна данных возвращают 0xFFFFFFFF (sentinel "нет устройства").
   Полноценные 32-битные IN/OUT через 0x66-префикс декомпозируются
