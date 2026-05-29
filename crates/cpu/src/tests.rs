@@ -5399,6 +5399,66 @@ fn cli_in_ring_3_faults_at_iopl_0_succeeds_at_iopl_3() {
     assert_eq!(cpu.ip, 0x8001);
 }
 
+/// STI in CPL=3 fires #GP iff IOPL < CPL — sibling check to the
+/// CLI test above. Both opcodes share the same
+/// `raise_gp_if_below_iopl` path, but a regression that wired
+/// STI to a *different* (looser) check would have a userspace
+/// STI succeed at IOPL=0 — silently allowing the userspace
+/// process to re-enable interrupts and dodge the kernel's
+/// scheduler-IRQ suppression.
+#[test]
+fn sti_in_ring_3_faults_at_iopl_0_succeeds_at_iopl_3() {
+    fn run(iopl: u16) -> (bool, Cpu) {
+        let mut mem = Memory::new(0x10_0000);
+        let gdt: [u8; 48] = [
+            0, 0, 0, 0, 0, 0, 0, 0, // null
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92,
+            0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, 0xFF, 0xFF, 0x00, 0x00,
+            0x00, 0xF2, 0xCF, 0x00, 0x67, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00,
+        ];
+        mem.write_slice(0x500, &gdt);
+        mem.write_u32(0x4004, 0x3000);
+        mem.write_u16(0x4008, 0x0010);
+        mem.write_slice(
+            0x6000 + 13 * 8,
+            &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
+        );
+        mem.write_u8(0x8000, 0xFB); // STI
+
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        cpu.cr0 = 1;
+        cpu.gdtr.base = 0x0500;
+        cpu.gdtr.limit = 0x2F;
+        cpu.idtr.base = 0x6000;
+        cpu.idtr.limit = 0x07FF;
+        cpu.tr = 0x28;
+        cpu.write_sreg(sreg::CS, 0x001B, &mem);
+        cpu.write_sreg(sreg::SS, 0x0023, &mem);
+        cpu.write_r32(r16::SP as u8, 0x2000);
+        cpu.ip = 0x8000;
+        // IF clear + the requested IOPL (so successful STI is visible).
+        cpu.flags = 0x0002 | (iopl << 12);
+
+        let mut io = IoBus::new();
+        cpu.step(&mut mem, &mut io).expect("step STI");
+        let faulted = cpu.sregs[sreg::CS] == 0x0008;
+        (faulted, cpu)
+    }
+
+    // IOPL=0 → CPL=3 > IOPL=0 → fault. IF stays clear because the
+    // instruction never committed.
+    let (faulted, cpu) = run(0);
+    assert!(faulted, "CPL=3 > IOPL=0 must #GP");
+    assert_eq!(cpu.flags & flag::IF, 0, "STI faulted, so IF stays clear");
+
+    // IOPL=3 → CPL=3 == IOPL → guard passes; STI commits, IF set.
+    let (faulted, cpu) = run(3);
+    assert!(!faulted, "CPL=3 <= IOPL=3 must succeed");
+    assert_ne!(cpu.flags & flag::IF, 0, "STI committed, IF set");
+    assert_eq!(cpu.ip, 0x8001);
+}
+
 /// HLT from CPL=3 raises #GP(0) instead of halting the CPU. The
 /// fault uses the same cross-ring entry path as INT-from-ring-3:
 /// land on the kernel stack via TSS, push the user frame, then
