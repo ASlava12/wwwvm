@@ -9785,6 +9785,118 @@ fn linux_userspace_dynamic_exec_diag() {
     }
 }
 
+/// Diagnostic isolating the dynamic-linking failure: boots busybox
+/// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
+/// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
+/// via an execve stub) and `dynamic_binary_diag` (rotdash, kernel-
+/// exec'd, libc-only → reaches a clean exit), this controls for the
+/// execve-stub variable: if busybox-direct still segfaults in ld.so's
+/// relocation walk, the stub is innocent and the bug is in the
+/// multi-library link path itself. Reports the faulting ip so it can
+/// be compared against the stub run's `b7f21e9d`. ALWAYS PASSES.
+#[test]
+#[ignore = "diagnostic: busybox kernel-exec'd to isolate ld.so bug; ~bounded"]
+fn linux_userspace_busybox_direct_diag() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let root =
+        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
+    let rd = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (Some(busybox), Some(ld), Some(libc), Some(libm), Some(libcrypt)) = (
+        rd("bin/busybox"),
+        rd("lib/ld-linux.so.2"),
+        rd("lib/libc.so.6"),
+        rd("lib/libm.so.6"),
+        rd("lib/libcrypt.so.1"),
+    ) else {
+        return;
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_cpio_with_libs(
+        &busybox,
+        &[
+            ("ld-linux.so.2", &ld),
+            ("libc.so.6", &libc),
+            ("libm.so.6", &libm),
+            ("libcrypt.so.1", &libcrypt),
+        ],
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 6_000_000_000u64;
+    let mut steps = 0u64;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        let t = String::from_utf8_lossy(&cumulative);
+        if t.contains("segfault at") || t.contains("Attempted to kill init") {
+            stop_reason = "segfault/panic".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "budget (likely past relocation, in init applet)".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox-direct diagnostic ===");
+    eprintln!("  steps: {steps}, stop: {stop_reason}");
+    eprintln!(
+        "  reached /init: {}",
+        text.contains("Run /init as init process")
+    );
+    for needle in ["segfault at", "Code:", "Kernel panic", "exitcode="] {
+        if let Some(p) = text.find(needle) {
+            let endp = text[p..]
+                .find('\n')
+                .map(|n| p + n)
+                .unwrap_or((p + 140).min(text.len()));
+            eprintln!("  [{needle}] {:?}", &text[p..endp]);
+        }
+    }
+}
+
 /// File-I/O round-trip milestone: /init creates a new file in
 /// initramfs (`/test_file`) with `open(O_CREAT|O_WRONLY, 0o644)`,
 /// writes `b"TESTDATA"` to it, closes, reopens read-only, reads
