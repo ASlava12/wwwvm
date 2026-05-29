@@ -31,7 +31,7 @@
 //!   WWWVM_INIT_INPUT=Q        builtin-initrd echo mode: queue this byte
 //!                             once /init's "echo " marker hits UART
 //!   WWWVM_INITRD=path         load a raw or gzipped cpio as the ramdisk
-//!   WWWVM_INITRD_BUILTIN=1    use the inline 136-byte ELF /init instead
+//!   WWWVM_INITRD_BUILTIN=1    use the inline 139-byte ELF /init instead
 //!   WWWVM_KERNEL=path         override the default vmlinuz path
 //!   WWWVM_QUIET=1             suppress the per-chunk UART-pushed dump
 //!                             (transition diagnostics stay on)
@@ -794,7 +794,7 @@ fn main() {
 
 /// Build the minimal newc cpio archive that reproduces the
 /// "HELLO FROM USERSPACE" milestone. Contains three entries:
-/// `/init` (136-byte static i386 ELF that issues
+/// `/init` (139-byte static i386 ELF that issues
 /// `write(1, msg, 21); exit(42)` via int 0x80), `/dev` (directory
 /// so Linux can mount the console node into it), and
 /// `/dev/console` (S_IFCHR, major=5 minor=1 — the TTYAUX node
