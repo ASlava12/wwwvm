@@ -286,12 +286,14 @@ WWWVM_INITRD_BUILTIN=1 cargo run --release --example linux_boot
 Полный прогон через linux_boot example ~10 минут wall-clock —
 там работает кучка per-step диагностики (EIP region tracking, IF
 transitions, stuck detection) которая интересна для отладки но
-жрёт ~5x времени. Если нужно ограничить прогон узким окном вокруг milestone'а
-(чтобы диагностический дамп — особенно гистограмма из
-`WWWVM_DUMP_REGIONS=1` — не размывался post-panic шагами после
-выхода /init), задайте `WWWVM_STEP_BUDGET=N` (decimal, без
-underscore'ов). Например `WWWVM_STEP_BUDGET=2000000000` режет
-прогон до 2 B шагов / ~52 секунды. Чистый прогон без диагностики
+жрёт ~5x времени. Если нужно ограничить прогон узким окном (чтобы диагностический
+дамп — особенно гистограмма из `WWWVM_DUMP_REGIONS=1` — не
+размывался post-panic шагами после выхода /init), задайте
+`WWWVM_STEP_BUDGET=N` (decimal, без underscore'ов). Cap имеет
+смысл выставлять выше 1.9 B (порог HELLO в integration test'е):
+example прогоняет ядро с расширенным cmdline (`initcall_debug`),
+который льёт UART-трассу на каждом initcall'е, так что USERSPACE
+в example достигается заметно позже — план ~10 B. Чистый прогон без диагностики
 (см. integration test ниже) занимает **~52 секунды** на той же
 машине: до момента когда /init успевает напечатать HELLO,
 проходит ≈1.9 миллиарда CPU-step'ов (т.е. итераций `cpu.step()` —
