@@ -7368,19 +7368,22 @@ impl Cpu {
                     }
 
                     // XADD r/m8, r8 — 0x0F 0xC0. Atomic exchange-and-
-                    // add: dest, src = dest + src, dest (in that order
-                    // — the src register receives the old dest value).
-                    // Used by Linux atomic_add_return and refcount_inc.
+                    // add. SDM order: SRC := DEST (old), then DEST :=
+                    // SRC+DEST. The destination is written LAST so that
+                    // when SRC and DEST are the SAME register (XADD AX,AX)
+                    // the register ends with the sum (2*old), not the old
+                    // value. Used by Linux atomic_add_return/refcount_inc.
                     0xC0 => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let dest = self.read_rm8(rm, mem);
                         let src = self.read_r8(reg);
                         let sum = dest.wrapping_add(src);
                         self.flags_add8(dest, src, 0, sum);
-                        self.write_rm8(rm, mem, sum);
                         self.write_r8(reg, dest);
+                        self.write_rm8(rm, mem, sum);
                     }
-                    // XADD r/m16/32, r16/32 — 0x0F 0xC1.
+                    // XADD r/m16/32, r16/32 — 0x0F 0xC1. Dest written last
+                    // (see 0xC0) for the register-aliased case.
                     0xC1 => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         if self.op_size_32 {
@@ -7388,15 +7391,15 @@ impl Cpu {
                             let src = self.read_r32(reg);
                             let sum = dest.wrapping_add(src);
                             self.flags_add32(dest, src, 0, sum);
-                            self.write_rm32(rm, mem, sum);
                             self.write_r32(reg, dest);
+                            self.write_rm32(rm, mem, sum);
                         } else {
                             let dest = self.read_rm16(rm, mem);
                             let src = self.read_r16(reg);
                             let sum = dest.wrapping_add(src);
                             self.flags_add16(dest, src, 0, sum);
-                            self.write_rm16(rm, mem, sum);
                             self.write_r16(reg, dest);
+                            self.write_rm16(rm, mem, sum);
                         }
                     }
 

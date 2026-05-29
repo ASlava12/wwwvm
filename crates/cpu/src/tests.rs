@@ -9848,6 +9848,24 @@ fn xadd_r16_swaps_and_adds() {
     assert_eq!(cpu.regs[r16::BX], 10);
 }
 
+/// XADD with the SAME source and destination register must leave the
+/// register holding 2*old (SDM writes the destination last). Regression
+/// for the reversed write order, which left the original value.
+#[test]
+fn xadd_aliased_reg16_doubles_value() {
+    // MOV AX, 5 ; XADD AX, AX (0F C1, ModRM=C0) ; HLT
+    let (cpu, _, _) = run_payload(&[0xB8, 0x05, 0x00, 0x0F, 0xC1, 0xC0, 0xF4], 8);
+    assert_eq!(cpu.regs[r16::AX], 10, "XADD AX,AX -> sum (2*old) wins");
+}
+
+/// 8-bit companion: XADD AL, AL.
+#[test]
+fn xadd_aliased_reg8_doubles_value() {
+    // MOV AL, 5 ; XADD AL, AL (0F C0, ModRM=C0) ; HLT
+    let (cpu, _, _) = run_payload(&[0xB0, 0x05, 0x0F, 0xC0, 0xC0, 0xF4], 8);
+    assert_eq!(cpu.read_r8(0), 10, "XADD AL,AL -> sum (2*old) wins");
+}
+
 /// 0x0F 0xC8 — BSWAP EAX. Reverses byte order in EAX. Linux uses
 /// this for converting between host and network byte order on
 /// 32-bit fields.
