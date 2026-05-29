@@ -933,6 +933,31 @@ mod tests {
         );
     }
 
+    /// Mirror of `tick_hpet_disabled_timer_does_not_fire_irq_on_…`:
+    /// timer with INT_ENB_CNF (bit 2) SET but FSB_EN_CNF (bit 14)
+    /// CLEAR must also not fire. The cfg gate requires *both*
+    /// bits — a regression that only checked one direction would
+    /// have one half of the pair silently break. Together with
+    /// the existing bit-2-clear test, this pins the bit-mask as
+    /// `bit 2 AND bit 14`, not `bit 2 OR bit 14`.
+    #[test]
+    fn tick_hpet_timer_with_fsb_disabled_does_not_fire_irq() {
+        let mut m = Memory::new(64);
+        m.write_u32(HPET_BASE + 0x10, 1); // HPET main enable
+                                          // Timer 0: bit 2 set (INT_ENB), bit 14 clear (FSB_EN).
+        m.write_u32(HPET_BASE + 0x100, 1 << 2);
+        m.write_u32(HPET_BASE + 0x108, 5);
+        m.write_u32(HPET_BASE + 0x110, 0x0000_0042);
+        for _ in 0..5 {
+            m.tick_hpet_counter();
+        }
+        assert_eq!(m.read_u32(HPET_BASE + 0xF0), 5, "counter still ticks");
+        assert!(
+            m.take_pending_lapic_irq().is_none(),
+            "FSB_EN=0 must suppress IRQ delivery even with INT_ENB=1"
+        );
+    }
+
     /// HPET main counter must freeze when ENABLE_CNF (General
     /// Configuration register, offset 0x010 bit 0) is clear.
     /// Linux relies on this for HPET pause-during-resume — without
