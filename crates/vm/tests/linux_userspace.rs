@@ -264,6 +264,84 @@ fn init_cpio_archives_start_with_newc_magic() {
     }
 }
 
+/// Hello /init padded to exactly 600 bytes — the simplest known
+/// reproducer of the binary-size-in-bad-range stall. If this
+/// hangs the same way the original uname /init does, we have a
+/// minimal-asm minimal-data reproducer for the next kernel-side
+/// debug pass: no uname syscall, no buf write, no marker
+/// segments, just the hello write + exit + 461 bytes of trailing
+/// zeros to push the binary to 600 bytes total.
+fn build_initramfs_hello_padded_to_600() -> Vec<u8> {
+    let msg: &[u8] = b"HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+    let build_code = |msg_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(34);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let code_len = build_code(0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let code = build_code(msg_addr);
+    // Target binary 600 bytes:
+    //   84 (ELF+PHDR) + code_len + msg_len + pad = 600
+    //   pad = 600 - 84 - code_len - msg_len
+    let pad_len = 600 - 84 - code_len as usize - msg_len as usize;
+    let pad = vec![0u8; pad_len];
+    let binary = make_init_elf32(&code, &[msg, &pad], 5);
+    debug_assert_eq!(binary.len(), 600, "should land at exactly 600 bytes");
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+#[test]
+#[ignore = "faster /init=600 reproducer — confirms minimal repro"]
+fn linux_userspace_hello_padded_to_600_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hello_padded_to_600();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen — minimal /init=600 reproduces the stall (good — \
+             use this as the canonical minimal reproducer for future debug); {}",
+            dump_uart_on_failure(&cumulative, "hello-600")
+        )
+    });
+    eprintln!(
+        "HELLO seen at {steps} steps — minimal /init=600 boots fast, the \
+         bug is more subtle than just binary size"
+    );
+}
+
 /// Pin `build_initramfs_uname` as the canonical reproducer of the
 /// /init-binary-size-600 stall: extract the /init filesize from
 /// the cpio header (field 6 of the 13 ASCII-hex fields after the
