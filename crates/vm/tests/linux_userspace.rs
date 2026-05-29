@@ -1086,3 +1086,95 @@ fn linux_userspace_marker_then_uname_then_buf_then_hello_with_exit_0_milestone()
     });
     eprintln!("HELLO seen after {steps} steps (exit(0) is fine — bug is in marker_post)");
 }
+
+/// Final-bisection probe. Build the same /init as the working
+/// `linux_userspace_marker_then_uname_then_buf_then_hello`, but
+/// replace the HELLO msg ("HELLO FROM USERSPACE\n", 21 bytes)
+/// with the failing marker_post ("\n[USERSPACE END]\n", 17 bytes).
+/// Since /init still also writes HELLO in the marker_then_uname
+/// version, we need a marker the test SEARCH for that's
+/// guaranteed to be in the output. Use a marker prefix WRAPPER:
+/// /init writes `[BISECT] HELLO`, then the failing msg, then
+/// exits. The test searches for `[BISECT] HELLO`.
+fn build_initramfs_bisect_with_msg(msg: &'static [u8]) -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let marker_pre: &[u8] = b"[BISECT] HELLO\n";
+    let msg_len = msg.len() as u32;
+
+    let build_code = |marker_pre_addr: u32, msg_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let msg_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = msg_addr + msg_len;
+    let code = build_code(marker_pre_addr, msg_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    let binary = make_init_elf32(&code, &[marker_pre, msg, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Bisect against the marker_post bytes themselves: if the same
+/// /init that worked with HELLO msg HANGS when msg is replaced
+/// with `\n[USERSPACE END]\n`, the trigger is specifically in
+/// that byte sequence appearing in /init.
+#[test]
+#[ignore = "marker_post byte-sequence probe"]
+fn linux_userspace_bisect_msg_is_marker_post_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_bisect_with_msg(b"\n[USERSPACE END]\n");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, b"[BISECT] HELLO", 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "[BISECT] HELLO not seen — marker_post bytes ARE the trigger; {}",
+                dump_uart_on_failure(&cumulative, "bisect-msg-marker-post")
+            )
+        });
+    eprintln!("[BISECT] HELLO seen after {steps} steps (msg=marker_post is fine)");
+}
