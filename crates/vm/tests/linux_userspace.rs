@@ -172,6 +172,38 @@ fn build_initramfs_hello() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Bisection probe: hello /init whose message is uname's
+/// marker_pre concatenated to HELLO. If HELLO appears at
+/// 1.9 B steps, the marker bytes themselves aren't the
+/// trigger of the uname hang. If HELLO never appears, the
+/// kernel boot path is reacting to the byte sequence
+/// `[USERSPACE uname]:` (or some substring) — wild but
+/// would explain why padding + content variation behave
+/// differently.
+fn build_initramfs_hello_with_uname_marker() -> Vec<u8> {
+    let msg: &[u8] = b"[USERSPACE uname]: HELLO FROM USERSPACE\n";
+    let msg_len = msg.len() as u32;
+    let build_code = |msg_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&msg_len.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x2A, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let code_len = build_code(0).len() as u32;
+    let msg_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let code = build_code(msg_addr);
+    let binary = make_init_elf32(&code, &[msg], 5);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Hybrid /init for the syscall-isolation experiment: same hello
 /// asm but with a `sys_uname(buf)` call inserted *before* the
 /// HELLO write. If this prints HELLO at the regular 1.9 B step
@@ -723,4 +755,46 @@ fn linux_userspace_uname_then_hello_milestone() {
         )
     });
     eprintln!("uname-then-HELLO seen after {steps} steps (sys_uname is fine)");
+}
+
+/// Marker-bytes bisection: hello /init prints
+/// `[USERSPACE uname]: HELLO FROM USERSPACE\n`. If HELLO appears,
+/// the marker_pre byte sequence isn't the trigger. If HELLO never
+/// appears, something about that specific 19-byte prefix
+/// is.
+#[test]
+#[ignore = "marker-bytes probe for the uname hang"]
+fn linux_userspace_hello_with_uname_marker_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hello_with_uname_marker();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"HELLO FROM USERSPACE",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "HELLO not seen — marker bytes ARE the trigger; {}",
+            dump_uart_on_failure(&cumulative, "hello-marker")
+        )
+    });
+    eprintln!("HELLO seen after {steps} steps (marker bytes not the trigger)");
 }
