@@ -9469,6 +9469,70 @@ fn movsx_r16_rm16_preserves_upper_half_under_0x66() {
     );
 }
 
+/// A 32-bit direct far CALL (0x9A) must push a dword CS (zero-extended)
+/// and the full 32-bit return EIP — an 8-byte frame — not a 16-bit
+/// word pair. Regression: 0x9A always used push16.
+#[test]
+fn far_call_32bit_pushes_dword_cs_and_eip() {
+    let mut mem = Memory::new(0x10_0000);
+    // 9A 00 7D 00 00 08 00 = CALL 0x0008:0x00007D00 (ptr16:32), 7 bytes.
+    mem.write_slice(0x7C00, &[0x9A, 0x00, 0x7D, 0x00, 0x00, 0x08, 0x00]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true; // -> op_size_32 defaults true at dispatch
+    cpu.stack_size_32 = true;
+    cpu.sregs[sreg::CS] = 0x0010; // current CS selector
+    cpu.write_r32(r16::SP as u8, 0x9000);
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    // 8-byte frame: ESP 0x9000 -> 0x8FF8.
+    assert_eq!(
+        cpu.read_r32(r16::SP as u8),
+        0x8FF8,
+        "ESP -= 8 (dword CS:EIP)"
+    );
+    // push order CS then IP: [ESP]=EIP=0x7C07 (after the 7-byte call),
+    // [ESP+4]=CS dword = 0x0000_0010.
+    assert_eq!(
+        mem.read_u32(0x8FF8),
+        0x0000_7C07,
+        "return EIP pushed as dword"
+    );
+    assert_eq!(
+        mem.read_u32(0x8FFC),
+        0x0000_0010,
+        "CS zero-extended to a dword"
+    );
+}
+
+/// A 32-bit RETF (0xCB) must pop a dword EIP and a dword CS slot
+/// (selector in the low 16), matching the far CALL frame. Regression:
+/// 0xCB always used pop16 for both, returning to a garbage CS:IP.
+#[test]
+fn retf_32bit_pops_dword_eip_and_cs() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x7C00, &[0xCB]); // RETF
+                                      // Frame at ESP=0x8FF8: EIP=0x0040_1000 (dword), CS=0x0008 (dword).
+    mem.write_u32(0x8FF8, 0x0040_1000);
+    mem.write_u32(0x8FFC, 0x0000_0008);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true;
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x8FF8);
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    assert_eq!(cpu.ip, 0x0040_1000, "EIP popped as a dword");
+    assert_eq!(
+        cpu.sregs[sreg::CS],
+        0x0008,
+        "CS from the dword slot's low 16"
+    );
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x9000, "ESP += 8");
+}
+
 /// LOOP must decrement and test the FULL ECX when the address size is
 /// 32-bit (Intel SDM uses the address-size attribute to pick the count
 /// register). Regression for the bug where it always used the low 16-bit

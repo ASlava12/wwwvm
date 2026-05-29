@@ -5030,12 +5030,19 @@ impl Cpu {
                     (off, sel)
                 };
                 let cs = self.sregs[sreg::CS];
-                self.push16(mem, cs);
-                // 16-bit gate convention: only low 16 of return IP go
-                // on the stack. A 32-bit-gate path (when we add it)
-                // pushes the full dword.
-                let ip = self.ip as u16;
-                self.push16(mem, ip);
+                // Return-frame width follows the operand size: a 32-bit
+                // far CALL pushes CS zero-extended to a dword + the full
+                // 32-bit return EIP (matching the indirect FF /3 path and
+                // the RETF that unwinds it); 16-bit pushes word CS:IP.
+                if self.op_size_32 {
+                    self.push32(mem, cs as u32);
+                    let ip = self.ip;
+                    self.push32(mem, ip);
+                } else {
+                    self.push16(mem, cs);
+                    let ip = self.ip as u16;
+                    self.push16(mem, ip);
+                }
                 self.write_sreg(sreg::CS, new_cs, mem);
                 self.ip = new_ip;
             }
@@ -5078,19 +5085,37 @@ impl Cpu {
                 };
                 self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
             }
-            // RETF — pop IP then CS (far return).
+            // RETF — pop IP then CS (far return). Width follows the
+            // operand size: a 32-bit far return pops a dword EIP and a
+            // dword CS slot (selector in the low 16, high 16 ignored),
+            // matching the far CALL that built the frame.
             0xCB => {
-                self.ip = self.pop16(mem) as u32;
-                let cs = self.pop16(mem);
-                self.write_sreg(sreg::CS, cs, mem);
+                if self.op_size_32 {
+                    self.ip = self.pop32(mem);
+                    let cs = self.pop32(mem) as u16;
+                    self.write_sreg(sreg::CS, cs, mem);
+                } else {
+                    self.ip = self.pop16(mem) as u32;
+                    let cs = self.pop16(mem);
+                    self.write_sreg(sreg::CS, cs, mem);
+                }
             }
             // RETF imm16 — far return with callee-side stack cleanup.
             0xCA => {
-                let extra = self.fetch_u16(mem);
-                self.ip = self.pop16(mem) as u32;
-                let cs = self.pop16(mem);
-                self.write_sreg(sreg::CS, cs, mem);
-                self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
+                let extra = self.fetch_u16(mem) as u32;
+                if self.op_size_32 {
+                    self.ip = self.pop32(mem);
+                    let cs = self.pop32(mem) as u16;
+                    self.write_sreg(sreg::CS, cs, mem);
+                } else {
+                    self.ip = self.pop16(mem) as u32;
+                    let cs = self.pop16(mem);
+                    self.write_sreg(sreg::CS, cs, mem);
+                }
+                // Pop the caller's argument bytes at the stack's native
+                // width (carry into the high half of ESP for a 32-bit stack).
+                let sp = self.read_stack_ptr().wrapping_add(extra);
+                self.write_stack_ptr(sp);
             }
 
             // PUSHF / PUSHFD — push FLAGS / EFLAGS. Under 0x66 the
