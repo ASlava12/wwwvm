@@ -232,6 +232,14 @@
 //!     legacy `sys_statfs` (syscall 99) returned 0/error in
 //!     our kernel build; modern Linux prefers statfs64.
 //!
+//!   - `linux_userspace_fcntl_milestone` — fd-flag storage:
+//!     /init opens a file, sets FD_CLOEXEC via
+//!     `sys_fcntl(fd, F_SETFD, 1)`, then reads it back via
+//!     `sys_fcntl(fd, F_GETFD, 0)`. Test asserts the returned
+//!     flags equal 1. Pins the fd-flag storage in the file-
+//!     descriptor table entry — distinct from open-file flags
+//!     (O_CREAT etc.) that live in the file struct itself.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -623,6 +631,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let getppid_in_child = build_initramfs_getppid_in_child();
     let access = build_initramfs_access();
     let statfs = build_initramfs_statfs();
+    let fcntl = build_initramfs_fcntl();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -652,6 +661,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&getppid_in_child[0..6], b"070701");
     assert_eq!(&access[0..6], b"070701");
     assert_eq!(&statfs[0..6], b"070701");
+    assert_eq!(&fcntl[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -682,6 +692,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-getppid-in-child.cpio", &getppid_in_child);
         let _ = std::fs::write("/tmp/wwwvm-access.cpio", &access);
         let _ = std::fs::write("/tmp/wwwvm-statfs.cpio", &statfs);
+        let _ = std::fs::write("/tmp/wwwvm-fcntl.cpio", &fcntl);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -2969,6 +2980,109 @@ fn build_initramfs_access() -> Vec<u8> {
             &pre_zeros,
             &post_zeros,
         ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init opens a file, calls
+/// `sys_fcntl(fd, F_SETFD=2, 1)` to mark it close-on-exec, then
+/// `sys_fcntl(fd, F_GETFD=1, 0)` to read the flag back. Writes
+/// the 4-byte returned value between
+/// `[USERSPACE FD_FLAGS=…][USERSPACE END]`. Test asserts the
+/// value equals `FD_CLOEXEC = 1` — proves the kernel stored the
+/// fd-flag in the file-descriptor table entry AND returned it
+/// on read.
+fn build_initramfs_fcntl() -> Vec<u8> {
+    let path: &[u8] = b"/probe\0";
+    let marker_pre: &[u8] = b"[USERSPACE FD_FLAGS=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      flags_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // fd = sys_open(path, O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[fd] = eax
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_fcntl(fd, F_SETFD=2, FD_CLOEXEC=1) — sys 55
+        out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd]
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x37, 0x00, 0x00, 0x00]); // mov eax, 55
+        out.extend_from_slice(&[0xB9, 0x02, 0x00, 0x00, 0x00]); // mov ecx, 2 (F_SETFD)
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1 (FD_CLOEXEC)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_fcntl(fd, F_GETFD=1, 0)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x37, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1 (F_GETFD)
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[flags_buf] = eax (fd flags returned)
+        out.extend_from_slice(&flags_buf_addr.to_le_bytes());
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, flags_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&flags_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_pre_addr = path_addr + path.len() as u32;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let flags_buf_addr = fd_addr + 4;
+    let code = build_code(
+        path_addr,
+        marker_pre_addr,
+        marker_post_addr,
+        fd_addr,
+        flags_buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let flags_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[path, marker_pre, marker_post, &fd_zeros, &flags_zeros],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -5780,6 +5894,74 @@ fn linux_userspace_mkdir_milestone() {
          write into /dir/test never happened; {}",
         file_bytes,
         dump_uart_on_failure(&cumulative, "mkdir-wrong")
+    );
+}
+
+/// `sys_fcntl` milestone: /init opens a file, sets FD_CLOEXEC
+/// via F_SETFD, reads back via F_GETFD. Test asserts the
+/// returned flags equal `FD_CLOEXEC = 1`. Pins fd-flag storage
+/// in the file-descriptor table entry (distinct from the
+/// open-file flags that O_CREAT etc. live in).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_fcntl_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_fcntl();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE FD_FLAGS=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "fcntl")
+            )
+        });
+    eprintln!("fcntl milestone end marker after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let flags_off = pre_pos + marker_pre.len();
+    let flags = u32::from_le_bytes(stripped[flags_off..flags_off + 4].try_into().unwrap());
+    eprintln!("fcntl F_GETFD returned flags = 0x{flags:08X}");
+    assert_eq!(
+        flags,
+        1,
+        "expected fd_flags = FD_CLOEXEC (1), got 0x{flags:08X}; if 0, F_SETFD \
+         silently failed; if some other bit, kernel has additional fd flags; {}",
+        dump_uart_on_failure(&cumulative, "fcntl-wrong")
     );
 }
 
