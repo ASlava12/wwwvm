@@ -3231,6 +3231,58 @@ fn pm_demand_paging_mov_eax_from_eax_preserves_base_on_fault() {
     assert!(cpu.pending_fault().is_none());
 }
 
+/// Far indirect CALL through memory in 32-bit mode (FF /3, m16:32)
+/// must use the FULL 32-bit offset and the selector at +4 — not the
+/// low 16 bits (the old bug truncated the i386 kernel's
+/// `lcall *%cs:[ptr]` BIOS-service target to a garbage low address).
+#[test]
+fn pm_far_call_indirect_m16_32_uses_full_offset() {
+    let mut mem = Memory::new(0x0020_0000);
+    // GDT: null, 32-bit flat code (0x08, D=1), 32-bit flat data (0x10).
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+    // Far pointer at 0x2000: offset = 0x00010050 (high 16 nonzero!),
+    // selector = 0x08 (at +4).
+    mem.write_u32(0x2000, 0x0001_0050);
+    mem.write_u16(0x2004, 0x0008);
+    // Code at phys 0x100000: lcall *[0x2000] = FF 1D 00 20 00 00.
+    mem.write_slice(0x0010_0000, &[0xFF, 0x1D, 0x00, 0x20, 0x00, 0x00]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x17;
+    cpu.cr0 = 1; // PE (no paging needed)
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.ip = 0x0010_0000;
+
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+
+    assert_eq!(
+        cpu.ip, 0x0001_0050,
+        "far call must jump to the FULL 32-bit offset, not the low 16 bits"
+    );
+    assert_eq!(
+        cpu.sregs[sreg::CS],
+        0x0008,
+        "far call must load the selector from offset +4"
+    );
+    // CS (u32) + return IP (u32) were pushed: ESP dropped by 8, and
+    // the return offset is the instruction's end (0x100006).
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0x0008_0000 - 8);
+    assert_eq!(mem.read_u32(0x0008_0000 - 8), 0x0010_0006);
+}
+
 /// Interrupt gates clear IF on entry; trap gates leave IF as-is.
 /// Linux uses trap gates for #DB and #BP so a debugger probe
 /// doesn't silently disable IRQs while the handler runs.

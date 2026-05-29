@@ -339,6 +339,18 @@ impl PfTrace {
         self.head = (self.head + 1) % cap;
         self.count += 1;
     }
+    /// Print the ring (oldest first) with a header. Fields are
+    /// (eip, eax, ebx, ebp) — see the recording site in `step`.
+    fn dump(&self, header: &str) {
+        let cap = self.ring.len();
+        let n = self.count.min(cap);
+        let start = if self.count <= cap { 0 } else { self.head };
+        eprintln!("=== PF-TRACE: {header}; last {n} instrs (oldest first) ===");
+        for k in 0..n {
+            let (eip, eax, ebx, ebp) = self.ring[(start + k) % cap];
+            eprintln!("  {k:4} eip={eip:#010x} eax={eax:#010x} ebx={ebx:#010x} ebp={ebp:#010x}");
+        }
+    }
 }
 
 /// Page-fault payload built by `translate()`. The `error_code` follows
@@ -1090,19 +1102,9 @@ impl Cpu {
             if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
                 if !t.fired && user_read && addr < 0x1000 {
                     t.fired = true;
-                    let cap = t.ring.len();
-                    let n = t.count.min(cap);
-                    let start = if t.count <= cap { 0 } else { t.head };
-                    eprintln!(
-                        "=== PF-TRACE: user read #PF addr={addr:#x} err={error_code:#x} \
-                         faulting_eip={last_ip:#x}; last {n} instrs (oldest first) ==="
-                    );
-                    for k in 0..n {
-                        let (eip, eax, ebx, ebp) = t.ring[(start + k) % cap];
-                        eprintln!(
-                            "  {k:4} eip={eip:#010x} eax={eax:#010x} ebx={ebx:#010x} ebp={ebp:#010x}"
-                        );
-                    }
+                    t.dump(&format!(
+                        "user read #PF addr={addr:#x} err={error_code:#x} faulting_eip={last_ip:#x}"
+                    ));
                 }
             }
         }
@@ -3502,13 +3504,19 @@ impl Cpu {
         // this instruction's memory accesses can rewind IP back here
         // when the fault is dispatched at the start of the next step.
         self.last_op_ip = op_ip;
-        // Record only USERSPACE instructions (eip < kernel base) so a
-        // long kernel excursion (interrupt/syscall handler) doesn't
-        // flush the ring of the userspace trail we care about. Tuple:
-        // (eip, eax, ebx, ebp).
-        if op_ip < 0xC000_0000 && self.pf_trace.borrow().is_some() {
+        // Debug trace (no-op unless enabled). Records (eip, eax, ebx,
+        // ebp) for every instruction; also fires a one-shot dump when
+        // about to execute at a "wild" low address (op_ip < 0x10000) —
+        // e.g. the kernel's bad jump to 0x2061 — so the ring shows the
+        // instruction (ret/jmp/call) that set the bad target.
+        if self.pf_trace.borrow().is_some() {
             let entry = (op_ip, self.read_r32(0), self.read_r32(3), self.read_r32(5));
+            let wild = op_ip < 0x1_0000;
             if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
+                if wild && !t.fired {
+                    t.fired = true;
+                    t.dump(&format!("WILD low-address execute at op_ip={op_ip:#x}"));
+                }
                 t.record(entry);
             }
         }
@@ -4514,10 +4522,14 @@ impl Cpu {
                             self.ip = target as u32;
                         }
                     }
-                    // CALL m16:16 — far indirect. The operand must be
-                    // memory (a 4-byte pointer). We re-fetch the linear
-                    // base from the resolved Rm::Mem so both words come
-                    // from the same segment + base address.
+                    // CALL FAR indirect through memory. The operand
+                    // size selects the pointer width: 16-bit → m16:16
+                    // (2-byte offset + 2-byte selector at +2); 32-bit →
+                    // m16:32 (4-byte offset + 2-byte selector at +4).
+                    // Reading only a 16-bit offset in 32-bit mode (the
+                    // old bug) truncates the target — the i386 kernel's
+                    // `lcall *%cs:[ptr]` BIOS-service calls then jumped
+                    // to a garbage low address (e.g. 0x2061).
                     3 => {
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
@@ -4529,15 +4541,27 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
-                        let new_cs =
-                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                        let base = self.linear_seg(ea.seg, ea.off);
                         let cs = self.sregs[sreg::CS];
-                        self.push16(mem, cs);
-                        let ip = self.ip as u16;
-                        self.push16(mem, ip);
-                        self.write_sreg(sreg::CS, new_cs, mem);
-                        self.ip = new_ip as u32;
+                        if self.op_size_32 {
+                            let new_ip = self.mem_read_u32(mem, base);
+                            let new_cs = self
+                                .mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(4)));
+                            self.push32(mem, cs as u32);
+                            let ip = self.ip;
+                            self.push32(mem, ip);
+                            self.write_sreg(sreg::CS, new_cs, mem);
+                            self.ip = new_ip;
+                        } else {
+                            let new_ip = self.mem_read_u16(mem, base);
+                            let new_cs = self
+                                .mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                            self.push16(mem, cs);
+                            let ip = self.ip as u16;
+                            self.push16(mem, ip);
+                            self.write_sreg(sreg::CS, new_cs, mem);
+                            self.ip = new_ip as u32;
+                        }
                     }
                     4 => {
                         if self.op_size_32 {
@@ -4548,7 +4572,9 @@ impl Cpu {
                             self.ip = target as u32;
                         }
                     }
-                    // JMP m16:16 — far indirect (no stack activity).
+                    // JMP FAR indirect through memory (no stack
+                    // activity). Same m16:16 vs m16:32 width handling as
+                    // the far CALL above.
                     5 => {
                         let ea = match rm {
                             Rm::Mem(ea) => ea,
@@ -4560,11 +4586,20 @@ impl Cpu {
                                 })
                             }
                         };
-                        let new_ip = self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off));
-                        let new_cs =
-                            self.mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
-                        self.write_sreg(sreg::CS, new_cs, mem);
-                        self.ip = new_ip as u32;
+                        let base = self.linear_seg(ea.seg, ea.off);
+                        if self.op_size_32 {
+                            let new_ip = self.mem_read_u32(mem, base);
+                            let new_cs = self
+                                .mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(4)));
+                            self.write_sreg(sreg::CS, new_cs, mem);
+                            self.ip = new_ip;
+                        } else {
+                            let new_ip = self.mem_read_u16(mem, base);
+                            let new_cs = self
+                                .mem_read_u16(mem, self.linear_seg(ea.seg, ea.off.wrapping_add(2)));
+                            self.write_sreg(sreg::CS, new_cs, mem);
+                            self.ip = new_ip as u32;
+                        }
                     }
                     6 => {
                         if self.op_size_32 {
