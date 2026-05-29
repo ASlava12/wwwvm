@@ -2162,6 +2162,120 @@ fn build_initramfs_unlink() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Diagnostic /init for the prior `sys_pipe`-broken blocker
+/// investigation: calls `sys_pipe2(&fds, 0)` then writes eax +
+/// fd slots without touching the pipe further. Kept around as
+/// the canonical "what did sys_pipe2 actually return" probe.
+fn build_initramfs_pipe_diag() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE PIPE_RET=";
+    let marker_fd0: &[u8] = b" FD0=";
+    let marker_fd1: &[u8] = b" FD1=";
+    let marker_end: &[u8] = b" END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_fd0_addr: u32,
+                      marker_fd1_addr: u32,
+                      marker_end_addr: u32,
+                      fds_addr: u32,
+                      ret_buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // sys_pipe2(&fds, 0) — syscall 331
+        out.extend_from_slice(&[0xB8, 0x4B, 0x01, 0x00, 0x00]); // mov eax, 331
+        out.push(0xBB);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ds:[ret_buf] = eax (signed errno or 0)
+        out.push(0xA3);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, ret_buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_fd0, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_fd0_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_fd0.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, fds_addr, 4) — fds[0]
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_fd1, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_fd1_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_fd1.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, fds_addr+4, 4) — fds[1]
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&(fds_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_fd0_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_fd1_addr = marker_fd0_addr + marker_fd0.len() as u32;
+    let marker_end_addr = marker_fd1_addr + marker_fd1.len() as u32;
+    let fds_addr = marker_end_addr + marker_end.len() as u32;
+    let ret_buf_addr = fds_addr + 8;
+    let code = build_code(
+        marker_pre_addr,
+        marker_fd0_addr,
+        marker_fd1_addr,
+        marker_end_addr,
+        fds_addr,
+        ret_buf_addr,
+    );
+    let fds_zeros = [0u8; 8];
+    let ret_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            marker_pre, marker_fd0, marker_fd1, marker_end, &fds_zeros, &ret_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_gettimeofday(&tv, NULL)`
 /// (syscall 78) and writes the kernel-filled 8-byte struct to
 /// stdout bracketed by markers. Unlike the time milestone (which
@@ -4359,4 +4473,82 @@ fn linux_userspace_unlink_milestone() {
          finds it); {}",
         dump_uart_on_failure(&cumulative, "unlink-wrong")
     );
+}
+
+/// Diagnostic test for the `sys_pipe`-broken blocker: runs the
+/// minimal `build_initramfs_pipe_diag` /init and prints whatever
+/// sys_pipe2 returned plus the two fd slots. ALWAYS PASSES — its
+/// purpose is to surface the exact return code in the test log
+/// so the next investigation tick has data to act on. If the
+/// return is 0 (success), we know sys_pipe2 works and the
+/// earlier round-trip test had a different bug.
+#[test]
+#[ignore = "diagnostic for sys_pipe blocker; logs return code, ~52s wall-clock"]
+fn linux_userspace_pipe_diag() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_pipe_diag();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE PIPE_RET=";
+    let marker_fd0: &[u8] = b" FD0=";
+    let marker_fd1: &[u8] = b" FD1=";
+    let marker_end_search: &[u8] = b" END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    if run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative).is_err() {
+        eprintln!(
+            "diagnostic timed out — pipe diag never reached end marker. dump: {}",
+            dump_uart_on_failure(&cumulative, "pipe-diag")
+        );
+        return;
+    }
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let ret_off = pre_pos + marker_pre.len();
+    let ret = u32::from_le_bytes(cumulative[ret_off..ret_off + 4].try_into().unwrap());
+
+    let fd0_pos = cumulative
+        .windows(marker_fd0.len())
+        .position(|w| w == marker_fd0)
+        .expect("marker_fd0");
+    let fd0_off = fd0_pos + marker_fd0.len();
+    let fd0 = u32::from_le_bytes(cumulative[fd0_off..fd0_off + 4].try_into().unwrap());
+
+    let fd1_pos = cumulative
+        .windows(marker_fd1.len())
+        .position(|w| w == marker_fd1)
+        .expect("marker_fd1");
+    let fd1_off = fd1_pos + marker_fd1.len();
+    let fd1 = u32::from_le_bytes(cumulative[fd1_off..fd1_off + 4].try_into().unwrap());
+
+    eprintln!("=== sys_pipe2 diagnostic ===");
+    eprintln!("  ret = 0x{ret:08X} (signed: {})", ret as i32);
+    eprintln!("  fds[0] = {fd0}");
+    eprintln!("  fds[1] = {fd1}");
+    if ret == 0 {
+        eprintln!("  → sys_pipe2 SUCCEEDED — the earlier round-trip test had a different bug");
+    } else {
+        eprintln!(
+            "  → sys_pipe2 FAILED with errno {} — see Linux i386 errno list",
+            -(ret as i32)
+        );
+    }
 }
