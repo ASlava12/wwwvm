@@ -217,24 +217,28 @@ fn build_initramfs_uname() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
-/// Diagnostic: dump the uname cpio + proc_version cpio side-by-
-/// side to /tmp so an off-line ELF/cpio decoder can compare what
-/// the working /init binary looks like vs. the broken one. Not
-/// ignored — runs in milliseconds, no kernel needed.
+/// Sanity check on the cpio builders: each archive starts with
+/// the newc magic, so a future refactor of `cpio_entry` or
+/// `build_cpio_archive` can't silently produce malformed output.
+///
+/// When `WWWVM_DUMP_INIT_ARTIFACTS=1` is set, also writes each
+/// cpio to `/tmp/wwwvm-{name}.cpio` so an off-line debugger can
+/// `cpio -tv` / `cpio -i` / `readelf` them without re-running.
+/// The dump is opt-in so the default `cargo test` run doesn't
+/// pollute /tmp with files no CI consumer reads.
 #[test]
-fn dump_init_artifacts_for_offline_diagnosis() {
+fn init_cpio_archives_start_with_newc_magic() {
     let uname = build_initramfs_uname();
     let proc_version = build_initramfs_proc_version();
     let hello = build_initramfs_hello();
-    // Don't blow up CI if /tmp isn't writable — the test passes
-    // either way; the files are a debugger convenience.
-    let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
-    let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
-    let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
-    // Sanity: every archive starts with the 070701 newc magic.
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
+    if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
+        let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
+        let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
+        let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
+    }
 }
 
 /// Build a cpio whose /init mounts procfs at /proc and reads
