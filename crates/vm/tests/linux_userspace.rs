@@ -162,6 +162,81 @@ fn build_initramfs_hello() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `sys_uname` and prints the
+/// sysname[0..65] slot bracketed by a unique marker. Last tick's
+/// integration test with this builder hung in mid-kernel boot
+/// without ever reaching /init exec — see commit message of the
+/// next test below for the dump tooling we use to debug it now.
+/// The builder itself is straightforward; the bug (if any) is
+/// either in the asm encoding or in some kernel-side quirk we
+/// haven't characterized yet.
+fn build_initramfs_uname() -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let marker_pre: &[u8] = b"[USERSPACE uname]: ";
+    let marker_post: &[u8] = b"\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]); // mov eax, 122
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x41, 0x00, 0x00, 0x00]); // mov edx, 65
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0)
+        out.extend_from_slice(&[0xBB, 0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    let binary = make_init_elf32(&code, &[marker_pre, marker_post, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Diagnostic: dump the uname cpio + proc_version cpio side-by-
+/// side to /tmp so an off-line ELF/cpio decoder can compare what
+/// the working /init binary looks like vs. the broken one. Not
+/// ignored — runs in milliseconds, no kernel needed.
+#[test]
+fn dump_init_artifacts_for_offline_diagnosis() {
+    let uname = build_initramfs_uname();
+    let proc_version = build_initramfs_proc_version();
+    let hello = build_initramfs_hello();
+    // Don't blow up CI if /tmp isn't writable — the test passes
+    // either way; the files are a debugger convenience.
+    let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
+    let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
+    let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
+    // Sanity: every archive starts with the 070701 newc magic.
+    assert_eq!(&uname[0..6], b"070701");
+    assert_eq!(&proc_version[0..6], b"070701");
+    assert_eq!(&hello[0..6], b"070701");
+}
+
 /// Build a cpio whose /init mounts procfs at /proc and reads
 /// /proc/version, printing it to stdout bracketed by a unique
 /// marker so the test can distinguish it from the kernel's own
