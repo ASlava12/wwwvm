@@ -110,6 +110,16 @@
 //!     argv but for the envp half — argv test alone doesn't
 //!     pin it.
 //!
+//!   - `linux_userspace_mmap_milestone` — anonymous mmap path:
+//!     /init asks the kernel for one anonymous page via
+//!     `sys_mmap2`, writes a sentinel byte (0x42), reads it
+//!     back, and writes `[USERSPACE MMAP=<addr>VAL=<byte>][USERSPACE END]`.
+//!     Test asserts addr lands in userspace + page-aligned and
+//!     the byte round-trips. Different mechanism than brk:
+//!     mmap allocates a fresh VMA at a kernel-chosen address;
+//!     brk extends the heap region contiguous with the data
+//!     segment. glibc's malloc uses both.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -485,6 +495,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let brk_extend = build_initramfs_brk_extend();
     let argv = build_initramfs_argv();
     let envp = build_initramfs_envp();
+    let mmap = build_initramfs_mmap();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -498,6 +509,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&brk_extend[0..6], b"070701");
     assert_eq!(&argv[0..6], b"070701");
     assert_eq!(&envp[0..6], b"070701");
+    assert_eq!(&mmap[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -512,6 +524,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-brk-extend.cpio", &brk_extend);
         let _ = std::fs::write("/tmp/wwwvm-argv.cpio", &argv);
         let _ = std::fs::write("/tmp/wwwvm-envp.cpio", &envp);
+        let _ = std::fs::write("/tmp/wwwvm-mmap.cpio", &mmap);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1263,6 +1276,134 @@ fn build_initramfs_brk_extend() -> Vec<u8> {
     let binary = make_init_elf32_safe(
         &code,
         &[marker_pre, marker_mid, marker_end, &buf_old, &buf_new],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init calls `sys_mmap2(NULL, 0x1000,
+/// PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0)` —
+/// syscall 192, asks the kernel for one anonymous page —
+/// stores the returned address, writes a sentinel byte (0x42)
+/// to it, reads the same byte back, then prints both bracketed
+/// by markers:
+///
+///   `[USERSPACE MMAP=<4 bytes addr>VAL=<1 byte>][USERSPACE END]`
+///
+/// Two assertions in the test:
+///   - addr lands in `[INIT_LOAD_ADDR, 0xC0000000)` and is
+///     page-aligned (low 12 bits zero) — proves mmap actually
+///     allocated a userspace page rather than returning -errno
+///   - the byte read back equals 0x42 — proves the page is
+///     genuinely backed by RAM (not a CoW-zero stub), and that
+///     userspace can both write and read it
+///
+/// Different mechanism than brk: brk extends the heap region
+/// contiguous with the data segment; mmap allocates a fresh
+/// VMA at an arbitrary virtual address chosen by the kernel.
+/// glibc's malloc uses both, depending on allocation size.
+fn build_initramfs_mmap() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE MMAP=";
+    let marker_mid: &[u8] = b"VAL=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      buf_addr: u32,
+                      buf_val_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // sys_mmap2(addr=NULL, len=0x1000, prot=R|W=3,
+        //           flags=MAP_ANONYMOUS|MAP_PRIVATE=0x22,
+        //           fd=-1, pgoff=0) — sys 192.
+        // ebx, ecx, edx, esi, edi, ebp = 6 args.
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]); // mov eax, 192
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (addr=0)
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        out.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]); // mov edx, PROT_R|W
+        out.extend_from_slice(&[0xBE, 0x22, 0x00, 0x00, 0x00]); // mov esi, 0x22
+        out.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]); // mov edi, -1
+        out.extend_from_slice(&[0x31, 0xED]); // xor ebp, ebp (pgoff=0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf], eax — stash returned address
+        out.push(0xA3);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // mov esi, eax — also keep in esi for the byte probe
+        out.extend_from_slice(&[0x89, 0xC6]);
+        // mov byte ptr [esi], 0x42 — write sentinel into the
+        // first byte of the new page. If mmap returned -errno
+        // (large negative as u32, e.g. 0xFFFFFFF...), this
+        // dereferences kernel space and would #PF; tested below.
+        out.extend_from_slice(&[0xC6, 0x06, 0x42]);
+        // mov al, byte ptr [esi] — read it back
+        out.extend_from_slice(&[0x8A, 0x06]);
+        // mov ds:[buf_val], al — store the byte
+        out.extend_from_slice(&[0xA2]);
+        out.extend_from_slice(&buf_val_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf_val, 1)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_val_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let buf_addr = marker_end_addr + marker_end.len() as u32;
+    let buf_val_addr = buf_addr + 4;
+    let code = build_code(
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        buf_addr,
+        buf_val_addr,
+    );
+    let buf_zeros = [0u8; 4];
+    let buf_val = [0u8; 1];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_mid, marker_end, &buf_zeros, &buf_val],
         7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
@@ -3038,5 +3179,93 @@ fn linux_userspace_envp_milestone() {
             .any(|w| w == marker_failed),
         "saw EXECVE_FAILED too — somehow both branches ran; {}",
         dump_uart_on_failure(&cumulative, "envp-both")
+    );
+}
+
+/// mmap2 milestone: /init asks the kernel for one anonymous
+/// page via `sys_mmap2(NULL, 0x1000, R|W, ANON|PRIVATE, -1, 0)`,
+/// writes 0x42 to the first byte, reads it back, and prints
+/// `[USERSPACE MMAP=<addr>VAL=<byte>][USERSPACE END]`. Test
+/// asserts addr is in userspace + page-aligned + the byte round-
+/// trips. Different mechanism than brk: mmap allocates a
+/// separate VMA at a kernel-chosen address; brk extends the
+/// heap region contiguous with data segment.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_mmap_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_mmap();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE MMAP=";
+    let marker_mid: &[u8] = b"VAL=";
+    let marker_end_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — mmap may have returned \
+                 -errno and the subsequent write to a bad pointer SIGSEGV'd /init; {}",
+                dump_uart_on_failure(&cumulative, "mmap")
+            )
+        });
+    eprintln!("mmap milestone end marker after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_end");
+    let addr_off = pre_pos + marker_pre.len();
+    let addr_bytes: [u8; 4] = cumulative[addr_off..addr_off + 4]
+        .try_into()
+        .expect("4 bytes for mmap addr");
+    let mmap_addr = u32::from_le_bytes(addr_bytes);
+
+    let mid_pos = cumulative
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid must follow marker_pre");
+    let val_byte = cumulative[mid_pos + marker_mid.len()];
+
+    eprintln!("mmap returned addr = 0x{mmap_addr:08X}, byte read back = 0x{val_byte:02X}");
+
+    // Same address bounds as the brk milestone: in userspace
+    // virtual range, page-aligned.
+    const KERNEL_BASE: u32 = 0xC000_0000;
+    assert!(
+        (INIT_LOAD_ADDR..KERNEL_BASE).contains(&mmap_addr),
+        "mmap addr 0x{mmap_addr:08X} outside expected range \
+         [0x{INIT_LOAD_ADDR:08X}, 0x{KERNEL_BASE:08X}); {}",
+        dump_uart_on_failure(&cumulative, "mmap-range")
+    );
+    assert_eq!(
+        mmap_addr & 0xFFF,
+        0,
+        "mmap addr 0x{mmap_addr:08X} not page-aligned (low 12 = {:#X}); {}",
+        mmap_addr & 0xFFF,
+        dump_uart_on_failure(&cumulative, "mmap-align")
+    );
+    assert_eq!(
+        val_byte,
+        0x42,
+        "expected byte read back to equal sentinel 0x42, got 0x{val_byte:02X} — \
+         either the page isn't backed by RAM or writes aren't persisting; {}",
+        dump_uart_on_failure(&cumulative, "mmap-byte")
     );
 }
