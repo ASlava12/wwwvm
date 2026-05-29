@@ -173,14 +173,18 @@ fn build_initramfs_hello() -> Vec<u8> {
 }
 
 /// Variant of `build_initramfs_hello` with `pad_bytes` of trailing
-/// zeros appended to the /init body. Used by the size-isolation
-/// experiment: if a hello /init padded to ~uname's 600-byte size
-/// still boots to userspace fast (matching the regular hello
-/// milestone's 52 s), then uname's hang is *not* a binary-size
-/// effect and the bug lives in the asm or kernel-side
-/// interaction. If padded-hello hangs the same way uname does,
-/// the size IS the trigger and the next debug step shifts to
-/// kernel-side (initramfs unpacker timing, exec loader probe).
+/// zeros appended to the /init body. Outcome of the
+/// size-isolation experiment (`d22718e` test landed, ran 52 s):
+///
+///   - padded-hello boots fast and prints HELLO at 1.9 B steps
+///     (matching the regular hello milestone byte-for-byte).
+///   - So **binary size is NOT** the trigger of the uname hang.
+///
+/// The bug therefore lives in uname's specific content (asm
+/// sequence, syscall 122, or data-segment ordering) or in some
+/// kernel-side path the hello sequence skips. Helper kept around
+/// in case a follow-up experiment needs to vary other dimensions
+/// (e.g. RWX pt_flags + padding, different code/data ratios).
 fn build_initramfs_hello_padded(pad_bytes: usize) -> Vec<u8> {
     let msg: &[u8] = b"HELLO FROM USERSPACE\n";
     let msg_len = msg.len() as u32;
