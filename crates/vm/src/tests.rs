@@ -1135,6 +1135,53 @@ fn start_protected_mode_at_honors_boot_protocol_4_1_initial_state() {
     assert_eq!(vm.cpu().read_r32(wwwvm_cpu::r16::SI as u8), 0x0009_0000);
 }
 
+/// `start_protected_mode_at` must populate `boot_params.e820_table`
+/// with a usable memory map. The cpu/lib.rs comment calls this
+/// load-bearing: without it, Linux's early-init
+/// `memblock_alloc_node_data()` sees zero usable RAM and panics
+/// with "Failed to allocate %ld bytes for node %d memory map".
+/// The BIOS INT 0x15 E820 shim is for real-mode setup only — a
+/// PM-direct entry never runs it.
+///
+/// boot_params layout: count at 0x9_01E8 (u8), three 20-byte
+/// entries starting at 0x9_02D0. Each entry: u64 base, u64 size,
+/// u32 type (1 = usable, 2 = reserved).
+#[test]
+fn start_protected_mode_at_writes_three_e820_entries_to_boot_params() {
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 1;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Au16.to_le_bytes());
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    bz.extend_from_slice(&[0xF4]); // kernel = HLT
+
+    // 8 MiB total RAM — gives a 0x10_0000..0x80_0000 = 7 MiB usable
+    // extended-memory entry that's easy to verify by hand.
+    let mut vm = Vm::with_ram_size(0x0080_0000);
+    let parsed = vm.load_bzimage(&bz).expect("load");
+    vm.start_protected_mode_at(parsed.code32_start);
+
+    let bp = 0x9_0000u32;
+    // Entry count = 3.
+    assert_eq!(vm.mem().read_u8(bp + 0x1E8), 3, "e820 entry count");
+
+    let entry = |i: u32| -> (u64, u64, u32) {
+        let off = bp + 0x2D0 + i * 20;
+        let base = (vm.mem().read_u32(off) as u64) | ((vm.mem().read_u32(off + 4) as u64) << 32);
+        let size =
+            (vm.mem().read_u32(off + 8) as u64) | ((vm.mem().read_u32(off + 12) as u64) << 32);
+        let kind = vm.mem().read_u32(off + 16);
+        (base, size, kind)
+    };
+    // Entry 0: conventional usable, 0..0x9FC00.
+    assert_eq!(entry(0), (0x0000_0000, 0x0009_FC00, 1));
+    // Entry 1: BIOS/video reserved, 0x9FC00..0x100000.
+    assert_eq!(entry(1), (0x0009_FC00, 0x0006_0400, 2));
+    // Entry 2: extended-memory usable, 0x100000..end of RAM.
+    assert_eq!(entry(2), (0x0010_0000, 0x0070_0000, 1));
+}
+
 /// `start_protected_mode_at` must leave ESP at a safe address so
 /// a kernel that takes any kind of fault (or interrupt) before
 /// it sets its own stack can push the IRET frame without
