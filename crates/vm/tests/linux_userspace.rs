@@ -2106,6 +2106,107 @@ fn build_initramfs_set_thread_area() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init proves `MAP_SHARED` anonymous memory is
+/// shared across a `fork`. It maps one page
+/// `PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS`, forks, the
+/// child writes a sentinel word into the page and exits, and the
+/// parent (after `waitpid`) reads the same page and reports it:
+///
+///   `[USERSPACE SHM=<4 bytes>][USERSPACE END]`
+///
+/// The decisive property: with `MAP_SHARED` the child and parent map
+/// the *same* physical page, so the child's write is visible to the
+/// parent. Under `MAP_PRIVATE`/COW it would NOT be — the parent
+/// would still see zero. Reading back the child's sentinel therefore
+/// pins shared-anonymous-memory semantics (the basis of POSIX shared
+/// memory and threaded data sharing), distinct from the COW path the
+/// fork/brk milestones exercise. The test asserts the parent read
+/// the child's sentinel (`0x12345678`).
+fn build_initramfs_shared_mmap() -> Vec<u8> {
+    let m_shm: &[u8] = b"[USERSPACE SHM=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+    const SENTINEL: u32 = 0x1234_5678;
+
+    let build_code = |m_shm_addr: u32, m_end_addr: u32, addr_buf: u32, shm_buf: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // addr = mmap2(NULL, 0x1000, PROT_R|W=3,
+        //              MAP_SHARED|MAP_ANONYMOUS=0x21, -1, 0)
+        out.extend_from_slice(&[0xB8, 0xC0, 0x00, 0x00, 0x00]); // mov eax, 192
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+        out.extend_from_slice(&[0xB9, 0x00, 0x10, 0x00, 0x00]); // mov ecx, 0x1000
+        out.extend_from_slice(&[0xBA, 0x03, 0x00, 0x00, 0x00]); // mov edx, R|W
+        out.extend_from_slice(&[0xBE, 0x21, 0x00, 0x00, 0x00]); // mov esi, 0x21
+        out.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]); // mov edi, -1
+        out.extend_from_slice(&[0x31, 0xED]); // xor ebp, ebp
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[addr_buf], eax
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        // fork
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]); // jnz parent (patched)
+                                              // ===== CHILD: write the sentinel into the shared page =====
+        out.extend_from_slice(&[0x8B, 0x3D]); // mov edi, ds:[addr_buf]
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0xC7, 0x07]); // mov dword [edi], imm32
+        out.extend_from_slice(&SENTINEL.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // exit(0)
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ===== PARENT =====
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+        // waitpid(-1, NULL, 0) — wait for the child to write + exit
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // read the shared page: mov edi,[addr_buf]; mov eax,[edi]
+        out.extend_from_slice(&[0x8B, 0x3D]);
+        out.extend_from_slice(&addr_buf.to_le_bytes());
+        out.extend_from_slice(&[0x8B, 0x07]); // mov eax, [edi]
+        out.push(0xA3); // mov ds:[shm_buf], eax
+        out.extend_from_slice(&shm_buf.to_le_bytes());
+        // emit SHM=<value> END
+        w(m_shm_addr, m_shm.len() as u32, &mut out);
+        w(shm_buf, 4, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0).len() as u32;
+    let m_shm_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_end_addr = m_shm_addr + m_shm.len() as u32;
+    let addr_buf = m_end_addr + m_end.len() as u32;
+    let shm_buf = addr_buf + 4;
+    let code = build_code(m_shm_addr, m_end_addr, addr_buf, shm_buf);
+    let addr_zeros = [0u8; 4];
+    let shm_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(&code, &[m_shm, m_end, &addr_zeros, &shm_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init creates a new file in initramfs,
 /// writes 8 bytes to it, closes, reopens read-only, reads the
 /// 8 bytes back, and prints them between markers:
@@ -7974,6 +8075,77 @@ fn linux_userspace_set_thread_area_milestone() {
          GDT TLS descriptor base was installed and `mov gs` cached it; got \
          {tls:#x?}; {}",
         dump_uart_on_failure(&cumulative, "tls-read")
+    );
+}
+
+/// Shared-memory milestone: /init maps a page MAP_SHARED|ANONYMOUS,
+/// forks, the child writes `0x12345678` into it and exits, and the
+/// parent (after waitpid) reads the same page. Asserts the parent
+/// sees the child's write — which only holds for MAP_SHARED (under
+/// MAP_PRIVATE/COW the parent would still read zero). Pins
+/// shared-anonymous-memory semantics, distinct from the COW path.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_shared_mmap_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_shared_mmap();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — shared mmap or fork/waitpid \
+             likely failed; {}",
+            dump_uart_on_failure(&cumulative, "shared-mmap")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let shm = stripped
+        .windows(15)
+        .position(|w| w == b"[USERSPACE SHM=")
+        .and_then(|p| stripped.get(p + 15..p + 19))
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        .unwrap_or_else(|| {
+            panic!(
+                "SHM marker not found; {}",
+                dump_uart_on_failure(&cumulative, "shm-marker")
+            )
+        });
+    eprintln!("parent read shared page = {shm:#010x} (child wrote 0x12345678)");
+    assert_eq!(
+        shm,
+        0x1234_5678,
+        "parent should see the child's write through the MAP_SHARED page; got \
+         {shm:#010x} (zero ⇒ the mapping behaved as private/COW, not shared); {}",
+        dump_uart_on_failure(&cumulative, "shm-value")
     );
 }
 
