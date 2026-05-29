@@ -501,6 +501,58 @@ fn bios_int10_scroll_up_by_one_line_shifts_rows_and_fills_bottom() {
     }
 }
 
+/// Scroll DOWN (AH=0x07) is the mirror of scroll-up: rows shift
+/// from top to bottom and the top row(s) get cleared. The
+/// implementation reverses the iteration order to avoid clobbering
+/// source rows before reading them — a regression that forgot the
+/// `.rev()` would have the second copy read already-overwritten
+/// data, producing duplicate rows instead of the expected shift.
+#[test]
+fn bios_int10_scroll_down_by_one_line_shifts_rows_and_fills_top() {
+    let mut vm = Vm::new();
+    vm.install_bios();
+    for (row, ch) in [(5, b'A'), (6, b'B'), (7, b'C'), (8, b'D')] {
+        for c in 0..80u32 {
+            let off = ((row * 80) + c as usize) * 2;
+            vm.mem.write_u8(VGA_TEXT_BASE + off as u32, ch);
+            vm.mem.write_u8(VGA_TEXT_BASE + off as u32 + 1, 0x07);
+        }
+    }
+    vm.load_image(
+        BOOT_LOAD_ADDR,
+        &[
+            0xB4, 0x07, // MOV AH, 0x07 (scroll down)
+            0xB0, 0x01, // AL=1
+            0xB7, 0x2F, // BH=0x2F (fill attribute)
+            0xB5, 0x05, // CH=5
+            0xB1, 0x00, // CL=0
+            0xB6, 0x08, // DH=8
+            0xB2, 0x4F, // DL=79
+            0xCD, 0x10, // INT 0x10
+            0xF4,
+        ],
+    );
+    vm.boot();
+    vm.run_steps(32);
+    // Rows shift DOWN: 6←A, 7←B, 8←C, 5 ← blanks(0x2F).
+    let want = [(6, b'A'), (7, b'B'), (8, b'C')];
+    for (row, ch) in want {
+        for c in 0..80usize {
+            let off = ((row * 80) + c) * 2;
+            assert_eq!(
+                vm.mem().read_u8(VGA_TEXT_BASE + off as u32),
+                ch,
+                "row {row} col {c}"
+            );
+        }
+    }
+    for c in 0..80usize {
+        let off = ((5 * 80) + c) * 2;
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32), b' ');
+        assert_eq!(vm.mem().read_u8(VGA_TEXT_BASE + off as u32 + 1), 0x2F);
+    }
+}
+
 #[test]
 fn bios_int10_set_video_mode_clears_screen_and_resets_cursor() {
     let mut vm = Vm::new();
