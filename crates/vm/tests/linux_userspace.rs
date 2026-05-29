@@ -278,6 +278,12 @@
 //!     `make_init_elf32_safe` neutralizes the historical 600-byte
 //!     hang that the raw `build_initramfs_uname` still reproduces.
 //!
+//!   - `linux_userspace_hardlink_milestone` — `sys_link` (9):
+//!     /init writes `/a`, hard-links it to `/b`, reads `/b` back.
+//!     Test asserts link_ret == 0 and content == `b"HARDLINK"`.
+//!     Distinct from symlink: a hard link is a second dentry to
+//!     the SAME inode (shared data blocks), not a separate inode.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -740,6 +746,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let signal = build_initramfs_signal();
     let symlink = build_initramfs_symlink();
     let uname_safe = build_initramfs_uname_safe();
+    let hardlink = build_initramfs_hardlink();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -775,6 +782,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&signal[0..6], b"070701");
     assert_eq!(&symlink[0..6], b"070701");
     assert_eq!(&uname_safe[0..6], b"070701");
+    assert_eq!(&hardlink[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -811,6 +819,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-signal.cpio", &signal);
         let _ = std::fs::write("/tmp/wwwvm-symlink.cpio", &symlink);
         let _ = std::fs::write("/tmp/wwwvm-uname-safe.cpio", &uname_safe);
+        let _ = std::fs::write("/tmp/wwwvm-hardlink.cpio", &hardlink);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -3651,6 +3660,153 @@ fn build_initramfs_symlink() -> Vec<u8> {
             &buf_zeros,
             &ret_zeros,
             &ret_zeros,
+        ],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init creates `/a` with "HARDLINK", hard-
+/// links it to `/b` via `sys_link("/a", "/b")` (syscall 9), then
+/// opens `/b` and reads the content back. Emits the link return
+/// and the 8-byte readback between
+/// `[USERSPACE LINK_RET=<4>DATA=<8>][USERSPACE END]`. Test asserts
+/// `link_ret == 0` and the content equals `b"HARDLINK"`.
+///
+/// Distinct from the symlink milestone: a hard link is a SECOND
+/// dentry pointing at the SAME inode (i_nlink incremented), not a
+/// separate symlink inode. Reading through `/b` returns `/a`'s
+/// content because they share one inode + one set of data blocks.
+fn build_initramfs_hardlink() -> Vec<u8> {
+    let path_a: &[u8] = b"/a\0";
+    let path_b: &[u8] = b"/b\0";
+    let payload: &[u8] = b"HARDLINK"; // 8 bytes
+    let marker_pre: &[u8] = b"[USERSPACE LINK_RET=";
+    let marker_mid: &[u8] = b"DATA=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |path_a_addr: u32,
+                      path_b_addr: u32,
+                      payload_addr: u32,
+                      marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_post_addr: u32,
+                      fd_addr: u32,
+                      ret_buf_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        // fd = sys_open("/a", O_CREAT|O_WRONLY, 0o644)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_a_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB9, 0x41, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBA, 0xA4, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_write(fd, payload, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&payload_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_link("/a", "/b") — sys 9. ebx=oldname, ecx=newname.
+        out.extend_from_slice(&[0xB8, 0x09, 0x00, 0x00, 0x00]); // mov eax, 9
+        out.push(0xBB);
+        out.extend_from_slice(&path_a_addr.to_le_bytes());
+        out.push(0xB9);
+        out.extend_from_slice(&path_b_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[ret_buf], eax
+        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
+        // fd = sys_open("/b", O_RDONLY, 0)
+        out.extend_from_slice(&[0xB8, 0x05, 0x00, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&path_b_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        // sys_read(fd, buf, 8)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_close(fd)
+        out.extend_from_slice(&[0x8B, 0x1D]);
+        out.extend_from_slice(&fd_addr.to_le_bytes());
+        out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Emit: marker_pre, ret_buf(4), marker_mid, buf(8), marker_post.
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        w(marker_pre_addr, marker_pre.len() as u32, &mut out);
+        w(ret_buf_addr, 4, &mut out);
+        w(marker_mid_addr, marker_mid.len() as u32, &mut out);
+        w(buf_addr, 8, &mut out);
+        w(marker_post_addr, marker_post.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
+    let path_a_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let path_b_addr = path_a_addr + path_a.len() as u32;
+    let payload_addr = path_b_addr + path_b.len() as u32;
+    let marker_pre_addr = payload_addr + payload.len() as u32;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_post_addr = marker_mid_addr + marker_mid.len() as u32;
+    let fd_addr = marker_post_addr + marker_post.len() as u32;
+    let ret_buf_addr = fd_addr + 4;
+    let buf_addr = ret_buf_addr + 4;
+    let code = build_code(
+        path_a_addr,
+        path_b_addr,
+        payload_addr,
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_post_addr,
+        fd_addr,
+        ret_buf_addr,
+        buf_addr,
+    );
+    let fd_zeros = [0u8; 4];
+    let ret_zeros = [0u8; 4];
+    let buf_zeros = [0u8; 8];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[
+            path_a,
+            path_b,
+            payload,
+            marker_pre,
+            marker_mid,
+            marker_post,
+            &fd_zeros,
+            &ret_zeros,
+            &buf_zeros,
         ],
         7,
     );
@@ -6884,6 +7040,94 @@ fn linux_userspace_uname_milestone() {
             )
         });
     eprintln!("uname milestone — sysname=\"Linux\" confirmed after {steps} steps");
+}
+
+/// `sys_link` (hard link) milestone: /init writes `/a`, hard-links
+/// it to `/b`, reads `/b` back. Test asserts link_ret == 0 and the
+/// content equals `b"HARDLINK"` — proving `/b` shares `/a`'s inode.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_hardlink_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hardlink();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE LINK_RET=";
+    let marker_mid: &[u8] = b"DATA=";
+    let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` not seen in 16 B steps — link or the read-back \
+                 open may have failed; {}",
+                dump_uart_on_failure(&cumulative, "hardlink")
+            )
+        });
+    eprintln!("hardlink milestone end marker after {steps} steps");
+
+    // link_ret is binary u32 (may contain 0x0A) → strip ONLCR.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre");
+    let ret_off = pre_pos + marker_pre.len();
+    let link_ret = u32::from_le_bytes(stripped[ret_off..ret_off + 4].try_into().unwrap());
+
+    let mid_pos = stripped
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid");
+    let data_off = mid_pos + marker_mid.len();
+    let data: [u8; 8] = stripped[data_off..data_off + 8].try_into().unwrap();
+
+    eprintln!(
+        "sys_link ret = 0x{link_ret:08X} ({}), content via /b = {:?}",
+        link_ret as i32,
+        std::str::from_utf8(&data).unwrap_or("<non-utf8>")
+    );
+    assert_eq!(
+        link_ret,
+        0,
+        "sys_link returned 0x{link_ret:08X} ({}) — expected 0; {}",
+        link_ret as i32,
+        dump_uart_on_failure(&cumulative, "hardlink-ret")
+    );
+    assert_eq!(
+        &data,
+        b"HARDLINK",
+        "expected content via /b = b\"HARDLINK\" (shared inode), got {:02X?}; {}",
+        data,
+        dump_uart_on_failure(&cumulative, "hardlink-wrong")
+    );
 }
 
 /// `sys_statfs` milestone: /init calls `sys_statfs("/", &buf)`,
