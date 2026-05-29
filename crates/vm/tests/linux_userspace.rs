@@ -34,6 +34,12 @@
 //!     UART output. Pins CMOS RTC read → kernel timekeeping →
 //!     sys_time → cross-ring trampoline → userspace decode.
 //!
+//!   - `linux_userspace_getpid_milestone` — task-struct
+//!     primitive: /init calls `sys_getpid` (syscall 20), writes
+//!     the returned pid bracketed by `[USERSPACE PID=]` markers.
+//!     Asserts exactly `pid == 1` (any other value would mean
+//!     the kernel exec'd /init under a different task struct).
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -305,15 +311,18 @@ fn init_cpio_archives_start_with_newc_magic() {
     let proc_version = build_initramfs_proc_version();
     let hello = build_initramfs_hello();
     let time = build_initramfs_time();
+    let getpid = build_initramfs_getpid();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
     assert_eq!(&time[0..6], b"070701");
+    assert_eq!(&getpid[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
         let _ = std::fs::write("/tmp/wwwvm-hello.cpio", &hello);
         let _ = std::fs::write("/tmp/wwwvm-time.cpio", &time);
+        let _ = std::fs::write("/tmp/wwwvm-getpid.cpio", &getpid);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -779,6 +788,72 @@ fn build_initramfs_time() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `sys_getpid` (syscall 20), stores
+/// the returned 32-bit PID in a buffer, and writes the buffer to
+/// stdout bracketed by markers. Same shape as `build_initramfs_time`
+/// (no-arg syscall returning a u32 in eax → store via `mov ds:[],
+/// eax` → write 4 bytes), so the code structure is intentionally
+/// parallel. What's different is what's pinned: the kernel must
+/// have a task struct for PID 1, and `sys_getpid` returns its `pid`
+/// field via the syscall ABI. /init is always PID 1 — a value
+/// stable enough that the test asserts exactly `== 1`, unlike the
+/// time milestone's range check.
+fn build_initramfs_getpid() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE PID=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, marker_pre.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_getpid() — sys 20. Returns pid in eax. No args.
+        out.extend_from_slice(&[0xB8, 0x14, 0x00, 0x00, 0x00]); // mov eax, 20
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf_addr], eax — A3 = MOV moffs32, EAX.
+        out.push(0xA3);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // write(1, buf, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, marker_post.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32(
+        &code,
+        &[marker_pre, marker_post, &buf_zeros],
+        7, // R | W | X — /init writes pid into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -1043,5 +1118,70 @@ fn linux_userspace_time_milestone() {
         "sys_time returned {time_t} (0x{time_t:08X}); expected \
          [{RTC_CMOS_FLOOR}, {Y2038_CEIL}); {}",
         dump_uart_on_failure(&cumulative, "time-range")
+    );
+}
+
+/// Task-struct primitive milestone: /init calls `sys_getpid`
+/// (syscall 20), writes the returned 32-bit pid bracketed by
+/// `[USERSPACE PID=]` markers. The shape mirrors the time
+/// milestone (no-arg syscall → eax → 4-byte buffer → write),
+/// but what's pinned is the kernel's task-struct path, not its
+/// clock subsystem. /init is always PID 1 — the test asserts
+/// exactly `== 1` rather than a range, because any deviation
+/// here would mean the kernel is exec'ing /init under a
+/// different task struct (or the syscall ABI mis-routes its
+/// return).
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_getpid_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_getpid();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE PID=";
+    // ONLCR: kernel TTY translates /init's `\n` into `\r\n` before
+    // it hits UART. Search needle uses the kernel-emitted form.
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "getpid")
+            )
+        });
+    eprintln!("sys_getpid userspace milestone seen after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let p_off = pre_pos + marker_pre.len();
+    let p_bytes: [u8; 4] = cumulative[p_off..p_off + 4]
+        .try_into()
+        .expect("4 bytes between markers");
+    let pid = u32::from_le_bytes(p_bytes);
+    eprintln!("sys_getpid returned pid = {pid}");
+    assert_eq!(
+        pid,
+        1,
+        "sys_getpid returned {pid} (expected 1 — /init is PID 1); {}",
+        dump_uart_on_failure(&cumulative, "getpid-wrong")
     );
 }
