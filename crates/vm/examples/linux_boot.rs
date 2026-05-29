@@ -15,7 +15,12 @@
 //!   * EIP / EAX / EBX / EFLAGS / CR0 / CR3 at stop
 //!   * any UART bytes the kernel pushed (earlyprintk output)
 //!
-//! Cargo budget: 256 MiB RAM, 5M steps. Both are tunable below.
+//! Cargo budget: 256 MiB RAM, 16 B (16 × 10⁹) steps. Both are tunable
+//! below. The integration test in `tests/linux_userspace.rs` runs
+//! the same VM with the same budget but bails the moment its
+//! marker shows up — typically at ~1.9 B steps for hello mode.
+//! The example always exhausts the full budget so its diagnostic
+//! prints can show what happens *after* the milestone too.
 
 use std::env;
 use std::fs;
