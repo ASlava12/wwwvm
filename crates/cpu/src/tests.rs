@@ -2439,6 +2439,80 @@ fn translate_with_non_present_pde_raises_page_fault() {
     );
 }
 
+/// `mem_write_u8` must abort the byte write when `translate_write`
+/// flagged a #PF. The translate path returns the 0 sentinel on
+/// fault, and *without* the abort guard the write would land at
+/// physical 0 — corrupting BIOS data area / IVT / setup header.
+/// Per the cpu/lib.rs comment, Linux's vmalloc stack pushes go
+/// through this path constantly during boot; a regression would
+/// turn each missed page-table walk into a clobber at phys 0.
+#[test]
+fn mem_write_u8_aborts_when_translate_raises_page_fault() {
+    let mut mem = Memory::new(0x10_0000);
+    // Park a sentinel at physical 0 — if the abort guard slips,
+    // this is what gets clobbered.
+    mem.write_u8(0, 0xAA);
+    // PDE table at 0x1000, PDE[0] entirely zero (P=0) → translate
+    // raises #PF and returns 0 as the bogus phys.
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // CR0.PG (CR0.PE=0 keeps real-mode-style CPL=0)
+    cpu.cr3 = 0x0000_1000;
+    cpu.mem_write_u8(&mut mem, 0x0040_1234, 0x99);
+    // Fault was latched.
+    let pf = cpu.pending_fault().expect("write must raise #PF");
+    assert_eq!(pf.addr, 0x0040_1234);
+    // Sentinel at physical 0 still intact — the abort guard held.
+    assert_eq!(
+        mem.read_u8(0),
+        0xAA,
+        "faulting write must not clobber physical 0"
+    );
+}
+
+/// Companion: if a #PF is *already* pending when `mem_write_u8`
+/// is called (e.g. a previous byte of a multi-byte access
+/// faulted), the second byte must also abort — even if its own
+/// translate would have succeeded under different state. Real
+/// x86 aborts the instruction on the first faulting access; we
+/// model that by checking `pending_fault` *before* doing the
+/// second translate. Arm the fault by triggering a real one on
+/// an unrelated address first, then issue the would-have-been-OK
+/// write.
+#[test]
+fn mem_write_u8_aborts_when_pending_fault_already_set() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u8(0x4000, 0xAA); // sentinel
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // CR0.PG
+    cpu.cr3 = 0x0000_1000;
+    // PDE table at 0x1000 — leave PDE[0] zero so any low-address
+    // translate faults. But pre-arm a *valid* PDE for the 0x4000
+    // range so the second write's own translate would succeed
+    // (PDE[0] covers 0x0..0x40_0000 — the range that includes
+    // both the bad addr below and the sentinel). Actually
+    // simpler: leave PDE[0] zero, then the first translate
+    // raises #PF, and the second write to 0x4000 also faults on
+    // its own merits — but the *abort guard* short-circuits
+    // before re-translating. To isolate the guard, we map
+    // PDE[0] -> identity 4 MiB PSE page (CR4.PSE=1, PDE.PS=1).
+    cpu.cr4 = 0x10; // CR4.PSE
+                    // PDE[0]: PS=1, P=1, RW=1, base 0x0 → identity 4 MiB.
+    mem.write_u32(0x1000, 0x0000_0083);
+    // Trigger a fault on an unmapped address (PDE[1] not present).
+    let _ = cpu.translate(&mem, 0x0040_0000);
+    assert!(cpu.pending_fault().is_some(), "fault armed");
+    // Now write to 0x4000 — its own translate would identity-map
+    // through PDE[0] cleanly, but the guard must short-circuit.
+    cpu.mem_write_u8(&mut mem, 0x4000, 0x55);
+    assert_eq!(
+        mem.read_u8(0x4000),
+        0xAA,
+        "pre-pending fault must abort the would-be-OK second write"
+    );
+}
+
 /// PDE present, PTE not present. Same expectation, different stop in
 /// the walk.
 #[test]
