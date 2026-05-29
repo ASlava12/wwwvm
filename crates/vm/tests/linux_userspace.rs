@@ -6986,6 +6986,85 @@ fn build_initramfs_sigprocmask() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init issues `ioctl(0, TCGETS, &termios)` (syscall
+/// 54) on its stdin. The init process inherits `/dev/console` (the
+/// serial tty ttyS0) on fd 0, so TCGETS must succeed (eax == 0) — a
+/// non-tty fd would return -ENOTTY. The 4-byte return value plus the
+/// termios `c_lflag` field (offset 12) are dumped between
+/// `[USERSPACE IOCTL=` and `]\n[USERSPACE END]\n`. Pins the kernel
+/// tty/line-discipline ioctl path that every interactive program (the
+/// shell's `isatty`, `tcgetattr`) drives.
+fn build_initramfs_ioctl() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE IOCTL=";
+    let marker_post: &[u8] = b"]\n[USERSPACE END]\n";
+
+    // buf layout: [0..4) ioctl ret, [4..8) c_lflag copy; termios at termios_addr.
+    let build_code = |marker_pre_addr: u32,
+                      marker_post_addr: u32,
+                      termios_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // ioctl(0, TCGETS=0x5401, &termios)
+        out.extend_from_slice(&[0xB8, 0x36, 0x00, 0x00, 0x00]); // mov eax, 54
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (fd 0)
+        out.extend_from_slice(&[0xB9, 0x01, 0x54, 0x00, 0x00]); // mov ecx, 0x5401
+        out.push(0xBA);
+        out.extend_from_slice(&termios_addr.to_le_bytes()); // edx = &termios
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // mov ds:[buf+0], eax (ioctl ret)
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // Copy termios.c_lflag (offset 12) into buf+4 for logging.
+        out.extend_from_slice(&[0xA1]); // mov eax, ds:[moffs32]
+        out.extend_from_slice(&(termios_addr + 12).to_le_bytes());
+        out.push(0xA3); // mov ds:[buf+4], eax
+        out.extend_from_slice(&(buf_addr + 4).to_le_bytes());
+        // write(1, buf, 8)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x08, 0x00, 0x00, 0x00]); // edx = 8
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let termios_addr = marker_post_addr + marker_post.len() as u32;
+    let buf_addr = termios_addr + 64; // 64 >= sizeof(struct termios)=36
+    let code = build_code(marker_pre_addr, marker_post_addr, termios_addr, buf_addr);
+    let termios_zeros = [0u8; 64];
+    let buf_zeros = [0u8; 8];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_post, &termios_zeros, &buf_zeros],
+        7,
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Build a cpio whose /init calls `sys_fork` (syscall 2) and then
 /// — in BOTH parent and child — writes `[USERSPACE FORK ret=`
 /// followed by its own 4-byte `eax`, then `][USERSPACE END]\n`.
@@ -8406,6 +8485,77 @@ fn linux_userspace_sigprocmask_milestone() {
         "after SIG_BLOCK the mask must have SIGUSR1's bit (0x200)"
     );
     assert_eq!(old2_hi, 0, "no high-word signals blocked");
+}
+
+/// ioctl/tty milestone: /init issues `ioctl(0, TCGETS, &termios)` on its
+/// console stdin. fd 0 is `/dev/console` (ttyS0), a real tty, so the
+/// call must return 0 — a non-tty would give -ENOTTY. Asserts ret == 0.
+/// Pins the kernel tty/line-discipline ioctl path used by `isatty`/
+/// `tcgetattr` in every interactive program.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_ioctl_tcgets_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_ioctl();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE IOCTL=";
+    let marker_post_search: &[u8] = b"]\r\n[USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`[USERSPACE END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "ioctl")
+            )
+        });
+    eprintln!("sys_ioctl(TCGETS) userspace milestone seen after {steps} steps");
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let pre_pos = stripped
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must precede marker_post");
+    let off = pre_pos + marker_pre.len();
+    let dw = |o: usize| -> u32 {
+        u32::from_le_bytes(stripped[off + o..off + o + 4].try_into().expect("4 bytes"))
+    };
+    let ret = dw(0) as i32;
+    let c_lflag = dw(4);
+    eprintln!("ioctl(TCGETS) ret={ret} termios.c_lflag={c_lflag:#010x}");
+    assert_eq!(
+        ret,
+        0,
+        "TCGETS on the console must succeed (fd 0 is a tty); -ENOTTY=-25 \
+         would mean fd 0 is not a tty; {}",
+        dump_uart_on_failure(&cumulative, "ioctl-ret")
+    );
 }
 
 /// Process-creation milestone: /init calls `sys_fork` (syscall 2),
