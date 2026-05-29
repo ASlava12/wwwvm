@@ -395,6 +395,14 @@ mod tests {
         let total = (u16::from_le_bytes([got[120], got[121]]) as u32)
             | ((u16::from_le_bytes([got[122], got[123]]) as u32) << 16);
         assert_eq!(total, 2);
+        // Word 80 = 0x0040 (major version: ATA-6 bit set). Without
+        // this Linux's `ata_dev_classify` would log "obsolete" and
+        // refuse to issue further commands.
+        assert_eq!(
+            u16::from_le_bytes([got[160], got[161]]),
+            1u16 << 6,
+            "word 80 must advertise ATA-6 so the kernel doesn't reject the drive as antique"
+        );
     }
 
     #[test]
