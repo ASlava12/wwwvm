@@ -5010,6 +5010,143 @@ fn build_initramfs_poll_pipe() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init runs a real `cmd1 | cmd2` shell
+/// pipeline: it makes a pipe, forks a *writer* child, and the
+/// *parent* is the *reader*.
+///
+///   * writer child: `dup2(pipe_write, 1)`, closes both original
+///     pipe fds, `write(1, "PIPED", 5)` (which now lands in the
+///     pipe), `exit(0)`,
+///   * parent reader: closes the write end, `dup2(pipe_read, 0)`,
+///     closes the original read fd, `read(0, buf, 5)` (which now
+///     reads from the pipe), reaps the child with `waitpid`, then
+///     reports what it received to the real console:
+///     `[USERSPACE PIPELINE=PIPED][USERSPACE END]`.
+///
+/// This is the capstone integration of every primitive proven
+/// separately — pipe, fork, dup2, close, blocking read/write across
+/// processes, and waitpid — and is exactly the fd-plumbing a shell
+/// performs for `echo PIPED | cat`. The test asserts the parent
+/// read back `"PIPED"`, i.e. bytes flowed writer-stdout → pipe →
+/// reader-stdin across the process boundary.
+fn build_initramfs_pipeline() -> Vec<u8> {
+    let msg: &[u8] = b"PIPED";
+    let m_pipeline: &[u8] = b"[USERSPACE PIPELINE=";
+    let m_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |m_pipeline_addr: u32,
+                      m_end_addr: u32,
+                      msg_addr: u32,
+                      fds_addr: u32,
+                      buf_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1 (stdout)
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        let close = |fd_mem: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x06, 0x00, 0x00, 0x00]); // mov eax, 6 (close)
+            out.extend_from_slice(&[0x8B, 0x1D]); // mov ebx, ds:[fd_mem]
+            out.extend_from_slice(&fd_mem.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        // pipe2(&fds, 0) — sys 331
+        out.extend_from_slice(&[0xB8, 0x4B, 0x01, 0x00, 0x00]);
+        out.push(0xBB);
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // fork — sys 2
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        let jnz_at = out.len();
+        out.extend_from_slice(&[0x75, 0x00]); // jnz parent (patched)
+
+        // ===== CHILD (writer): eax == 0 =====
+        // dup2(fds[1], 1): ebx=oldfd=fds[1], ecx=newfd=1
+        out.push(0xA1); // mov eax, ds:[fds+4]
+        out.extend_from_slice(&(fds_addr + 4).to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1
+        out.extend_from_slice(&[0xB8, 0x3F, 0x00, 0x00, 0x00]); // mov eax, 63 (dup2)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        close(fds_addr, &mut out); // close(fds[0])
+        close(fds_addr + 4, &mut out); // close(fds[1])
+                                       // write(1, msg, 5) — fd 1 is now the pipe write end
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&msg_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+
+        // ===== PARENT (reader) =====
+        let parent_start = out.len();
+        let disp = (parent_start - (jnz_at + 2)) as i32;
+        assert!(
+            (-128..=127).contains(&disp),
+            "child block too large for jnz disp8 (got {disp})"
+        );
+        out[jnz_at + 1] = disp as u8;
+        close(fds_addr + 4, &mut out); // close(fds[1]) — parent drops write end
+                                       // dup2(fds[0], 0): ebx=fds[0], ecx=0
+        out.push(0xA1); // mov eax, ds:[fds]
+        out.extend_from_slice(&fds_addr.to_le_bytes());
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (newfd = 0)
+        out.extend_from_slice(&[0xB8, 0x3F, 0x00, 0x00, 0x00]); // mov eax, 63 (dup2)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        close(fds_addr, &mut out); // close(fds[0]) — original read fd
+                                   // read(0, buf, 5) — stdin is now the pipe read end
+        out.extend_from_slice(&[0xB8, 0x03, 0x00, 0x00, 0x00]); // mov eax, 3 (read)
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx (fd 0)
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // waitpid(-1, NULL, 0) — reap the writer
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]);
+        out.extend_from_slice(&[0x31, 0xC9]);
+        out.extend_from_slice(&[0x31, 0xD2]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // emit PIPELINE=<buf> END to the console (parent's fd 1)
+        w(m_pipeline_addr, m_pipeline.len() as u32, &mut out);
+        w(buf_addr, msg.len() as u32, &mut out);
+        w(m_end_addr, m_end.len() as u32, &mut out);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let m_pipeline_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let m_end_addr = m_pipeline_addr + m_pipeline.len() as u32;
+    let msg_addr = m_end_addr + m_end.len() as u32;
+    let fds_addr = msg_addr + msg.len() as u32;
+    let buf_addr = fds_addr + 8;
+    let code = build_code(m_pipeline_addr, m_end_addr, msg_addr, fds_addr, buf_addr);
+    let fds_zeros = [0u8; 8];
+    let buf_zeros = [0u8; 8];
+    let binary = make_init_elf32_safe(&code, &[m_pipeline, m_end, msg, &fds_zeros, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Diagnostic /init for the prior `sys_pipe`-broken blocker
 /// investigation: calls `sys_pipe2(&fds, 0)` then writes eax +
 /// fd slots without touching the pipe further. Kept around as
@@ -9362,6 +9499,80 @@ fn linux_userspace_poll_pipe_milestone() {
         revents & POLLIN != 0,
         "revents should have POLLIN set (the pipe has a buffered byte), got {revents:#x}; {}",
         dump_uart_on_failure(&cumulative, "poll-revents")
+    );
+}
+
+/// Milestone: a real `cmd1 | cmd2` shell pipeline. /init pipes a
+/// forked writer child's stdout into the parent reader's stdin via
+/// `dup2`, and the parent reports the bytes it read back from the
+/// pipe. Asserts the parent received `"PIPED"` — i.e. data flowed
+/// writer-stdout → pipe → reader-stdin across the process boundary,
+/// the exact fd-plumbing a shell does for `echo PIPED | cat`. This
+/// is the capstone integration of pipe + fork + dup2 + close +
+/// cross-process blocking I/O + waitpid.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_pipeline_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_pipeline();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let end: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    run_until_marker(&mut vm, end, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+        panic!(
+            "`[USERSPACE END]` not seen in 16 B steps — the pipeline likely \
+             deadlocked or a step failed; {}",
+            dump_uart_on_failure(&cumulative, "pipeline")
+        )
+    });
+
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let m: &[u8] = b"[USERSPACE PIPELINE=";
+    let got = stripped
+        .windows(m.len())
+        .position(|w| w == m)
+        .and_then(|p| stripped.get(p + m.len()..p + m.len() + 5))
+        .map(|s| s.to_vec());
+    eprintln!(
+        "pipeline received: {:?}",
+        got.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    );
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"PIPED"[..]),
+        "parent should have read \"PIPED\" from the pipe (writer's stdout → \
+         reader's stdin); got {:?}; {}",
+        got.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned()),
+        dump_uart_on_failure(&cumulative, "pipeline-bytes")
     );
 }
 
