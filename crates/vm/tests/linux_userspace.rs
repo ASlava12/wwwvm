@@ -86,6 +86,14 @@
 //!     the end of the data segment, rounded up to a page, when
 //!     it sets up the new process's mm.
 //!
+//!   - `linux_userspace_brk_extend_milestone` — on-demand heap
+//!     allocation: /init queries the current break, requests
+//!     `+0x1000` (one page), and the test asserts the new break
+//!     equals `old + 0x1000` exactly. brk(2) returns the new
+//!     break on success OR the current (unchanged) break on
+//!     failure, so a kernel that rejected the grow shows as
+//!     `new == old` and the assert fires.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -458,6 +466,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let execve = build_initramfs_execve();
     let execve_chain = build_initramfs_execve_chain();
     let brk = build_initramfs_brk();
+    let brk_extend = build_initramfs_brk_extend();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -468,6 +477,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&execve[0..6], b"070701");
     assert_eq!(&execve_chain[0..6], b"070701");
     assert_eq!(&brk[0..6], b"070701");
+    assert_eq!(&brk_extend[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -479,6 +489,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-execve.cpio", &execve);
         let _ = std::fs::write("/tmp/wwwvm-execve-chain.cpio", &execve_chain);
         let _ = std::fs::write("/tmp/wwwvm-brk.cpio", &brk);
+        let _ = std::fs::write("/tmp/wwwvm-brk-extend.cpio", &brk_extend);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1122,6 +1133,115 @@ fn build_initramfs_brk() -> Vec<u8> {
         &code,
         &[marker_pre, marker_post, &buf_zeros],
         7, // R | W | X — /init writes brk into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
+/// Build a cpio whose /init queries the current break with
+/// `sys_brk(0)`, then asks the kernel to GROW the heap by one
+/// page with `sys_brk(old_break + 0x1000)`, and writes both
+/// returns between markers:
+///
+///   `[USERSPACE BRK_OLD=<4 bytes>BRK_NEW=<4 bytes>END]`
+///
+/// Test asserts `new == old + 0x1000` — proves the kernel
+/// actually allocates a new page on demand, not just returns the
+/// queried value. If the heap can't grow, kernel returns the
+/// CURRENT brk (per the brk(2) contract: returns new break on
+/// success OR current break on failure), and the test catches
+/// `new == old` which would mean growth was rejected.
+fn build_initramfs_brk_extend() -> Vec<u8> {
+    let marker_pre: &[u8] = b"[USERSPACE BRK_OLD=";
+    let marker_mid: &[u8] = b"BRK_NEW=";
+    let marker_end: &[u8] = b"END]\n";
+
+    let build_code = |marker_pre_addr: u32,
+                      marker_mid_addr: u32,
+                      marker_end_addr: u32,
+                      buf_old_addr: u32,
+                      buf_new_addr: u32|
+     -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        // sys_brk(0) — query current break. Returns eax = brk.
+        out.extend_from_slice(&[0xB8, 0x2D, 0x00, 0x00, 0x00]); // mov eax, 45
+        out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf_old], eax — stash original
+        out.push(0xA3);
+        out.extend_from_slice(&buf_old_addr.to_le_bytes());
+        // ebx = eax + 0x1000 — request +1 page
+        out.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax
+        out.extend_from_slice(&[0x81, 0xC3, 0x00, 0x10, 0x00, 0x00]); // add ebx, 0x1000
+                                                                      // sys_brk(new_brk) — set break.
+        out.extend_from_slice(&[0xB8, 0x2D, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // mov ds:[buf_new], eax
+        out.push(0xA3);
+        out.extend_from_slice(&buf_new_addr.to_le_bytes());
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf_old, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_old_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_mid, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_mid_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_mid.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf_new, 4)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_new_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_mid_addr = marker_pre_addr + marker_pre.len() as u32;
+    let marker_end_addr = marker_mid_addr + marker_mid.len() as u32;
+    let buf_old_addr = marker_end_addr + marker_end.len() as u32;
+    let buf_new_addr = buf_old_addr + 4;
+    let code = build_code(
+        marker_pre_addr,
+        marker_mid_addr,
+        marker_end_addr,
+        buf_old_addr,
+        buf_new_addr,
+    );
+    let buf_old = [0u8; 4];
+    let buf_new = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_pre, marker_mid, marker_end, &buf_old, &buf_new],
+        7,
     );
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
@@ -2353,5 +2473,88 @@ fn linux_userspace_brk_milestone() {
         "sys_brk returned 0x{brk:08X} — not page-aligned (low 12 bits = {:#X}); {}",
         brk & 0xFFF,
         dump_uart_on_failure(&cumulative, "brk-unaligned")
+    );
+}
+
+/// Heap-extend milestone: /init queries the current break with
+/// `sys_brk(0)`, requests `current + 0x1000`, and the test
+/// asserts the new break equals `old + 0x1000` exactly.
+///
+/// What this pins beyond the brk-query milestone:
+///   - on-demand page allocation: the kernel actually maps a
+///     new page when brk is extended, not just bumps the
+///     pointer
+///   - brk's set semantics (vs query): brk(2) returns the new
+///     break on success OR the current (unchanged) break on
+///     failure; if heap growth was rejected the test catches
+///     `new == old` instead of `new == old + 0x1000`
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_brk_extend_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_brk_extend();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE BRK_OLD=";
+    let marker_mid: &[u8] = b"BRK_NEW=";
+    let marker_end_search: &[u8] = b"END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "`END]` marker not seen in 16 B steps; {}",
+                dump_uart_on_failure(&cumulative, "brk-extend")
+            )
+        });
+    eprintln!("brk-extend milestone seen after {steps} steps");
+
+    let pre_pos = cumulative
+        .windows(marker_pre.len())
+        .position(|w| w == marker_pre)
+        .expect("marker_pre must be present");
+    let old_off = pre_pos + marker_pre.len();
+    let old_bytes: [u8; 4] = cumulative[old_off..old_off + 4]
+        .try_into()
+        .expect("4 bytes for old brk");
+    let old_brk = u32::from_le_bytes(old_bytes);
+
+    let mid_pos = cumulative
+        .windows(marker_mid.len())
+        .position(|w| w == marker_mid)
+        .expect("marker_mid must follow marker_pre");
+    let new_off = mid_pos + marker_mid.len();
+    let new_bytes: [u8; 4] = cumulative[new_off..new_off + 4]
+        .try_into()
+        .expect("4 bytes for new brk");
+    let new_brk = u32::from_le_bytes(new_bytes);
+
+    eprintln!(
+        "old_brk = 0x{old_brk:08X}, new_brk = 0x{new_brk:08X}, delta = {} bytes",
+        new_brk.wrapping_sub(old_brk),
+    );
+
+    assert_eq!(
+        new_brk,
+        old_brk.wrapping_add(0x1000),
+        "expected new_brk = old_brk + 0x1000 (one page), but got old=0x{old_brk:08X} \
+         new=0x{new_brk:08X}; either the kernel rejected the grow (returned old) or \
+         allocated a different size; {}",
+        dump_uart_on_failure(&cumulative, "brk-extend-mismatch")
     );
 }
