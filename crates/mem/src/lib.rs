@@ -744,6 +744,34 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// A guest write to an HPET timer's comparator low dword
+    /// (0x108 / 0x128 / 0x148) must latch the value into
+    /// `hpet_period[tn]` so periodic mode's auto-advance uses it.
+    /// `b995bc5` covers the *consumption* side (auto-advance fires
+    /// at match and adds period); v13 round-trip covers the
+    /// snapshot side. This pins the *write-time latch* — the path
+    /// the kernel actually exercises when it programs a periodic
+    /// HPET timer.
+    #[test]
+    fn hpet_comparator_low_write_latches_into_period_array() {
+        let mut m = Memory::new(64);
+        // Timer 1's comparator low at 0x128. Write a sentinel.
+        m.write_u32(HPET_BASE + 0x128, 0xCAFE_BABE);
+        // Period[1] should reflect the latched value. Read via the
+        // snapshot helper so we exercise the same accessor v13 uses.
+        let periods = m.hpet_period_bytes();
+        let p1 = u32::from_le_bytes([periods[4], periods[5], periods[6], periods[7]]);
+        assert_eq!(
+            p1, 0xCAFE_BABE,
+            "comparator-low write to timer 1 must latch into period[1]"
+        );
+        // Timer 0 and 2 should be untouched.
+        let p0 = u32::from_le_bytes([periods[0], periods[1], periods[2], periods[3]]);
+        let p2 = u32::from_le_bytes([periods[8], periods[9], periods[10], periods[11]]);
+        assert_eq!(p0, 0, "period[0] must not leak across timers");
+        assert_eq!(p2, 0, "period[2] must not leak across timers");
+    }
+
     /// A write to LAPIC Initial Count (0x380..0x384) must also
     /// land in Current Count (0x390..0x394). Real silicon snaps
     /// `current = initial` atomically on the write; without this
