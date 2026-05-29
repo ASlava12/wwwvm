@@ -58,6 +58,15 @@
 //!     are (0, child_PID_in_parent_view). Pins kernel
 //!     copy_process + scheduler + return-from-fork in child.
 //!
+//!   - `linux_userspace_execve_milestone` — second-binary load:
+//!     /init forks, child calls `sys_execve("/helper", NULL, NULL)`,
+//!     /helper writes `[USERSPACE EXECVE_OK]` and exits. Initramfs
+//!     gets TWO files (init + helper) via
+//!     `build_cpio_archive_with_helper`. Pins path-resolving
+//!     execve: VFS lookup in initramfs, ELF parse + new mm setup,
+//!     jump to /helper's entry. If execve had returned to child
+//!     (failure), the FAILED marker would have shown instead.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -247,6 +256,29 @@ fn build_cpio_archive(init_binary: &[u8], proc_dir: bool) -> Vec<u8> {
     archive
 }
 
+/// Same as `build_cpio_archive` but adds a second executable
+/// file at the root with the given name and bytes. Used by the
+/// execve milestone: /init forks, child calls `sys_execve` on
+/// the second binary, the second binary writes a marker. The
+/// second file gets the same 0o100_755 mode as /init so the
+/// kernel's `do_execve` path treats it identically.
+fn build_cpio_archive_with_helper(
+    init_binary: &[u8],
+    helper_name: &str,
+    helper_binary: &[u8],
+) -> Vec<u8> {
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry(helper_name, helper_binary, 0o100_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    archive
+}
+
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -377,6 +409,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let getpid = build_initramfs_getpid();
     let gettimeofday = build_initramfs_gettimeofday();
     let fork = build_initramfs_fork();
+    let execve = build_initramfs_execve();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -384,6 +417,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&getpid[0..6], b"070701");
     assert_eq!(&gettimeofday[0..6], b"070701");
     assert_eq!(&fork[0..6], b"070701");
+    assert_eq!(&execve[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -392,6 +426,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-getpid.cpio", &getpid);
         let _ = std::fs::write("/tmp/wwwvm-gettimeofday.cpio", &gettimeofday);
         let _ = std::fs::write("/tmp/wwwvm-fork.cpio", &fork);
+        let _ = std::fs::write("/tmp/wwwvm-execve.cpio", &execve);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1148,6 +1183,128 @@ fn build_initramfs_fork() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio with TWO executables: /init (forks + has child
+/// execve /helper) and /helper (writes marker, exits). Proves
+/// the kernel's path-resolving execve(2) path: child must
+/// `do_execve("/helper", NULL, NULL)`, kernel must look /helper
+/// up in initramfs, read its ELF header, set up a new mm, jump
+/// to /helper's entry point, and the new process must reach
+/// userspace and successfully write its marker to UART.
+///
+/// /init layout:
+///
+///   sys_fork
+///   test eax, eax
+///   jnz parent           ; eax != 0 → parent path
+///   ; child: execve("/helper", NULL, NULL)
+///   sys_execve
+///   ; only reached on execve FAILURE (e.g. -ENOENT, -ENOEXEC).
+///   ; If we get here, write a distinct error marker so the test
+///   ; sees the *cause* instead of just a missing OK marker.
+///   write(1, "[USERSPACE EXECVE_FAILED]\n", N)
+///   exit(1)
+/// parent:
+///   sys_waitpid(-1, NULL, 0)
+///   exit(0)
+///
+/// /helper layout (minimal):
+///
+///   write(1, "[USERSPACE EXECVE_OK]\n", N)
+///   exit(0)
+fn build_initramfs_execve() -> Vec<u8> {
+    let helper_path: &[u8] = b"/helper\0";
+    let marker_failed: &[u8] = b"[USERSPACE EXECVE_FAILED]\n";
+
+    let init_build_code =
+        |helper_path_addr: u32, marker_failed_addr: u32, _padding: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(96);
+            // sys_fork
+            out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // test eax, eax
+            out.extend_from_slice(&[0x85, 0xC0]);
+            // jnz parent (forward, disp8 — child path follows;
+            // parent path is at the end of the function. We'll
+            // compute the disp after assembling the child block.)
+            // For now reserve 2 bytes; patch after.
+            let jnz_at = out.len();
+            out.extend_from_slice(&[0x75, 0x00]); // jnz +disp (placeholder)
+
+            let _child_start = out.len();
+            // child: sys_execve(helper_path, NULL, NULL) — sys 11.
+            out.extend_from_slice(&[0xB8, 0x0B, 0x00, 0x00, 0x00]); // mov eax, 11
+            out.push(0xBB);
+            out.extend_from_slice(&helper_path_addr.to_le_bytes()); // ebx = filename
+            out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (argv=NULL)
+            out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (envp=NULL)
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // Only reached on execve FAILURE. Print a marker and
+            // exit(1) so the test sees the cause.
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4 (write)
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.push(0xB9);
+            out.extend_from_slice(&marker_failed_addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&(marker_failed.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // exit(1)
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+            out.extend_from_slice(&[0xCD, 0x80]);
+
+            let parent_start = out.len();
+            // Patch the jnz disp8.
+            let disp = (parent_start - (jnz_at + 2)) as i32;
+            assert!(
+                (-128..=127).contains(&disp),
+                "child block too large for jnz disp8 (got {disp}); switch to jnz rel32"
+            );
+            out[jnz_at + 1] = disp as u8;
+
+            // parent: sys_waitpid(-1, NULL, 0)
+            out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]); // mov eax, 7
+            out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]); // mov ebx, -1
+            out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+            out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+            out.extend_from_slice(&[0xCD, 0x80]);
+            // exit(0)
+            out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0x31, 0xDB]); // xor ebx, ebx
+            out.extend_from_slice(&[0xCD, 0x80]);
+            out
+        };
+
+    let init_code_len = init_build_code(0, 0, 0).len() as u32;
+    let helper_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + init_code_len;
+    let marker_failed_addr = helper_path_addr + helper_path.len() as u32;
+    let init_code = init_build_code(helper_path_addr, marker_failed_addr, 0);
+    let init_binary = make_init_elf32_safe(&init_code, &[helper_path, marker_failed], 5);
+
+    // /helper — minimal "write marker + exit" binary.
+    let marker_ok: &[u8] = b"[USERSPACE EXECVE_OK]\n";
+    let helper_build_code = |marker_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(40);
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&marker_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_ok.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+    let helper_code_len = helper_build_code(0).len() as u32;
+    let helper_marker_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + helper_code_len;
+    let helper_code = helper_build_code(helper_marker_addr);
+    let helper_binary = make_init_elf32_safe(&helper_code, &[marker_ok], 5);
+
+    build_cpio_archive_with_helper(&init_binary, "helper", &helper_binary)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -1704,5 +1861,75 @@ fn linux_userspace_fork_milestone() {
         (2..0x8000_0000).contains(&parent_return),
         "expected parent's fork return in [2, 0x80000000), got {parent_return} (0x{parent_return:08X}); {}",
         dump_uart_on_failure(&cumulative, "fork-parent-bad")
+    );
+}
+
+/// Execve milestone: /init forks, child calls
+/// `sys_execve("/helper", NULL, NULL)`, /helper writes
+/// `[USERSPACE EXECVE_OK]` and exits. Parent waitpid's. Test
+/// asserts the OK marker appears (and the FAILED marker does
+/// not). Pins the kernel's *second-binary* loading path: path
+/// resolve in initramfs, ELF parse, address-space teardown,
+/// new mm setup, jump to /helper's entry point — none of which
+/// the boot-time initramfs-unpack path exercises in the same
+/// way (boot exec is a kernel-internal call, not user-issued
+/// `execve(2)` from a forked child).
+///
+/// Two diagnostic markers: OK if execve succeeded + helper
+/// ran; FAILED (`[USERSPACE EXECVE_FAILED]`) if execve
+/// returned to the caller (which only happens on failure —
+/// success replaces the process image entirely). If the test
+/// fails, the dump tells us *which* mode it failed in.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_execve_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_execve();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_ok: &[u8] = b"[USERSPACE EXECVE_OK]";
+    let marker_failed: &[u8] = b"[USERSPACE EXECVE_FAILED]";
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, marker_ok, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            let cause = if cumulative
+                .windows(marker_failed.len())
+                .any(|w| w == marker_failed)
+            {
+                "execve returned to child — likely -ENOENT (path not in initramfs?) \
+                 or -ENOEXEC (bad ELF)"
+            } else {
+                "neither OK nor FAILED marker seen — fork may have failed before execve, \
+                 or the parent's waitpid-then-exit raced ahead of child"
+            };
+            panic!(
+                "`[USERSPACE EXECVE_OK]` not seen in 16 B steps; {cause}; {}",
+                dump_uart_on_failure(&cumulative, "execve")
+            )
+        });
+    eprintln!("execve OK marker seen after {steps} steps");
+    assert!(
+        !cumulative
+            .windows(marker_failed.len())
+            .any(|w| w == marker_failed),
+        "saw FAILED marker too — both branches ran, which means execve happened \
+         AND then somehow returned. Shouldn't be possible; {}",
+        dump_uart_on_failure(&cumulative, "execve-both")
     );
 }
