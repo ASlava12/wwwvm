@@ -348,4 +348,45 @@ mod tests {
         pic.raise_irq(0);
         assert_eq!(pic.pending_vector(), Some(0x08));
     }
+
+    /// snapshot/restore must round-trip every field that affects
+    /// IRQ dispatch: vector_base (so re-mapped IRQ 0 still lands
+    /// at the kernel's chosen vector), IMR (which IRQs the guest
+    /// has unmasked), IRR (pending edges that haven't been ack'd
+    /// yet), ISR (in-service status — controls EOI semantics on
+    /// resume), and the ICW init-state machine (so a snapshot
+    /// taken mid-init sequence resumes at the right step).
+    #[test]
+    fn snapshot_round_trip_preserves_dispatch_state() {
+        let mut pic = Pic::master();
+        pic.vector_base = 0x40;
+        pic.imr = 0xAB;
+        pic.irr = 0x34;
+        pic.isr = 0x12;
+        pic.init_state = InitState::ExpectIcw3;
+
+        let mut buf = Vec::new();
+        pic.snapshot_into(&mut buf);
+        let mut pic2 = Pic::master();
+        let consumed = pic2.restore(&buf).expect("restore");
+        assert_eq!(consumed, 5);
+        assert_eq!(pic2.vector_base, 0x40);
+        assert_eq!(pic2.imr, 0xAB);
+        assert_eq!(pic2.irr, 0x34);
+        assert_eq!(pic2.isr, 0x12);
+        assert!(matches!(pic2.init_state, InitState::ExpectIcw3));
+    }
+
+    /// restore must reject malformed inputs rather than panic.
+    /// Two failure modes: truncated (<5 bytes), and unknown
+    /// init_state tag (the tag is an exhaustive 4-variant enum;
+    /// any byte > 3 is a payload corruption).
+    #[test]
+    fn restore_rejects_truncated_blob_and_bad_init_tag() {
+        let mut pic = Pic::master();
+        assert!(pic.restore(&[0u8; 4]).is_err(), "truncated");
+        // 5 bytes with init_state tag = 7 (out of range).
+        let bad = [0x40, 0, 0, 0, 7u8];
+        assert!(pic.restore(&bad).is_err(), "bad init_state tag");
+    }
 }
