@@ -271,6 +271,13 @@
 //!     (S_IFLNK in tmpfs) AND readlink returning the link body
 //!     string + byte count (without following the link).
 //!
+//!   - `linux_userspace_uname_milestone` — `sys_uname` (122):
+//!     /init fills `struct new_utsname`, writes `sysname[0..65]`;
+//!     test asserts it is "Linux". Built via the safe wrapper
+//!     (`build_initramfs_uname_safe`), so it also validates that
+//!     `make_init_elf32_safe` neutralizes the historical 600-byte
+//!     hang that the raw `build_initramfs_uname` still reproduces.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -622,6 +629,71 @@ fn build_initramfs_uname() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Production-safe variant of the uname /init: calls `sys_uname`
+/// (syscall 122), filling a `struct new_utsname` (6 × 65-byte
+/// fields: sysname, nodename, release, version, machine,
+/// domainname), then writes `sysname[0..65]` between
+/// `[USERSPACE UNAME=…][USERSPACE END]` markers. Unlike
+/// `build_initramfs_uname` — which deliberately uses raw
+/// `make_init_elf32` to land at exactly 600 bytes and reproduce
+/// the historical {600,602}-bad-size boot stall — this one
+/// routes through `make_init_elf32_safe`, so if it lands on a
+/// known-bad size it gets a 4-byte tail-pad to dodge it. This
+/// milestone therefore doubles as live validation that the
+/// safety wrapper actually neutralizes the original hang that
+/// started the whole bisection saga.
+fn build_initramfs_uname_safe() -> Vec<u8> {
+    const UTSNAME_LEN: u32 = 390;
+    let marker_pre: &[u8] = b"[USERSPACE UNAME=";
+    let marker_post: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_pre_addr: u32, marker_post_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // write(1, marker_pre, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // sys_uname(&buf) — sys 122
+        out.extend_from_slice(&[0xB8, 0x7A, 0x00, 0x00, 0x00]); // mov eax, 122
+        out.push(0xBB);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf (sysname), 65)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x41, 0x00, 0x00, 0x00]); // mov edx, 65
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_post, len)
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_post_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_pre_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_post_addr = marker_pre_addr + marker_pre.len() as u32;
+    let buf_addr = marker_post_addr + marker_post.len() as u32;
+    let code = build_code(marker_pre_addr, marker_post_addr, buf_addr);
+    let buf_zeros = vec![0u8; UTSNAME_LEN as usize];
+    let binary = make_init_elf32_safe(&code, &[marker_pre, marker_post, &buf_zeros], 7);
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Sanity check on the cpio builders: each archive starts with
 /// the newc magic, so a future refactor of `cpio_entry` or
 /// `build_cpio_archive` can't silently produce malformed output.
@@ -667,6 +739,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     let mprotect = build_initramfs_mprotect();
     let signal = build_initramfs_signal();
     let symlink = build_initramfs_symlink();
+    let uname_safe = build_initramfs_uname_safe();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
@@ -701,6 +774,7 @@ fn init_cpio_archives_start_with_newc_magic() {
     assert_eq!(&mprotect[0..6], b"070701");
     assert_eq!(&signal[0..6], b"070701");
     assert_eq!(&symlink[0..6], b"070701");
+    assert_eq!(&uname_safe[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -736,6 +810,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-mprotect.cpio", &mprotect);
         let _ = std::fs::write("/tmp/wwwvm-signal.cpio", &signal);
         let _ = std::fs::write("/tmp/wwwvm-symlink.cpio", &symlink);
+        let _ = std::fs::write("/tmp/wwwvm-uname-safe.cpio", &uname_safe);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -6758,6 +6833,57 @@ fn linux_userspace_symlink_milestone() {
         link_bytes,
         dump_uart_on_failure(&cumulative, "symlink-wrong")
     );
+}
+
+/// `sys_uname` milestone: /init calls `sys_uname` and writes the
+/// `sysname` field, which must be "Linux". Doubles as validation
+/// that `make_init_elf32_safe` neutralizes the historical
+/// {600,602}-bad-size hang that the raw `build_initramfs_uname`
+/// (the original trigger of the bisection saga) reproduces.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_uname_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_uname_safe();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_pre: &[u8] = b"[USERSPACE UNAME=";
+    // sysname is "Linux\0\0..." (65 bytes), then the kernel TTY
+    // emits the marker_post. Search for the marker_pre + "Linux".
+    let needle: &[u8] = b"[USERSPACE UNAME=Linux";
+    let mut cumulative = Vec::<u8>::new();
+    let steps =
+        run_until_marker(&mut vm, needle, 16_000_000_000, &mut cumulative).unwrap_or_else(|()| {
+            let saw_pre = cumulative
+                .windows(marker_pre.len())
+                .any(|w| w == marker_pre);
+            let cause = if saw_pre {
+                "marker appeared but sysname != \"Linux\" — uname filled a wrong/empty sysname"
+            } else {
+                "no UNAME marker — uname may have hung (bad /init size?) or returned -errno"
+            };
+            panic!(
+                "`[USERSPACE UNAME=Linux` not seen in 16 B steps; {cause}; {}",
+                dump_uart_on_failure(&cumulative, "uname")
+            )
+        });
+    eprintln!("uname milestone — sysname=\"Linux\" confirmed after {steps} steps");
 }
 
 /// `sys_statfs` milestone: /init calls `sys_statfs("/", &buf)`,
