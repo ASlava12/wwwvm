@@ -1214,3 +1214,41 @@ fn linux_userspace_bisect_no_leading_newline_milestone() {
         });
     eprintln!("[BISECT] HELLO seen after {steps} steps (leading \\n WAS the trigger)");
 }
+
+/// `[USERSPACE END]` substring or length-17 — bisect with a
+/// completely different 17-byte msg (alphabet). If alphabet
+/// works, `[USERSPACE END]` substring is the trigger. If
+/// alphabet hangs, length-17 (or its cpio-padding alignment) is.
+#[test]
+#[ignore = "alphabet-msg bisection"]
+fn linux_userspace_bisect_alphabet_msg_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_bisect_with_msg(b"ABCDEFGHIJKLMNOPQ");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(&mut vm, b"[BISECT] HELLO", 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "alphabet-17 also hangs — length-17 alignment IS the trigger; {}",
+                dump_uart_on_failure(&cumulative, "bisect-alphabet")
+            )
+        });
+    eprintln!(
+        "[BISECT] HELLO seen after {steps} steps (substring `[USERSPACE END]` WAS the trigger)"
+    );
+}
