@@ -50,6 +50,14 @@
 //!     proves the syscall ABI moves a u32 through eax, this one
 //!     proves the kernel's copy_to_user fills a user-side struct.
 //!
+//!   - `linux_userspace_fork_milestone` — process creation:
+//!     /init calls `sys_fork` (syscall 2), then `sys_waitpid`
+//!     to order parent-after-child, and BOTH processes write
+//!     `[USERSPACE FORK ret=<eax>][USERSPACE END]`. Test
+//!     verifies both occurrences in UART and asserts the values
+//!     are (0, child_PID_in_parent_view). Pins kernel
+//!     copy_process + scheduler + return-from-fork in child.
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -368,12 +376,14 @@ fn init_cpio_archives_start_with_newc_magic() {
     let time = build_initramfs_time();
     let getpid = build_initramfs_getpid();
     let gettimeofday = build_initramfs_gettimeofday();
+    let fork = build_initramfs_fork();
     assert_eq!(&uname[0..6], b"070701");
     assert_eq!(&proc_version[0..6], b"070701");
     assert_eq!(&hello[0..6], b"070701");
     assert_eq!(&time[0..6], b"070701");
     assert_eq!(&getpid[0..6], b"070701");
     assert_eq!(&gettimeofday[0..6], b"070701");
+    assert_eq!(&fork[0..6], b"070701");
     if std::env::var_os("WWWVM_DUMP_INIT_ARTIFACTS").is_some() {
         let _ = std::fs::write("/tmp/wwwvm-uname.cpio", &uname);
         let _ = std::fs::write("/tmp/wwwvm-proc-version.cpio", &proc_version);
@@ -381,6 +391,7 @@ fn init_cpio_archives_start_with_newc_magic() {
         let _ = std::fs::write("/tmp/wwwvm-time.cpio", &time);
         let _ = std::fs::write("/tmp/wwwvm-getpid.cpio", &getpid);
         let _ = std::fs::write("/tmp/wwwvm-gettimeofday.cpio", &gettimeofday);
+        let _ = std::fs::write("/tmp/wwwvm-fork.cpio", &fork);
         // Bisection-debug cpios for the {600, 602} stall — the
         // failing minimal reproducer and the just-above-bad-set
         // counter-example. Pair these with
@@ -1034,6 +1045,109 @@ fn build_initramfs_gettimeofday() -> Vec<u8> {
     build_cpio_archive(&binary, /* proc_dir */ false)
 }
 
+/// Build a cpio whose /init calls `sys_fork` (syscall 2) and then
+/// — in BOTH parent and child — writes `[USERSPACE FORK ret=`
+/// followed by its own 4-byte `eax`, then `][USERSPACE END]\n`.
+/// The marker_fork write happens AFTER the fork on purpose so
+/// both processes emit it; the buf and the rest of the post-fork
+/// code run in two independent address spaces (kernel
+/// copy-on-write), so each process prints its own eax value:
+///
+///   parent eax = child PID  (>= 2, typically the next free pid)
+///   child  eax = 0          (fork(2) contract for the child)
+///
+/// /init code structure:
+///
+///   sys_fork           ; eax = child PID (parent) or 0 (child)
+///   write(1, marker_fork, len)
+///   mov ds:[buf], eax
+///   write(1, buf, 4)
+///   write(1, marker_end, len)
+///   exit(0)
+///
+/// What this pins beyond `getpid`:
+///   - kernel process creation (do_fork → copy_process →
+///     copy_mm CoW + new task_struct + add to runqueue)
+///   - scheduler actually schedules a child (without that, child's
+///     code never runs and only ONE marker shows up in UART)
+///   - return-to-user from fork in child with eax=0
+fn build_initramfs_fork() -> Vec<u8> {
+    let marker_fork: &[u8] = b"[USERSPACE FORK ret=";
+    let marker_end: &[u8] = b"][USERSPACE END]\n";
+
+    let build_code = |marker_fork_addr: u32, marker_end_addr: u32, buf_addr: u32| -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        // sys_fork() — sys 2. No args. Returns child PID in eax for
+        // parent, 0 for child. After this point both processes run
+        // independently in CoW-copied address spaces.
+        out.extend_from_slice(&[0xB8, 0x02, 0x00, 0x00, 0x00]); // mov eax, 2
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // Stash fork return in buf BEFORE the waitpid call below
+        // clobbers eax — both branches need the original return
+        // for the buf write further down.
+        out.push(0xA3); // mov ds:[buf_addr], eax
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        // sys_waitpid(-1, NULL, 0) — sys 7. Ordering trick: parent
+        // blocks until child exits; child returns -ECHILD instantly
+        // (no children of its own). So by the time control reaches
+        // the writes below, the child has ALREADY run them and
+        // exited — parent's writes come second, and only THEN does
+        // PID 1 exit and trigger the "Attempted to kill init"
+        // panic. Without this, the first parent's `exit(0)` panics
+        // the kernel mid-child-write and we see only ONE complete
+        // marker_fork + buf + marker_end sequence (verified in
+        // /tmp/wwwvm-userspace-fork-second-failure.bin: parent's
+        // 0x4B = 75 = child PID landed but child's `0` never did).
+        out.extend_from_slice(&[0xB8, 0x07, 0x00, 0x00, 0x00]); // mov eax, 7
+        out.extend_from_slice(&[0xBB, 0xFF, 0xFF, 0xFF, 0xFF]); // mov ebx, -1
+        out.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx (status=NULL)
+        out.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (options=0)
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_fork, marker_fork.len())
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.push(0xB9); // mov ecx, marker_fork_addr
+        out.extend_from_slice(&marker_fork_addr.to_le_bytes());
+        out.push(0xBA); // mov edx, len
+        out.extend_from_slice(&(marker_fork.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, buf, 4) — buf already holds the original fork
+        // return that we stashed before clobbering eax.
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]); // mov eax, 4
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]); // mov ebx, 1
+        out.push(0xB9);
+        out.extend_from_slice(&buf_addr.to_le_bytes());
+        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // write(1, marker_end, marker_end.len())
+        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+        out.push(0xB9);
+        out.extend_from_slice(&marker_end_addr.to_le_bytes());
+        out.push(0xBA);
+        out.extend_from_slice(&(marker_end.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0xCD, 0x80]);
+        // exit(0)
+        out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&[0x31, 0xDB]);
+        out.extend_from_slice(&[0xCD, 0x80]);
+        out
+    };
+
+    let code_len = build_code(0, 0, 0).len() as u32;
+    let marker_fork_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
+    let marker_end_addr = marker_fork_addr + marker_fork.len() as u32;
+    let buf_addr = marker_end_addr + marker_end.len() as u32;
+    let code = build_code(marker_fork_addr, marker_end_addr, buf_addr);
+    let buf_zeros = [0u8; 4];
+    let binary = make_init_elf32_safe(
+        &code,
+        &[marker_fork, marker_end, &buf_zeros],
+        7, // R | W | X — /init writes fork return into buf
+    );
+    build_cpio_archive(&binary, /* proc_dir */ false)
+}
+
 /// Pretty-print a marker-search failure: dump the *full* UART
 /// stream to a stable path under `/tmp` (the same directory the
 /// vmlinuz already lives in) so a debugger can grep it without
@@ -1450,5 +1564,145 @@ fn linux_userspace_gettimeofday_milestone() {
         tv_usec < 1_000_000,
         "tv_usec = {tv_usec} (0x{tv_usec:08X}); expected < 1_000_000; {}",
         dump_uart_on_failure(&cumulative, "gettimeofday-usec")
+    );
+}
+
+/// Process-creation milestone: /init calls `sys_fork` (syscall 2),
+/// then both parent AND child run the rest of /init's code and
+/// each emit `[USERSPACE FORK ret=<eax_le32>][USERSPACE END]`.
+/// Parent's eax is the child PID (>= 2), child's eax is 0. The
+/// test searches `cumulative` for both occurrences, decodes their
+/// 4-byte return values, asserts:
+///
+///   - one is exactly 0 (child fork return)
+///   - the other is >= 2 and < 0x80000000 (sensible child PID,
+///     not a sign-extended -errno from a failed fork)
+///   - the two values differ (parent saw the child it spawned,
+///     child saw the contract'd 0)
+///
+/// What this pins beyond every earlier milestone:
+///   - kernel process creation: do_fork → copy_process →
+///     copy_mm (CoW page tables) + dup_task_struct +
+///     wake_up_new_task
+///   - scheduler actually running both processes: if the child
+///     never gets cycles, only ONE marker appears in UART and
+///     the test fails the "two occurrences" check
+///   - return-to-user-from-fork in the child: kernel must
+///     set up child's regs so it re-enters userspace at the
+///     same EIP with eax=0, *into its own address space*
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_fork_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_fork();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let marker_fork: &[u8] = b"[USERSPACE FORK ret=";
+    let marker_end_search: &[u8] = b"][USERSPACE END]\r\n";
+    let mut cumulative = Vec::<u8>::new();
+
+    // Run until we see TWO end markers (parent + child both
+    // finished). One run_until_marker gets us the first; we then
+    // keep stepping and re-checking for a SECOND occurrence.
+    let r1 = run_until_marker(&mut vm, marker_end_search, 16_000_000_000, &mut cumulative)
+        .unwrap_or_else(|()| {
+            panic!(
+                "first `[USERSPACE END]` not seen in 16 B steps — fork may have failed or \
+                 child never ran; {}",
+                dump_uart_on_failure(&cumulative, "fork-first")
+            )
+        });
+    eprintln!("first end marker after {r1} steps");
+
+    // Step further until a SECOND occurrence appears. We re-scan
+    // cumulative from offset just past the first END's position
+    // each chunk; budget another 4 B for the second one.
+    let chunk = 10_000_000u32;
+    let mut extra_steps = 0u64;
+    let extra_budget = 4_000_000_000u64;
+    let second_pos = loop {
+        // Find all occurrences in cumulative; we need at least two.
+        let mut positions = cumulative
+            .windows(marker_end_search.len())
+            .enumerate()
+            .filter(|(_, w)| *w == marker_end_search)
+            .map(|(i, _)| i);
+        let _first = positions.next(); // already-found
+        if let Some(p) = positions.next() {
+            break p;
+        }
+        if extra_steps >= extra_budget {
+            panic!(
+                "second `[USERSPACE END]` not seen +{extra_budget} steps after first — child \
+                 likely never executed; {}",
+                dump_uart_on_failure(&cumulative, "fork-second")
+            );
+        }
+        let (s, _) = vm.run_steps_idle_aware(chunk);
+        extra_steps += s as u64;
+        if extra_steps % 100_000_000 < chunk as u64 {
+            let out = vm.drain_output();
+            if !out.is_empty() {
+                cumulative.extend_from_slice(&out);
+            }
+        }
+    };
+    eprintln!("second end marker after +{extra_steps} more steps (offset {second_pos})");
+
+    // Find all `[USERSPACE FORK ret=` occurrences; extract the
+    // 4-byte eax that follows each.
+    let fork_positions: Vec<usize> = cumulative
+        .windows(marker_fork.len())
+        .enumerate()
+        .filter(|(_, w)| *w == marker_fork)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        fork_positions.len() >= 2,
+        "expected >= 2 `[USERSPACE FORK ret=` occurrences, got {}; {}",
+        fork_positions.len(),
+        dump_uart_on_failure(&cumulative, "fork-count")
+    );
+    let mut eaxes: Vec<u32> = fork_positions
+        .iter()
+        .take(2)
+        .map(|&p| {
+            let off = p + marker_fork.len();
+            let b: [u8; 4] = cumulative[off..off + 4]
+                .try_into()
+                .expect("4 bytes after marker_fork");
+            u32::from_le_bytes(b)
+        })
+        .collect();
+    eaxes.sort();
+    eprintln!("fork returns observed: {:?}", &eaxes);
+    let child_return = eaxes[0];
+    let parent_return = eaxes[1];
+    assert_eq!(
+        child_return,
+        0,
+        "expected child's fork return = 0, got {child_return}; {}",
+        dump_uart_on_failure(&cumulative, "fork-child-nonzero")
+    );
+    assert!(
+        (2..0x8000_0000).contains(&parent_return),
+        "expected parent's fork return in [2, 0x80000000), got {parent_return} (0x{parent_return:08X}); {}",
+        dump_uart_on_failure(&cumulative, "fork-parent-bad")
     );
 }
