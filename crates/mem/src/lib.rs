@@ -744,6 +744,38 @@ mod tests {
         assert_eq!(m.read_u32(HPET_BASE + 0x108), 20, "advanced again");
     }
 
+    /// LAPIC timer "lost tick" semantics: a second zero-crossing
+    /// while `pending_lapic_irq` is still Some must NOT overwrite
+    /// the pending vector. Real silicon coalesces via IRR/ISR; we
+    /// just drop the new edge, which matches the kernel's "lost
+    /// tick" handling (it tolerates missed ticks via jiffies skew
+    /// detection). The load-bearing line is `if pending.is_none()`
+    /// — a regression that flipped it would clobber the first
+    /// vector with the second whenever the kernel is slow to take
+    /// the IRQ, and the handler would dispatch at the *wrong*
+    /// vector. This pins the no-overwrite invariant directly.
+    #[test]
+    fn tick_lapic_timer_does_not_overwrite_already_pending_irq() {
+        let mut m = Memory::new(64);
+        // First IRQ: arm with vector 0x40, decrement to zero.
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0040); // LVT vector 0x40
+        m.write_u32(LAPIC_BASE + 0x390, 1); // current = 1
+        m.tick_lapic_timer();
+        // Don't take — leave pending = Some(0x40).
+        // Change LVT to a *different* vector and re-arm.
+        m.write_u32(LAPIC_BASE + 0x320, 0x0000_0055); // LVT vector 0x55
+        m.write_u32(LAPIC_BASE + 0x390, 1);
+        m.tick_lapic_timer();
+        // Pending must STILL be 0x40 — the new edge was dropped.
+        assert_eq!(
+            m.take_pending_lapic_irq(),
+            Some(0x40),
+            "second zero-crossing must not overwrite an unconsumed pending vector"
+        );
+        // And nothing extra is queued after the drain.
+        assert!(m.take_pending_lapic_irq().is_none());
+    }
+
     /// A guest write to an HPET timer's comparator low dword
     /// (0x108 / 0x128 / 0x148) must latch the value into
     /// `hpet_period[tn]` so periodic mode's auto-advance uses it.
