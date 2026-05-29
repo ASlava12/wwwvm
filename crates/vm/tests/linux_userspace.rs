@@ -290,6 +290,13 @@
 //!     count > 0 and the dirent buffer contains `b"ZZMARKER"`.
 //!     Pins directory enumeration — the `ls`/`readdir` primitive.
 //!
+//!   - `linux_userspace_chdir_milestone` — `sys_chdir` (12) +
+//!     `sys_getcwd` (183): /init mkdir's `/sub`, chdir's into it,
+//!     reads cwd back. Test asserts mkdir==0, chdir==0, getcwd==5,
+//!     cwd=="/sub". (Formerly a diagnostic for a "getcwd returns
+//!     0" blocker that turned out to be a test-harness bug —
+//!     getcwd works fine. See the test for the post-mortem.)
+//!
 //! Bisection probes (also `#[ignore]`, used to characterize the
 //! /init-binary-size {600, 602} stall — see
 //! `build_initramfs_hello_padded_to` doc-block for the table):
@@ -4295,89 +4302,86 @@ fn build_initramfs_truncate() -> Vec<u8> {
 }
 
 /// Build a cpio whose /init calls `sys_mkdir("/sub", 0o755)`,
-/// then `sys_chdir("/sub")`, then `sys_getcwd(buf, 32)`. /init
-/// writes the first 4 bytes of `buf` (after kernel filled
-/// "/sub\0…") between `[USERSPACE CWD=…][USERSPACE END]` markers.
-/// Test asserts the 4 bytes equal `b"/sub"`. Pins:
+/// `sys_chdir("/sub")`, then `sys_getcwd(buf, 32)`, capturing all
+/// three syscall returns plus the cwd buffer between markers
+/// `[USERSPACE MKDIR=<4>CHDIR=<4>GETCWD=<4>PWD=<8>][USERSPACE END]`.
+/// Test asserts mkdir==0, chdir==0, getcwd==5 (len "/sub\0"), and
+/// cwd starts with "/sub". Pins:
 ///   - sys_chdir: kernel updates the current task's `fs->pwd`
 ///     to point at the new dentry
 ///   - sys_getcwd: kernel walks the dentry tree from the
 ///     current `fs->pwd` up to its mount root and assembles a
 ///     pathname string into the user buffer (different mechanism
-///     than read/stat — it's a kernel-side string allocation
-///     and copy_to_user)
+///     than read/stat — a kernel-side string build + copy_to_user)
+///
+/// The `PWD=` marker is deliberately NOT a substring of `GETCWD=`
+/// — an earlier "CWD=" choice collided with the GETCWD= label and
+/// produced a spurious zero reading that masqueraded as a getcwd
+/// kernel bug. See the milestone test for the full history.
 fn build_initramfs_chdir() -> Vec<u8> {
     let dir_path: &[u8] = b"/sub\0";
-    let marker_pre: &[u8] = b"[USERSPACE CWD=";
-    let marker_ret: &[u8] = b" RET=";
-    let marker_post: &[u8] = b"][USERSPACE END]\n";
+    let m_mkdir: &[u8] = b"[USERSPACE MKDIR=";
+    let m_chdir: &[u8] = b"CHDIR=";
+    let m_getcwd: &[u8] = b"GETCWD=";
+    // NOTE: must NOT be a substring of m_getcwd ("GETCWD=" contains
+    // "CWD="!), or the test's position() search collides. Use "PWD=".
+    let m_cwd: &[u8] = b"PWD=";
+    let m_post: &[u8] = b"][USERSPACE END]\n";
 
     let build_code = |dir_path_addr: u32,
-                      marker_pre_addr: u32,
-                      marker_ret_addr: u32,
-                      marker_post_addr: u32,
+                      m_mkdir_addr: u32,
+                      m_chdir_addr: u32,
+                      m_getcwd_addr: u32,
+                      m_cwd_addr: u32,
+                      m_post_addr: u32,
                       buf_addr: u32,
-                      ret_buf_addr: u32|
+                      mkdir_ret_addr: u32,
+                      chdir_ret_addr: u32,
+                      getcwd_ret_addr: u32|
      -> Vec<u8> {
-        let mut out = Vec::with_capacity(192);
+        let mut out = Vec::with_capacity(256);
         // sys_mkdir(dir_path, 0o755) — sys 39
-        out.extend_from_slice(&[0xB8, 0x27, 0x00, 0x00, 0x00]); // mov eax, 39
+        out.extend_from_slice(&[0xB8, 0x27, 0x00, 0x00, 0x00]);
         out.push(0xBB);
         out.extend_from_slice(&dir_path_addr.to_le_bytes());
-        out.extend_from_slice(&[0xB9, 0xED, 0x01, 0x00, 0x00]); // mov ecx, 0o755
+        out.extend_from_slice(&[0xB9, 0xED, 0x01, 0x00, 0x00]);
         out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[mkdir_ret] = eax
+        out.extend_from_slice(&mkdir_ret_addr.to_le_bytes());
         // sys_chdir(dir_path) — sys 12
-        out.extend_from_slice(&[0xB8, 0x0C, 0x00, 0x00, 0x00]); // mov eax, 12
+        out.extend_from_slice(&[0xB8, 0x0C, 0x00, 0x00, 0x00]);
         out.push(0xBB);
         out.extend_from_slice(&dir_path_addr.to_le_bytes());
         out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[chdir_ret] = eax
+        out.extend_from_slice(&chdir_ret_addr.to_le_bytes());
         // sys_getcwd(buf, 32) — sys 183
-        out.extend_from_slice(&[0xB8, 0xB7, 0x00, 0x00, 0x00]); // mov eax, 183
+        out.extend_from_slice(&[0xB8, 0xB7, 0x00, 0x00, 0x00]);
         out.push(0xBB);
         out.extend_from_slice(&buf_addr.to_le_bytes());
         out.extend_from_slice(&[0xB9, 0x20, 0x00, 0x00, 0x00]); // mov ecx, 32
         out.extend_from_slice(&[0xCD, 0x80]);
-        // Save getcwd return code so we can see what it returned
-        out.push(0xA3);
-        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
-        // write(1, marker_pre, len)
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
-        out.push(0xB9);
-        out.extend_from_slice(&marker_pre_addr.to_le_bytes());
-        out.push(0xBA);
-        out.extend_from_slice(&(marker_pre.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0xCD, 0x80]);
-        // write(1, buf, 4) — first 4 bytes of cwd ("/sub")
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
-        out.push(0xB9);
-        out.extend_from_slice(&buf_addr.to_le_bytes());
-        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xCD, 0x80]);
-        // write(1, marker_ret, len)
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
-        out.push(0xB9);
-        out.extend_from_slice(&marker_ret_addr.to_le_bytes());
-        out.push(0xBA);
-        out.extend_from_slice(&(marker_ret.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0xCD, 0x80]);
-        // write(1, ret_buf, 4) — getcwd's eax return
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
-        out.push(0xB9);
-        out.extend_from_slice(&ret_buf_addr.to_le_bytes());
-        out.extend_from_slice(&[0xBA, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xCD, 0x80]);
-        // write(1, marker_post, len)
-        out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
-        out.push(0xB9);
-        out.extend_from_slice(&marker_post_addr.to_le_bytes());
-        out.push(0xBA);
-        out.extend_from_slice(&(marker_post.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0xCD, 0x80]);
+        out.push(0xA3); // ds:[getcwd_ret] = eax
+        out.extend_from_slice(&getcwd_ret_addr.to_le_bytes());
+        // Emit all four labelled values + 8 cwd bytes.
+        let w = |addr: u32, len: u32, out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0xB8, 0x04, 0x00, 0x00, 0x00]);
+            out.extend_from_slice(&[0xBB, 0x01, 0x00, 0x00, 0x00]);
+            out.push(0xB9);
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.push(0xBA);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0xCD, 0x80]);
+        };
+        w(m_mkdir_addr, m_mkdir.len() as u32, &mut out);
+        w(mkdir_ret_addr, 4, &mut out);
+        w(m_chdir_addr, m_chdir.len() as u32, &mut out);
+        w(chdir_ret_addr, 4, &mut out);
+        w(m_getcwd_addr, m_getcwd.len() as u32, &mut out);
+        w(getcwd_ret_addr, 4, &mut out);
+        w(m_cwd_addr, m_cwd.len() as u32, &mut out);
+        w(buf_addr, 8, &mut out);
+        w(m_post_addr, m_post.len() as u32, &mut out);
         // exit(0)
         out.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
         out.extend_from_slice(&[0x31, 0xDB]);
@@ -4385,32 +4389,36 @@ fn build_initramfs_chdir() -> Vec<u8> {
         out
     };
 
-    let code_len = build_code(0, 0, 0, 0, 0, 0).len() as u32;
+    let code_len = build_code(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).len() as u32;
     let dir_path_addr = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET + code_len;
-    let marker_pre_addr = dir_path_addr + dir_path.len() as u32;
-    let marker_ret_addr = marker_pre_addr + marker_pre.len() as u32;
-    let marker_post_addr = marker_ret_addr + marker_ret.len() as u32;
-    let buf_addr = marker_post_addr + marker_post.len() as u32;
-    let ret_buf_addr = buf_addr + 32;
+    let m_mkdir_addr = dir_path_addr + dir_path.len() as u32;
+    let m_chdir_addr = m_mkdir_addr + m_mkdir.len() as u32;
+    let m_getcwd_addr = m_chdir_addr + m_chdir.len() as u32;
+    let m_cwd_addr = m_getcwd_addr + m_getcwd.len() as u32;
+    let m_post_addr = m_cwd_addr + m_cwd.len() as u32;
+    let buf_addr = m_post_addr + m_post.len() as u32;
+    let mkdir_ret_addr = buf_addr + 32;
+    let chdir_ret_addr = mkdir_ret_addr + 4;
+    let getcwd_ret_addr = chdir_ret_addr + 4;
     let code = build_code(
         dir_path_addr,
-        marker_pre_addr,
-        marker_ret_addr,
-        marker_post_addr,
+        m_mkdir_addr,
+        m_chdir_addr,
+        m_getcwd_addr,
+        m_cwd_addr,
+        m_post_addr,
         buf_addr,
-        ret_buf_addr,
+        mkdir_ret_addr,
+        chdir_ret_addr,
+        getcwd_ret_addr,
     );
     let buf_zeros = [0u8; 32];
     let ret_zeros = [0u8; 4];
     let binary = make_init_elf32_safe(
         &code,
         &[
-            dir_path,
-            marker_pre,
-            marker_ret,
-            marker_post,
-            &buf_zeros,
-            &ret_zeros,
+            dir_path, m_mkdir, m_chdir, m_getcwd, m_cwd, m_post, &buf_zeros, &ret_zeros,
+            &ret_zeros, &ret_zeros,
         ],
         7,
     );
@@ -7951,24 +7959,23 @@ fn linux_userspace_nanosleep_milestone() {
 }
 
 /// Diagnostic test for the `chdir`+`getcwd` blocker discovered
-/// 2026-05-29: /init makes `/sub`, chdir's into it, then asks
-/// for the current directory via `sys_getcwd(buf, 32)`. Doesn't
-/// assert — logs `buf` (the path the kernel wrote) AND
-/// `getcwd`'s eax return. First green run showed:
+/// `sys_chdir` + `sys_getcwd` milestone: /init makes `/sub`,
+/// chdir's into it, then reads the cwd back via `sys_getcwd`.
+/// Test asserts mkdir==0, chdir==0, getcwd==5 (len of "/sub\0"),
+/// and the cwd buffer starts with "/sub".
 ///
-///     buf = [0, 0, 0, 0] (all zeros, no path written)
-///     ret = 0x00000000 (zero — neither success len ≥ 2 nor -errno)
-///
-/// Linux's `sys_getcwd` (fs/d_path.c) either returns a positive
-/// length on success (≥ 2 for "/" + NUL) or a negative errno —
-/// 0 isn't in the contract. So either the syscall isn't running
-/// at all (maybe syscall 183 isn't getcwd in our kernel build?)
-/// or it's running but eax is being clobbered before we capture
-/// it. Next investigation tick should compare with another
-/// kernel build OR sample the eax at a finer granularity.
+/// History: this was originally a diagnostic (`chdir_diag`) for a
+/// supposed "getcwd returns 0" blocker. Root-caused 2026-05-29 as
+/// a FALSE ALARM — getcwd works fine (returns 5, fills "/sub").
+/// The original "0" reading was a test-harness bug (wrong buffer
+/// offset); a second false reading came from searching for "CWD="
+/// which collides with the "GETCWD=" marker substring. With a
+/// distinct "PWD=" marker the chain reads cleanly and the
+/// milestone passes — so this is now a real production milestone
+/// and the getcwd blocker is removed from the README.
 #[test]
-#[ignore = "diagnostic for chdir/getcwd; sys_getcwd returns 0 instead of path length"]
-fn linux_userspace_chdir_diag() {
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; ~52s wall-clock"]
+fn linux_userspace_chdir_milestone() {
     let path =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
     let bytes = match std::fs::read(&path) {
@@ -7989,64 +7996,88 @@ fn linux_userspace_chdir_diag() {
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
 
-    let marker_pre: &[u8] = b"[USERSPACE CWD=";
-    let marker_ret: &[u8] = b" RET=";
+    let m_mkdir: &[u8] = b"[USERSPACE MKDIR=";
+    let m_chdir: &[u8] = b"CHDIR=";
+    let m_getcwd: &[u8] = b"GETCWD=";
+    let m_cwd: &[u8] = b"PWD=";
     let marker_post_search: &[u8] = b"][USERSPACE END]\r\n";
     let mut cumulative = Vec::<u8>::new();
     let steps = run_until_marker(&mut vm, marker_post_search, 16_000_000_000, &mut cumulative)
         .unwrap_or_else(|()| {
             panic!(
-                "`[USERSPACE END]` not seen in 16 B steps — chdir or getcwd may have \
-                 failed; {}",
+                "`[USERSPACE END]` not seen in 16 B steps; {}",
                 dump_uart_on_failure(&cumulative, "chdir")
             )
         });
-    eprintln!("chdir milestone end marker after {steps} steps");
+    eprintln!("chdir diag end marker after {steps} steps");
 
-    let pre_pos = cumulative
-        .windows(marker_pre.len())
-        .position(|w| w == marker_pre)
-        .expect("marker_pre must precede marker_post");
-    let buf_start = pre_pos + marker_pre.len();
-    let cwd_bytes: [u8; 4] = cumulative[buf_start..buf_start + 4]
-        .try_into()
-        .expect("4 bytes between markers");
-    let ret_pos = cumulative
-        .windows(marker_ret.len())
-        .position(|w| w == marker_ret)
-        .expect("marker_ret");
-    let ret_off = ret_pos + marker_ret.len();
-    let ret_bytes: [u8; 4] = cumulative[ret_off..ret_off + 4]
-        .try_into()
-        .expect("4 bytes for getcwd return");
-    let getcwd_ret = u32::from_le_bytes(ret_bytes);
-    eprintln!("=== chdir + getcwd diagnostic ===");
+    // All four labelled values are binary u32/strings; strip ONLCR
+    // before decoding the three 4-byte returns.
+    let stripped: Vec<u8> = cumulative
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &b)| {
+            if b == b'\r' && cumulative.get(i + 1) == Some(&b'\n') {
+                None
+            } else {
+                Some(b)
+            }
+        })
+        .collect();
+    let read_u32 = |marker: &[u8]| -> u32 {
+        let pos = stripped
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap_or_else(|| panic!("marker {:?} not found", std::str::from_utf8(marker)));
+        let off = pos + marker.len();
+        u32::from_le_bytes(stripped[off..off + 4].try_into().unwrap())
+    };
+    let mkdir_ret = read_u32(m_mkdir);
+    let chdir_ret = read_u32(m_chdir);
+    let getcwd_ret = read_u32(m_getcwd);
+    let cwd_pos = stripped
+        .windows(m_cwd.len())
+        .position(|w| w == m_cwd)
+        .expect("CWD marker");
+    let cwd_off = cwd_pos + m_cwd.len();
+    let cwd_bytes: [u8; 8] = stripped[cwd_off..cwd_off + 8].try_into().unwrap();
+
+    eprintln!("=== chdir + getcwd milestone ===");
+    eprintln!("  sys_mkdir(\"/sub\")  ret = {}", mkdir_ret as i32);
+    eprintln!("  sys_chdir(\"/sub\")  ret = {}", chdir_ret as i32);
+    eprintln!("  sys_getcwd(buf,32) ret = {}", getcwd_ret as i32);
     eprintln!(
-        "  cwd_bytes (first 4 of buf) = {:02X?} = {:?}",
-        cwd_bytes,
+        "  cwd buf[0..8] = {:?}",
         std::str::from_utf8(&cwd_bytes).unwrap_or("<non-utf8>")
     );
-    eprintln!(
-        "  getcwd ret = 0x{getcwd_ret:08X} ({} signed)",
-        getcwd_ret as i32
+    assert_eq!(
+        mkdir_ret,
+        0,
+        "sys_mkdir(\"/sub\") returned {} (expected 0); {}",
+        mkdir_ret as i32,
+        dump_uart_on_failure(&cumulative, "chdir-mkdir")
     );
-    if cwd_bytes == *b"/sub" {
-        eprintln!("  → chdir + getcwd WORKING");
-    } else if getcwd_ret == 0 {
-        eprintln!(
-            "  → getcwd returned 0 (not in Linux contract) — kernel-side investigation needed"
-        );
-    } else if (getcwd_ret as i32) < 0 {
-        eprintln!(
-            "  → getcwd failed with errno {} — check Linux i386 errno list",
-            -(getcwd_ret as i32)
-        );
-    } else {
-        eprintln!(
-            "  → getcwd returned positive {} but buf doesn't match expected '/sub'",
-            getcwd_ret
-        );
-    }
+    assert_eq!(
+        chdir_ret,
+        0,
+        "sys_chdir(\"/sub\") returned {} (expected 0); {}",
+        chdir_ret as i32,
+        dump_uart_on_failure(&cumulative, "chdir-chdir")
+    );
+    assert_eq!(
+        getcwd_ret,
+        5,
+        "sys_getcwd returned {} (expected 5 = len of \"/sub\\0\"); {}",
+        getcwd_ret as i32,
+        dump_uart_on_failure(&cumulative, "chdir-getcwd-ret")
+    );
+    assert_eq!(
+        &cwd_bytes[..4],
+        b"/sub",
+        "expected cwd to start with \"/sub\", got {:02X?}; {}",
+        &cwd_bytes[..4],
+        dump_uart_on_failure(&cumulative, "chdir-cwd")
+    );
 }
 
 /// Diagnostic test for the `sys_pipe`-broken blocker: runs the
