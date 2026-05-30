@@ -398,6 +398,34 @@ fn ret_imm16_pops_extra_bytes() {
     assert_eq!(cpu.regs[r16::SP], 0x7C00);
 }
 
+/// Near RET imm16 (0xC2) on a 32-bit stack must add the immediate to the
+/// FULL ESP (carry into the high half), not just the low 16 bits of SP.
+/// Regression: it used `regs[SP].wrapping_add(extra)`.
+#[test]
+fn ret_imm16_adjusts_full_esp_on_32bit_stack() {
+    let mut mem = Memory::new(0x10_0000);
+    // C2 08 00 = RET 8 ; (no further code needed — we inspect ESP).
+    mem.write_slice(0x7C00, &[0xC2, 0x08, 0x00]);
+    // Return address at the top of stack so pop32 lands EIP somewhere
+    // harmless; we only check ESP.
+    mem.write_u32(0x0001_FFF8, 0x0000_7C20); // return EIP (-> next is HLT)
+    mem.write_u8(0x7C20, 0xF4); // HLT at the return target
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true;
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0001_FFF8);
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step"); // RET 8
+                                                // pop32 -> ESP = 0x0001_FFFC, then +8 -> 0x0002_0004 (carry into high).
+    assert_eq!(
+        cpu.read_r32(r16::SP as u8),
+        0x0002_0004,
+        "RET imm16 must carry the stack-cleanup add into the upper half of ESP"
+    );
+}
+
 #[test]
 fn pushf_popf_round_trips_flags() {
     // Set ZF via XOR AX, AX ; PUSHF ; clear ZF via MOV AX, 1 (no

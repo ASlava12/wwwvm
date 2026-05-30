@@ -5271,13 +5271,17 @@ impl Cpu {
             // RET imm16 (near) — pop IP, then SP += imm16. Used by
             // callee-cleanup conventions.
             0xC2 => {
-                let extra = self.fetch_u16(mem);
+                let extra = self.fetch_u16(mem) as u32;
                 self.ip = if self.op_size_32 {
                     self.pop32(mem)
                 } else {
                     self.pop16(mem) as u32
                 };
-                self.regs[r16::SP] = self.regs[r16::SP].wrapping_add(extra);
+                // Pop the caller's argument bytes at the stack's native
+                // width so the count carries into the upper half of ESP
+                // for a 32-bit stack (not just the low 16 bits of SP).
+                let sp = self.read_stack_ptr().wrapping_add(extra);
+                self.write_stack_ptr(sp);
             }
             // RETF — pop IP then CS (far return). Width follows the
             // operand size: a 32-bit far return pops a dword EIP and a
