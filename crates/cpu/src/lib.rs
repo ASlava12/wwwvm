@@ -1817,6 +1817,59 @@ impl Cpu {
         (self.fpu_sw & !0x3800) | (((self.fpu_top & 7) as u16) << 11)
     }
 
+    /// Set EFLAGS ZF/PF/CF directly from an x87 compare (FCOMI/FUCOMI
+    /// family), clearing OF/SF/AF, per Intel SDM. Encoding matches SSE
+    /// COMISS: >, <, =, unordered → (0,0,0)/(0,0,1)/(1,0,0)/(1,1,1).
+    fn fpu_set_eflags_compare(&mut self, a: f64, b: f64) {
+        let (zf, pf, cf) = if a.is_nan() || b.is_nan() {
+            (true, true, true)
+        } else if a > b {
+            (false, false, false)
+        } else if a < b {
+            (false, false, true)
+        } else {
+            (true, false, false)
+        };
+        self.set_flag(flag::ZF, zf);
+        self.set_flag(flag::PF, pf);
+        self.set_flag(flag::CF, cf);
+        self.set_flag(flag::OF, false);
+        self.set_flag(flag::SF, false);
+        self.set_flag(flag::AF, false);
+    }
+
+    /// FXAM — classify ST(0) into the condition codes C3:C2:C0 and set
+    /// C1 to the sign. We model ST as f64, so the "empty" and
+    /// "unsupported" classes aren't distinguished.
+    fn fpu_fxam(&mut self) {
+        let v = self.fpu_st(0);
+        self.fpu_sw &= !0x4700; // clear C3/C2/C1/C0
+        if v.is_sign_negative() {
+            self.fpu_sw |= 0x0200; // C1 = sign
+        }
+        // (C3, C2, C0): NaN=001, Inf=011, Zero=100, Denormal=110, Normal=010.
+        let (c3, c2, c0) = if v.is_nan() {
+            (false, false, true)
+        } else if v.is_infinite() {
+            (false, true, true)
+        } else if v == 0.0 {
+            (true, false, false)
+        } else if v.is_subnormal() {
+            (true, true, false)
+        } else {
+            (false, true, false)
+        };
+        if c3 {
+            self.fpu_sw |= 0x4000;
+        }
+        if c2 {
+            self.fpu_sw |= 0x0400;
+        }
+        if c0 {
+            self.fpu_sw |= 0x0100;
+        }
+    }
+
     fn fpu_compare(&mut self, a: f64, b: f64) {
         // Clear C3 (0x4000), C2 (0x0400), C1 (0x0200), C0 (0x0100). The
         // SDM requires FCOM/FUCOM/FTST to clear C1 (no stack fault here).
@@ -7691,6 +7744,17 @@ impl Cpu {
                             // FNCLEX — clear exception flags (SW bits 0..7).
                             self.fpu_sw &= !0x00FF;
                         }
+                        // FUCOMI ST(0),ST(i) (DB E8+i) and FCOMI
+                        // ST(0),ST(i) (DB F0+i): set EFLAGS directly, no
+                        // pop. Modern compilers emit these for float
+                        // comparisons. (Our f64 model treats the ordered
+                        // FCOMI and unordered FUCOMI identically.)
+                        0xE8..=0xF7 => {
+                            let i = modrm & 7;
+                            let a = self.fpu_st(0);
+                            let b = self.fpu_st(i);
+                            self.fpu_set_eflags_compare(a, b);
+                        }
                         _ => {
                             return Err(CpuError::Unimplemented {
                                 opcode,
@@ -7755,6 +7819,13 @@ impl Cpu {
                     // FNSTSW AX — copy FPU status (incl. the TOP field)
                     // into AX.
                     self.regs[r16::AX] = self.fpu_status_word();
+                } else if (0xE8..=0xF7).contains(&modrm) {
+                    // FUCOMIP/FCOMIP ST(0),ST(i): set EFLAGS, then pop.
+                    let i = modrm & 7;
+                    let a = self.fpu_st(0);
+                    let b = self.fpu_st(i);
+                    self.fpu_set_eflags_compare(a, b);
+                    let _ = self.fpu_pop();
                 } else {
                     return Err(CpuError::Unimplemented {
                         opcode,
@@ -7787,6 +7858,8 @@ impl Cpu {
                             let st0 = self.fpu_st(0);
                             self.fpu_compare(st0, 0.0);
                         }
+                        // FXAM — classify ST(0) into C3:C2:C1:C0.
+                        0xE5 => self.fpu_fxam(),
                         // FSQRT — square root of ST(0).
                         0xFA => self.fpu_set_st(0, self.fpu_st(0).sqrt()),
                         // FRNDINT — round ST(0) to integer (nearest-even,
@@ -7970,6 +8043,25 @@ impl Cpu {
                     }
                 }
             }
+            // DA — only FUCOMPP (DA E9) is modeled; the FCMOVcc and
+            // integer-arith (FIADD/FIMUL/…) forms remain Unimplemented.
+            0xDA => {
+                let modrm = self.fetch_u8(mem);
+                if modrm == 0xE9 {
+                    // FUCOMPP — unordered compare ST(0),ST(1), pop twice.
+                    let st0 = self.fpu_st(0);
+                    let st1 = self.fpu_st(1);
+                    self.fpu_compare(st0, st1);
+                    let _ = self.fpu_pop();
+                    let _ = self.fpu_pop();
+                } else {
+                    return Err(CpuError::Unimplemented {
+                        opcode,
+                        cs: op_cs,
+                        ip: op_ip,
+                    });
+                }
+            }
             // DE — arithmetic with a pop. The register forms used by
             // compilers: FADDP/FMULP/FSUBRP/FSUBP/FDIVRP/FDIVP ST(i),
             // ST(0). DE C1 = FADDP ST(1),ST(0): ST(1) op= ST(0), pop.
@@ -7982,27 +8074,38 @@ impl Cpu {
                         ip: op_ip,
                     });
                 }
-                let i = modrm & 0x07; // DE C0+i → ST(i) destination
-                let op = (modrm >> 3) & 0x07;
-                let dst = self.fpu_st(i);
-                let src = self.fpu_st(0);
-                let r = match op {
-                    0 => dst + src, // FADDP
-                    1 => dst * src, // FMULP
-                    4 => src - dst, // FSUBRP
-                    5 => dst - src, // FSUBP
-                    6 => src / dst, // FDIVRP
-                    7 => dst / src, // FDIVP
-                    _ => {
-                        return Err(CpuError::Unimplemented {
-                            opcode,
-                            cs: op_cs,
-                            ip: op_ip,
-                        });
-                    }
-                };
-                self.fpu_set_st(i, r);
-                let _ = self.fpu_pop();
+                if modrm == 0xD9 {
+                    // FCOMPP — compare ST(0) with ST(1), set condition
+                    // codes, then pop twice. (The classic
+                    // `fcompp; fnstsw ax; sahf` float-compare idiom.)
+                    let st0 = self.fpu_st(0);
+                    let st1 = self.fpu_st(1);
+                    self.fpu_compare(st0, st1);
+                    let _ = self.fpu_pop();
+                    let _ = self.fpu_pop();
+                } else {
+                    let i = modrm & 0x07; // DE C0+i → ST(i) destination
+                    let op = (modrm >> 3) & 0x07;
+                    let dst = self.fpu_st(i);
+                    let src = self.fpu_st(0);
+                    let r = match op {
+                        0 => dst + src, // FADDP
+                        1 => dst * src, // FMULP
+                        4 => src - dst, // FSUBRP
+                        5 => dst - src, // FSUBP
+                        6 => src / dst, // FDIVRP
+                        7 => dst / src, // FDIVP
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    };
+                    self.fpu_set_st(i, r);
+                    let _ = self.fpu_pop();
+                }
             }
             // D8 — arithmetic with ST(0) as destination, source is a
             // 32-bit memory float or ST(i). FADD/FMUL/FSUB/etc.
@@ -8089,6 +8192,19 @@ impl Cpu {
                         // DD C0+i FFREE — mark a register free; we don't
                         // model tags, so it's a no-op.
                         0 => {}
+                        // DD E0+i FUCOM ST(i) / DD E8+i FUCOMP ST(i):
+                        // unordered compare ST(0) vs ST(i) → condition
+                        // codes; FUCOMP pops once. (f64 model: same as
+                        // FCOM.)
+                        4 | 5 => {
+                            let i = modrm & 0x07;
+                            let st0 = self.fpu_st(0);
+                            let sti = self.fpu_st(i);
+                            self.fpu_compare(st0, sti);
+                            if sub == 5 {
+                                let _ = self.fpu_pop();
+                            }
+                        }
                         _ => {
                             return Err(CpuError::Unimplemented {
                                 opcode,

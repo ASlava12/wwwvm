@@ -7562,6 +7562,159 @@ fn fpu_fcom_clears_c1() {
     assert_eq!(cpu.fpu_sw & 0x0200, 0, "FCOM must clear C1");
 }
 
+/// FCOMI ST(0),ST(1) (DB F1) sets EFLAGS ZF/PF/CF directly. Regression:
+/// the whole FCOMI/FUCOMI family was Unimplemented (CPU error).
+#[test]
+fn fpu_fcomi_sets_eflags() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 1.0); // ST(1)
+    fpu_w64(&mut mem, 0x608, 2.0); // ST(0)
+                                   // FLD [0x600] ; FLD [0x608] ; FCOMI ST(0),ST(1) (DB F1) ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDB, 0xF1, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    // ST(0)=2 > ST(1)=1 -> ZF=0, PF=0, CF=0.
+    assert!(!cpu.has(flag::ZF) && !cpu.has(flag::PF) && !cpu.has(flag::CF));
+    assert_eq!(cpu.fpu_top, 6, "FCOMI does not pop (two FLDs -> TOP=6)");
+}
+
+/// FCOMIP (DF F1) sets EFLAGS then pops; less-than sets CF.
+#[test]
+fn fpu_fcomip_sets_cf_and_pops() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 9.0); // ST(1)
+    fpu_w64(&mut mem, 0x608, 4.0); // ST(0)
+                                   // FLD 9 ; FLD 4 ; FCOMIP ST(0),ST(1) (DF F1) ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDF, 0xF1, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    // ST(0)=4 < ST(1)=9 -> CF=1, ZF=0; then pop -> TOP=7.
+    assert!(cpu.has(flag::CF) && !cpu.has(flag::ZF), "4 < 9 -> CF set");
+    assert_eq!(cpu.fpu_top, 7, "FCOMIP pops once");
+}
+
+/// FXAM (D9 E5) classifies ST(0): a negative normal sets C2 and the
+/// sign bit C1, leaving C3/C0 clear.
+#[test]
+fn fpu_fxam_classifies_negative_normal() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, -3.0);
+    mem.write_slice(0x7C00, &[0xDD, 0x06, 0x00, 0x06, 0xD9, 0xE5, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    // Normal finite: C3:C2:C0 = 010 -> only C2 (0x0400) of {C3,C2,C0}.
+    assert_eq!(cpu.fpu_sw & 0x4500, 0x0400, "FXAM(normal) -> C2 set");
+    assert_ne!(cpu.fpu_sw & 0x0200, 0, "FXAM C1 = sign (negative)");
+}
+
+/// FUCOM ST(1) (DD E1) sets condition codes without popping.
+#[test]
+fn fpu_fucom_sets_condition_codes() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 7.0); // ST(1)
+    fpu_w64(&mut mem, 0x608, 7.0); // ST(0)
+                                   // FLD 7 ; FLD 7 ; FUCOM ST(1) (DD E1) ; HLT  -> equal -> C3 set.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDD, 0xE1, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_ne!(cpu.fpu_sw & 0x4000, 0, "FUCOM 7==7 -> C3 set");
+    assert_eq!(cpu.fpu_top, 6, "FUCOM does not pop");
+}
+
+/// FCOMPP (DE D9) compares ST(0)/ST(1), sets condition codes, pops twice.
+#[test]
+fn fpu_fcompp_compares_and_double_pops() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 5.0);
+    // FLD 5 ; FLD 5 ; FCOMPP (DE D9) ; HLT -> equal -> C3 set; TOP back to 0.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x00, 0x06, 0xDE, 0xD9, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_ne!(cpu.fpu_sw & 0x4000, 0, "FCOMPP 5==5 -> C3 set");
+    assert_eq!(cpu.fpu_top, 0, "FCOMPP pops twice");
+}
+
+/// FUCOMPP (DA E9) — the previously-missing 0xDA escape handler.
+#[test]
+fn fpu_fucompp_da_e9_double_pops() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 1.0); // ST(1)
+    fpu_w64(&mut mem, 0x608, 2.0); // ST(0)
+                                   // FLD 1 ; FLD 2 ; FUCOMPP (DA E9) ; HLT -> 2>1 -> cond codes clear.
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDA, 0xE9, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(cpu.fpu_sw & 0x4500, 0, "FUCOMPP 2>1 -> C3/C2/C0 clear");
+    assert_eq!(cpu.fpu_top, 0, "FUCOMPP pops twice");
+}
+
 /// FLD1 / FLDZ constant loads and FMULP.
 #[test]
 fn fpu_constants_and_fmulp() {
