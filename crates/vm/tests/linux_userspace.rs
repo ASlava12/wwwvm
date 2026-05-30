@@ -11244,6 +11244,61 @@ fn linux_userspace_busybox_gzip_milestone() {
     eprintln!("  ✓ GZIP_RT_OK — gzip|gunzip round-trip (DEFLATE + CRC32) works!");
 }
 
+/// SIGNAL-DELIVERY milestone: validates the kernel path that the recent
+/// sys_rt_sigaction + sys_kill commits built but no test exercised
+/// end-to-end. /init runs
+/// `sh -c "trap 'echo TRAP_OK' TERM; kill -TERM $$; echo AFTER"`.
+/// The shell installs a SIGTERM handler (rt_sigaction), then sends itself
+/// SIGTERM (kill). For the marker to print, the kernel must actually
+/// DELIVER the signal to userspace: build an rt_sigframe on the user
+/// stack, redirect execution to the handler (sa_restorer trampoline as
+/// the return address), run it, then handle the rt_sigreturn syscall to
+/// restore the pre-signal context — after which ash runs the pending trap
+/// action ("echo TRAP_OK") and continues to "echo AFTER". If delivery or
+/// sigreturn were broken, the default SIGTERM action would instead kill
+/// the shell (→ init dies → kernel panic, which run_busybox_dynamic now
+/// detects), so the marker would never appear. Asserts TRAP_OK with no
+/// segfault / loader error / execve failure / panic.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_signal_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "trap 'echo TRAP_OK' TERM; kill -TERM $$; echo AFTER",
+        ],
+        "TRAP_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox signal-delivery milestone: TRAP_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "signal-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the signal shell; {}",
+        dump_uart_on_failure(&cumulative, "signal-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the shell segfaulted during signal delivery / sigreturn; {}",
+        dump_uart_on_failure(&cumulative, "signal-segv")
+    );
+    assert!(
+        found,
+        "the shell never printed TRAP_OK — SIGTERM was not delivered to the \
+         trap handler (rt_sigaction → signal frame → handler → rt_sigreturn); {}",
+        dump_uart_on_failure(&cumulative, "signal-marker")
+    );
+    eprintln!("  ✓ TRAP_OK — signal delivery (frame + handler + rt_sigreturn) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
