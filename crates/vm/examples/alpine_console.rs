@@ -180,7 +180,6 @@ fn main() {
     let net_start = Instant::now();
 
     let mut stdout = std::io::stdout();
-    let chunk = 5_000_000u32;
     // Don't forward keystrokes until /init's interactive shell is up; early
     // bytes get eaten before the tty line discipline is in canonical mode.
     // Buffer them until the readiness line appears, then flush and go live.
@@ -189,7 +188,21 @@ fn main() {
     let mut boot_log: Vec<u8> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
     'main: loop {
-        let (steps, stop) = vm.run_steps_idle_aware(chunk);
+        // While a TCP flow is live, step only until the guest goes idle
+        // (blocked waiting for a NIC frame) so we hand it the next RX batch
+        // immediately instead of letting it spin its whole budget on the idle
+        // HLT — that's what keeps a download from crawling. At all other times
+        // (boot, idle shell) use the big idle-aware batch: there, idle HLTs are
+        // timer-waits that smoltcp/the PIT wake internally, so returning on
+        // every one would make the loop iterate per-step and crawl.
+        let net_active = nat
+            .as_ref()
+            .is_some_and(|n| n.flow_count() > 0 || n.has_egress());
+        let (steps, stop) = if net_active {
+            vm.run_steps_until_idle(2_000_000)
+        } else {
+            vm.run_steps_idle_aware(5_000_000)
+        };
         // Always drain TX (else the host queue grows unbounded); feed each
         // frame to the host stack.
         for frame in vm.drain_tx_frames() {
@@ -207,14 +220,17 @@ fn main() {
         // order so the guest doesn't see gaps).
         if let Some(n) = nat.as_mut() {
             n.poll(net_start.elapsed().as_millis() as i64);
-            let mut budget = 8;
-            while budget > 0 {
+            // Inject until the RX ring is full (then requeue-to-front and stop)
+            // or the egress queue drains. The ring's own back-pressure paces
+            // us; the cap is just a runaway guard.
+            let mut guard = 1024;
+            while guard > 0 {
                 let Some(reply) = n.pop_egress() else { break };
                 if vm.inject_rx_frame(&reply) {
                     if dump_tx {
                         eprint!("\r\n[wwwvm RX-inject {} bytes → eth0]\r\n", reply.len());
                     }
-                    budget -= 1;
+                    guard -= 1;
                 } else {
                     n.requeue_egress_front(reply); // RX ring full — retry next turn
                     break;
@@ -264,7 +280,13 @@ fn main() {
                 break;
             }
             Stop::StepBudget => {
-                if steps < chunk && out.is_empty() {
+                // Sleep only when there's genuinely nothing to do. While a TCP
+                // flow is live (or frames are queued to inject) keep looping at
+                // full tilt so the transfer doesn't stall.
+                let net_active = nat
+                    .as_ref()
+                    .is_some_and(|n| n.flow_count() > 0 || n.has_egress());
+                if steps < 2_000_000 && out.is_empty() && !net_active {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }

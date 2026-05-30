@@ -82,6 +82,20 @@ impl DnsForwarder {
         self.by_ip.get(&ip).map(String::as_str)
     }
 
+    /// Decide whether the guest may open a TCP connection to `ip:port`:
+    /// recover the hostname we resolved that IP to, then apply the allowlist
+    /// by name+port. Returns the host name on success (for logging), or None
+    /// if the IP was never resolved by us or the host:port isn't allowed —
+    /// closing both the rebinding/SSRF and the literal-IP escape paths.
+    pub fn connection_permitted(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
+        let name = self.by_ip.get(&ip)?;
+        if self.allow.permits(name, port) {
+            Some(name.clone())
+        } else {
+            None
+        }
+    }
+
     /// Reject non-globally-routable destinations so an allowlisted name that
     /// (mis)resolves to an internal address can't be used to reach the host
     /// or its LAN.

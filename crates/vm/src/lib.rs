@@ -2073,6 +2073,42 @@ impl Vm {
         (executed, Stop::StepBudget)
     }
 
+    /// Like `run_steps_idle_aware`, but returns as soon as the guest is
+    /// *genuinely idle* — halted with IF=1 and no internal source (timer,
+    /// LAPIC) about to wake it. That's the moment the guest is blocked
+    /// waiting for EXTERNAL input (a NIC RX frame, a console keystroke), so
+    /// the host loop should stop spinning and go feed it. Without this, a
+    /// guest blocked on network data spins the whole step budget on its idle
+    /// HLT before the host gets a turn to inject, starving throughput.
+    ///
+    /// HLT with IF=0 is still terminal (`Halted`); a CPU error still returns
+    /// `CpuError`; exhausting `max` returns `StepBudget`. The early idle
+    /// return also reports `StepBudget` (the caller treats "ran < max" as a
+    /// cue to inject + briefly sleep).
+    pub fn run_steps_until_idle(&mut self, max: u32) -> (u32, Stop) {
+        if !self.booted {
+            self.boot();
+        }
+        let mut executed = 0;
+        for _ in 0..max {
+            if self.cpu.halted && self.cpu.flags & flag::IF == 0 {
+                return (executed, Stop::Halted);
+            }
+            let was_halted = self.cpu.halted;
+            if let Err(e) = self.cpu.step(&mut self.mem, &mut self.io) {
+                return (executed, Stop::CpuError(e));
+            }
+            executed += 1;
+            // Entered the step halted-with-IF and still halted afterwards: the
+            // tick didn't surface an IRQ, so nothing internal will wake it.
+            // Hand control back so the host can deliver external input.
+            if was_halted && self.cpu.halted {
+                return (executed, Stop::StepBudget);
+            }
+        }
+        (executed, Stop::StepBudget)
+    }
+
     pub fn cpu(&self) -> &Cpu {
         &self.cpu
     }

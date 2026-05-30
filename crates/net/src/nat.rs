@@ -1,20 +1,66 @@
 //! The smoltcp-based host stack that owns the gateway IP on the guest's
-//! virtual LAN. It answers ARP and ICMP (smoltcp handles those internally
-//! for its own address) and serves DNS on UDP/53 via the [`DnsForwarder`]
-//! policy. TCP NAT (catch-all SYN → real host socket) lands on top of this
-//! in the next step.
+//! virtual LAN. It is the single ARP authority and:
+//!   * answers ARP + ICMP echo (smoltcp, internally), so `ping 10.0.2.2` works;
+//!   * serves DNS on UDP/53 via the [`DnsForwarder`] policy;
+//!   * NATs guest TCP connections out to real host sockets (the "slirp" role).
 //!
-//! Being the single owner of the gateway IP is deliberate: smoltcp must be
-//! the sole ARP authority, so this replaces the hand-rolled `VirtualGateway`
-//! responders once wired in (ping/nslookup are re-confirmed as regressions).
+//! TCP NAT, concretely: smoltcp runs with `any_ip`, so it accepts the guest's
+//! SYN to *any* destination. We sniff each initial SYN, recover the
+//! destination's hostname from the DNS cache and apply the allowlist, then
+//! lazily `listen` a TCP socket bound to that exact destination (before the
+//! SYN is processed) and spawn a [`crate::relay`] thread that opens the real
+//! host connection. From then on smoltcp terminates the guest's TCP and we
+//! shuttle the payload byte stream to/from the host socket — so TLS, when the
+//! guest uses it, stays end-to-end (we never decrypt).
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::udp;
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+};
 
 use crate::device::{GuestDevice, MTU};
 use crate::forwarder::DnsForwarder;
+
+const ETH_IPV4: u16 = 0x0800;
+const IP_PROTO_TCP: u8 = 6;
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
+/// Per-socket TCP buffer (64 KiB each way) — generous enough for the guest's
+/// window without over-producing against the small NIC RX ring.
+const TCP_BUF: usize = 64 * 1024;
+/// Max payload we move per direction per flow per poll, to bound work.
+const PUMP_CHUNK: usize = 8 * 1024;
+
+/// Identifies one guest TCP flow (the guest IP is fixed, so it's omitted).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct FlowKey {
+    guest_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+}
+
+/// One NATed TCP connection: the smoltcp socket plus the host relay channels
+/// and the single-chunk backpressure slots in each direction.
+struct Flow {
+    handle: SocketHandle,
+    /// Guest → host. `None` once we've half-closed the host write side.
+    to_host: Option<SyncSender<Vec<u8>>>,
+    from_host: Receiver<Vec<u8>>,
+    /// A chunk recv'd from the guest we couldn't hand to the channel yet.
+    pending_to_host: Option<Vec<u8>>,
+    /// A chunk from the host we couldn't fully push into the guest socket yet.
+    pending_to_guest: Option<Vec<u8>>,
+    /// The host reader signalled EOF/closed (channel disconnected).
+    host_done: bool,
+    /// We've seen the connection established (guards premature half-close).
+    established: bool,
+}
 
 /// Host stack for the guest's virtual LAN.
 pub struct NatStack {
@@ -22,16 +68,16 @@ pub struct NatStack {
     device: GuestDevice,
     sockets: SocketSet<'static>,
     dns: DnsForwarder,
-    dns_handle: smoltcp::iface::SocketHandle,
+    dns_handle: SocketHandle,
+    guest_ip: Ipv4Addr,
+    flows: HashMap<FlowKey, Flow>,
 }
 
 impl NatStack {
     /// Build the stack on `gw_ip`/`gw_mac`, serving the guest at `guest_ip`.
     /// `dns` carries the (pre-resolved) name cache + allowlist.
     pub fn new(gw_ip: [u8; 4], gw_mac: [u8; 6], guest_ip: [u8; 4], dns: DnsForwarder) -> Self {
-        let _ = guest_ip; // reserved for the neighbour-cache / route wiring in the TCP step
         let mut device = GuestDevice::new();
-
         let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(gw_mac)));
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
@@ -42,9 +88,17 @@ impl NatStack {
                 ))
                 .unwrap();
         });
-        // Accept packets addressed to IPs other than our own — required for
-        // the upcoming TCP catch-all NAT; harmless for ARP/ICMP/DNS.
+        // Accept (and answer for) destination IPs other than our own — this is
+        // what lets the catch-all TCP listener terminate the guest's SYN to an
+        // arbitrary mirror address. smoltcp's AnyIP only accepts a foreign-dst
+        // packet if a route resolves that dst to one of OUR addresses, so a
+        // default route via our own gateway IP makes every unicast destination
+        // "locally routed" and the SYN reaches the listening socket.
         iface.set_any_ip(true);
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(gw_ip[0], gw_ip[1], gw_ip[2], gw_ip[3]))
+            .expect("default route");
 
         let mut sockets = SocketSet::new(Vec::new());
         let udp_rx =
@@ -61,28 +115,83 @@ impl NatStack {
             sockets,
             dns,
             dns_handle,
+            guest_ip: Ipv4Addr::from(guest_ip),
+            flows: HashMap::new(),
         }
     }
 
-    /// Feed one guest-transmitted Ethernet frame into the stack.
+    /// Feed one guest-transmitted Ethernet frame into the stack. An initial
+    /// TCP SYN to a new destination is intercepted FIRST — allowlist-checked,
+    /// then a listening socket is bound to the exact destination and a relay
+    /// spawned — *before* the frame reaches smoltcp, so the handshake the
+    /// next `poll` completes lands on a socket that's ready for it.
     pub fn push_guest_frame(&mut self, frame: Vec<u8>) {
+        if let Some(key) = parse_initial_syn(&frame) {
+            if !self.flows.contains_key(&key) {
+                self.try_open_flow(key);
+            }
+        }
         self.device.push_guest_frame(frame);
     }
 
-    /// Advance the stack at host time `now_millis` (monotonic ms). Processes
-    /// inbound frames (ARP/ICMP/DNS), services the DNS socket, and lets
-    /// smoltcp emit any replies into the egress queue.
+    fn try_open_flow(&mut self, key: FlowKey) {
+        // Allowlist by recovered hostname; an unknown/denied destination is
+        // simply not listened for (the guest's SYN goes unanswered → it gives
+        // up). Deny-by-default.
+        let host = match self.dns.connection_permitted(key.dst_ip, key.dst_port) {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "[wwwvm net] denied TCP to {}:{} (not allowlisted)",
+                    key.dst_ip, key.dst_port
+                );
+                return;
+            }
+        };
+        eprintln!(
+            "[wwwvm net] TCP open {host} ({}:{})",
+            key.dst_ip, key.dst_port
+        );
+
+        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+        let mut sock = tcp::Socket::new(rx, tx);
+        // Listen on the EXACT destination so smoltcp accepts only this SYN.
+        let listen = IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(key.dst_ip.into())),
+            port: key.dst_port,
+        };
+        if sock.listen(listen).is_err() {
+            return;
+        }
+        let handle = self.sockets.add(sock);
+        let conn = crate::relay::spawn(key.dst_ip, key.dst_port);
+        self.flows.insert(
+            key,
+            Flow {
+                handle,
+                to_host: Some(conn.to_host),
+                from_host: conn.from_host,
+                pending_to_host: None,
+                pending_to_guest: None,
+                host_done: false,
+                established: false,
+            },
+        );
+    }
+
+    /// Advance the stack at host time `now_millis` (monotonic ms): process
+    /// inbound frames, service DNS, pump every TCP flow, reap dead ones, then
+    /// re-poll so replies egress this turn.
     pub fn poll(&mut self, now_millis: i64) {
         let ts = Instant::from_millis(now_millis);
         self.iface.poll(ts, &mut self.device, &mut self.sockets);
         self.service_dns();
-        // Re-poll so freshly-queued DNS replies egress in this turn.
+        self.pump_flows();
         self.iface.poll(ts, &mut self.device, &mut self.sockets);
     }
 
     fn service_dns(&mut self) {
-        // Collect pending queries first — copying them out releases the
-        // socket's read borrow before we send replies on the same socket.
         let mut pending: Vec<(Vec<u8>, IpEndpoint)> = Vec::new();
         {
             let sock = self.sockets.get_mut::<udp::Socket>(self.dns_handle);
@@ -96,6 +205,28 @@ impl NatStack {
                 let _ = sock.send_slice(&resp, endpoint);
             }
         }
+    }
+
+    fn pump_flows(&mut self) {
+        let Self { sockets, flows, .. } = self;
+        let mut dead: Vec<FlowKey> = Vec::new();
+        for (key, flow) in flows.iter_mut() {
+            let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
+            pump_flow(sock, flow);
+            if sock.state() == tcp::State::Closed && flow.established {
+                dead.push(*key);
+            }
+        }
+        for key in dead {
+            if let Some(flow) = flows.remove(&key) {
+                sockets.remove(flow.handle);
+            }
+        }
+    }
+
+    /// Feed one guest-transmitted frame (no SYN interception — used by tests).
+    pub fn push_guest_frame_raw(&mut self, frame: Vec<u8>) {
+        self.device.push_guest_frame(frame);
     }
 
     /// Next frame to inject into the guest's NIC RX ring, if any.
@@ -112,7 +243,162 @@ impl NatStack {
     pub fn has_egress(&self) -> bool {
         self.device.has_egress()
     }
+
+    /// Number of live NATed flows (diagnostics/tests).
+    pub fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// The guest IP this stack serves.
+    pub fn guest_ip(&self) -> Ipv4Addr {
+        self.guest_ip
+    }
+}
+
+/// Move bytes both ways between the guest's smoltcp socket and the host relay,
+/// respecting backpressure (one buffered chunk per direction) and propagating
+/// half-closes.
+fn pump_flow(sock: &mut tcp::Socket, flow: &mut Flow) {
+    if sock.may_send() || sock.may_recv() {
+        flow.established = true;
+    }
+
+    // Host → guest.
+    loop {
+        if flow.pending_to_guest.is_none() {
+            match flow.from_host.try_recv() {
+                Ok(buf) => flow.pending_to_guest = Some(buf),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    flow.host_done = true;
+                    break;
+                }
+            }
+        }
+        let Some(buf) = flow.pending_to_guest.take() else {
+            break;
+        };
+        if !sock.can_send() {
+            flow.pending_to_guest = Some(buf);
+            break;
+        }
+        match sock.send_slice(&buf) {
+            Ok(n) if n < buf.len() => {
+                flow.pending_to_guest = Some(buf[n..].to_vec());
+                break;
+            }
+            Ok(_) => {} // fully sent — loop for more
+            Err(_) => break,
+        }
+    }
+    // Host closed and we've flushed everything → send FIN to the guest.
+    if flow.host_done && flow.pending_to_guest.is_none() && sock.may_send() {
+        sock.close();
+    }
+
+    // Guest → host.
+    let mut moved = 0;
+    loop {
+        if let Some(buf) = flow.pending_to_host.take() {
+            match flow.to_host.as_ref().map(|tx| tx.try_send(buf)) {
+                Some(Ok(())) => {} // delivered — loop
+                Some(Err(TrySendError::Full(b))) => {
+                    flow.pending_to_host = Some(b); // channel full — backpressure
+                    break;
+                }
+                Some(Err(TrySendError::Disconnected(_))) | None => break, // host gone
+            }
+        } else if sock.can_recv() && moved < PUMP_CHUNK {
+            let mut tmp = vec![0u8; 4096];
+            match sock.recv_slice(&mut tmp) {
+                Ok(n) if n > 0 => {
+                    tmp.truncate(n);
+                    moved += n;
+                    flow.pending_to_host = Some(tmp);
+                }
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+    // Guest closed its write side (we got its FIN) and we've drained it →
+    // half-close the host write side by dropping the sender.
+    if matches!(sock.state(), tcp::State::CloseWait) && flow.pending_to_host.is_none() {
+        flow.to_host = None;
+    }
+}
+
+/// If `frame` is an initial TCP SYN (SYN set, ACK clear), return its flow key.
+fn parse_initial_syn(frame: &[u8]) -> Option<FlowKey> {
+    if frame.len() < 14 + 20 || u16::from_be_bytes([frame[12], frame[13]]) != ETH_IPV4 {
+        return None;
+    }
+    let ip = 14;
+    let ihl = (frame[ip] & 0x0F) as usize * 4;
+    if ihl < 20 || frame.len() < ip + ihl + 20 || frame[ip + 9] != IP_PROTO_TCP {
+        return None;
+    }
+    let tcp_off = ip + ihl;
+    let flags = frame[tcp_off + 13];
+    if flags & TCP_SYN == 0 || flags & TCP_ACK != 0 {
+        return None; // not an initial SYN
+    }
+    let src_port = u16::from_be_bytes([frame[tcp_off], frame[tcp_off + 1]]);
+    let dst_port = u16::from_be_bytes([frame[tcp_off + 2], frame[tcp_off + 3]]);
+    let dst_ip = Ipv4Addr::new(
+        frame[ip + 16],
+        frame[ip + 17],
+        frame[ip + 18],
+        frame[ip + 19],
+    );
+    Some(FlowKey {
+        guest_port: src_port,
+        dst_ip,
+        dst_port,
+    })
 }
 
 /// The link MTU smoltcp negotiates for this device.
 pub const LINK_MTU: usize = MTU;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syn_frame(dst_ip: [u8; 4], dst_port: u16, src_port: u16, ack: bool) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // dst MAC (gw)
+        f.extend_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]); // src MAC (guest)
+        f.extend_from_slice(&ETH_IPV4.to_be_bytes());
+        // IPv4 header (20 bytes).
+        f.extend_from_slice(&[0x45, 0x00, 0x00, 0x28, 0, 0, 0, 0, 64, IP_PROTO_TCP, 0, 0]);
+        f.extend_from_slice(&[10, 0, 2, 15]); // src IP (guest)
+        f.extend_from_slice(&dst_ip);
+        // TCP header (20 bytes).
+        f.extend_from_slice(&src_port.to_be_bytes());
+        f.extend_from_slice(&dst_port.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0]); // seq
+        f.extend_from_slice(&[0, 0, 0, 0]); // ack
+        let flags = if ack { TCP_SYN | TCP_ACK } else { TCP_SYN };
+        f.extend_from_slice(&[0x50, flags, 0xFF, 0xFF, 0, 0, 0, 0]); // dataoff/flags/win/cksum/urg
+        f
+    }
+
+    #[test]
+    fn parses_initial_syn() {
+        let f = syn_frame([93, 184, 216, 34], 80, 50000, false);
+        let key = parse_initial_syn(&f).expect("a SYN");
+        assert_eq!(key.dst_ip, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(key.dst_port, 80);
+        assert_eq!(key.guest_port, 50000);
+    }
+
+    #[test]
+    fn ignores_syn_ack_and_non_tcp() {
+        // SYN+ACK is not an *initial* SYN (that's the reply, never from guest).
+        assert!(parse_initial_syn(&syn_frame([1, 2, 3, 4], 80, 1, true)).is_none());
+        // A short/ARP-ish frame.
+        assert!(parse_initial_syn(&[0u8; 30]).is_none());
+    }
+}
