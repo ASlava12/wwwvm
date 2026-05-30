@@ -49,6 +49,12 @@ pub struct Rtl8139 {
     /// length). The device can't read guest RAM itself, so the VM loop
     /// drains this, DMAs each frame out, and the bytes go to the host.
     tx_pending: Vec<(u32, u16)>,
+    /// RX read pointer (offset into the ring), the chip's internal
+    /// `RxBufPtr`. Resets to 0 and is reloaded as `(CAPR + 16) mod len`
+    /// only when the driver *writes* CAPR — the hardware's −16 quirk. We
+    /// can't derive it from CAPR alone (reset 0 vs a written 0 differ), so
+    /// it's tracked explicitly. CBR (reg 0x3A) is the matching write ptr.
+    rx_rptr: u32,
 }
 
 // RTL8139 register offsets (within the BAR0 I/O window).
@@ -98,6 +104,7 @@ impl Rtl8139 {
             ee_shift: 0,
             ee_dobit: 0,
             tx_pending: Vec::new(),
+            rx_rptr: 0,
         }
     }
 
@@ -155,13 +162,11 @@ impl Rtl8139 {
     }
 
     /// True when the RX ring holds no unread packets — the NIC's write
-    /// offset (CBR) has caught up to the driver's read offset (CAPR + 16).
+    /// offset (CBR) has caught up to the driver's read offset (`rx_rptr`).
     /// The driver polls this via ChipCmd bit 0 (BUFE) to drain its rx loop.
     fn rx_buffer_empty(&self) -> bool {
         let len = self.rx_buf_len();
-        let wptr = self.reg_u16(CBR) as u32 % len;
-        let rptr = (self.reg_u16(CAPR) as u32).wrapping_add(16) % len;
-        wptr == rptr
+        (self.reg_u16(CBR) as u32 % len) == self.rx_rptr % len
     }
 
     /// Accept one inbound Ethernet frame (L2, no CRC) into the RX ring.
@@ -189,7 +194,7 @@ impl Rtl8139 {
             return None; // frame larger than the whole ring — drop
         }
         let wptr = self.reg_u16(CBR) as u32 % len;
-        let rptr = (self.reg_u16(CAPR) as u32).wrapping_add(16) % len;
+        let rptr = self.rx_rptr % len;
         let unread = (wptr + len - rptr) % len;
         if unread + total as u32 >= len {
             return None; // would overrun unread data — drop
@@ -253,6 +258,14 @@ impl Rtl8139 {
             // ISR (interrupt status) is write-1-to-clear: the driver acks
             // an interrupt by writing 1s to the bits it handled.
             0x3E | 0x3F => self.regs[off] &= !value,
+            // CAPR (RxBufPtr): the driver advances its read pointer here as
+            // it drains the ring. The chip stores it −16 (a hardware quirk),
+            // so the real read offset is CAPR + 16. Reload rx_rptr after the
+            // 16-bit write completes (high byte at 0x39 lands last).
+            0x38 | 0x39 => {
+                self.regs[off] = value;
+                self.rx_rptr = (self.reg_u16(CAPR) as u32).wrapping_add(16) % self.rx_buf_len();
+            }
             // TSD0-3 high byte completes a 32-bit transmit-descriptor write.
             // The 8139too driver writes the full dword (size + OWN cleared)
             // to kick TX; we queue the frame and report TX done at once.
@@ -336,10 +349,14 @@ impl Rtl8139 {
         for w in &self.eeprom {
             out.extend_from_slice(&w.to_le_bytes());
         }
+        // RX read pointer — derived state that can't be reconstructed from
+        // CAPR alone. Appended after the original 384-byte layout.
+        out.extend_from_slice(&self.rx_rptr.to_le_bytes());
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        // 256 register bytes + 64 EEPROM words (128 bytes) = 384.
+        // 256 register bytes + 64 EEPROM words (128 bytes) = 384, then an
+        // optional 4-byte rx_rptr (absent in pre-RX snapshots → 0).
         if bytes.len() < 384 {
             return Err("rtl8139: truncated");
         }
@@ -348,7 +365,13 @@ impl Rtl8139 {
             let o = 256 + i * 2;
             *w = u16::from_le_bytes([bytes[o], bytes[o + 1]]);
         }
-        Ok(384)
+        if bytes.len() >= 388 {
+            self.rx_rptr = u32::from_le_bytes([bytes[384], bytes[385], bytes[386], bytes[387]]);
+            Ok(388)
+        } else {
+            self.rx_rptr = 0;
+            Ok(384)
+        }
     }
 }
 
@@ -594,14 +617,30 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips() {
-        let mut nic = Rtl8139::new();
+        let mut nic = rx_ready(0x5000);
         nic.write_reg(0x3C, 0x05);
+        // Receive a frame so CBR and rx_rptr hold non-trivial state.
+        nic.accept_rx(&[0x55; 64]).expect("accepted");
         let mut buf = Vec::new();
         nic.snapshot_into(&mut buf);
-        assert_eq!(buf.len(), 384);
+        assert_eq!(buf.len(), 388); // 256 regs + 128 EEPROM + 4 rx_rptr
         let mut nic2 = Rtl8139::new();
         nic2.restore(&buf).expect("restore");
         assert_eq!(nic2.read_reg(0x3C), 0x05);
         assert_eq!(eeprom_read(&mut nic2, 7), 0x5452);
+        // RX ring pointers (CBR + rx_rptr) survive, so BUFE is preserved.
+        assert_eq!(nic2.read_reg(0x37) & 0x01, nic.read_reg(0x37) & 0x01);
+    }
+
+    #[test]
+    fn snapshot_restores_old_384_byte_blob() {
+        // A pre-RX snapshot (no trailing rx_rptr) must still load, with
+        // rx_rptr defaulting to 0.
+        let nic = Rtl8139::new();
+        let mut buf = Vec::new();
+        nic.snapshot_into(&mut buf);
+        buf.truncate(384); // drop the rx_rptr tail → legacy layout
+        let mut nic2 = Rtl8139::new();
+        assert_eq!(nic2.restore(&buf).expect("restore"), 384);
     }
 }

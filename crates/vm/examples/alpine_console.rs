@@ -142,6 +142,14 @@ fn main() {
     // `ip link set eth0 up` + an ARP actually puts a frame on the wire.
     let dump_tx = std::env::var_os("WWWVM_DUMP_TX").is_some();
 
+    // WWWVM_NET_STUB=1 turns on a tiny host that answers the guest's ARP
+    // "who-has HOST_IP" with HOST_MAC, by injecting a reply into the NIC's
+    // RX ring. Enough to confirm the inbound (RX + IRQ 11) path end-to-end:
+    // after a `ping HOST_IP`, the guest's `ip neigh` resolves the entry.
+    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
+    const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+    const HOST_IP: [u8; 4] = [10, 0, 2, 2];
+
     let mut stdout = std::io::stdout();
     let chunk = 5_000_000u32;
     // Don't forward keystrokes until /init's interactive shell is up; early
@@ -153,9 +161,19 @@ fn main() {
     let mut pending: Vec<u8> = Vec::new();
     'main: loop {
         let (steps, stop) = vm.run_steps_idle_aware(chunk);
-        if dump_tx {
-            for frame in vm.drain_tx_frames() {
+        // Always drain TX (else the host queue grows unbounded); print and/or
+        // answer ARP per the flags.
+        for frame in vm.drain_tx_frames() {
+            if dump_tx {
                 eprint!("\r\n{}\r\n", describe_eth_frame(&frame));
+            }
+            if net_stub {
+                if let Some(reply) = arp_reply(&frame, HOST_MAC, HOST_IP) {
+                    let ok = vm.inject_rx_frame(&reply);
+                    if dump_tx {
+                        eprint!("\r\n[wwwvm RX-inject ARP reply → eth0 ok={ok}]\r\n");
+                    }
+                }
             }
         }
         let out = vm.drain_output();
@@ -245,6 +263,34 @@ fn describe_eth_frame(f: &[u8]) -> String {
         hex,
         if f.len() > 42 { " …" } else { "" }
     )
+}
+
+/// Build an ARP reply for the guest's "who-has HOST_IP" request, or None if
+/// `frame` isn't an ARP request targeting `host_ip`. ARP carries no checksum,
+/// so this isolates the inbound NIC path (RX ring + IRQ) from L3/L4 concerns.
+fn arp_reply(frame: &[u8], host_mac: [u8; 6], host_ip: [u8; 4]) -> Option<Vec<u8>> {
+    if frame.len() < 42 {
+        return None;
+    }
+    let ethertype = &frame[12..14];
+    let op = &frame[20..22];
+    let target_ip = &frame[38..42];
+    if ethertype != [0x08, 0x06] || op != [0x00, 0x01] || target_ip != host_ip {
+        return None; // not an ARP request for us
+    }
+    let sender_mac = &frame[6..12]; // guest's MAC (Ethernet source)
+    let sender_ip = &frame[28..32]; // guest's IP (ARP sender)
+
+    let mut r = Vec::with_capacity(42);
+    r.extend_from_slice(sender_mac); // Ethernet dst = the guest
+    r.extend_from_slice(&host_mac); // Ethernet src = us
+    r.extend_from_slice(&[0x08, 0x06]); // ethertype ARP
+    r.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02]); // hw/proto, op=reply
+    r.extend_from_slice(&host_mac); // sender MAC = us
+    r.extend_from_slice(&host_ip); // sender IP = HOST_IP
+    r.extend_from_slice(sender_mac); // target MAC = the guest
+    r.extend_from_slice(sender_ip); // target IP = the guest
+    Some(r)
 }
 
 // ---------------------------------------------------------------------------
