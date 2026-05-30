@@ -1556,6 +1556,25 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 64-битных `n % d` / `n / d`, на i386 это софтовые `__umoddi3`/`__udivdi3`
 поверх 32-битного `DIV` — точная факторизация пинит частное И остаток.
 
+**LZMA range-decoder (xzcat):**
+
+```bash
+cd /tmp/alpine && cp -a root xroot
+printf 'LZMA_RANGEDECODE_OK\n' | xz -9 > xroot/payload.xz   # asset: .xz внутри rootfs
+cd /home/slava/projects/wwwvm
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_xz_milestone -- --ignored --nocapture
+```
+
+→ `busybox xzcat /payload.xz` распаковывает host-сделанный `.xz` и печатает
+вшитый маркер. XZ/LZMA2-декодер — это путь, не похожий на другие апплеты:
+бинарный RANGE-декодер с адаптивной моделью вероятностей (`bound =
+(range>>11)*prob`, ренормализация сдвигами, подстройка `prob`) — плотный
+цикл умножений/сдвигов/carry-сравнений, совсем не как table-lookup'ы
+DEFLATE (gzip) или повороты хеша. xz ещё проверяет CRC64 над выходом
+(второй 64-битный путь), так что верный маркер = range-декодер +
+match-copy + CRC64 все бит-точны.
+
 ### Throughput-бенчмарк
 
 ```bash

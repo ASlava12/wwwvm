@@ -12701,6 +12701,107 @@ fn linux_userspace_alpine_factor_milestone() {
     );
 }
 
+/// LZMA RANGE-DECODER milestone — `busybox xzcat /payload.xz` decompresses
+/// a host-made `.xz` and must print the embedded marker `LZMA_RANGEDECODE_OK`.
+/// The XZ/LZMA2 decoder is a code path unlike any other applet: a binary
+/// RANGE decoder driving an adaptive bit-probability model. Each decoded
+/// bit does `bound = (range >> 11) * prob`, compares the 32-bit code against
+/// it, renormalizes `range`/`code` with conditional shifts, and nudges
+/// `prob` up/down — a tight loop of multiplies, shifts, and carry-sensitive
+/// compares totally different from DEFLATE's table lookups (gzip) or a hash's
+/// rotates. xz also verifies a CRC64 over the output (a second 64-bit path),
+/// so a correct marker means the range decoder, the LZMA2 match-copy engine,
+/// AND the CRC64 all came out bit-exact. Asset: WWWVM_ALPINE_XZ_ROOT
+/// (default /tmp/alpine/xroot) = the minirootfs with /payload.xz dropped in
+/// (`printf 'LZMA_RANGEDECODE_OK\n' | xz -9 > xroot/payload.xz`; see README).
+/// Skips if assets are absent.
+#[test]
+#[ignore = "Alpine xzcat: LZMA range-decoder + CRC64; needs WWWVM_ALPINE_XZ_ROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_xz_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let xroot =
+        std::env::var("WWWVM_ALPINE_XZ_ROOT").unwrap_or_else(|_| "/tmp/alpine/xroot".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    const EXPECT: &str = "LZMA_RANGEDECODE_OK";
+    let init = b"#!/bin/sh\nbusybox xzcat /payload.xz\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&xroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {xroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT) {
+            found = true;
+            stop_reason = "found decompressed marker".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE xzcat (LZMA range-decoder + CRC64): decompressed_marker={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "busybox xzcat segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-xz-segv")
+    );
+    assert!(
+        found,
+        "busybox xzcat did not reproduce the decompressed marker ({stop_reason}) — the LZMA \
+         range decoder / match-copy / CRC64 is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-xz-marker")
+    );
+    eprintln!("  ✓ LZMA_RANGEDECODE_OK — the LZMA range decoder + CRC64 decompress bit-exactly!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
