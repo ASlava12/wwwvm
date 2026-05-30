@@ -7489,6 +7489,79 @@ fn fpu_fistp_rounds_to_nearest_default() {
     );
 }
 
+/// FNSTSW must encode the stack-top pointer into status-word bits 11-13.
+/// Regression: it stored only fpu_sw, leaving TOP always 0.
+#[test]
+fn fpu_fnstsw_ax_encodes_top_field() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 1.0);
+    // FLD m64 [0x600] (push -> TOP = (0-1)&7 = 7) ; FNSTSW AX (DF E0) ; HLT
+    mem.write_slice(0x7C00, &[0xDD, 0x06, 0x00, 0x06, 0xDF, 0xE0, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(cpu.fpu_top, 7, "one FLD leaves TOP=7");
+    assert_eq!(
+        (cpu.regs[r16::AX] >> 11) & 7,
+        7,
+        "FNSTSW AX must encode TOP (7) in bits 11-13"
+    );
+}
+
+/// FNINIT must reset the stack-top pointer to 0.
+#[test]
+fn fpu_fninit_resets_top() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 1.0);
+    // FLD (TOP->7) ; FNINIT (DB E3) ; HLT
+    mem.write_slice(0x7C00, &[0xDD, 0x06, 0x00, 0x06, 0xDB, 0xE3, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(cpu.fpu_top, 0, "FNINIT must reset TOP to 0");
+    assert_eq!(cpu.fpu_cw, 0x037F, "FNINIT resets CW");
+    assert_eq!(cpu.fpu_sw, 0, "FNINIT resets SW");
+}
+
+/// FCOM must clear C1 (status-word bit 9). Regression: fpu_compare
+/// cleared C3/C2/C0 but left C1.
+#[test]
+fn fpu_fcom_clears_c1() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 1.0);
+    fpu_w64(&mut mem, 0x608, 2.0);
+    // FLD [0x600] ; FLD [0x608] ; FCOM ST(1) (D8 D1) ; HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xD8, 0xD1, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.fpu_sw |= 0x0200; // preset C1
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(cpu.fpu_sw & 0x0200, 0, "FCOM must clear C1");
+}
+
 /// FLD1 / FLDZ constant loads and FMULP.
 #[test]
 fn fpu_constants_and_fmulp() {

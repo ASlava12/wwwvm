@@ -1809,9 +1809,18 @@ impl Cpu {
     /// Set the x87 condition-code bits C3/C2/C0 (status word bits
     /// 14/10/8) from a compare of `a` vs `b`, mirroring FCOM. Linux/
     /// glibc test these via FNSTSW + SAHF or `sahf; jcc`.
+    /// The architectural x87 status word: `fpu_sw` merged with the
+    /// separately-tracked TOP pointer in bits 11-13. FNSTSW reads this;
+    /// glibc's `fpu_top`-dependent code (and any FNSTSW→stack-relative
+    /// logic) needs the real TOP, not a hardcoded 0.
+    fn fpu_status_word(&self) -> u16 {
+        (self.fpu_sw & !0x3800) | (((self.fpu_top & 7) as u16) << 11)
+    }
+
     fn fpu_compare(&mut self, a: f64, b: f64) {
-        // Clear C3 (0x4000), C2 (0x0400), C0 (0x0100).
-        self.fpu_sw &= !0x4500;
+        // Clear C3 (0x4000), C2 (0x0400), C1 (0x0200), C0 (0x0100). The
+        // SDM requires FCOM/FUCOM/FTST to clear C1 (no stack fault here).
+        self.fpu_sw &= !0x4700;
         if a.is_nan() || b.is_nan() {
             self.fpu_sw |= 0x4500; // unordered: C3=C2=C0=1
         } else if a > b {
@@ -7669,9 +7678,14 @@ impl Cpu {
                 if mode == 0b11 {
                     match modrm {
                         0xE3 => {
-                            // FNINIT — reset SW to 0, CW to 0x037F.
+                            // FNINIT — reset CW to 0x037F, SW to 0
+                            // (which also zeroes the TOP field), and the
+                            // stack-top pointer to 0 (tag word = all
+                            // empty). fpu_top is tracked separately, so it
+                            // must be reset explicitly.
                             self.fpu_sw = 0;
                             self.fpu_cw = 0x037F;
+                            self.fpu_top = 0;
                         }
                         0xE2 => {
                             // FNCLEX — clear exception flags (SW bits 0..7).
@@ -7738,8 +7752,9 @@ impl Cpu {
             0xDF => {
                 let modrm = self.fetch_u8(mem);
                 if modrm == 0xE0 {
-                    // FNSTSW AX — copy FPU status into AX.
-                    self.regs[r16::AX] = self.fpu_sw;
+                    // FNSTSW AX — copy FPU status (incl. the TOP field)
+                    // into AX.
+                    self.regs[r16::AX] = self.fpu_status_word();
                 } else {
                     return Err(CpuError::Unimplemented {
                         opcode,
@@ -8112,7 +8127,7 @@ impl Cpu {
                         // because we silently failed and Linux then
                         // clears X86_FEATURE_FPU.
                         7 => {
-                            let sw = self.fpu_sw;
+                            let sw = self.fpu_status_word();
                             self.mem_write_u16(mem, addr, sw);
                         }
                         _ => {
