@@ -11400,6 +11400,65 @@ fn linux_userspace_busybox_jobcontrol_milestone() {
     eprintln!("  ✓ ALL_REAPED — concurrent fork/exec + multi-child wait reaping works!");
 }
 
+/// SORT memory-stress milestone: the only remaining untested load
+/// dimension — every other milestone uses tiny inputs. /init runs
+/// `sh -c 'busybox seq 1 20000 | busybox sort -rn | busybox head -1 | busybox sed s/^/SORTED_MAX_/'`.
+/// seq emits 20 000 lines (~120 KB); sort -rn must buffer them ALL in
+/// memory and do a full reverse-numeric comparison sort (real malloc/brk
+/// pressure + ~20k·log20k comparisons, far more allocation and demand-
+/// paging than the one-line inputs elsewhere); head takes the top line,
+/// which for a correct reverse-numeric sort is the maximum, 20000; sed
+/// prefixes the marker. So "SORTED_MAX_20000" proves sort allocated and
+/// processed the whole dataset under load AND ordered it correctly (a
+/// broken comparison or a paging bug under pressure would surface a wrong
+/// max or a crash). Asserts the marker with no segfault / loader error /
+/// execve failure / out-of-memory.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~70s"]
+fn linux_userspace_busybox_sort_stress_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "busybox seq 1 20000 | busybox sort -rn | busybox head -1 \
+             | busybox sed 's/^/SORTED_MAX_/'",
+        ],
+        "SORTED_MAX_20000",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox sort memory-stress milestone: SORTED_MAX_20000={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "sort-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the sort pipeline; {}",
+        dump_uart_on_failure(&cumulative, "sort-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a stage of the sort pipeline segfaulted under memory load; {}",
+        dump_uart_on_failure(&cumulative, "sort-segv")
+    );
+    assert!(
+        !text.to_lowercase().contains("out of memory"),
+        "the kernel OOM-killed the sort pipeline; {}",
+        dump_uart_on_failure(&cumulative, "sort-oom")
+    );
+    assert!(
+        found,
+        "the sort pipeline never produced SORTED_MAX_20000 — sorting 20k \
+         buffered lines under memory load failed or mis-ordered; {}",
+        dump_uart_on_failure(&cumulative, "sort-marker")
+    );
+    eprintln!("  ✓ SORTED_MAX_20000 — sort of 20k buffered lines (alloc/paging under load) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
