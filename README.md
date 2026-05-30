@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**625 тестов** зелёные (mem 30 + devices 77 + cpu 373 + vm 128 +
+**632 теста** зелёные (mem 30 + devices 77 + cpu 380 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -336,6 +336,26 @@ operand-size 0F-опкоды (MOVZX/MOVSX/CMOVcc/BT/…) не тронуты. Н
 FUCOMI/FUCOMIP (ставят EFLAGS — современные компиляторы их генерят для
 float-сравнений), FXAM (libm-классификация), FUCOM/FUCOMP, FCOMPP,
 FUCOMPP (новый 0xDA-handler).
+
+**Пятый проход — префиксы/декод + CPUID/MSR + mode-transition
+(30 мая 2026):** 6 находок, 5 исправлено (1 отложена). ГЛАВНАЯ —
+**`rep ret` (F3 C3)**: дефолтный GCC function-return эпилог ~десятилетие
+(обход AMD K8/K10 branch-predict), поэтому реальные i386-бинари содержат
+ТЫСЯЧИ F3 C3 на горячем пути. F2/F3-handler спец-кейсил только
+inner=0x0F (SSE) и 0x90 (PAUSE); всё прочее падало в string-loop, который
+для не-string опкода либо ошибался (CX!=0 → Unimplemented), либо ПРОПУСКАЛ
+инструкцию (CX==0 → corrupt control-flow). Фикс: string-loop только для
+реальных string-опкодов (A4-A7/AA-AF/6C-6F), иначе префикс игнорируется
+(rewind на байт после него). (НЕ исправил multi-lib busybox — тот же
+0x6f622037-краш; значит rep ret не причина того коррапта.) Остальные:
+near RET imm16 (0xC2) корректирует полный ESP (carry в верхнюю
+половину); SS-load защёлкивает stack_size_32 из B-бита дескриптора;
+SYSEXIT форсит RPL=3/CPL=3 на CS/SS (иначе post-sysenter userspace бежал
+на CPL=0 → неверный U/S в #PF — а glibc через vDSO использует sysenter,
+SEP в CPUID есть); real-mode CS/SS reload сбрасывает code/stack_size_32 в
+16-бит. Отложено: LOCK-префикс (0xF0) как отдельный no-op-шаг теряет
+предшествующий префикс (`66 F0 …`, неканонический порядок — ассемблеры
+так не генерят).
 
 ## Что уже работает (i386-ядро)
 
@@ -1249,7 +1269,7 @@ milestone'ы re-verified зелёными на Tinycore 15.x kernel'е при
 cargo test --workspace
 ```
 
-Должно вывести 625 пройденных тестов на текущий момент. CI
+Должно вывести 632 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
