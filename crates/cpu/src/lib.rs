@@ -487,6 +487,16 @@ impl Cpu {
         *self.pf_trace.borrow_mut() = Some(PfTrace::new(cap));
     }
 
+    /// Dump the instruction-trace ring on demand (no-op if not enabled).
+    /// Lets a harness dump the last `cap` instructions at a known failure
+    /// point (e.g. when the UART shows a kernel panic) rather than relying
+    /// on a fault trigger.
+    pub fn dump_pf_trace(&self, header: &str) {
+        if let Some(t) = self.pf_trace.borrow().as_ref() {
+            t.dump(header);
+        }
+    }
+
     /// Read the CPU's segment-override prefix. Exposed so the VM
     /// snapshot helper can persist transient state without crates
     /// having to make the field itself public.
@@ -1109,7 +1119,11 @@ impl Cpu {
             // ASCII-printable — so we skip benign first-touch demand-page
             // faults of real code (e.g. ld.so's entry) and fire only when
             // EIP has clearly landed inside a string/data region.
-            let fetch_fault = user_read && addr.wrapping_sub(last_ip) < 16;
+            // An instruction-FETCH fault (I/D bit 4 set) into ASCII/string
+            // data is a wild control transfer — fire regardless of
+            // privilege (a wild KERNEL jump into data, U=0, is the busybox
+            // multi-lib symptom and the user filter missed it).
+            let is_fetch = error_code & 0x10 != 0;
             let looks_ascii = addr
                 .to_le_bytes()
                 .iter()
@@ -1120,12 +1134,12 @@ impl Cpu {
                     t.dump(&format!(
                         "user read #PF addr={addr:#x} err={error_code:#x} faulting_eip={last_ip:#x}"
                     ));
-                } else if !t.fired && fetch_fault && looks_ascii {
+                } else if !t.fired && is_fetch && looks_ascii {
                     // EIP jumped into ASCII/string data — the trace ring
                     // shows the ret/call/jmp that set this bad target.
                     t.fired = true;
                     t.dump(&format!(
-                        "user FETCH #PF (wild jump into data) addr={addr:#x} err={error_code:#x} eip={last_ip:#x}"
+                        "FETCH #PF (wild jump into data) addr={addr:#x} err={error_code:#x} eip={last_ip:#x}"
                     ));
                 }
             }

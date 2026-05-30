@@ -986,6 +986,13 @@ impl Vm {
         self.cpu.enable_pf_trace(cap);
     }
 
+    /// Dump the CPU instruction-trace ring on demand (no-op if not
+    /// enabled). Call at a known failure point (e.g. after the UART shows
+    /// a kernel panic) to see the last instructions leading up to it.
+    pub fn dump_cpu_pf_trace(&self, header: &str) {
+        self.cpu.dump_pf_trace(header);
+    }
+
     /// Write an IVT entry for the given vector. Vector `v` lives at
     /// linear address `v*4` as a 4-byte (offset, segment) record. JS
     /// callers use this to wire up handlers without emitting a string

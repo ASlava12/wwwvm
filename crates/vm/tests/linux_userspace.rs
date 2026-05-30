@@ -10830,8 +10830,10 @@ fn linux_userspace_busybox_direct_diag() {
     );
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
-    // Capture the instruction ring so the wild-jump #PF (EIP landing in
-    // data/ASCII) dumps the ret/call/jmp that produced the bad target.
+    // Capture the instruction ring; the ASCII wild-FETCH trigger dumps
+    // it if EIP ever lands in string/data. (NOTE: busybox's multi-lib
+    // failure is a corrupted *saved* EIP, not a fetch — it does not fire
+    // this; see the multilib-dynamic-linking memory note.)
     vm.enable_cpu_pf_trace(96);
 
     let mut cumulative = Vec::<u8>::new();
