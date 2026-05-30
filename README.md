@@ -1223,6 +1223,7 @@ milestone'ы ниже — **asserting** (не diag), `#[ignore]`, требуют
 | `busybox_interactive_milestone` | `INTERACTIVE_OK` | интерактивный ввод с tty: `send_input` → UART RX → IRQ → line discipline → shell `read()` |
 | `busybox_interactive_session_milestone` | `PROD_42` | интерактивная СЕССИЯ: 3 команды через отдельные `read()`, состояние переменных persist'ит (`n=7;m=6;echo PROD_$((n*m))`) |
 | `busybox_libm_milestone` | `LIBM_699` | awk libm-математика: sin/cos/exp/log/atan2/sqrt (софтверный x87-полином) численно корректны (×100, см. оговорки ниже) |
+| `busybox_tar_milestone` | `TAR_RT_OK` | tar create→extract round-trip: ustar-заголовок (octal-поля + checksum) + 512-байт блоки; оригинал удалён, маркер только из архива |
 
 **Корневая причина (была):** **SYSEXIT CPL=3 баг**. CPUID рекламирует
 SEP → glibc идёт через vDSO `sysenter`; SYSEXIT возвращался с RPL=0, так

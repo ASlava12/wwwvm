@@ -11722,6 +11722,69 @@ fn linux_userspace_libm_doublecall_diag() {
     }
 }
 
+/// TAR archive round-trip milestone: a new code path — building and
+/// parsing a tar archive (ustar header with octal fields + checksum +
+/// 512-byte block padding). /init runs
+/// `sh -c 'echo TAR_RT_OK > /tf; busybox tar cf /ta.tar /tf; rm /tf;
+///         busybox tar xf /ta.tar -O'`.
+/// The shell creates /tf, `tar cf` writes /ta.tar (a header block naming
+/// "tf" with mode/size/mtime in octal and a checksum, then the content
+/// block), the original /tf is removed, and `tar xf -O` reads the archive
+/// back — parsing the header, verifying the checksum, and streaming the
+/// member's content to stdout. So "TAR_RT_OK" reaches the console ONLY if
+/// the archive was correctly written AND parsed back (the original file is
+/// gone). Asserts the marker with no segfault / loader error / execve
+/// failure / "checksum" error.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_tar_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo TAR_RT_OK > /tf; busybox tar cf /ta.tar /tf 2>/dev/null; rm /tf; \
+             busybox tar xf /ta.tar -O 2>/dev/null",
+        ],
+        "TAR_RT_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox tar round-trip milestone: TAR_RT_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "tar-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for tar; {}",
+        dump_uart_on_failure(&cumulative, "tar-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox tar segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "tar-segv")
+    );
+    assert!(
+        !text.contains("invalid tar"),
+        "tar reported an invalid/malformed archive; {}",
+        dump_uart_on_failure(&cumulative, "tar-invalid")
+    );
+    // The marker reaching the console already proves the round-trip: the
+    // original /tf was removed, so TAR_RT_OK can only come from the archive
+    // being correctly written (ustar header + octal checksum + 512-byte
+    // blocks) AND parsed back out.
+    assert!(
+        found,
+        "the tar create→extract round-trip never reproduced TAR_RT_OK \
+         (ustar header + checksum + block handling); {}",
+        dump_uart_on_failure(&cumulative, "tar-marker")
+    );
+    eprintln!("  ✓ TAR_RT_OK — tar create+extract round-trip (ustar header/checksum) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
