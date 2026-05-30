@@ -33,13 +33,13 @@ fn bios_int1a_set_then_read_tick_counter_round_trip() {
 }
 
 /// INT 0x1A AH=0x02 reads the RTC time from CMOS and returns it
-/// BCD-encoded — even though our CMOS stores binary internally,
-/// BIOS callers expect BCD on this path.
+/// BCD-encoded — the CMOS stores BCD (BIOS/PC convention), so the
+/// register bytes pass straight through.
 #[test]
 fn bios_int1a_read_rtc_time_returns_bcd_from_cmos() {
     let mut vm = Vm::new();
     vm.install_bios();
-    // Seed CMOS to 23:45:09 (binary; BIOS will convert to BCD).
+    // Seed CMOS to 23:45:09 (set_time BCD-encodes; registers hold BCD).
     vm.io.cmos.set_time(26, 1, 1, 23, 45, 9);
     vm.load_image(
         BOOT_LOAD_ADDR,
@@ -82,6 +82,21 @@ fn bios_int1a_read_rtc_date_returns_bcd_from_cmos() {
     assert_eq!(cpu.read_r8(1), 0x26, "CL = year 2026");
     assert_eq!(cpu.read_r8(6), 0x05, "DH = May");
     assert_eq!(cpu.read_r8(2), 0x27, "DL = day 27");
+}
+
+/// civil_from_unix_secs must match known UTC calendar points, including a
+/// leap day (2024-02-29) — the RTC-from-host-time seed depends on it.
+#[test]
+fn civil_from_unix_secs_matches_known_dates() {
+    assert_eq!(civil_from_unix_secs(0), (1970, 1, 1, 0, 0, 0));
+    assert_eq!(civil_from_unix_secs(1_577_836_800), (2020, 1, 1, 0, 0, 0));
+    assert_eq!(civil_from_unix_secs(1_577_840_461), (2020, 1, 1, 1, 1, 1));
+    // Leap day with a time-of-day component.
+    assert_eq!(
+        civil_from_unix_secs(1_709_214_330),
+        (2024, 2, 29, 13, 45, 30)
+    );
+    assert_eq!(civil_from_unix_secs(1_748_563_200), (2025, 5, 30, 0, 0, 0));
 }
 
 /// INT 0x16 AH=0x00 (blocking read). With a key already queued, the
@@ -3626,9 +3641,9 @@ fn snapshot_v2_preserves_uart_buffers_and_pic_state() {
     assert_eq!(vm2.io.pic.imr, 0xEF);
     // Slave PIC vector base preserved.
     assert_eq!(vm2.io.slave_pic.vector_base, 0x70);
-    // CMOS storage preserved.
+    // CMOS storage preserved (BCD: year 26 -> 0x26).
     vm2.io.cmos.write(0x70, 0x09); // index = YEAR
-    assert_eq!(vm2.io.cmos.read(0x71), 26);
+    assert_eq!(vm2.io.cmos.read(0x71), 0x26);
 }
 
 /// v11 adds an HPET section right after the LAPIC. Same shape as

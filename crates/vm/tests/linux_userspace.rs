@@ -8190,18 +8190,18 @@ fn linux_userspace_time_milestone() {
         .expect("4 bytes between markers");
     let time_t = u32::from_le_bytes(t_bytes);
     eprintln!("sys_time returned time_t = {time_t} (0x{time_t:08X})");
-    // The kernel's rtc_cmos initializes the system clock to
-    // 2020-01-01T00:00:00 UTC = 1577836800 (printed in the
-    // boot log as `rtc_cmos rtc_cmos: setting system clock to
-    // 2020-01-01T00:00:00 UTC (1577836800)`). By the time /init
-    // runs the clock has advanced a few seconds via jiffies, so
-    // observed time_t is consistently `1577836800 + k` for small
-    // k (e.g. 9 on the first green run). Assert `>= 2020-01-01`
-    // and `< 2038-01-19` (i386 sys_time32 hard wall) so the
-    // test catches both an under-initialized clock (0, partial
-    // RTC read) and a sign-extended errno that happens to land
-    // in a plausible-looking range.
-    const RTC_CMOS_FLOOR: u32 = 1_577_836_800; // 2020-01-01 UTC
+    // The kernel reads the CMOS RTC at boot. The device defaults to
+    // 2026-01-01T00:00:00 UTC (BCD-encoded, the PC/AT convention the
+    // kernel expects), so the system clock initializes to ~that, plus a
+    // few jiffies by the time /init runs. (Before the RTC was made
+    // BCD-native it stored binary, which the kernel mis-read as BCD —
+    // binary 26 = 0x1A, bcd2bin(0x1A) = 20 — so the clock used to come up
+    // as 2020-01-01; that's why the floor below is 2020 and not 2026.)
+    // Assert `>= 2020-01-01` (a conservative lower bound that still
+    // catches an under-initialized clock — 0, or a partial RTC read) and
+    // `< 2038-01-19` (the i386 sys_time32 hard wall, which also rejects a
+    // sign-extended errno that happens to land in a plausible range).
+    const RTC_CMOS_FLOOR: u32 = 1_577_836_800; // 2020-01-01 UTC (floor, not the default)
     const Y2038_CEIL: u32 = 0x7FFF_FFFF; // i386 sys_time32 wraps here
     assert!(
         (RTC_CMOS_FLOOR..Y2038_CEIL).contains(&time_t),

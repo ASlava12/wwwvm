@@ -8,13 +8,20 @@
 //!     updates it.
 //!   * 128-byte storage backing the standard register layout.
 //!   * Sensible defaults so a guest that probes 0x0B (Status B) finds
-//!     binary + 24-hour mode set, and 0x0D (Status D) reports a good
+//!     BCD + 24-hour mode set, and 0x0D (Status D) reports a good
 //!     battery.
+//!
+//! Time is stored in **BCD** (packed binary-coded decimal), the PC/AT
+//! convention that essentially every BIOS and the Linux `rtc-cmos` driver
+//! expect — e.g. year 26 is the byte 0x26, not 0x1A. (We previously stored
+//! binary and set Status B's DM bit, but the guest kernel read the
+//! registers as BCD regardless, mangling the date — binary 26 = 0x1A,
+//! and `bcd2bin(0x1A)` = 20, which is exactly why `date` showed 2020.)
 //!
 //! What we don't model:
 //!   * Periodic / alarm / update-ended IRQs (no slave PIC anyway).
-//!   * BCD vs binary mode switching (Status B bit 2 is always set).
-//!   * The 24h / 12h flag (Status B bit 1 is always set).
+//!   * BCD vs binary mode switching (Status B DM bit is always clear = BCD).
+//!   * The 24h / 12h flag (Status B bit 1 is always set = 24-hour).
 //!   * UIP flag — Status A bit 7 stays clear, so reads are always
 //!     valid.
 //!
@@ -22,6 +29,12 @@
 //! reads as the build-time default below.
 
 use crate::IoDevice;
+
+/// Pack a natural decimal value 0..99 into BCD (e.g. 26 -> 0x26).
+#[inline]
+fn bcd(v: u8) -> u8 {
+    ((v / 10) << 4) | (v % 10)
+}
 
 pub struct Cmos {
     index_port: u16,
@@ -51,18 +64,18 @@ impl Cmos {
 
     pub fn new() -> Self {
         let mut storage = [0u8; 128];
-        // Default clock: 2026-01-01 00:00:00, Thursday.
-        storage[reg::SECONDS as usize] = 0;
-        storage[reg::MINUTES as usize] = 0;
-        storage[reg::HOURS as usize] = 0;
-        storage[reg::DAY_OF_WEEK as usize] = 5; // Thursday (1=Sun … 7=Sat)
-        storage[reg::DAY_OF_MONTH as usize] = 1;
-        storage[reg::MONTH as usize] = 1;
-        storage[reg::YEAR as usize] = 26;
+        // Default clock: 2026-01-01 00:00:00, Thursday. Stored BCD.
+        storage[reg::SECONDS as usize] = bcd(0);
+        storage[reg::MINUTES as usize] = bcd(0);
+        storage[reg::HOURS as usize] = bcd(0);
+        storage[reg::DAY_OF_WEEK as usize] = bcd(5); // Thursday (1=Sun … 7=Sat)
+        storage[reg::DAY_OF_MONTH as usize] = bcd(1);
+        storage[reg::MONTH as usize] = bcd(1);
+        storage[reg::YEAR as usize] = bcd(26);
         // Status A — divider chain on, 1024 Hz rate. UIP stays clear.
         storage[reg::STATUS_A as usize] = 0x26;
-        // Status B — bit 2 = binary format (not BCD), bit 1 = 24-hour.
-        storage[reg::STATUS_B as usize] = 0x06;
+        // Status B — bit 2 (DM) clear = BCD format, bit 1 = 24-hour.
+        storage[reg::STATUS_B as usize] = 0x02;
         // Status C — no pending IRQs.
         storage[reg::STATUS_C as usize] = 0;
         // Status D — bit 7 = valid CMOS RAM / battery good.
@@ -75,16 +88,16 @@ impl Cmos {
         }
     }
 
-    /// Seed the date/time bytes in binary format. Year is 2-digit
-    /// (00..99) per the MC146818 convention; everything else is the
-    /// natural numeric value.
+    /// Seed the date/time registers. Arguments are natural decimal values
+    /// (year 2-digit 00..99 per the MC146818 convention); they're stored
+    /// BCD-encoded, matching the registers' default BCD mode (Status B).
     pub fn set_time(&mut self, year: u8, month: u8, day: u8, hour: u8, minute: u8, second: u8) {
-        self.storage[reg::SECONDS as usize] = second;
-        self.storage[reg::MINUTES as usize] = minute;
-        self.storage[reg::HOURS as usize] = hour;
-        self.storage[reg::DAY_OF_MONTH as usize] = day;
-        self.storage[reg::MONTH as usize] = month;
-        self.storage[reg::YEAR as usize] = year;
+        self.storage[reg::SECONDS as usize] = bcd(second);
+        self.storage[reg::MINUTES as usize] = bcd(minute);
+        self.storage[reg::HOURS as usize] = bcd(hour);
+        self.storage[reg::DAY_OF_MONTH as usize] = bcd(day);
+        self.storage[reg::MONTH as usize] = bcd(month);
+        self.storage[reg::YEAR as usize] = bcd(year);
     }
 
     /// Host-side read of any CMOS byte, bypassing the index latch.
@@ -150,10 +163,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_status_b_is_binary_24h() {
+    fn default_status_b_is_bcd_24h() {
         let cmos = Cmos::new();
         let sb = cmos.storage_byte(reg::STATUS_B);
-        assert_eq!(sb & 0x04, 0x04, "binary bit");
+        assert_eq!(sb & 0x04, 0x00, "DM bit clear = BCD format");
         assert_eq!(sb & 0x02, 0x02, "24h bit");
     }
 
@@ -179,18 +192,19 @@ mod tests {
     fn set_time_updates_register_bytes() {
         let mut cmos = Cmos::new();
         cmos.set_time(26, 5, 27, 12, 34, 56);
+        // Registers are BCD: 12 -> 0x12, 34 -> 0x34, etc.
         cmos.write(0x70, reg::HOURS);
-        assert_eq!(cmos.read(0x71), 12);
+        assert_eq!(cmos.read(0x71), 0x12);
         cmos.write(0x70, reg::MINUTES);
-        assert_eq!(cmos.read(0x71), 34);
+        assert_eq!(cmos.read(0x71), 0x34);
         cmos.write(0x70, reg::SECONDS);
-        assert_eq!(cmos.read(0x71), 56);
+        assert_eq!(cmos.read(0x71), 0x56);
         cmos.write(0x70, reg::DAY_OF_MONTH);
-        assert_eq!(cmos.read(0x71), 27);
+        assert_eq!(cmos.read(0x71), 0x27);
         cmos.write(0x70, reg::MONTH);
-        assert_eq!(cmos.read(0x71), 5);
+        assert_eq!(cmos.read(0x71), 0x05);
         cmos.write(0x70, reg::YEAR);
-        assert_eq!(cmos.read(0x71), 26);
+        assert_eq!(cmos.read(0x71), 0x26);
     }
 
     #[test]
@@ -230,10 +244,10 @@ mod tests {
 
         // Index round-tripped.
         assert_eq!(cmos2.read(0x71), cmos.read(0x71), "index latch");
-        // Time bytes round-tripped through storage (binary, not BCD).
-        assert_eq!(cmos2.storage_byte(reg::SECONDS), 30);
-        assert_eq!(cmos2.storage_byte(reg::MINUTES), 15);
-        assert_eq!(cmos2.storage_byte(reg::HOURS), 8);
+        // Time bytes round-tripped through storage (BCD: 30 -> 0x30, …).
+        assert_eq!(cmos2.storage_byte(reg::SECONDS), 0x30);
+        assert_eq!(cmos2.storage_byte(reg::MINUTES), 0x15);
+        assert_eq!(cmos2.storage_byte(reg::HOURS), 0x08);
         // Scratch register round-tripped too.
         assert_eq!(cmos2.storage_byte(0x40), 0xAB);
     }

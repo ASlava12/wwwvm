@@ -726,13 +726,6 @@ fn bios_int16(cpu: &mut Cpu, io: &mut IoBus) -> bool {
 const BDA_TICK_LOW: u32 = 0x046C; // u32 low word
 const BDA_TICK_HIGH: u32 = 0x046E; // u32 high word
 
-/// Convert a binary 0..99 byte to its packed-BCD form. INT 0x1A
-/// AH=0x02/0x04 return time/date as BCD regardless of the CMOS
-/// internal format, so we always convert on the way out.
-fn to_bcd(v: u8) -> u8 {
-    ((v / 10) << 4) | (v % 10)
-}
-
 fn bios_int1a(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
     let ah = cpu.read_r8(4);
     match ah {
@@ -757,35 +750,62 @@ fn bios_int1a(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
             true
         }
         // Read RTC time. CH=hours, CL=minutes, DH=seconds, DL=DST.
-        // The CMOS we model stores time in binary mode (Status B
-        // bit 2 set); BIOS callers expect BCD here, so we convert.
+        // The CMOS stores BCD (the BIOS convention), so the register
+        // bytes are returned as-is.
         0x02 => {
             let hours = io.cmos.storage_byte(wwwvm_devices::cmos_reg::HOURS);
             let mins = io.cmos.storage_byte(wwwvm_devices::cmos_reg::MINUTES);
             let secs = io.cmos.storage_byte(wwwvm_devices::cmos_reg::SECONDS);
-            cpu.write_r8(5, to_bcd(hours)); // CH
-            cpu.write_r8(1, to_bcd(mins)); // CL
-            cpu.write_r8(6, to_bcd(secs)); // DH
+            cpu.write_r8(5, hours); // CH (BCD)
+            cpu.write_r8(1, mins); // CL (BCD)
+            cpu.write_r8(6, secs); // DH (BCD)
             cpu.write_r8(2, 0); // DL = DST flag (none)
             cpu.flags &= !wwwvm_cpu::flag::CF;
             true
         }
         // Read RTC date. CH=century, CL=year, DH=month, DL=day —
-        // all BCD. We don't store century in CMOS, so hard-code
-        // 0x20 (the 21st century).
+        // all BCD (stored BCD, returned as-is). We don't store
+        // century in CMOS, so hard-code 0x20 (the 21st century).
         0x04 => {
             let year = io.cmos.storage_byte(wwwvm_devices::cmos_reg::YEAR);
             let month = io.cmos.storage_byte(wwwvm_devices::cmos_reg::MONTH);
             let day = io.cmos.storage_byte(wwwvm_devices::cmos_reg::DAY_OF_MONTH);
             cpu.write_r8(5, 0x20); // CH = century
-            cpu.write_r8(1, to_bcd(year)); // CL = year
-            cpu.write_r8(6, to_bcd(month)); // DH = month
-            cpu.write_r8(2, to_bcd(day)); // DL = day
+            cpu.write_r8(1, year); // CL = year (BCD)
+            cpu.write_r8(6, month); // DH = month (BCD)
+            cpu.write_r8(2, day); // DL = day (BCD)
             cpu.flags &= !wwwvm_cpu::flag::CF;
             true
         }
         _ => false,
     }
+}
+
+/// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a civil
+/// UTC date/time `(year, month, day, hour, minute, second)`. Uses Howard
+/// Hinnant's days-from-civil inverse, valid across the proleptic Gregorian
+/// calendar — no leap-year special-casing bugs. Used to seed the RTC from
+/// the host clock.
+fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
+    // days-from-civil inverse (era-based), epoch shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, hour, minute, second)
 }
 
 /// Snapshot format constants and the error type used by `restore`.
@@ -1924,9 +1944,10 @@ impl Vm {
         self.io.kbd.push_scancode(code);
     }
 
-    /// Seed the CMOS clock with binary date/time. Year is two-digit
-    /// (00..99). A guest probing 0x70/0x71 sees these values, with
-    /// Status B already configured for binary + 24-hour mode.
+    /// Seed the CMOS clock with a date/time. Arguments are natural decimal
+    /// values, year two-digit (00..99); the device stores them BCD-encoded
+    /// (Status B is BCD + 24-hour), which is what a guest probing 0x70/0x71
+    /// and the Linux `rtc-cmos` driver expect.
     pub fn set_cmos_time(
         &mut self,
         year: u8,
@@ -1939,6 +1960,30 @@ impl Vm {
         self.io
             .cmos
             .set_time(year, month, day, hour, minute, second);
+    }
+
+    /// Seed the CMOS clock from the HOST's current wall-clock time (UTC),
+    /// so the guest's `date` reflects real time instead of the build-time
+    /// default. Interactive front-ends (the console examples) call this;
+    /// tests deliberately don't, keeping a deterministic 2026-01-01 default.
+    /// A pre-epoch host clock leaves the default untouched.
+    pub fn set_cmos_time_from_host(&mut self) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if secs == 0 {
+            return;
+        }
+        let (y, mo, d, h, mi, s) = civil_from_unix_secs(secs);
+        self.set_cmos_time(
+            (y % 100) as u8,
+            mo as u8,
+            d as u8,
+            h as u8,
+            mi as u8,
+            s as u8,
+        );
     }
 
     /// Drain everything the guest has transmitted since the last call.

@@ -105,6 +105,7 @@ fn main() {
     );
 
     let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    vm.set_cmos_time_from_host(); // so the guest's `date` is the real time
     let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
     vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4");
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
