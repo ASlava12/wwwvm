@@ -11960,17 +11960,48 @@ fn linux_userspace_busybox_fifo_milestone() {
 /// with no segfault / loader error / execve failure. Set up the assets via
 /// `alpine-minirootfs-3.21-x86.tar.gz` (see README). Skips if absent.
 #[test]
-#[ignore = "Alpine stage A: musl PIE busybox on the current kernel; needs WWWVM_ALPINE_ROOTFS; ~60s"]
+#[ignore = "Alpine stage A: musl PIE busybox on the current (Tinycore) kernel; needs WWWVM_ALPINE_ROOTFS; ~60s"]
 fn linux_userspace_alpine_musl_milestone() {
     let kpath =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
     let root = std::env::var("WWWVM_ALPINE_ROOTFS")
         .unwrap_or_else(|_| "/tmp/wwwvm-alpine/rootfs".to_string());
-    let kbytes = match std::fs::read(&kpath) {
+    let Some((found, cumulative, stop_reason)) = run_alpine_musl(&kpath, &root, "stage A") else {
+        return;
+    };
+    assert_alpine_ok(found, &cumulative, &stop_reason);
+}
+
+/// ALPINE STAGE B: boot Alpine's OWN kernel (vmlinuz-lts, a 6.12 LTS) and
+/// run the musl PIE busybox on it — i.e. the Alpine kernel AND the Alpine
+/// userspace together (the real distro, minus OpenRC/apk). Same musl rootfs
+/// as stage A; the kernel comes from WWWVM_ALPINE_KERNEL (default
+/// /tmp/wwwvm-alpine/vmlinuz-lts — `cp` it from the alpine-netboot tarball's
+/// boot/vmlinuz-lts, see README). Asserts ALPINE_MUSL_OK. Skips if absent.
+#[test]
+#[ignore = "Alpine stage B: Alpine's own kernel + musl busybox; needs WWWVM_ALPINE_KERNEL + WWWVM_ALPINE_ROOTFS; ~55s"]
+fn linux_userspace_alpine_kernel_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let root = std::env::var("WWWVM_ALPINE_ROOTFS")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/rootfs".to_string());
+    let Some((found, cumulative, stop_reason)) = run_alpine_musl(&kpath, &root, "stage B") else {
+        return;
+    };
+    assert_alpine_ok(found, &cumulative, &stop_reason);
+}
+
+/// Boot `kpath` with an initramfs whose /init execve's the Alpine musl
+/// `busybox sh -c "echo ALPINE_MUSL_OK"`, reading busybox + ld-musl from
+/// `root`. Returns (found, full UART, stop reason), or None if any asset is
+/// missing (the test then skips). Shared by the Alpine stage A / B
+/// milestones, which differ only in the kernel.
+fn run_alpine_musl(kpath: &str, root: &str, stage: &str) -> Option<(bool, Vec<u8>, String)> {
+    let kbytes = match std::fs::read(kpath) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: read {kpath}: {e}");
-            return;
+            return None;
         }
     };
     let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
@@ -11982,13 +12013,11 @@ fn linux_userspace_alpine_musl_milestone() {
             }
         }
     };
-    let (Some(busybox), Some(ld_musl), Some(libc_musl)) = (
-        read_or_skip("bin/busybox"),
-        read_or_skip("lib/ld-musl-i386.so.1"),
-        read_or_skip("lib/libc.musl-x86.so.1"),
-    ) else {
-        return;
-    };
+    let (busybox, ld_musl, libc_musl) = (
+        read_or_skip("bin/busybox")?,
+        read_or_skip("lib/ld-musl-i386.so.1")?,
+        read_or_skip("lib/libc.musl-x86.so.1")?,
+    );
 
     let init = build_init_execve_argv(&["busybox", "sh", "-c", "echo ALPINE_MUSL_OK"]);
     let cpio = build_cpio_tree(
@@ -12047,27 +12076,32 @@ fn linux_userspace_alpine_musl_milestone() {
             }
         }
     }
-    let text = String::from_utf8_lossy(&cumulative);
-    eprintln!("=== ALPINE stage A (musl busybox): ALPINE_MUSL_OK={found} steps={steps} stop={stop_reason} ===");
+    eprintln!("=== ALPINE {stage} (musl busybox): ALPINE_MUSL_OK={found} steps={steps} stop={stop_reason} ===");
+    Some((found, cumulative, stop_reason))
+}
+
+/// Shared assertions for the Alpine musl milestones.
+fn assert_alpine_ok(found: bool, cumulative: &[u8], stop_reason: &str) {
+    let text = String::from_utf8_lossy(cumulative);
     assert!(
         !text.contains("[EXECVE-FAIL]"),
         "execve(/bin/busybox) failed; {}",
-        dump_uart_on_failure(&cumulative, "alpine-execve")
+        dump_uart_on_failure(cumulative, "alpine-execve")
     );
     assert!(
         !text.contains("error while loading shared libraries"),
         "ld-musl could not load busybox/libc; {}",
-        dump_uart_on_failure(&cumulative, "alpine-liberr")
+        dump_uart_on_failure(cumulative, "alpine-liberr")
     );
     assert!(
         !text.contains("segfault at"),
         "Alpine musl busybox segfaulted ({stop_reason}); {}",
-        dump_uart_on_failure(&cumulative, "alpine-segv")
+        dump_uart_on_failure(cumulative, "alpine-segv")
     );
     assert!(
         found,
         "Alpine's musl PIE busybox did not print ALPINE_MUSL_OK ({stop_reason}); {}",
-        dump_uart_on_failure(&cumulative, "alpine-marker")
+        dump_uart_on_failure(cumulative, "alpine-marker")
     );
     eprintln!("  ✓ ALPINE_MUSL_OK — Alpine's musl PIE busybox sh runs on the emulator!");
 }

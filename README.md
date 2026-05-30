@@ -1418,8 +1418,25 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 ```
 
 → `ALPINE_MUSL_OK`: musl-libc + musl-ld.so + PIE-релокация работают.
-Стадия B (загрузка родного ядра Alpine `vmlinuz-lts`) и C (полный Alpine с
-OpenRC + apk) — следующие.
+
+**Стадия B — родное ядро Alpine + musl-userspace (= Alpine, без OpenRC/apk):**
+
+```bash
+# взять ядро Alpine (vmlinuz-lts, ~8 МБ) из netboot:
+cd /tmp/alpine
+curl -sO https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86/alpine-netboot-3.21.7-x86.tar.gz
+tar -xzf alpine-netboot-3.21.7-x86.tar.gz boot/vmlinuz-lts
+cp boot/vmlinuz-lts /tmp/wwwvm-alpine/vmlinuz-lts
+
+cd /home/slava/projects/wwwvm
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_kernel_milestone -- --ignored --nocapture
+```
+
+→ `ALPINE_MUSL_OK`: эмулятор **грузит ядро Alpine 6.12 LTS И гоняет
+Alpine-musl-busybox** — то есть Alpine (ядро + userspace), пока без полного
+init. Стадия C (полный Alpine: OpenRC + apk + настоящий minirootfs) —
+следующая.
 
 ### Throughput-бенчмарк
 
