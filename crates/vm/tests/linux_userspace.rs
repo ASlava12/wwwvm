@@ -316,10 +316,24 @@ use wwwvm_vm::Vm;
 /// 4. Shared between every `build_initramfs_*` so a regression in
 /// the header layout shows up across the whole test file at once.
 fn cpio_entry(name: &str, data: &[u8], mode: u32, rdevmaj: u32, rdevmin: u32) -> Vec<u8> {
+    cpio_entry_mtime(name, data, mode, rdevmaj, rdevmin, 0)
+}
+
+/// Like [`cpio_entry`] but with an explicit mtime (newc field index 5,
+/// Unix seconds). The directory packer passes each file's real host mtime
+/// so `ls -l` in the guest shows sensible dates instead of 1970.
+fn cpio_entry_mtime(
+    name: &str,
+    data: &[u8],
+    mode: u32,
+    rdevmaj: u32,
+    rdevmin: u32,
+    mtime: u32,
+) -> Vec<u8> {
     let namesize = name.len() as u32 + 1;
     let filesize = data.len() as u32;
     let fields = [
-        0u32, mode, 0, 0, 1, 0, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
+        0u32, mode, 0, 0, 1, mtime, filesize, 0, 0, rdevmaj, rdevmin, namesize, 0,
     ];
     let mut hdr = Vec::with_capacity(110);
     hdr.extend_from_slice(b"070701");
@@ -12143,21 +12157,37 @@ fn build_cpio_from_dir(
                 .into_owned();
             let md = std::fs::symlink_metadata(&path)?;
             let mode = md.permissions().mode() & 0o7777;
+            // Carry the file's real host mtime so `ls -l` in the guest
+            // shows sensible dates rather than 1970 (epoch 0).
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
             if md.file_type().is_symlink() {
                 let target = std::fs::read_link(&path)?;
-                out.extend_from_slice(&cpio_entry(
+                out.extend_from_slice(&cpio_entry_mtime(
                     &rel,
                     target.to_string_lossy().as_bytes(),
                     0o120_000 | 0o777,
                     0,
                     0,
+                    mtime,
                 ));
             } else if md.is_dir() {
-                out.extend_from_slice(&cpio_entry(&rel, &[], 0o040_000 | mode, 0, 0));
+                out.extend_from_slice(&cpio_entry_mtime(&rel, &[], 0o040_000 | mode, 0, 0, mtime));
                 walk(&path, base, out)?;
             } else {
                 let data = std::fs::read(&path)?;
-                out.extend_from_slice(&cpio_entry(&rel, &data, 0o100_000 | mode, 0, 0));
+                out.extend_from_slice(&cpio_entry_mtime(
+                    &rel,
+                    &data,
+                    0o100_000 | mode,
+                    0,
+                    0,
+                    mtime,
+                ));
             }
         }
         Ok(())
