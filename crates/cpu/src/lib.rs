@@ -782,6 +782,14 @@ impl Cpu {
             // walk under the new privilege level.
             self.invalidate_fetch_tlb();
         }
+        // SS load: latch the B bit (same byte 6 bit 6 = 0x40) into
+        // `stack_size_32`. The B bit selects ESP-vs-SP for every implicit
+        // stack access (PUSH/POP/CALL/RET/ENTER/LEAVE/interrupt frames);
+        // without this a guest that reloads SS with a differently-sized
+        // descriptor would keep the stale stack width.
+        if idx == sreg::SS {
+            self.stack_size_32 = (d3 >> 6) & 1 != 0;
+        }
     }
 
     /// PE-aware linear-address translation. In real mode the cache

@@ -2322,6 +2322,43 @@ fn write_sreg_cs_load_with_d_zero_keeps_code_size_16() {
     );
 }
 
+/// SS load latches the descriptor B bit (byte 6 bit 6) into
+/// stack_size_32 — the B bit selects ESP-vs-SP for implicit stack
+/// accesses. Regression: write_sreg only latched the CS D bit.
+#[test]
+fn write_sreg_ss_load_latches_b_bit_into_stack_size_32() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    let mut mem = Memory::new(0x10_0000);
+    // GDT[1] = ring-0 data segment, B=1, G=1 (flags 0xCF). access 0x92.
+    mem.write_slice(0x0508, &[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00]);
+    cpu.stack_size_32 = false;
+    cpu.write_sreg(sreg::SS, 0x08, &mem);
+    assert!(cpu.stack_size_32, "SS load with B=1 must set stack_size_32");
+}
+
+/// Negative companion: SS load with B=0 (16-bit stack) clears it.
+#[test]
+fn write_sreg_ss_load_with_b_zero_keeps_stack_size_16() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    let mut mem = Memory::new(0x10_0000);
+    // Data segment with B=0 (flags 0x00 = no B/G).
+    mem.write_slice(0x0508, &[0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0x00, 0x00]);
+    cpu.stack_size_32 = true;
+    cpu.write_sreg(sreg::SS, 0x08, &mem);
+    assert!(
+        !cpu.stack_size_32,
+        "SS load with B=0 must clear stack_size_32"
+    );
+}
+
 /// Granularity bit (G=1) shifts limit left by 12 and fills the low
 /// 12 with ones — turning 0xFFFFF into 0xFFFF_FFFF (a 4 GiB segment).
 #[test]
