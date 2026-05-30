@@ -19,11 +19,62 @@
 //! prefer `busybox ls`, `busybox cat /etc/alpine-release`, etc.; shell
 //! builtins (echo, cd, for/while/if, `$((…))`) work directly. Ctrl-C quits
 //! (exiting the shell panics the kernel — the shell is PID 1).
+//!
+//! The host terminal is put into raw mode for the session (see `RawMode`)
+//! so your keystrokes aren't echoed twice and the shell's cursor-position
+//! queries don't leak `^[[…R` onto the prompt; it's restored on exit.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use wwwvm_vm::{Stop, Vm};
+
+/// RAII guard that switches the host terminal to raw mode and restores the
+/// original settings on drop. Without this the host tty stays in cooked
+/// mode: it echoes every keystroke (so input appears twice — once from the
+/// host line discipline, once from the guest tty) and it line-buffers, so
+/// the guest shell's `ESC[6n` cursor-position query gets answered late and
+/// the terminal's `ESC[<row>;<col>R` reply leaks onto the screen as
+/// `^[[8;5R`. Raw mode disables host echo + canonical buffering (fixing
+/// both) while keeping OPOST so the guest's `\n` output is still formatted.
+/// ISIG is disabled so Ctrl-C arrives as a 0x03 byte we handle at the app
+/// level (quit) rather than killing us before this guard's Drop can restore
+/// the terminal. If stdin isn't a tty (piped input), `new` returns None and
+/// nothing is changed.
+struct RawMode {
+    fd: i32,
+    orig: libc::termios,
+}
+
+impl RawMode {
+    fn new() -> Option<Self> {
+        let fd = std::io::stdin().as_raw_fd();
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut orig) != 0 {
+                return None; // not a tty (e.g. piped input)
+            }
+            let mut raw = orig;
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+            raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                return None;
+            }
+            Some(RawMode { fd, orig })
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        }
+    }
+}
 
 fn main() {
     let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
@@ -60,6 +111,11 @@ fn main() {
     );
     eprintln!("[wwwvm] no PATH set — run applets as `busybox ls`; builtins work directly; Ctrl-C to quit.\n");
 
+    // Put the host terminal in raw mode for the session (restored on drop).
+    // Must happen before the stdin reader thread starts so reads come in
+    // un-echoed and un-buffered. None if stdin isn't a tty (piped input).
+    let _raw = RawMode::new();
+
     // Background thread does the blocking stdin reads; the main loop polls
     // the channel so it can keep stepping the VM and flushing output.
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -88,7 +144,7 @@ fn main() {
     let mut ready = false;
     let mut boot_log: Vec<u8> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
-    loop {
+    'main: loop {
         let (steps, stop) = vm.run_steps_idle_aware(chunk);
         let out = vm.drain_output();
         if !out.is_empty() {
@@ -110,6 +166,13 @@ fn main() {
             }
         }
         while let Ok(bytes) = rx.try_recv() {
+            // In raw mode ISIG is off, so Ctrl-C arrives as a 0x03 byte;
+            // treat it as "quit" at the app level (the `_raw` guard's Drop
+            // restores the terminal on the way out).
+            if bytes.contains(&0x03) {
+                eprintln!("\r\n[wwwvm] Ctrl-C — bye.");
+                break 'main;
+            }
             if ready {
                 vm.send_input(&bytes);
             } else {

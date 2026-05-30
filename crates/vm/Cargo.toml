@@ -12,3 +12,9 @@ path = "src/lib.rs"
 wwwvm-cpu = { path = "../cpu" }
 wwwvm-mem = { path = "../mem" }
 wwwvm-devices = { path = "../devices" }
+
+[dev-dependencies]
+# Used only by the interactive console examples (alpine_console / busybox_console)
+# to put the HOST terminal into raw mode (termios) so keystrokes aren't
+# double-echoed and cursor-position-report replies don't leak onto the prompt.
+libc = "0.2"
