@@ -136,6 +136,12 @@ fn main() {
         }
     });
 
+    // WWWVM_DUMP_TX=1 prints every Ethernet frame the guest's NIC driver
+    // transmits (captured by the RTL8139 bus-master TX path) to stderr, so
+    // it doesn't corrupt the guest console on stdout. Useful for confirming
+    // `ip link set eth0 up` + an ARP actually puts a frame on the wire.
+    let dump_tx = std::env::var_os("WWWVM_DUMP_TX").is_some();
+
     let mut stdout = std::io::stdout();
     let chunk = 5_000_000u32;
     // Don't forward keystrokes until /init's interactive shell is up; early
@@ -147,6 +153,11 @@ fn main() {
     let mut pending: Vec<u8> = Vec::new();
     'main: loop {
         let (steps, stop) = vm.run_steps_idle_aware(chunk);
+        if dump_tx {
+            for frame in vm.drain_tx_frames() {
+                eprint!("\r\n{}\r\n", describe_eth_frame(&frame));
+            }
+        }
         let out = vm.drain_output();
         if !out.is_empty() {
             let _ = stdout.write_all(&out);
@@ -196,6 +207,44 @@ fn main() {
             }
         }
     }
+}
+
+/// One-line summary of a captured Ethernet frame: dst/src MAC, ethertype
+/// (decoded for ARP/IPv4/IPv6), length, and a hex dump of the first bytes.
+fn describe_eth_frame(f: &[u8]) -> String {
+    let mac = |o: usize| {
+        (0..6)
+            .map(|i| format!("{:02x}", f.get(o + i).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let ethertype = if f.len() >= 14 {
+        ((f[12] as u16) << 8) | f[13] as u16
+    } else {
+        0
+    };
+    let proto = match ethertype {
+        0x0806 => "ARP",
+        0x0800 => "IPv4",
+        0x86DD => "IPv6",
+        _ => "?",
+    };
+    let hex: String = f
+        .iter()
+        .take(42)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "[wwwvm TX {} bytes] dst={} src={} type=0x{:04x}({}) | {}{}",
+        f.len(),
+        mac(0),
+        mac(6),
+        ethertype,
+        proto,
+        hex,
+        if f.len() > 42 { " …" } else { "" }
+    )
 }
 
 // ---------------------------------------------------------------------------
