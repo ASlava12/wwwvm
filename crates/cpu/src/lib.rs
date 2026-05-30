@@ -1105,19 +1105,27 @@ impl Cpu {
             // A wild control transfer (bad ret/call/jmp target) shows up
             // as an instruction-FETCH fault: the address being faulted on
             // is the current op_ip (flat user CS → linear == offset).
+            // Require the address to look like DATA — all four bytes
+            // ASCII-printable — so we skip benign first-touch demand-page
+            // faults of real code (e.g. ld.so's entry) and fire only when
+            // EIP has clearly landed inside a string/data region.
             let fetch_fault = user_read && addr.wrapping_sub(last_ip) < 16;
+            let looks_ascii = addr
+                .to_le_bytes()
+                .iter()
+                .all(|&b| (0x20..=0x7e).contains(&b));
             if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
                 if !t.fired && user_read && addr < 0x1000 {
                     t.fired = true;
                     t.dump(&format!(
                         "user read #PF addr={addr:#x} err={error_code:#x} faulting_eip={last_ip:#x}"
                     ));
-                } else if !t.fired && fetch_fault && addr >= 0x1_0000 {
-                    // EIP jumped to an unmapped (often data/ASCII) address
-                    // — the trace ring shows the ret/call/jmp that set it.
+                } else if !t.fired && fetch_fault && looks_ascii {
+                    // EIP jumped into ASCII/string data — the trace ring
+                    // shows the ret/call/jmp that set this bad target.
                     t.fired = true;
                     t.dump(&format!(
-                        "user FETCH #PF (wild jump) addr={addr:#x} err={error_code:#x} eip={last_ip:#x}"
+                        "user FETCH #PF (wild jump into data) addr={addr:#x} err={error_code:#x} eip={last_ip:#x}"
                     ));
                 }
             }
