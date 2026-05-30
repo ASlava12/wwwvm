@@ -12832,6 +12832,106 @@ fn linux_userspace_alpine_xz_milestone() {
     eprintln!("  ✓ LZMA_RANGEDECODE_OK — the LZMA range decoder + CRC64 decompress bit-exactly!");
 }
 
+/// BZIP2 (BWT) decoder milestone — `busybox bzcat /payload.bz2` decompresses
+/// a host-made `.bz2` and must print the embedded marker `BZIP2_BWT_OK`.
+/// bzip2's decode path is a third, distinct decompression pipeline (after
+/// gzip's DEFLATE and xz's LZMA range coder): a Huffman decode feeding an
+/// inverse Move-To-Front transform, then the **inverse Burrows-Wheeler
+/// transform** (a large sort-index walk over the block, very pointer-/
+/// index-chase heavy), and finally a CRC32 over the output. A correct
+/// marker means all three stages plus the BWT inverse came out bit-exact —
+/// exercising data-dependent indexed loads/stores nothing else in the suite
+/// stresses. Reuses the xz asset dir (WWWVM_ALPINE_XZ_ROOT, default
+/// /tmp/alpine/xroot) with a /payload.bz2 dropped in
+/// (`printf 'BZIP2_BWT_OK\n' | bzip2 -9 > xroot/payload.bz2`; see README).
+/// Skips if assets are absent.
+#[test]
+#[ignore = "Alpine bzcat: bzip2 BWT decoder; needs WWWVM_ALPINE_XZ_ROOT (with /payload.bz2) + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_bzip2_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let xroot =
+        std::env::var("WWWVM_ALPINE_XZ_ROOT").unwrap_or_else(|_| "/tmp/alpine/xroot".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    const EXPECT: &str = "BZIP2_BWT_OK";
+    let init = b"#!/bin/sh\nbusybox bzcat /payload.bz2\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&xroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {xroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT) {
+            found = true;
+            stop_reason = "found decompressed marker".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE bzcat (bzip2 BWT decoder): decompressed_marker={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "busybox bzcat segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-bz-segv")
+    );
+    assert!(
+        found,
+        "busybox bzcat did not reproduce the decompressed marker ({stop_reason}) — the bzip2 \
+         Huffman/MTF/inverse-BWT pipeline is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-bz-marker")
+    );
+    eprintln!("  ✓ BZIP2_BWT_OK — bzip2's Huffman + MTF + inverse-BWT + CRC32 decode bit-exactly!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is

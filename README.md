@@ -1578,6 +1578,14 @@ DEFLATE (gzip) или повороты хеша. xz ещё проверяет CR
 (второй 64-битный путь), так что верный маркер = range-декодер +
 match-copy + CRC64 все бит-точны.
 
+**bzip2 (BWT) декодер (bzcat):** `printf 'BZIP2_BWT_OK\n' | bzip2 -9 >
+xroot/payload.bz2`, затем `linux_userspace_alpine_bzip2_milestone`
+(`busybox bzcat /payload.bz2`). Третий, отдельный декомпрессор: Huffman →
+inverse-MTF → **inverse Burrows-Wheeler** (обход sort-индексов по блоку,
+тяжёлый на data-dependent indexed load/store) → CRC32. Верный маркер = весь
+конвейер + инверсия BWT бит-точны — путь, которого не задевают ни DEFLATE,
+ни LZMA.
+
 ### Throughput-бенчмарк
 
 ```bash
