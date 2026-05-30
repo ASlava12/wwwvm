@@ -1545,21 +1545,27 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 бинарь затем запустился. То есть apk (musl + его zlib/crypto/db) **работает
 на эмуляторе** — установка пакета внутри гостя выполнена (offline).
 
-Осталось: **сетевой `apk add` (fetch из remote-репозитория)** — это
-вторая половина apk. Прогресс (фичу строим по частям, каждая
-teeth-confirmed в реальном Alpine):
+**Сетевой `apk` РАБОТАЕТ** ✅ — `apk update` из реального зеркала Alpine
+проходит: **`OK: 5532 distinct packages available`** (HTTP-fetch через NAT +
+проверка RSA-подписи APKINDEX). Строилось по частям, каждая teeth-confirmed
+в реальном Alpine:
 - **A (NIC) ✅** — эмулированный RTL8139 + PCI host-bridge; стоковые
   `mii.ko`+`8139too.ko` из `modloop-lts` грузятся `insmod` как есть
-  (релокация модуля/`finit_module` — это гостевой код на нашем CPU,
-  кастомное ядро НЕ нужно). eth0 поднимается с реальным MAC; bus-master
-  TX/RX-DMA + IRQ 11 работают (см. секцию «Сеть» выше).
-- **B1 (L2/L3-шлюз) ✅** — `crates/vm/src/lan.rs::VirtualGateway` отвечает
-  на ARP и ICMP echo; `ping 10.0.2.2` из гостя проходит (0% loss).
-- **B2/B3 (DNS + TCP-NAT) — в работе** — host-side мост: терминируем
-  гостевой TCP, открываем реальный сокет к destination (прозрачный relay,
-  TLS остаётся end-to-end), DNS-форвардер; всё через allowlist
-  (`WWWVM_PROXY_ALLOWLIST`, deny-by-default, `*` в проде нельзя).
-- **C/D** — `apk update`/`apk add` из сети поверх этого.
+  (кастомное ядро НЕ нужно). bus-master TX/RX-DMA + IRQ 11 (секция «Сеть»).
+- **B1 (L2/L3-шлюз) ✅** — `ping 10.0.2.2` из гостя (0% loss). Изначально
+  hand-rolled `lan.rs::VirtualGateway`; теперь ARP/ICMP отдаёт smoltcp.
+- **B2 (DNS) ✅** — `crates/net` форвардер на 10.0.2.2:53: имена
+  пре-резолвятся на хосте при старте (никаких блокировок VM-петли + нет
+  DNS-rebinding); `nslookup` из гостя резолвит, неразрешённое → NXDOMAIN.
+- **B3a (TCP-NAT) ✅** — `crates/net` поверх **smoltcp**: ловим SYN, по
+  allowlist'у открываем реальный host-сокет к destination, шлём байты
+  (TLS остался бы end-to-end). `wget` тянет полный APKINDEX (485109 байт).
+- **MMX** ✅ — `apk` (libcrypto) использует MMX (x86-32 baseline без SSE2):
+  реализованы mm0-7 + MOVD/MOVQ/PXOR/PADD/PMULUDQ/сдвиги/… → RSA-подпись
+  проверяется. Всё через allowlist (`WWWVM_PROXY_ALLOWLIST`,
+  deny-by-default, `*` в проде нельзя).
+- **Осталось** — `apk add <pkg>` (полная установка из сети); HTTPS (Phase D:
+  CA-bundle в cpio + https-репозитории; relay уже прозрачный).
 
 **Бит-точность 64-битного ALU (sha512):**
 
