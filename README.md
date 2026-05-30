@@ -1537,6 +1537,21 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 встроенным (`CONFIG_8139TOO=y`), плюс (3) host-side TCP/IP-мост через
 allowlist'нутый proxy. Это большая многосессионная фича.
 
+**Бит-точность 64-битного ALU (sha512):**
+
+```bash
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_sha512_milestone -- --ignored --nocapture
+```
+
+→ `echo SHA512_INPUT | busybox sha512sum`, ассерт **точного** 128-hex
+дайджеста. SHA-512 (в отличие от md5/sha1 — 32-битных) работает на
+64-битных словах, которые 32-битный CPU считает парами регистров: каждый
+64-битный поворот = `shld`/`shrd`, каждое 64-битное сложение = `add`+`adc`.
+Точное совпадение 512-битного дайджеста доказывает, что `SHLD`/`SHRD` и
+цепочки add-with-carry эмулятора бит-корректны на всю 64-битную ширину —
+путь, который 32-битные хеши не задевают.
+
 ### Throughput-бенчмарк
 
 ```bash

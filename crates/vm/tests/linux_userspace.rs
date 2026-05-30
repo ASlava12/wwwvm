@@ -12500,6 +12500,105 @@ fn linux_userspace_alpine_apk_milestone() {
     eprintln!("  ✓ APK_TREE_INSTALLED_OK — Alpine's apk installed a local package offline and the new binary ran!");
 }
 
+/// SHA-512 bit-exactness milestone — the sharpest 64-bit-integer ALU check
+/// in the suite. `echo SHA512_INPUT | busybox sha512sum` hashes the 13-byte
+/// input and the test asserts the EXACT 128-hex-digit host digest. Unlike
+/// md5sum/sha1sum (32-bit words), SHA-512 operates on 64-bit words, which a
+/// 32-bit CPU implements as register PAIRS: each 64-bit rotate becomes a
+/// `shld`/`shrd` pair, each 64-bit add an `add`+`adc`. An exact 512-bit
+/// digest match therefore proves the emulator's `SHLD`/`SHRD` (double-
+/// precision shifts) and add-with-carry chains are bit-correct across the
+/// full 64-bit width — paths the 32-bit hashes never stress. Run on the
+/// Alpine musl busybox (the glibc/Tinycore busybox build omits sha512sum).
+/// Asset: WWWVM_ALPINE_MINIROOT (default /tmp/alpine/root). Skips if absent.
+#[test]
+#[ignore = "Alpine sha512: exact 512-bit digest (64-bit ALU/SHLD/SHRD check); needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_sha512_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // Exact host digest of "SHA512_INPUT\n" (echo SHA512_INPUT | sha512sum).
+    const EXPECT: &str = "c52af1221beeaf2ab2551f270dcc8ffe1457406b4a6d69a93f6ed7dfc1c7e92a76c4a9093dfbbbd7ad28d3e20979d474932655d9a09477865edbfed8eb3e5637";
+    let init = b"#!/bin/sh\necho SHA512_INPUT | busybox sha512sum\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT) {
+            found = true;
+            stop_reason = "found exact sha512 digest".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE sha512 (64-bit ALU bit-exactness): exact_digest={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "busybox sha512sum segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-sha512-segv")
+    );
+    assert!(
+        found,
+        "busybox sha512sum did not produce the exact 512-bit digest ({stop_reason}) — a 64-bit \
+         SHLD/SHRD or add-with-carry path is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-sha512-marker")
+    );
+    eprintln!("  ✓ exact SHA-512 digest — 64-bit shifts (SHLD/SHRD) + add-with-carry chains are bit-correct!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
