@@ -12391,6 +12391,115 @@ fn linux_userspace_alpine_interactive_milestone() {
     eprintln!("  ✓ ALPINE_LIVE_42 — typed `echo $((6*7))` into the live Alpine musl shell and it answered!");
 }
 
+/// ALPINE apk INSTALL (offline): run the REAL `apk` package manager INSIDE
+/// the guest to install a package — `apk add --allow-untrusted --no-network
+/// /tree.apk` — then run the freshly-installed binary (`tree --version`).
+/// The marker `APK_TREE_INSTALLED_OK` is gated behind a successful
+/// `tree --version`, so it only prints if apk actually unpacked the package
+/// to /usr/bin/tree, registered it, satisfied its `so:libc.musl-x86.so.1`
+/// dependency from the already-installed musl, AND the new binary then
+/// executed. This proves Alpine's apk (musl-linked, with its zlib/crypto/
+/// db machinery) WORKS on the emulator. It is fully OFFLINE: the package is
+/// a local .apk on the rootfs and `--no-network` is set — the emulator has
+/// no NIC, so fetching from a remote repo (the other half of `apk add`)
+/// would additionally need a network device + a host bridge through the
+/// allowlisted proxy. Asset: WWWVM_ALPINE_APK_ROOT (default
+/// /tmp/alpine/aproot) = the minirootfs with /tree.apk dropped in (see
+/// README). Skips if assets are absent.
+#[test]
+#[ignore = "Alpine apk: real apk installs a local package offline in-guest; needs WWWVM_ALPINE_APK_ROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_apk_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let aproot =
+        std::env::var("WWWVM_ALPINE_APK_ROOT").unwrap_or_else(|_| "/tmp/alpine/aproot".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // Install a local .apk offline, then RUN the installed binary — the
+    // marker only appears if both the install and the new binary worked.
+    let init = b"#!/bin/sh\nexport PATH=/usr/bin:/bin:/usr/sbin:/sbin\n\
+                 apk add --allow-untrusted --no-network /tree.apk\n\
+                 tree --version && echo APK_TREE_INSTALLED_OK\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&aproot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {aproot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains("APK_TREE_INSTALLED_OK") {
+            found = true;
+            stop_reason = "found APK_TREE_INSTALLED_OK".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE apk (offline local install): APK_TREE_INSTALLED_OK={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld-musl could not load apk or the installed binary; {}",
+        dump_uart_on_failure(&cumulative, "alpine-apk-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a process segfaulted during the apk install ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-apk-segv")
+    );
+    assert!(
+        found,
+        "apk did not install /tree.apk and run the new binary ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-apk-marker")
+    );
+    eprintln!("  ✓ APK_TREE_INSTALLED_OK — Alpine's apk installed a local package offline and the new binary ran!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is

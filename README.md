@@ -1501,11 +1501,37 @@ $((6*7))` в живой musl-шелл по UART и ассертит, что об
 `ALPINE_LIVE_42` — то есть весь tty-input-путь (send_input → 16550 RX →
 RX-IRQ → musl ash read() → арифметика → write) работает на Alpine/musl.
 
-Осталось: **apk внутри гостя** (нужна сетевая карта в эмуляторе + мост к
-хосту через proxy с безопасным allowlist'ом — `*` нельзя). Подтверждено
+**apk внутри гостя (offline-установка пакета):**
+
+Настоящий пакетный менеджер Alpine `apk` РАБОТАЕТ внутри гостя — ставит
+пакет из локального `.apk` без сети:
+
+```bash
+cd /tmp/alpine
+# точное имя/версию берём из APKINDEX (прямой scrape листинга врёт):
+curl -sL -o APKINDEX.tar.gz https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86/APKINDEX.tar.gz
+# tree — крошечный пакет, единственная зависимость so:libc.musl-x86.so.1 (musl уже стоит):
+curl -sL -o tree.apk https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86/tree-2.2.1-r0.apk
+cp -a root aproot && cp tree.apk aproot/tree.apk   # rootfs с локальным .apk внутри
+
+cd /home/slava/projects/wwwvm
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_apk_milestone -- --ignored --nocapture
+```
+
+→ `/init` делает `apk add --allow-untrusted --no-network /tree.apk`, затем
+`tree --version`; маркер `APK_TREE_INSTALLED_OK` печатается только если apk
+реально распаковал пакет в `/usr/bin/tree`, зарегистрировал его, разрешил
+зависимость `so:libc.musl-x86.so.1` из уже установленного musl, И новый
+бинарь затем запустился. То есть apk (musl + его zlib/crypto/db) **работает
+на эмуляторе** — установка пакета внутри гостя выполнена (offline).
+
+Осталось: **сетевой `apk add` (fetch из remote-репозитория)** — это
+вторая половина apk, которой нужна сетевая карта в эмуляторе + мост к
+хосту через proxy с безопасным allowlist'ом (`*` нельзя). Подтверждено
 исследованием: NIC-драйверы (rtl8139/virtio-net/e1000) в Alpine
 `vmlinuz-lts` НЕ встроены — они модули в `modloop-lts` (squashfs `.ko`).
-Поэтому apk-в-госте требует: (1) устройство-NIC в эмуляторе, плюс (2) либо
+Поэтому сетевой apk требует: (1) устройство-NIC в эмуляторе, плюс (2) либо
 загрузку модуля в госте (mount squashfs + `finit_module` + релокация
 модуля — ничего из этого пока нет), либо своё ядро с драйвером,
 встроенным (`CONFIG_8139TOO=y`), плюс (3) host-side TCP/IP-мост через
