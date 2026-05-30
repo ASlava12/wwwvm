@@ -11034,6 +11034,57 @@ fn linux_userspace_busybox_file_io_milestone() {
     eprintln!("  ✓ FILE_OK — file write+read round-trip on tmpfs works!");
 }
 
+/// SED/REGEX milestone: a distinct heavy code path from awk's interpreter
+/// — regular-expression compilation + substitution. /init runs
+/// `sh -c 'echo foo123 | busybox sed s/[a-z][a-z]*/SED_OK_/'`. The shell
+/// builds a pipeline; sed compiles the BRE `[a-z][a-z]*` (a character
+/// class with a `*` quantifier), matches the leading run of lowercase
+/// letters in "foo123", and substitutes "SED_OK_" → "SED_OK_123". The marker
+/// "SED_OK_123" can ONLY appear if sed's regex engine compiled and ran
+/// correctly (echo alone prints "foo123"). Regex engines lean on string
+/// scanning / table lookups the simpler applets don't exercise, so this
+/// is a good probe for the next CPU gap. Asserts the marker with no
+/// segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_sed_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo foo123 | busybox sed 's/[a-z][a-z]*/SED_OK_/'",
+        ],
+        "SED_OK_123",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox sed milestone: SED_OK_123={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "sed-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for sed; {}",
+        dump_uart_on_failure(&cumulative, "sed-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox sed segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "sed-segv")
+    );
+    assert!(
+        found,
+        "busybox sed never printed SED_OK_123 (regex compile + \
+         substitution); {}",
+        dump_uart_on_failure(&cumulative, "sed-marker")
+    );
+    eprintln!("  ✓ SED_OK_123 — busybox sed (regex compile + substitute) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
