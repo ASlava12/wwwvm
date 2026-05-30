@@ -1252,6 +1252,22 @@ impl Cpu {
     /// (WWWVM_WATCH_WRITE) fires for every byte regardless of which
     /// path we take.
     fn mem_write_aligned(&self, m: &mut Memory, linear: u32, bytes: &[u8]) {
+        // Diagnostic VALUE watchpoint (one-shot pf_trace dump).
+        if bytes.len() == 4 {
+            if let Some(wv) = *Self::watch_write_value() {
+                if u32::from_le_bytes(bytes.try_into().unwrap()) == wv {
+                    let eip = self.last_op_ip;
+                    if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
+                        if !t.fired {
+                            t.fired = true;
+                            t.dump(&format!(
+                                "VALUE-WATCH {wv:#010x} -> VA={linear:#010x} EIP={eip:#010x}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let len = bytes.len() as u32;
         let page_off = linear & 0xFFF;
         if page_off + len <= 0x1000 {
@@ -1341,6 +1357,20 @@ impl Cpu {
                 u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
                 u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
             ))
+        })
+    }
+
+    /// Diagnostic VALUE watchpoint: `WWWVM_WATCH_VALUE=0xNNNNNNNN` makes
+    /// a 4-byte store of that exact value dump the pf_trace ring once
+    /// (with the target VA + storing EIP). Used to find the instruction
+    /// that corrupts a saved EIP with string bytes (see the multilib
+    /// memory note). No-op unless the env var + pf_trace are set.
+    fn watch_write_value() -> &'static Option<u32> {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<Option<u32>> = OnceLock::new();
+        SPEC.get_or_init(|| {
+            let spec = std::env::var("WWWVM_WATCH_VALUE").ok()?;
+            u32::from_str_radix(spec.trim_start_matches("0x"), 16).ok()
         })
     }
 
