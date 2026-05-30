@@ -659,11 +659,6 @@ fn build_init_execve_argv(argv: &[&str]) -> Vec<u8> {
     make_init_elf32_safe(&code, &segs, 7)
 }
 
-/// `execve("/bin/busybox", ["busybox", "echo", "DYNLINK_OK"])`.
-fn build_init_execve_busybox() -> Vec<u8> {
-    build_init_execve_argv(&["busybox", "echo", "DYNLINK_OK"])
-}
-
 /// Build the same minimal newc cpio archive the linux_boot example
 /// uses for hello mode: /init + /dev + /dev/console (S_IFCHR 5:1).
 /// Inlined here so the test stays self-contained (no example
@@ -10652,6 +10647,90 @@ fn linux_userspace_dynamic_single_lib_milestone() {
     );
 }
 
+/// Shared engine for the multi-library dynamic-linking milestones. Boots
+/// the kernel with an initramfs of busybox + ld.so + the three libraries
+/// (libc/libm/libcrypt), with /init `execve`ing busybox with `argv`, and
+/// runs until `marker` appears in the UART (or a 10 B-step budget).
+/// Returns `(marker_found, full_uart)`, or None if the kernel/rootfs
+/// files are absent (caller should skip).
+fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return None;
+        }
+    };
+    let root =
+        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
+    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (busybox, ld, libc, libm, libcrypt) = (
+        read_or_skip("bin/busybox")?,
+        read_or_skip("lib/ld-linux.so.2")?,
+        read_or_skip("lib/libc.so.6")?,
+        read_or_skip("lib/libm.so.6")?,
+        read_or_skip("lib/libcrypt.so.1")?,
+    );
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let init = build_init_execve_argv(argv);
+    let cpio = build_cpio_tree(
+        &init,
+        &[
+            ("bin/busybox", &busybox),
+            ("lib/ld-linux.so.2", &ld),
+            ("lib/libc.so.6", &libc),
+            ("lib/libm.so.6", &libm),
+            ("lib/libcrypt.so.1", &libcrypt),
+        ],
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        if String::from_utf8_lossy(&cumulative).contains(marker) {
+            found = true;
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(_) | wwwvm_vm::Stop::Halted => break,
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("  run_busybox_dynamic({argv:?}): steps={steps} {marker}={found}");
+    Some((found, cumulative))
+}
+
 /// MULTI-LIBRARY dynamic linking milestone — a real glibc binary that
 /// pulls in THREE shared objects runs end to end. A tiny hand-assembled
 /// /init `execve`s `/bin/busybox` with argv `["busybox", "echo",
@@ -10675,117 +10754,13 @@ fn linux_userspace_dynamic_single_lib_milestone() {
 #[test]
 #[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
 fn linux_userspace_dynamic_multilib_milestone() {
-    let kpath =
-        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
-    let kbytes = match std::fs::read(&kpath) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: read {kpath}: {e}");
-            return;
-        }
-    };
-    let root =
-        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
-    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
-        match std::fs::read(format!("{root}/{rel}")) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!("skipping: read {root}/{rel}: {e}");
-                None
-            }
-        }
-    };
-    let (Some(busybox), Some(ld), Some(libc), Some(libm), Some(libcrypt)) = (
-        read_or_skip("bin/busybox"),
-        read_or_skip("lib/ld-linux.so.2"),
-        read_or_skip("lib/libc.so.6"),
-        read_or_skip("lib/libm.so.6"),
-        read_or_skip("lib/libcrypt.so.1"),
-    ) else {
+    let Some((found, cumulative)) =
+        run_busybox_dynamic(&["busybox", "echo", "DYNLINK_OK"], "DYNLINK_OK")
+    else {
         return;
     };
-
-    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
-    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
-    vm.set_kernel_cmdline(
-        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
-         debug loglevel=8 ignore_loglevel",
-    );
-    let init = build_init_execve_busybox();
-    let cpio = build_cpio_tree(
-        &init,
-        &[
-            ("bin/busybox", &busybox),
-            ("lib/ld-linux.so.2", &ld),
-            ("lib/libc.so.6", &libc),
-            ("lib/libm.so.6", &libm),
-            ("lib/libcrypt.so.1", &libcrypt),
-        ],
-    );
-    vm.set_ramdisk(&cpio).expect("set_ramdisk");
-    vm.start_protected_mode_at(bz.code32_start);
-
-    let mut cumulative = Vec::<u8>::new();
-    let chunk = 10_000_000u32;
-    let budget = 10_000_000_000u64;
-    let mut steps = 0u64;
-    let mut found = false;
-    let stop_reason: String;
-    loop {
-        let (s, stop) = vm.run_steps_idle_aware(chunk);
-        steps += s as u64;
-        let out = vm.drain_output();
-        if !out.is_empty() {
-            cumulative.extend_from_slice(&out);
-        }
-        if String::from_utf8_lossy(&cumulative).contains("DYNLINK_OK") {
-            found = true;
-            stop_reason = "found DYNLINK_OK".to_string();
-            break;
-        }
-        match stop {
-            wwwvm_vm::Stop::CpuError(e) => {
-                stop_reason = format!("CpuError: {e}");
-                break;
-            }
-            wwwvm_vm::Stop::Halted => {
-                stop_reason = "Halted".to_string();
-                break;
-            }
-            wwwvm_vm::Stop::StepBudget => {
-                if steps >= budget {
-                    stop_reason = "step budget exhausted".to_string();
-                    break;
-                }
-            }
-        }
-    }
-
     let text = String::from_utf8_lossy(&cumulative);
-    eprintln!("=== dynamic exec milestone ===");
-    eprintln!("  steps run: {steps}");
-    eprintln!("  stop reason: {stop_reason}");
-    eprintln!("  DYNLINK_OK seen: {found}");
-    for needle in [
-        "[EXECVE-FAIL]",
-        "error while loading shared libraries",
-        "segfault at",
-        "trap invalid opcode",
-        "Kernel panic",
-    ] {
-        if let Some(p) = text.find(needle) {
-            let endp = text[p..]
-                .find('\n')
-                .map(|n| p + n)
-                .unwrap_or((p + 120).min(text.len()));
-            eprintln!("  [{needle}] {:?}", &text[p..endp]);
-        }
-    }
-    if !found {
-        let tail = &cumulative[cumulative.len().saturating_sub(700)..];
-        eprintln!("  --- last {} bytes of UART ---", tail.len());
-        eprintln!("{}", String::from_utf8_lossy(tail));
-    }
+    eprintln!("=== multi-lib dynamic milestone: DYNLINK_OK={found} ===");
 
     // Assertions: busybox's echo applet must have run end to end through
     // ld.so + the three libraries, with no loader/relocation failure.
@@ -10825,84 +10800,13 @@ fn linux_userspace_dynamic_multilib_milestone() {
 #[test]
 #[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
 fn linux_userspace_busybox_sh_milestone() {
-    let kpath =
-        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
-    let kbytes = match std::fs::read(&kpath) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: read {kpath}: {e}");
-            return;
-        }
-    };
-    let root =
-        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
-    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
-        match std::fs::read(format!("{root}/{rel}")) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!("skipping: read {root}/{rel}: {e}");
-                None
-            }
-        }
-    };
-    let (Some(busybox), Some(ld), Some(libc), Some(libm), Some(libcrypt)) = (
-        read_or_skip("bin/busybox"),
-        read_or_skip("lib/ld-linux.so.2"),
-        read_or_skip("lib/libc.so.6"),
-        read_or_skip("lib/libm.so.6"),
-        read_or_skip("lib/libcrypt.so.1"),
-    ) else {
+    let Some((found, cumulative)) =
+        run_busybox_dynamic(&["busybox", "sh", "-c", "echo SHELL_OK"], "SHELL_OK")
+    else {
         return;
     };
-
-    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
-    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
-    vm.set_kernel_cmdline(
-        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
-         debug loglevel=8 ignore_loglevel",
-    );
-    let init = build_init_execve_argv(&["busybox", "sh", "-c", "echo SHELL_OK"]);
-    let cpio = build_cpio_tree(
-        &init,
-        &[
-            ("bin/busybox", &busybox),
-            ("lib/ld-linux.so.2", &ld),
-            ("lib/libc.so.6", &libc),
-            ("lib/libm.so.6", &libm),
-            ("lib/libcrypt.so.1", &libcrypt),
-        ],
-    );
-    vm.set_ramdisk(&cpio).expect("set_ramdisk");
-    vm.start_protected_mode_at(bz.code32_start);
-
-    let mut cumulative = Vec::<u8>::new();
-    let chunk = 10_000_000u32;
-    let budget = 10_000_000_000u64;
-    let mut steps = 0u64;
-    let mut found = false;
-    loop {
-        let (s, stop) = vm.run_steps_idle_aware(chunk);
-        steps += s as u64;
-        let out = vm.drain_output();
-        if !out.is_empty() {
-            cumulative.extend_from_slice(&out);
-        }
-        if String::from_utf8_lossy(&cumulative).contains("SHELL_OK") {
-            found = true;
-            break;
-        }
-        match stop {
-            wwwvm_vm::Stop::CpuError(_) | wwwvm_vm::Stop::Halted => break,
-            wwwvm_vm::Stop::StepBudget => {
-                if steps >= budget {
-                    break;
-                }
-            }
-        }
-    }
-
     let text = String::from_utf8_lossy(&cumulative);
-    eprintln!("=== busybox sh milestone (steps {steps}, SHELL_OK={found}) ===");
+    eprintln!("=== busybox sh milestone: SHELL_OK={found} ===");
     assert!(
         !text.contains("[EXECVE-FAIL]"),
         "execve(/bin/busybox sh) failed; {}",
@@ -10924,6 +10828,49 @@ fn linux_userspace_busybox_sh_milestone() {
         dump_uart_on_failure(&cumulative, "sh-marker")
     );
     eprintln!("  ✓ SHELL_OK — busybox shell runs a -c command end to end!");
+}
+
+/// Fork+exec milestone: the busybox shell launches ANOTHER dynamically-
+/// linked program. /init `execve`s `busybox sh -c "/bin/busybox echo
+/// FORK_OK"`; the explicit `/bin/busybox` path (not a shell builtin)
+/// forces `sh` to fork() and execve() a SECOND copy of busybox, so the
+/// kernel + ld.so load libc+libm+libcrypt again for the child. This is
+/// the essence of "running programs from a shell" — fork, exec, and a
+/// fresh dynamic-link cycle from inside a running glibc process. Asserts
+/// FORK_OK appears with no segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_sh_fork_exec_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &["busybox", "sh", "-c", "/bin/busybox echo FORK_OK"],
+        "FORK_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox sh fork+exec milestone: FORK_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "fork-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the forked busybox; {}",
+        dump_uart_on_failure(&cumulative, "fork-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox sh/child segfaulted during fork+exec; {}",
+        dump_uart_on_failure(&cumulative, "fork-segv")
+    );
+    assert!(
+        found,
+        "the shell's `/bin/busybox echo FORK_OK` (fork+exec of a 2nd \
+         dynamic load) never printed its marker; {}",
+        dump_uart_on_failure(&cumulative, "fork-marker")
+    );
+    eprintln!("  ✓ FORK_OK — shell fork+exec of a dynamic program works!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
