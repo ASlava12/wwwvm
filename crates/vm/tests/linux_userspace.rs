@@ -13034,6 +13034,107 @@ fn linux_userspace_alpine_printf_dtoa_milestone() {
     eprintln!("  ✓ printf '%.17g' 0.1 → 0.10000000000000001, π → 3.1415926535897931 — 80-bit x87 precision works!");
 }
 
+/// ARBITRARY-PRECISION ARITHMETIC milestone — `echo '2^200' | busybox bc`
+/// must print the exact 61-digit integer 2^200. bc is a real POSIX
+/// arbitrary-precision calculator (a genuine bignum library, NOT the
+/// double-based busybox `dc`), so this computes 2^200 via repeated bignum
+/// multiplication over limb arrays and converts the result to a 61-digit
+/// decimal string. An exact match validates the bignum multiply + carry +
+/// base-10 conversion across hundreds of limb operations — a software
+/// big-integer workload distinct from the bit-exact hashes (md5/sha) and
+/// the fixed-width ALU. 61 digits < bc's 70-column wrap, so it stays on one
+/// line. Alpine musl busybox (the glibc/Tinycore build omits bc). Asset
+/// WWWVM_ALPINE_MINIROOT (default /tmp/alpine/root). Skips if absent.
+#[test]
+#[ignore = "Alpine bc: exact arbitrary-precision 2^200; needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_bc_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // 2^200, exact (Python: 2**200). 61 digits.
+    const EXPECT: &str = "1606938044258990275541962092341162602522202993782792835301376";
+    let init = b"#!/bin/sh\necho '2^200' | busybox bc\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT) {
+            found = true;
+            stop_reason = "found exact 2^200".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE bc (arbitrary precision): 2^200 exact={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "busybox bc segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-bc-segv")
+    );
+    assert!(
+        found,
+        "busybox bc did not print the exact 61-digit 2^200 ({stop_reason}) — a bignum \
+         multiply/carry/base-conversion path is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-bc-marker")
+    );
+    eprintln!(
+        "  ✓ 2^200 exact — bc's arbitrary-precision bignum multiply + base-10 conversion works!"
+    );
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
