@@ -11679,6 +11679,49 @@ fn linux_userspace_libm_bindnow_diag() {
     }
 }
 
+/// DIAGNOSTIC (always passes): the cleanest possible probe of the
+/// first-libm-call bug, with the awk sum/eval-order confounds removed.
+/// Runs `awk 'BEGIN{x=sin(1); y=sin(1); printf "RES_%d_%d", int(x*10000),
+/// int(y*10000)}'` DIRECTLY as /init (no sh wrapper). sin(1)=0.8414709,
+/// so int(sin(1)*10000)=8414. Two back-to-back identical calls:
+///   - RES_8414_8414 → both correct → the "first call lost" model is WRONG
+///     (the minimal form does NOT reproduce it; the earlier loss was an
+///     awk/sum artifact).
+///   - RES_0_8414 (or X≠8414, Y=8414) → first call lost, second correct →
+///     model CONFIRMED with minimal confounds; next step is to trace the
+///     single first sin() call.
+#[test]
+#[ignore = "diagnostic: minimal two-sin-call probe for the first-libm-call bug; ~60s"]
+fn linux_userspace_libm_doublecall_diag() {
+    let Some((both_ok, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "awk",
+            "BEGIN{x=sin(1); y=sin(1); printf \"RES_%d_%d\\n\", int(x*10000), int(y*10000)}",
+        ],
+        "RES_8414_8414",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    // Pull whatever RES_ token actually printed.
+    let got = text
+        .split_whitespace()
+        .find(|t| t.starts_with("RES_"))
+        .unwrap_or("(none)");
+    eprintln!("=== minimal two-sin-call diag: both_ok={both_ok} got={got} ===");
+    if both_ok {
+        eprintln!(
+            "  → RES_8414_8414: minimal form does NOT reproduce — loss was an awk/sum artifact."
+        );
+    } else if got.starts_with("RES_0_") {
+        eprintln!("  → first sin() lost, second correct: model CONFIRMED. Trace the first call.");
+    } else {
+        eprintln!("  → unexpected ({got}); see dump.");
+        eprintln!("{}", dump_uart_on_failure(&cumulative, "libm-doublecall"));
+    }
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
