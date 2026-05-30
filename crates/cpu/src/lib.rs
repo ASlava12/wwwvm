@@ -6702,6 +6702,28 @@ impl Cpu {
                         let v = self.xmm[reg as usize];
                         self.write_xmm_rm(rm, mem, v);
                     }
+                    // PUNPCKL/H {BW,WD,DQ,QDQ} (66 0F 60/61/62/6C and
+                    // 68/69/6A/6D) — interleave the low / high elements of
+                    // the destination (reg) and source (rm). SSE2 xmm form;
+                    // emitted by musl/openssl SIMD (e.g. `punpckldq xmm,xmm`
+                    // to broadcast/duplicate dwords). We model the xmm forms;
+                    // the MMX (no-66) forms use the separate mm stack.
+                    0x60 | 0x61 | 0x62 | 0x6C | 0x68 | 0x69 | 0x6A | 0x6D if self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        let dst = self.xmm[reg as usize];
+                        let (elem, high) = match op2 {
+                            0x60 => (8, false),
+                            0x61 => (16, false),
+                            0x62 => (32, false),
+                            0x6C => (64, false),
+                            0x68 => (8, true),
+                            0x69 => (16, true),
+                            0x6A => (32, true),
+                            _ => (64, true), // 0x6D PUNPCKHQDQ
+                        };
+                        self.xmm[reg as usize] = punpck(dst, src, elem, high);
+                    }
                     // Packed-integer logicals (66 0F): PAND/POR/PXOR.
                     // Lane-independent, so they're plain 128-bit bitops.
                     // `pxor xmm, xmm` is the canonical XMM-zeroing idiom.
@@ -9021,6 +9043,27 @@ fn comis_flags(ord: Option<std::cmp::Ordering>) -> (bool, bool, bool) {
         Some(Less) => (false, false, true),     // a < b
         Some(Equal) => (true, false, false),    // a == b
     }
+}
+
+/// PUNPCKL/H interleave for SSE2: weave the low (`high=false`) or high
+/// (`high=true`) half's `elem`-bit elements of `d` (destination) and `s`
+/// (source) — `out[2i] = d[base+i]`, `out[2i+1] = s[base+i]`. `elem` is
+/// one of 8/16/32/64; `base` is 0 for the low half, `n/2` for the high.
+fn punpck(d: u128, s: u128, elem: u32, high: bool) -> u128 {
+    let n = 128 / elem; // element count
+    let base = if high { n / 2 } else { 0 };
+    let mask: u128 = if elem >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << elem) - 1
+    };
+    let get = |v: u128, i: u32| (v >> (i * elem)) & mask;
+    let mut out = 0u128;
+    for i in 0..(n / 2) {
+        out |= get(d, base + i) << ((2 * i) * elem);
+        out |= get(s, base + i) << ((2 * i + 1) * elem);
+    }
+    out
 }
 
 /// x86 MIN/MAX lane rule for f64: `MIN` returns the source (`b`)

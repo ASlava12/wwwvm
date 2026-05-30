@@ -11395,3 +11395,48 @@ fn unknown_opcode_reports_error() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+/// PUNPCKL/H {BW,WD,DQ,QDQ} (66 0F 60/61/62/6C / 68/69/6A/6D) — the SSE2
+/// interleave family. `apk` (no args) crashed on `66 0F 62 C0`
+/// (PUNPCKLDQ xmm0,xmm0), emitted by musl/openssl SIMD.
+#[test]
+fn sse_punpck_family() {
+    fn run(xmm0: u128, xmm1: u128, code: &[u8]) -> u128 {
+        let mut mem = Memory::new(0x10_0000);
+        mem.write_slice(0x7C00, code);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        cpu.xmm[0] = xmm0;
+        cpu.xmm[1] = xmm1;
+        let mut io = IoBus::new();
+        for _ in 0..8 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        cpu.xmm[0]
+    }
+    let a = 0xDDDDDDDD_CCCCCCCC_BBBBBBBB_AAAAAAAA_u128;
+    let b = 0x44444444_33333333_22222222_11111111_u128;
+    // 66 0F 62 C0 — PUNPCKLDQ xmm0,xmm0 → [d0,d0,d1,d1]
+    assert_eq!(
+        run(a, 0, &[0x66, 0x0F, 0x62, 0xC0, 0xF4]),
+        0xBBBBBBBB_BBBBBBBB_AAAAAAAA_AAAAAAAA
+    );
+    // 66 0F 62 C1 — PUNPCKLDQ xmm0,xmm1 → [d0,s0,d1,s1]
+    assert_eq!(
+        run(a, b, &[0x66, 0x0F, 0x62, 0xC1, 0xF4]),
+        0x22222222_BBBBBBBB_11111111_AAAAAAAA
+    );
+    // 66 0F 6D C1 — PUNPCKHQDQ xmm0,xmm1 → [d.hi64, s.hi64]
+    assert_eq!(
+        run(a, b, &[0x66, 0x0F, 0x6D, 0xC1, 0xF4]),
+        0x44444444_33333333_DDDDDDDD_CCCCCCCC
+    );
+    // 66 0F 60 C1 — PUNPCKLBW xmm0,xmm1 → interleave low 8 bytes
+    assert_eq!(
+        run(a, b, &[0x66, 0x0F, 0x60, 0xC1, 0xF4]),
+        0x22BB22BB_22BB22BB_11AA11AA_11AA11AA
+    );
+}
