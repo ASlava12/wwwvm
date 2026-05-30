@@ -11085,6 +11085,57 @@ fn linux_userspace_busybox_sed_milestone() {
     eprintln!("  ✓ SED_OK_123 — busybox sed (regex compile + substitute) works!");
 }
 
+/// LS -l milestone: a different SYSCALL surface than the text-processing
+/// applets — directory enumeration and file metadata. /init runs
+/// `sh -c 'echo x > /LSMARK_FILE; busybox ls -l /'`. The shell creates a
+/// uniquely-named file at the rootfs root, then `ls -l /` enumerates the
+/// directory (getdents64), lstat's every entry, and formats mode / link
+/// count / uid / gid / size / mtime into columns. The marker
+/// "LSMARK_FILE" appears in the listing only if getdents64 returned the
+/// freshly-created entry AND the stat/format path ran — exercising the
+/// VFS metadata path (readdir + stat + time formatting) that pipes and
+/// regex never touch. Asserts the marker with no segfault / loader error
+/// / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_ls_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo x > /LSMARK_FILE; busybox ls -l /",
+        ],
+        "LSMARK_FILE",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox ls -l milestone: LSMARK_FILE={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "ls-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for ls; {}",
+        dump_uart_on_failure(&cumulative, "ls-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox ls segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "ls-segv")
+    );
+    assert!(
+        found,
+        "busybox ls -l / never listed the freshly-created LSMARK_FILE \
+         (getdents64 + lstat + format); {}",
+        dump_uart_on_failure(&cumulative, "ls-marker")
+    );
+    eprintln!("  ✓ LSMARK_FILE — busybox ls -l (getdents64 + lstat + format) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
