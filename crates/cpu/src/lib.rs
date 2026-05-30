@@ -6444,8 +6444,15 @@ impl Cpu {
                         if self.raise_gp_if_user(op_ip, mem) {
                             return Ok(());
                         }
-                        let cs_sel = ((self.sysenter_cs & 0xFFFC).wrapping_add(16)) as u16;
-                        let ss_sel = cs_sel.wrapping_add(8);
+                        // Return to ring 3: CS = SYSENTER_CS+16, SS =
+                        // SYSENTER_CS+24, BOTH with RPL forced to 3 (so
+                        // CPL becomes 3). Without the RPL=3 the returned
+                        // userspace ran at CPL=0, which mis-tags every
+                        // subsequent user memory access as supervisor
+                        // (wrong U/S bit in #PF error codes).
+                        let base = (self.sysenter_cs & 0xFFFC) as u16;
+                        let cs_sel = base.wrapping_add(16) | 3;
+                        let ss_sel = base.wrapping_add(24) | 3;
                         self.write_sreg(sreg::CS, cs_sel, mem);
                         self.write_sreg(sreg::SS, ss_sel, mem);
                         self.ip = self.read_r32(2); // EDX

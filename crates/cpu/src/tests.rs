@@ -8542,6 +8542,32 @@ fn sysenter_loads_cs_eip_ss_esp_from_msrs() {
     assert_eq!(cpu.read_r32(r16::SP as u8), 0x0007_0000);
 }
 
+/// SYSEXIT (0F 35) must return to ring 3: CS = SYSENTER_CS+16 and
+/// SS = SYSENTER_CS+24, BOTH with RPL forced to 3 (CPL becomes 3).
+/// Regression: it left RPL=0, so post-syscall userspace ran at CPL=0
+/// and every user memory access was mis-tagged supervisor (wrong U/S
+/// bit in #PF error codes).
+#[test]
+fn sysexit_returns_to_ring3() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE; CS selector 0 -> CPL=0, so SYSEXIT is allowed.
+    cpu.sysenter_cs = 0x10; // kernel CS base value
+    cpu.write_r32(2, 0x0040_1000); // EDX = return EIP
+    cpu.write_r32(1, 0xBFFF_0000); // ECX = return ESP
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x7C00, &[0x0F, 0x35]); // SYSEXIT
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("step");
+    // base = 0x10: CS = 0x10+16=0x20 | 3 = 0x23; SS = 0x10+24=0x28 | 3 = 0x2B.
+    assert_eq!(cpu.sregs[sreg::CS], 0x23, "SYSEXIT CS = base+16, RPL=3");
+    assert_eq!(cpu.sregs[sreg::SS], 0x2B, "SYSEXIT SS = base+24, RPL=3");
+    assert_eq!(cpu.sregs[sreg::CS] & 3, 3, "CPL = 3 after SYSEXIT");
+    assert_eq!(cpu.ip, 0x0040_1000, "EIP from EDX");
+    assert_eq!(cpu.read_r32(r16::SP as u8), 0xBFFF_0000, "ESP from ECX");
+}
+
 /// 0x0F 0x1F — multi-byte NOP. Verifies the dispatch consumes the
 /// ModR/M (and disp here) without touching architectural state.
 #[test]
