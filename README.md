@@ -207,11 +207,27 @@ ModR/M полный — все 16-битные формы адресации с 
 | PS/2 keyboard            | 0x60/0x64    | 1  | level (rx queue non-empty) |
 | MC146818 CMOS/RTC        | 0x70/0x71    | —  | (alarm IRQ 8 не реализован) |
 | VGA text mode (RAM)      | mem 0xB8000  | —  | — |
+| PCI host bridge + RTL8139 NIC | 0xCF8/0xCFC + BAR0 | 11 → slave bit 3 | level (ISR & IMR) |
 
 `IoBus::refresh_irqs` на каждом шаге CPU перекладывает все pending
 IRQ в IRR. Slave автоматически каскадит через master IRQ 2: если master
 выставляет IRQ 2, `pending_irq_vector` спускается в slave и возвращает
 его вектор, а `ack_irq` ack'ает оба чипа — двухтактный INTA на железе.
+
+**Сеть (RTL8139, `crates/devices/src/{pci,rtl8139}.rs`).** PCI Mechanism #1
+(0xCF8/0xCFC) с host-bridge (Intel 440FX) на 00:00.0 — без него ядро
+печатает «PCI: Fatal» и отключает шину. NIC RealTek RTL8139 на 00:01.0
+(vendor 0x10EC device 0x8139), MAC `52:54:00:12:34:56` читается стоковым
+`8139too` из модели 93C46 EEPROM (Microwire bit-bang на Cmd9346). BAR0 —
+256-байтное I/O-окно. **Bus-master DMA** идёт через шаг CPU (у устройства
+нет доступа к гостевой RAM): на TX `Cpu::service_nic_tx` копирует кадры
+из RAM по дескрипторам TSAD/TSD в `Vm::drain_tx_frames`; на RX
+`Vm::inject_rx_frame` пишет кадр в кольцо RBSTART (заголовок status+len,
+−16-quirk у CAPR) и поднимает ISR.ROK → IRQ 11. Драйверы NIC у Alpine —
+модули (`mii.ko`+`8139too.ko` из modloop-lts), грузятся `insmod` как есть
+(кастомное ядро не нужно). Хост-сторона — `crates/vm/src/lan.rs`
+(`VirtualGateway`): отвечает на ARP и ICMP echo; **`ping 10.0.2.2` из
+гостя проходит** (0% loss, ядро проверяет наши IP/ICMP-контрольные суммы).
 
 ### Оркестрация (`crates/vm`)
 
@@ -1530,15 +1546,20 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 на эмуляторе** — установка пакета внутри гостя выполнена (offline).
 
 Осталось: **сетевой `apk add` (fetch из remote-репозитория)** — это
-вторая половина apk, которой нужна сетевая карта в эмуляторе + мост к
-хосту через proxy с безопасным allowlist'ом (`*` нельзя). Подтверждено
-исследованием: NIC-драйверы (rtl8139/virtio-net/e1000) в Alpine
-`vmlinuz-lts` НЕ встроены — они модули в `modloop-lts` (squashfs `.ko`).
-Поэтому сетевой apk требует: (1) устройство-NIC в эмуляторе, плюс (2) либо
-загрузку модуля в госте (mount squashfs + `finit_module` + релокация
-модуля — ничего из этого пока нет), либо своё ядро с драйвером,
-встроенным (`CONFIG_8139TOO=y`), плюс (3) host-side TCP/IP-мост через
-allowlist'нутый proxy. Это большая многосессионная фича.
+вторая половина apk. Прогресс (фичу строим по частям, каждая
+teeth-confirmed в реальном Alpine):
+- **A (NIC) ✅** — эмулированный RTL8139 + PCI host-bridge; стоковые
+  `mii.ko`+`8139too.ko` из `modloop-lts` грузятся `insmod` как есть
+  (релокация модуля/`finit_module` — это гостевой код на нашем CPU,
+  кастомное ядро НЕ нужно). eth0 поднимается с реальным MAC; bus-master
+  TX/RX-DMA + IRQ 11 работают (см. секцию «Сеть» выше).
+- **B1 (L2/L3-шлюз) ✅** — `crates/vm/src/lan.rs::VirtualGateway` отвечает
+  на ARP и ICMP echo; `ping 10.0.2.2` из гостя проходит (0% loss).
+- **B2/B3 (DNS + TCP-NAT) — в работе** — host-side мост: терминируем
+  гостевой TCP, открываем реальный сокет к destination (прозрачный relay,
+  TLS остаётся end-to-end), DNS-форвардер; всё через allowlist
+  (`WWWVM_PROXY_ALLOWLIST`, deny-by-default, `*` в проде нельзя).
+- **C/D** — `apk update`/`apk add` из сети поверх этого.
 
 **Бит-точность 64-битного ALU (sha512):**
 

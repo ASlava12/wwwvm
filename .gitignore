@@ -5,3 +5,7 @@ pkg/
 node_modules/
 dist/
 .DS_Store
+
+# Scratch notes and Claude runtime state (accidentally committed earlier)
+/temp
+.claude/
