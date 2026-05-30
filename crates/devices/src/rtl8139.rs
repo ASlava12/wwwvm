@@ -113,6 +113,13 @@ impl Rtl8139 {
         self.reg_u16(ISR) & self.reg_u16(IMR) != 0
     }
 
+    /// True when the driver has kicked one or more transmits that the VM
+    /// hasn't drained yet — a cheap guard so the step loop only does the
+    /// bus-master copy when there's actually a frame waiting.
+    pub fn has_pending_tx(&self) -> bool {
+        !self.tx_pending.is_empty()
+    }
+
     /// Drain the frames the driver queued for transmit, as (guest-physical
     /// addr, len). The VM reads each from RAM and sends it to the host. TX
     /// is reported complete synchronously (OWN+TOK already set), so the

@@ -1995,6 +1995,15 @@ impl Vm {
         self.io.uart_mut().drain_tx()
     }
 
+    /// Drain the Ethernet frames the guest's NIC driver has transmitted
+    /// since the last call. Each is a complete L2 frame (dst/src MAC,
+    /// ethertype, payload) the CPU step copied out of guest RAM via the
+    /// RTL8139 bus-master TX path. The host networking bridge feeds these
+    /// onward; an empty vec means nothing was sent.
+    pub fn drain_tx_frames(&mut self) -> Vec<Vec<u8>> {
+        self.io.drain_nic_tx()
+    }
+
     /// Step the CPU up to `max` times. Returns (steps_executed, reason).
     /// HLT is treated as a *terminal* stop here — for the guests in
     /// our test fleet (HELLO_GUEST, the calculator demo, etc.) the

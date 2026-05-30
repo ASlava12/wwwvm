@@ -11442,3 +11442,97 @@ fn sse_punpck_family() {
         0x22BB22BB_22BB22BB_11AA11AA_11AA11AA
     );
 }
+
+// --- RTL8139 NIC: bus-master TX DMA + IRQ 11 wiring (integration) ---
+
+/// Latch a PCI mechanism-#1 config address for 00:01.0 (the RTL8139),
+/// register `reg`, via four byte OUTs to 0xCF8.
+fn pci_cfg_addr(io: &mut IoBus, reg: u32) {
+    let addr = 0x8000_0000u32 | (1 << 11) | reg; // enable | dev 1 | reg
+    for i in 0..4u16 {
+        io.write(0xCF8 + i, (addr >> (i * 8)) as u8);
+    }
+}
+
+/// Write a dword to the PCI config data window (0xCFC) byte by byte.
+fn pci_cfg_data(io: &mut IoBus, val: u32) {
+    for i in 0..4u16 {
+        io.write(0xCFC + i, (val >> (i * 8)) as u8);
+    }
+}
+
+/// Bring the NIC's I/O BAR online exactly as the kernel does: assign
+/// BAR0 (reg 0x10) the I/O base, then set the command register's
+/// I/O-enable bit (reg 0x04). Returns the assigned base.
+fn enable_nic_io(io: &mut IoBus, base: u16) -> u16 {
+    pci_cfg_addr(io, 0x10);
+    pci_cfg_data(io, base as u32);
+    pci_cfg_addr(io, 0x04);
+    pci_cfg_data(io, 0x0000_0001);
+    assert!(io.pci.nic_io_enabled());
+    assert_eq!(io.pci.nic_io_base(), base);
+    base
+}
+
+/// Write a 32-bit NIC register (offset within the I/O window) via four
+/// byte OUTs, low byte first — how a guest 32-bit OUT decomposes.
+fn nic_out32(io: &mut IoBus, base: u16, off: u16, val: u32) {
+    for i in 0..4u16 {
+        io.write(base + off + i, (val >> (i * 8)) as u8);
+    }
+}
+
+#[test]
+fn rtl8139_bus_master_tx_dma_captures_frame() {
+    let mut mem = Memory::new(0x10_0000);
+    // A recognizable 64-byte frame sitting in guest RAM.
+    let frame: Vec<u8> = (0..64u8).map(|b| b ^ 0xA5).collect();
+    let buf_addr = 0x2_0000u32;
+    mem.write_slice(buf_addr, &frame);
+    // A lone NOP for the CPU to retire, so step() runs the TX service.
+    mem.write_slice(0x7C00, &[0x90]);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    let base = enable_nic_io(&mut io, 0xC000);
+
+    // Driver programs the descriptor: buffer address, then size+OWN=0.
+    nic_out32(&mut io, base, 0x20, buf_addr); // TSAD0
+    nic_out32(&mut io, base, 0x10, frame.len() as u32); // TSD0 (OWN clear)
+    assert!(io.nic_has_pending_tx());
+
+    // One CPU step copies the frame out of guest RAM (bus-master TX).
+    cpu.step(&mut mem, &mut io).expect("step");
+
+    assert_eq!(io.drain_nic_tx(), vec![frame]);
+    assert!(io.drain_nic_tx().is_empty(), "drained exactly once");
+    assert!(!io.nic_has_pending_tx(), "descriptor consumed");
+}
+
+#[test]
+fn rtl8139_tx_completion_raises_irq11_through_cascade() {
+    let mut io = IoBus::new();
+    let base = enable_nic_io(&mut io, 0xC000);
+    // Unmask TOK in the NIC IMR (reg 0x3C, 16-bit).
+    io.write(base + 0x3C, 0x04);
+    io.write(base + 0x3D, 0x00);
+    // Unmask the cascade on the master (IRQ 2) and IRQ 11 on the slave
+    // (bit 3) — what the kernel does when it requests the NIC's IRQ.
+    io.pic.imr &= !(1 << 2);
+    io.slave_pic.imr &= !(1 << 3);
+
+    // Kick a transmit; the device latches ISR.TOK.
+    nic_out32(&mut io, base, 0x20, 0x1000);
+    nic_out32(&mut io, base, 0x10, 60);
+
+    io.refresh_irqs();
+    // IRQ 11 is slave-PIC vector base 0x70 + 3 = 0x73; the CPU sees the
+    // slave vector, never the cascade IRQ 2 itself.
+    assert_eq!(io.pending_irq_vector(), Some(0x73));
+
+    // After the driver acks ISR.TOK, the line drops.
+    io.write(base + 0x3E, 0x04);
+    io.refresh_irqs();
+    assert_eq!(io.pending_irq_vector(), None);
+}

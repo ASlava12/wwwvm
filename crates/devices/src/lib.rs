@@ -77,6 +77,10 @@ pub struct IoBus {
     /// RTL8139 NIC register file (00:01.0). Dispatched at the I/O base the
     /// kernel assigns to BAR0 (see `pci.nic_io_base`).
     pub rtl8139: Rtl8139,
+    /// Ethernet frames the guest transmitted, copied out of guest RAM by
+    /// the CPU step's bus-master TX service. The host (run loop / bridge)
+    /// drains this with `drain_nic_tx`. Ephemeral — not snapshotted.
+    nic_tx_frames: Vec<Vec<u8>>,
 }
 
 impl IoBus {
@@ -107,6 +111,7 @@ impl IoBus {
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
             rtl8139: Rtl8139::new(),
+            nic_tx_frames: Vec::new(),
             pit_div_counter: 0,
         }
     }
@@ -125,6 +130,7 @@ impl IoBus {
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
             rtl8139: Rtl8139::new(),
+            nic_tx_frames: Vec::new(),
             pit_div_counter: 0,
         }
     }
@@ -184,6 +190,15 @@ impl IoBus {
                 self.pic.irr |= 1u8 << 0;
             }
         }
+        // RTL8139 NIC — level-triggered on IRQ 11, which lives on the
+        // slave PIC (IRQ 8..15 → slave IRR bits 0..7, so IRQ 11 = bit 3).
+        // The cascade block below then propagates it to master IRQ 2.
+        let nic_slave_bit = 1u8 << 3;
+        if self.rtl8139.irq_pending() {
+            self.slave_pic.irr |= nic_slave_bit;
+        } else {
+            self.slave_pic.irr &= !nic_slave_bit;
+        }
         // Cascade — slave-pending state controls master IRR bit 2.
         // Level-triggered so master deasserts as soon as the slave has
         // nothing left to deliver.
@@ -225,6 +240,33 @@ impl IoBus {
             self.slave_pic.ack();
         }
         self.pic.ack();
+    }
+
+    /// True when the NIC has a transmit the CPU step should DMA out of
+    /// guest RAM. Cheap guard so the bus-master copy only runs when work
+    /// is actually queued.
+    pub fn nic_has_pending_tx(&self) -> bool {
+        self.rtl8139.has_pending_tx()
+    }
+
+    /// Drain the NIC's queued transmit descriptors as (guest-physical
+    /// address, length). The CPU step reads each frame out of guest RAM
+    /// (it holds the `Memory`) and hands the bytes back via
+    /// `record_nic_tx_frame` — the device crate itself never touches RAM.
+    pub fn take_nic_tx_descriptors(&mut self) -> Vec<(u32, u16)> {
+        self.rtl8139.take_tx_frames()
+    }
+
+    /// Store one Ethernet frame copied out of guest RAM, ready for the
+    /// host bridge to pick up with `drain_nic_tx`.
+    pub fn record_nic_tx_frame(&mut self, frame: Vec<u8>) {
+        self.nic_tx_frames.push(frame);
+    }
+
+    /// Take every Ethernet frame the guest has transmitted since the last
+    /// drain. The host networking bridge calls this each run-loop batch.
+    pub fn drain_nic_tx(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.nic_tx_frames)
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
@@ -675,13 +717,17 @@ mod tests {
         let mut bus = IoBus::new();
         bus.slave_pic.imr = 0;
         bus.pic.imr = !(1 << 2);
-        bus.slave_pic.raise_irq(3); // slave IRQ 11 → vector 0x73
+        // Use IRQ 9 (slave bit 1, vector 0x71) — a line no device drives,
+        // so the level-triggered refresh below leaves our manual raise
+        // alone. (Slave bit 3 / IRQ 11 now belongs to the RTL8139, whose
+        // own cascade path is covered in the cpu crate's NIC test.)
+        bus.slave_pic.raise_irq(1);
         bus.refresh_irqs();
-        assert_eq!(bus.pending_irq_vector(), Some(0x73));
+        assert_eq!(bus.pending_irq_vector(), Some(0x71));
         bus.ack_irq();
         // Both PICs moved their bits from IRR to ISR.
         assert_eq!(bus.pic.isr & (1 << 2), 1 << 2);
-        assert_eq!(bus.slave_pic.isr & (1 << 3), 1 << 3);
+        assert_eq!(bus.slave_pic.isr & (1 << 1), 1 << 1);
         // No further pending — refresh_irqs deasserts master cascade
         // once slave has nothing left unmasked-and-unserviced.
         bus.refresh_irqs();

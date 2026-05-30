@@ -3474,6 +3474,22 @@ impl Cpu {
         Ok(())
     }
 
+    /// RTL8139 bus-master transmit. When the guest kicks a TX descriptor
+    /// the device records (guest-physical addr, len); the device crate
+    /// can't read guest RAM, so the CPU step (which holds the `Memory`)
+    /// copies each frame out here and hands the bytes to the IoBus for the
+    /// host bridge. Done promptly each step so the driver can't reuse the
+    /// transmit buffer before we've captured its contents.
+    fn service_nic_tx(mem: &Memory, io: &mut IoBus) {
+        for (addr, size) in io.take_nic_tx_descriptors() {
+            let mut frame = Vec::with_capacity(size as usize);
+            for i in 0..size as u32 {
+                frame.push(mem.read_u8(addr.wrapping_add(i)));
+            }
+            io.record_nic_tx_frame(frame);
+        }
+    }
+
     /// Execute a single instruction. Returns Ok(()) on success, or an
     /// error if the opcode/ModR/M form is not implemented.
     ///
@@ -3493,6 +3509,9 @@ impl Cpu {
             mem.tick_lapic_timer();
             mem.tick_hpet_counter();
             io.refresh_irqs();
+            if io.nic_has_pending_tx() {
+                Self::service_nic_tx(mem, io);
+            }
             // Sleeping ticks still advance TSC — Linux measures
             // idle time against TSC and expects monotonic forward
             // motion even when no instruction retires.
@@ -3581,6 +3600,9 @@ impl Cpu {
         // clear, so software-paused HPET still works.
         mem.tick_hpet_counter();
         io.refresh_irqs();
+        if io.nic_has_pending_tx() {
+            Self::service_nic_tx(mem, io);
+        }
         if self.has(flag::IF) {
             // LAPIC IRQs win over legacy PIC — they're the higher-
             // priority source on real silicon, and the kernel
