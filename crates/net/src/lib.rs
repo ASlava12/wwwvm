@@ -19,5 +19,6 @@
 #![forbid(unsafe_code)]
 
 pub mod allow;
+pub mod dns;
 
 pub use allow::Allowlist;
