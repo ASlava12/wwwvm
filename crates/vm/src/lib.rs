@@ -2004,6 +2004,24 @@ impl Vm {
         self.io.drain_nic_tx()
     }
 
+    /// Deliver one inbound Ethernet frame (L2, no CRC) to the guest's NIC.
+    /// The device lays out the RX-ring header and tells us where to DMA it;
+    /// we (holding the `Memory`) write the bytes into guest RAM and the
+    /// device raises ISR.ROK, so the next CPU step asserts IRQ 11 and the
+    /// driver's receive handler runs. Returns false if RX is disabled or
+    /// the ring is full (frame dropped) — the inverse of `drain_tx_frames`.
+    pub fn inject_rx_frame(&mut self, frame: &[u8]) -> bool {
+        match self.io.rtl8139.accept_rx(frame) {
+            Some((dest, bytes)) => {
+                for (i, b) in bytes.iter().enumerate() {
+                    self.mem.write_u8(dest.wrapping_add(i as u32), *b);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Step the CPU up to `max` times. Returns (steps_executed, reason).
     /// HLT is treated as a *terminal* stop here — for the guests in
     /// our test fleet (HELLO_GUEST, the calculator demo, etc.) the

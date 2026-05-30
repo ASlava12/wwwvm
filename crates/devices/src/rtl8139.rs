@@ -62,6 +62,17 @@ const TSD_SIZE_MASK: u32 = 0x1FFF; // frame length, bits 0..12
 const ISR_TOK: u16 = 1 << 2; // transmit-OK interrupt
 const ISR_ROK: u16 = 1 << 0; // receive-OK interrupt
 
+// Receive path.
+const RBSTART: usize = 0x30; // RX ring base, guest-physical (32-bit)
+const CAPR: usize = 0x38; // Current Address of Packet Read (driver's rptr − 16)
+const CBR: usize = 0x3A; // Current Buffer Address (NIC's write offset)
+const RCR: usize = 0x44; // RX Configuration (buffer-length + WRAP bits)
+const CMD_RX_ENABLE: u8 = 1 << 3; // ChipCmd: RX engine enabled
+const CMD_BUFE: u8 = 1 << 0; // ChipCmd: RX buffer empty (read-only status)
+const RX_STATUS_ROK: u16 = 0x0001; // per-packet RX header status: receive OK
+const ETH_MIN_FRAME: usize = 60; // minimum Ethernet frame (sans 4-byte CRC)
+const RX_CRC_LEN: usize = 4; // trailing FCS the driver strips off
+
 impl Rtl8139 {
     pub fn new() -> Self {
         Self::with_mac(DEFAULT_MAC)
@@ -135,6 +146,68 @@ impl Rtl8139 {
         self.regs[ISR..ISR + 2].copy_from_slice(&isr.to_le_bytes());
     }
 
+    /// RX ring length in bytes, selected by RCR bits 11-12 (00=8K, 01=16K,
+    /// 10=32K, 11=64K). This is the modulo length the driver uses; the
+    /// driver allocates an extra ~1.5 KB of slack so a packet written near
+    /// the end (WRAP/RxNoWrap mode) can spill past it without wrapping.
+    fn rx_buf_len(&self) -> u32 {
+        8192u32 << ((self.reg_u32(RCR) >> 11) & 0x3)
+    }
+
+    /// True when the RX ring holds no unread packets — the NIC's write
+    /// offset (CBR) has caught up to the driver's read offset (CAPR + 16).
+    /// The driver polls this via ChipCmd bit 0 (BUFE) to drain its rx loop.
+    fn rx_buffer_empty(&self) -> bool {
+        let len = self.rx_buf_len();
+        let wptr = self.reg_u16(CBR) as u32 % len;
+        let rptr = (self.reg_u16(CAPR) as u32).wrapping_add(16) % len;
+        wptr == rptr
+    }
+
+    /// Accept one inbound Ethernet frame (L2, no CRC) into the RX ring.
+    /// Returns the guest-physical destination and the exact bytes to write
+    /// there — the device can't touch RAM, so the VM performs the DMA — or
+    /// `None` if RX is disabled or the ring lacks room (frame dropped).
+    ///
+    /// Layout per the RTL8139 legacy receiver: a 4-byte header (u16 status,
+    /// u16 length-including-CRC) then the frame, a 4-byte dummy CRC, padded
+    /// to a dword. We assume RxNoWrap (8139too's mode): the packet is
+    /// written contiguously from the current offset, spilling into the
+    /// driver's slack rather than wrapping mid-packet; CBR wraps for the
+    /// next one. ISR.ROK is raised so the VM's refresh asserts IRQ 11.
+    pub fn accept_rx(&mut self, frame: &[u8]) -> Option<(u32, Vec<u8>)> {
+        if self.regs[0x37] & CMD_RX_ENABLE == 0 {
+            return None;
+        }
+        // Pad runt frames to the Ethernet minimum, as a real NIC does.
+        let payload = frame.len().max(ETH_MIN_FRAME);
+        let rx_size = payload + RX_CRC_LEN; // length field counts the CRC
+        let total = (4 + rx_size).next_multiple_of(4); // header + data, dword-aligned
+
+        let len = self.rx_buf_len();
+        if total as u32 >= len {
+            return None; // frame larger than the whole ring — drop
+        }
+        let wptr = self.reg_u16(CBR) as u32 % len;
+        let rptr = (self.reg_u16(CAPR) as u32).wrapping_add(16) % len;
+        let unread = (wptr + len - rptr) % len;
+        if unread + total as u32 >= len {
+            return None; // would overrun unread data — drop
+        }
+
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&RX_STATUS_ROK.to_le_bytes());
+        buf.extend_from_slice(&(rx_size as u16).to_le_bytes());
+        buf.extend_from_slice(frame);
+        buf.resize(total, 0); // pad payload to ETH_MIN, CRC, and dword align
+
+        let dest = self.reg_u32(RBSTART).wrapping_add(wptr);
+        let new_cbr = ((wptr + total as u32) % len) as u16;
+        self.regs[CBR..CBR + 2].copy_from_slice(&new_cbr.to_le_bytes());
+        self.signal_rx_ok();
+        Some((dest, buf))
+    }
+
     /// Read one byte from the register window (offset within BAR0).
     pub fn read_reg(&self, off: u16) -> u8 {
         let off = (off & 0xFF) as usize;
@@ -149,6 +222,16 @@ impl Rtl8139 {
             // so `mii` brings the carrier on and the interface can go UP.
             0x64 => 0x2D,
             0x65 => 0x78,
+            // ChipCmd: bit 0 (BUFE) is a live status bit the driver polls to
+            // tell whether the RX ring has an unread packet; the stored
+            // RX/TX-enable bits ride alongside it.
+            0x37 => {
+                if self.rx_buffer_empty() {
+                    self.regs[0x37] | CMD_BUFE
+                } else {
+                    self.regs[0x37] & !CMD_BUFE
+                }
+            }
             _ => self.regs[off],
         }
     }
@@ -431,6 +514,82 @@ mod tests {
         let mut nic = Rtl8139::new();
         nic.signal_rx_ok();
         assert_ne!(nic.read_reg(0x3E) & 0x01, 0, "ISR ROK");
+    }
+
+    // Bring the RX engine online exactly as 8139too's open() does: program
+    // the ring base (RBSTART), default RCR (8 KB buffer), initialise CAPR to
+    // −16 (0xFFF0, the driver's quirk), and set ChipCmd RxEnable.
+    fn rx_ready(rbstart: u32) -> Rtl8139 {
+        let mut nic = Rtl8139::new();
+        wreg32(&mut nic, 0x30, rbstart); // RBSTART
+        nic.write_reg(0x38, 0xF0); // CAPR = 0xFFF0
+        nic.write_reg(0x39, 0xFF);
+        nic.write_reg(0x37, 0x08); // ChipCmd: RxEnable
+        nic
+    }
+
+    #[test]
+    fn rx_accept_writes_header_and_marks_data_available() {
+        let rbstart = 0x4_0000u32;
+        let mut nic = rx_ready(rbstart);
+        // Fresh ring: BUFE set (empty), no ROK yet.
+        assert_ne!(nic.read_reg(0x37) & 0x01, 0, "BUFE set when empty");
+
+        let frame = vec![0xAA; 64];
+        let (dest, bytes) = nic.accept_rx(&frame).expect("frame accepted");
+        assert_eq!(dest, rbstart, "first packet lands at the ring base");
+        // Header: status ROK, length = frame + 4-byte CRC.
+        assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0x0001);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 68);
+        assert_eq!(&bytes[4..4 + 64], &frame[..], "frame copied after header");
+        // total = align_up(4 header + 68, 4) = 72.
+        assert_eq!(bytes.len(), 72);
+        // CBR advanced; ROK raised; ring no longer empty.
+        let cbr = nic.read_reg(0x3A) as u16 | ((nic.read_reg(0x3B) as u16) << 8);
+        assert_eq!(cbr, 72);
+        assert_ne!(nic.read_reg(0x3E) & 0x01, 0, "ISR.ROK raised");
+        assert_eq!(nic.read_reg(0x37) & 0x01, 0, "BUFE clear — packet waiting");
+
+        // Driver consumes the packet: cur_rx = 72 → CAPR = 72 − 16 = 56.
+        nic.write_reg(0x38, 56);
+        nic.write_reg(0x39, 0);
+        assert_ne!(
+            nic.read_reg(0x37) & 0x01,
+            0,
+            "BUFE set once read ptr catches up"
+        );
+    }
+
+    #[test]
+    fn rx_runt_frame_padded_to_min() {
+        let mut nic = rx_ready(0x1000);
+        let frame = vec![0x11; 20]; // a 20-byte runt
+        let (_, bytes) = nic.accept_rx(&frame).expect("accepted");
+        // Length field is the padded minimum (60) plus the 4-byte CRC.
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 64);
+        assert_eq!(bytes.len(), 68); // align_up(4 + 64, 4)
+        assert_eq!(&bytes[4..24], &frame[..], "real bytes preserved");
+        assert!(bytes[24..].iter().all(|&b| b == 0), "padding is zero");
+    }
+
+    #[test]
+    fn rx_dropped_when_engine_disabled() {
+        let mut nic = Rtl8139::new(); // RxEnable never set
+        assert!(nic.accept_rx(&[0u8; 64]).is_none());
+    }
+
+    #[test]
+    fn rx_ring_full_drops_until_drained() {
+        let mut nic = rx_ready(0x2000);
+        let frame = vec![0x22; 60];
+        let mut accepted = 0;
+        // The driver never advances CAPR, so the 8 KB ring eventually fills.
+        while nic.accept_rx(&frame).is_some() {
+            accepted += 1;
+            assert!(accepted < 1000, "must stop, not loop forever");
+        }
+        assert!(accepted > 0, "some frames fit");
+        assert!(nic.accept_rx(&frame).is_none(), "still full");
     }
 
     #[test]

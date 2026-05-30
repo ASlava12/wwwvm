@@ -11536,3 +11536,43 @@ fn rtl8139_tx_completion_raises_irq11_through_cascade() {
     io.refresh_irqs();
     assert_eq!(io.pending_irq_vector(), None);
 }
+
+#[test]
+fn rtl8139_rx_dmas_frame_into_ring_and_raises_irq11() {
+    let mut mem = Memory::new(0x10_0000);
+    let mut io = IoBus::new();
+    let base = enable_nic_io(&mut io, 0xC000);
+
+    let rbstart = 0x3_0000u32;
+    // Driver brings RX up: ring base, CAPR=-16, ChipCmd RxEnable, and
+    // unmasks ROK in the NIC IMR + the cascade/IRQ-11 lines in the PICs.
+    nic_out32(&mut io, base, 0x30, rbstart); // RBSTART
+    io.write(base + 0x38, 0xF0); // CAPR = 0xFFF0
+    io.write(base + 0x39, 0xFF);
+    io.write(base + 0x37, 0x08); // ChipCmd: RxEnable
+    io.write(base + 0x3C, 0x01); // IMR: unmask ROK
+    io.write(base + 0x3D, 0x00);
+    io.pic.imr &= !(1 << 2);
+    io.slave_pic.imr &= !(1 << 3);
+
+    // Host delivers an inbound frame: the device lays out the ring entry
+    // and we DMA the bytes into guest RAM — exactly Vm::inject_rx_frame.
+    let frame: Vec<u8> = (0..72u8).map(|b| b.wrapping_mul(3)).collect();
+    let (dest, bytes) = io.rtl8139.accept_rx(&frame).expect("frame accepted");
+    assert_eq!(dest, rbstart);
+    for (i, b) in bytes.iter().enumerate() {
+        mem.write_u8(dest + i as u32, *b);
+    }
+
+    // The ring entry: [status ROK][len = frame + CRC] then the frame.
+    assert_eq!(mem.read_u8(rbstart) & 0x01, 0x01, "RX status ROK");
+    let len = mem.read_u8(rbstart + 2) as u16 | ((mem.read_u8(rbstart + 3) as u16) << 8);
+    assert_eq!(len, (frame.len() + 4) as u16);
+    for (i, b) in frame.iter().enumerate() {
+        assert_eq!(mem.read_u8(rbstart + 4 + i as u32), *b, "frame byte {i}");
+    }
+
+    // ROK unmasked → IRQ 11 (vector 0x73) pending through the cascade.
+    io.refresh_irqs();
+    assert_eq!(io.pending_irq_vector(), Some(0x73));
+}
