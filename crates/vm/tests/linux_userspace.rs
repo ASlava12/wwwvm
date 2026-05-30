@@ -10873,6 +10873,50 @@ fn linux_userspace_busybox_sh_fork_exec_milestone() {
     eprintln!("  ✓ FORK_OK — shell fork+exec of a dynamic program works!");
 }
 
+/// Shell PIPELINE milestone: /init runs
+/// `busybox sh -c "echo PIPE_OK | busybox cat"`. The shell builds a
+/// two-stage pipeline — it `pipe()`s, `fork()`s both stages, `dup2()`s
+/// the pipe onto stdin/stdout, runs `echo PIPE_OK` (its stdout → the
+/// pipe) and `busybox cat` (its stdin ← the pipe, stdout → the console).
+/// So `PIPE_OK` flows echo → pipe → cat → UART. This exercises the full
+/// shell I/O-plumbing path (pipe + fork + dup2 + exec of a dynamic
+/// binary) on top of multi-library linking. Asserts PIPE_OK with no
+/// segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_pipeline_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &["busybox", "sh", "-c", "echo PIPE_OK | busybox cat"],
+        "PIPE_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox pipeline milestone: PIPE_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "pipe-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for a pipeline stage; {}",
+        dump_uart_on_failure(&cumulative, "pipe-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a pipeline stage segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "pipe-segv")
+    );
+    assert!(
+        found,
+        "the shell pipeline `echo PIPE_OK | busybox cat` never printed its \
+         marker; {}",
+        dump_uart_on_failure(&cumulative, "pipe-marker")
+    );
+    eprintln!("  ✓ PIPE_OK — shell pipeline (pipe+fork+dup2+exec) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
