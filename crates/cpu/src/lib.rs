@@ -7813,6 +7813,22 @@ impl Cpu {
                             let b = self.fpu_st(i);
                             self.fpu_set_eflags_compare(a, b);
                         }
+                        // FCMOVNcc ST(0),ST(i): copy ST(i) into ST(0) if the
+                        // negated EFLAGS condition holds. DB C0+i=FCMOVNB
+                        // (CF=0), C8+i=FCMOVNE(ZF=0), D0+i=FCMOVNBE(CF=0&ZF=0),
+                        // D8+i=FCMOVNU(PF=0).
+                        0xC0..=0xDF => {
+                            let cc = match modrm & 0x38 {
+                                0x00 => 0x03, // FCMOVNB  (CF=0)
+                                0x08 => 0x05, // FCMOVNE  (ZF=0)
+                                0x10 => 0x07, // FCMOVNBE (CF=0 & ZF=0)
+                                _ => 0x0B,    // FCMOVNU  (PF=0)
+                            };
+                            if self.eval_cond(cc) {
+                                let v = self.fpu_st(modrm & 0x07);
+                                self.fpu_set_st(0, v);
+                            }
+                        }
                         _ => {
                             return Err(CpuError::Unimplemented {
                                 opcode,
@@ -8140,8 +8156,38 @@ impl Cpu {
                             let v = self.fpu_pop() as f32;
                             self.mem_write_u32(mem, addr, v.to_bits());
                         }
+                        // FLDENV m28 — load the x87 environment. glibc's
+                        // feholdexcept/fesetenv (used to bracket libm
+                        // transcendentals) round-trip CW/SW/TOP through this.
+                        // The 32-bit protected-mode image puts CW at +0, SW
+                        // at +4, tag word at +8; we restore CW/SW/TOP and
+                        // ignore the (unmodeled) instruction/data pointers.
+                        4 => {
+                            let cw = self.mem_read_u16(mem, addr);
+                            let sw = self.mem_read_u16(mem, addr.wrapping_add(4));
+                            self.fpu_cw = cw;
+                            self.fpu_top = ((sw >> 11) & 7) as u8;
+                            self.fpu_sw = sw & !0x3800;
+                        }
                         // FLDCW m16 — load control word.
                         5 => self.fpu_cw = self.mem_read_u16(mem, addr),
+                        // FNSTENV m28 — store the x87 environment, then mask
+                        // all FP exceptions (CW |= 0x3F), per the SDM (this
+                        // is why feholdexcept uses it). We write CW/SW/TW;
+                        // the IP/DP/opcode fields are zeroed (not modeled).
+                        6 => {
+                            let cw = self.fpu_cw;
+                            let sw = self.fpu_status_word();
+                            for off in (0..28).step_by(4) {
+                                self.mem_write_u32(mem, addr.wrapping_add(off), 0);
+                            }
+                            self.mem_write_u16(mem, addr, cw);
+                            self.mem_write_u16(mem, addr.wrapping_add(4), sw);
+                            // tag word: 0xFFFF = all empty. Our model doesn't
+                            // enforce tags, so the exact value is cosmetic.
+                            self.mem_write_u16(mem, addr.wrapping_add(8), 0xFFFF);
+                            self.fpu_cw |= 0x3F;
+                        }
                         // FNSTCW m16 — store control word.
                         7 => {
                             let cw = self.fpu_cw;
@@ -8157,23 +8203,66 @@ impl Cpu {
                     }
                 }
             }
-            // DA — only FUCOMPP (DA E9) is modeled; the FCMOVcc and
-            // integer-arith (FIADD/FIMUL/…) forms remain Unimplemented.
+            // DA — 32-bit-integer-source arithmetic (FIADD/FIMUL/FICOM/
+            // FICOMP/FISUB/FISUBR/FIDIV/FIDIVR with an m32int operand), the
+            // FCMOVcc register forms (B/E/BE/U), and FUCOMPP (DA E9). The
+            // integer-arith forms appear directly in busybox/glibc.
             0xDA => {
                 let modrm = self.fetch_u8(mem);
-                if modrm == 0xE9 {
-                    // FUCOMPP — unordered compare ST(0),ST(1), pop twice.
-                    let st0 = self.fpu_st(0);
-                    let st1 = self.fpu_st(1);
-                    self.fpu_compare(st0, st1);
-                    let _ = self.fpu_pop();
-                    let _ = self.fpu_pop();
+                let mode = modrm >> 6;
+                if mode == 0b11 {
+                    match modrm {
+                        // DA E9 — FUCOMPP: compare ST(0),ST(1), pop twice.
+                        0xE9 => {
+                            let st0 = self.fpu_st(0);
+                            let st1 = self.fpu_st(1);
+                            self.fpu_compare(st0, st1);
+                            let _ = self.fpu_pop();
+                            let _ = self.fpu_pop();
+                        }
+                        // FCMOVcc ST(0),ST(i): if the EFLAGS condition holds,
+                        // copy ST(i) into ST(0). DA C0+i=FCMOVB(CF=1), C8+i=
+                        // FCMOVE(ZF=1), D0+i=FCMOVBE(CF=1|ZF=1), D8+i=
+                        // FCMOVU(PF=1).
+                        0xC0..=0xDF => {
+                            let cc = match modrm & 0x38 {
+                                0x00 => 0x02, // FCMOVB  — "below"  (CF=1)
+                                0x08 => 0x04, // FCMOVE  — "equal"  (ZF=1)
+                                0x10 => 0x06, // FCMOVBE — "be"     (CF=1|ZF=1)
+                                _ => 0x0A,    // FCMOVU  — "parity" (PF=1)
+                            };
+                            if self.eval_cond(cc) {
+                                let v = self.fpu_st(modrm & 0x07);
+                                self.fpu_set_st(0, v);
+                            }
+                        }
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
                 } else {
-                    return Err(CpuError::Unimplemented {
-                        opcode,
-                        cs: op_cs,
-                        ip: op_ip,
-                    });
+                    // Memory form: signed 32-bit integer source → f64.
+                    let op = (modrm >> 3) & 0x07;
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    let src = self.mem_read_u32(mem, addr) as i32 as f64;
+                    let st0 = self.fpu_st(0);
+                    if op == 2 || op == 3 {
+                        self.fpu_compare(st0, src);
+                        if op == 3 {
+                            let _ = self.fpu_pop(); // FICOMP pops
+                        }
+                    } else if let Some(r) = Self::fpu_arith(op, st0, src) {
+                        self.fpu_set_st(0, r);
+                    }
                 }
             }
             // DE — arithmetic with a pop. The register forms used by

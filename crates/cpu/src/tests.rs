@@ -7553,6 +7553,173 @@ fn fpu_fild_fist_m16_signed() {
     );
 }
 
+/// DA memory forms — 32-bit-integer-source arithmetic (FIADD /0, FIMUL
+/// /1). busybox/glibc emit these (`da 44 24 58 fiaddl`); they were
+/// Unimplemented before. (10 + 5) * 2 = 30.
+#[test]
+fn fpu_da_mem_integer_arith() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 10); // ST0 seed (FILD)
+    mem.write_u32(0x604, 5); // FIADD operand
+    mem.write_u32(0x60C, 2); // FIMUL operand
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600]   -> ST0 = 10
+            0xDA, 0x06, 0x04, 0x06, // FIADD m32 [0x604]  -> ST0 = 15
+            0xDA, 0x0E, 0x0C, 0x06, // FIMUL m32 [0x60C]  -> ST0 = 30
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 30, "(10 + 5) * 2 = 30 via FIADD/FIMUL");
+}
+
+/// DA FIDIVR (/7) — REVERSED integer divide: ST0 = mem / ST0, not
+/// ST0 / mem. 30 / 10 = 3 (FIDIV would give 10/30 = 0).
+#[test]
+fn fpu_da_fidivr_reversed() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 10);
+    mem.write_u32(0x604, 30);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 10
+            0xDA, 0x3E, 0x04, 0x06, // FIDIVR m32 [0x604] -> ST0 = 30/10 = 3
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 3, "FIDIVR: 30 / 10 = 3 (reversed)");
+}
+
+/// DA C8+i FCMOVE — conditional move ST(i)->ST(0) when ZF=1. With ZF
+/// set (xor eax,eax), FCMOVE ST(0),ST(1) replaces ST0(=1) with ST1(=99).
+#[test]
+fn fpu_da_fcmove_moves_when_zf() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 99);
+    mem.write_u32(0x604, 1);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 99
+            0xDB, 0x06, 0x04, 0x06, // FILD m32 [0x604] -> ST0 = 1, ST1 = 99
+            0x31, 0xC0, // XOR AX,AX -> ZF = 1
+            0xDA, 0xC9, // FCMOVE ST(0),ST(1) -> ZF set -> ST0 = 99
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 99, "FCMOVE moves ST(1) when ZF=1");
+}
+
+/// DB C8+i FCMOVNE — conditional move when ZF=0. With ZF clear
+/// (mov ax,1; test ax,ax), FCMOVNE ST(0),ST(1) replaces ST0 with ST1.
+#[test]
+fn fpu_db_fcmovne_moves_when_not_zf() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 77);
+    mem.write_u32(0x604, 1);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 77
+            0xDB, 0x06, 0x04, 0x06, // FILD m32 [0x604] -> ST0 = 1, ST1 = 77
+            0xB8, 0x01, 0x00, // MOV AX,1
+            0x85, 0xC0, // TEST AX,AX -> ZF = 0
+            0xDB, 0xC9, // FCMOVNE ST(0),ST(1) -> ZF clear -> ST0 = 77
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..20 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 77, "FCMOVNE moves ST(1) when ZF=0");
+}
+
+/// D9 /6 FNSTENV + D9 /4 FLDENV — x87 environment save/restore (glibc
+/// feholdexcept/fesetenv use these to bracket libm math). FNSTENV stores
+/// the control word and then MASKS all exceptions (CW |= 0x3F); FLDENV
+/// restores the originally-stored CW.
+#[test]
+fn fpu_d9_fldenv_fnstenv_roundtrip() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u16(0x600, 0x0400); // CW1: RC=01, all exceptions UNmasked
+    mem.write_u16(0x640, 0x0C00); // CW2: a different control word
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x2E, 0x00, 0x06, // FLDCW [0x600]   -> CW = 0x0400
+            0xD9, 0x36, 0x20, 0x06, // FNSTENV [0x620] -> store env, then CW |= 0x3F
+            0xD9, 0x3E, 0x30, 0x06, // FNSTCW [0x630]  -> store post-mask CW
+            0xD9, 0x2E, 0x40, 0x06, // FLDCW [0x640]   -> CW = 0x0C00
+            0xD9, 0x26, 0x20, 0x06, // FLDENV [0x620]  -> restore CW = 0x0400
+            0xD9, 0x3E, 0x50, 0x06, // FNSTCW [0x650]  -> store restored CW
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    // FNSTENV stored the pre-mask CW into the env image at [0x620].
+    assert_eq!(mem.read_u16(0x620), 0x0400, "FNSTENV stores CW at +0");
+    // ...and masked exceptions in the live CW (0x0400 | 0x3F).
+    assert_eq!(
+        mem.read_u16(0x630),
+        0x043F,
+        "FNSTENV masks exceptions (CW |= 0x3F)"
+    );
+    // FLDENV restored the stored CW, overwriting the 0x0C00 from FLDCW.
+    assert_eq!(mem.read_u16(0x650), 0x0400, "FLDENV restores the stored CW");
+}
+
 /// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
 /// the "wrong" order, fix with FXCH, FSUBP.
 #[test]

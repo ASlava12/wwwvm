@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**634 теста** зелёные (mem 30 + devices 77 + cpu 382 + vm 128 +
+**639 тестов** зелёные (mem 30 + devices 77 + cpu 387 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -1235,13 +1235,25 @@ fault-trace/watchpoint трейл расследования (wild-jumps в ст
 ложным следом — он был downstream от U/S-коррапта; см. git history +
 memory `multilib-dynamic-linking-state.md`.
 
-**Единственный CPU-баг, вскрытый этими workload'ами:** awk вызвал
-`unimplemented opcode 0xDF` — x87 **DF memory-формы** (`FILD/FIST/FISTP
-m16/m64`, int↔double-конверсия), которых не было в декодере (echo/cat/sh/
-pipeline их не трогают). Реализованы DF /0 /2 /3 /5 /7 + 2 teeth-confirmed
+**CPU-баги, вскрытые этими workload'ами:** awk вызвал `unimplemented
+opcode 0xDF` — x87 **DF memory-формы** (`FILD/FIST/FISTP m16/m64`,
+int↔double-конверсия), которых не было в декодере (echo/cat/sh/pipeline
+их не трогают). Реализованы DF /0 /2 /3 /5 /7 + 2 teeth-confirmed
 unit-теста. Урок: реальные workload'ы ходят по путям, которых нет у
 простых applet'ов — стресс-тестирование настоящими программами находит
 дыры, недостижимые синтетикой.
+
+**Проактивный аудит декодера (workflow):** дизассемблировали РЕАЛЬНЫЕ
+busybox/libc/libm/ld.so/libcrypt через `llvm-objdump`, извлекли все
+редкие инструкции, которые они используют, и сверили с декодером — чтобы
+найти латентные unimplemented-краши ДО того, как на них наткнётся
+workload. Нашли и реализовали: x87 **DA memory integer-arith**
+(`FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR m32int` — есть прямо
+в busybox), **FLDENV/FNSTENV** (D9 /4,/6 — glibc `feholdexcept`/`fesetenv`
+вокруг libm-математики), и **FCMOVcc/FCMOVNcc** (DA/DB регистровые формы —
+libm `fcmove`). 5 teeth-confirmed unit-тестов. Низкорисковые находки
+(TSX `xbegin`/`xend`, PKU `rdpkru`, `xgetbv`) оставлены unimplemented —
+они CPUID-gated cold (leaf 7/OSXSAVE отключены, glibc идёт по fallback).
 
 ## Что НЕ работает (дорожная карта к Alpine)
 
