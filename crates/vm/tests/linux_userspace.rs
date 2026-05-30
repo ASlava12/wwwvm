@@ -11136,6 +11136,58 @@ fn linux_userspace_busybox_ls_milestone() {
     eprintln!("  ✓ LSMARK_FILE — busybox ls -l (getdents64 + lstat + format) works!");
 }
 
+/// SHELL CONTROL-FLOW milestone: real shell scripting, not just running a
+/// single applet. /init runs
+/// `sh -c 'n=0; for x in 1 2 3 4; do n=$((n+x)); done; if [ $n -eq 10 ]; then echo SHELL_SUM_10; fi'`.
+/// This drives the shell's own interpreter: variable assignment, a `for`
+/// loop over a word list, arithmetic expansion `$((n+x))` accumulating a
+/// running total, then an `if` with the `[` test builtin doing an integer
+/// `-eq` comparison. The marker "SHELL_SUM_10" is printed ONLY if the loop
+/// iterated all four times, the arithmetic summed to exactly 10, and the
+/// conditional evaluated true — so it validates control-flow AND arithmetic
+/// correctness, not merely "the shell didn't crash". Asserts the marker
+/// with no segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_shell_arith_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "n=0; for x in 1 2 3 4; do n=$((n+x)); done; \
+             if [ $n -eq 10 ]; then echo SHELL_SUM_10; fi",
+        ],
+        "SHELL_SUM_10",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox shell control-flow milestone: SHELL_SUM_10={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "shell-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the shell; {}",
+        dump_uart_on_failure(&cumulative, "shell-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the shell segfaulted running the control-flow script; {}",
+        dump_uart_on_failure(&cumulative, "shell-segv")
+    );
+    assert!(
+        found,
+        "the shell never printed SHELL_SUM_10 — a for-loop with arithmetic \
+         expansion + an `if [ -eq ]` test did not evaluate correctly; {}",
+        dump_uart_on_failure(&cumulative, "shell-marker")
+    );
+    eprintln!("  ✓ SHELL_SUM_10 — shell for-loop + $(()) arithmetic + [ -eq ] test works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
