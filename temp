@@ -1,0 +1,18 @@
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack            # один раз
+wasm-pack build crates/wasm --target web --out-dir ../../web/pkg
+python3 -m http.server -d web 8080
+
+
+
+
+
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_busybox_sh_milestone -- --ignored --nocapture
+
+
+
+WWWVM_KERNEL=/tmp/wwwvm-linux/vmlinuz cargo run -p wwwvm-vm --release --example linux_boot
+
+
+

@@ -45,7 +45,22 @@ pub struct Rtl8139 {
     ee_count: u8,
     ee_shift: u16,
     ee_dobit: u8,
+    /// Frames the driver kicked for transmit, as (guest-physical addr,
+    /// length). The device can't read guest RAM itself, so the VM loop
+    /// drains this, DMAs each frame out, and the bytes go to the host.
+    tx_pending: Vec<(u32, u16)>,
 }
+
+// RTL8139 register offsets (within the BAR0 I/O window).
+const TSD0: usize = 0x10; // TxStatus0-3 at 0x10/0x14/0x18/0x1C
+const TSAD0: usize = 0x20; // TxAddr0-3 at 0x20/0x24/0x28/0x2C
+const IMR: usize = 0x3C; // interrupt mask (16-bit)
+const ISR: usize = 0x3E; // interrupt status (16-bit, write-1-to-clear)
+const TSD_OWN: u32 = 1 << 13; // descriptor owned by NIC (driver clears to TX)
+const TSD_TOK: u32 = 1 << 15; // transmit OK (NIC sets on completion)
+const TSD_SIZE_MASK: u32 = 0x1FFF; // frame length, bits 0..12
+const ISR_TOK: u16 = 1 << 2; // transmit-OK interrupt
+const ISR_ROK: u16 = 1 << 0; // receive-OK interrupt
 
 impl Rtl8139 {
     pub fn new() -> Self {
@@ -71,7 +86,46 @@ impl Rtl8139 {
             ee_count: 0,
             ee_shift: 0,
             ee_dobit: 0,
+            tx_pending: Vec::new(),
         }
+    }
+
+    /// Read a little-endian u32 from the register file.
+    fn reg_u32(&self, off: usize) -> u32 {
+        u32::from_le_bytes([
+            self.regs[off],
+            self.regs[off + 1],
+            self.regs[off + 2],
+            self.regs[off + 3],
+        ])
+    }
+    fn set_reg_u32(&mut self, off: usize, v: u32) {
+        self.regs[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn reg_u16(&self, off: usize) -> u16 {
+        u16::from_le_bytes([self.regs[off], self.regs[off + 1]])
+    }
+
+    /// True when the NIC is asserting its interrupt line — any interrupt
+    /// status bit that the mask (IMR) has enabled. The VM wires this into
+    /// the PIC (IRQ 11).
+    pub fn irq_pending(&self) -> bool {
+        self.reg_u16(ISR) & self.reg_u16(IMR) != 0
+    }
+
+    /// Drain the frames the driver queued for transmit, as (guest-physical
+    /// addr, len). The VM reads each from RAM and sends it to the host. TX
+    /// is reported complete synchronously (OWN+TOK already set), so the
+    /// caller must copy the bytes out before the driver reuses the buffer.
+    pub fn take_tx_frames(&mut self) -> Vec<(u32, u16)> {
+        core::mem::take(&mut self.tx_pending)
+    }
+
+    /// Mark a receive-OK interrupt (the VM calls this after DMAing a frame
+    /// into the RX ring). Sets ISR.ROK; the VM then re-checks irq_pending.
+    pub fn signal_rx_ok(&mut self) {
+        let isr = self.reg_u16(ISR) | ISR_ROK;
+        self.regs[ISR..ISR + 2].copy_from_slice(&isr.to_le_bytes());
     }
 
     /// Read one byte from the register window (offset within BAR0).
@@ -83,6 +137,11 @@ impl Rtl8139 {
             0x50 => (self.regs[0x50] & !EE_DO) | self.ee_dobit,
             // TxConfig high byte: report the RTL-8139C hardware version.
             0x43 => HW_VERSION_HI,
+            // BasicModeStatus (BMSR, the internal PHY's MII status, 0x64):
+            // report link-up + autoneg-complete + 10/100 capable (0x782D)
+            // so `mii` brings the carrier on and the interface can go UP.
+            0x64 => 0x2D,
+            0x65 => 0x78,
             _ => self.regs[off],
         }
     }
@@ -101,6 +160,28 @@ impl Rtl8139 {
             0x37 => self.regs[0x37] = value & !0x10,
             // IDR0-5 hold the MAC; read-only.
             0x00..=0x05 => {}
+            // ISR (interrupt status) is write-1-to-clear: the driver acks
+            // an interrupt by writing 1s to the bits it handled.
+            0x3E | 0x3F => self.regs[off] &= !value,
+            // TSD0-3 high byte completes a 32-bit transmit-descriptor write.
+            // The 8139too driver writes the full dword (size + OWN cleared)
+            // to kick TX; we queue the frame and report TX done at once.
+            0x13 | 0x17 | 0x1B | 0x1F => {
+                self.regs[off] = value;
+                let n = (off - 0x13) / 4; // descriptor index 0..3
+                let tsd_off = TSD0 + n * 4;
+                let tsd = self.reg_u32(tsd_off);
+                if tsd & TSD_OWN == 0 {
+                    let addr = self.reg_u32(TSAD0 + n * 4);
+                    let size = (tsd & TSD_SIZE_MASK) as u16;
+                    self.tx_pending.push((addr, size));
+                    // Synchronous completion: NIC now owns the descriptor
+                    // (OWN) and the transmit is OK (TOK); raise the TOK intr.
+                    self.set_reg_u32(tsd_off, tsd | TSD_OWN | TSD_TOK);
+                    let isr = self.reg_u16(ISR) | ISR_TOK;
+                    self.regs[ISR..ISR + 2].copy_from_slice(&isr.to_le_bytes());
+                }
+            }
             _ => self.regs[off] = value,
         }
     }
@@ -280,6 +361,69 @@ mod tests {
         let mut nic = Rtl8139::new();
         nic.write_reg(0x3C, 0xBE); // IntrMask low byte
         assert_eq!(nic.read_reg(0x3C), 0xBE);
+    }
+
+    // Write a 32-bit NIC register via 4 byte writes (as the guest's 32-bit
+    // OUT decomposes), low byte first.
+    fn wreg32(nic: &mut Rtl8139, off: u16, val: u32) {
+        for i in 0..4u16 {
+            nic.write_reg(off + i, (val >> (i * 8)) as u8);
+        }
+    }
+
+    #[test]
+    fn tx_kick_queues_frame_and_signals_tok() {
+        let mut nic = Rtl8139::new();
+        // Driver: set TX buffer address (TSAD0), then write TSD0 with the
+        // size and OWN cleared to start the transmit.
+        wreg32(&mut nic, 0x20, 0x0010_0000); // TSAD0 = guest phys 0x100000
+        wreg32(&mut nic, 0x10, 64); // TSD0 = size 64, OWN=0
+        let frames = nic.take_tx_frames();
+        assert_eq!(frames, vec![(0x0010_0000u32, 64u16)]);
+        // The descriptor is reported complete (OWN + TOK set).
+        assert_ne!(nic.read_reg(0x11) & 0x20, 0, "OWN set");
+        assert_ne!(nic.read_reg(0x11) & 0x80, 0, "TOK set");
+        // ISR.TOK (bit 2) raised.
+        assert_ne!(nic.read_reg(0x3E) & 0x04, 0, "ISR TOK");
+        // A second drain is empty.
+        assert!(nic.take_tx_frames().is_empty());
+    }
+
+    #[test]
+    fn tx_uses_the_right_descriptor() {
+        let mut nic = Rtl8139::new();
+        wreg32(&mut nic, 0x28, 0xDEAD_0000); // TSAD2
+        wreg32(&mut nic, 0x18, 128); // TSD2, size 128
+        assert_eq!(nic.take_tx_frames(), vec![(0xDEAD_0000u32, 128u16)]);
+    }
+
+    #[test]
+    fn irq_pending_tracks_isr_and_mask() {
+        let mut nic = Rtl8139::new();
+        wreg32(&mut nic, 0x20, 0x1000);
+        wreg32(&mut nic, 0x10, 60); // TX → sets ISR.TOK
+        assert!(!nic.irq_pending(), "masked: IMR=0");
+        // Unmask TOK in IMR (0x3C).
+        nic.write_reg(0x3C, 0x04);
+        assert!(nic.irq_pending(), "TOK unmasked → IRQ");
+        // Driver acks by writing 1 to ISR.TOK (write-1-to-clear).
+        nic.write_reg(0x3E, 0x04);
+        assert!(!nic.irq_pending(), "ISR cleared → no IRQ");
+    }
+
+    #[test]
+    fn bmsr_reports_link_up() {
+        let nic = Rtl8139::new();
+        let bmsr = (nic.read_reg(0x64) as u16) | ((nic.read_reg(0x65) as u16) << 8);
+        assert_ne!(bmsr & 0x0004, 0, "link-status bit set");
+        assert_ne!(bmsr & 0x0020, 0, "autoneg-complete bit set");
+    }
+
+    #[test]
+    fn signal_rx_ok_sets_isr() {
+        let mut nic = Rtl8139::new();
+        nic.signal_rx_ok();
+        assert_ne!(nic.read_reg(0x3E) & 0x01, 0, "ISR ROK");
     }
 
     #[test]
