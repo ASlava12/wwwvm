@@ -1225,6 +1225,7 @@ milestone'ы ниже — **asserting** (не diag), `#[ignore]`, требуют
 | `busybox_libm_milestone` | `LIBM_699` | awk libm-математика: sin/cos/exp/log/atan2/sqrt (софтверный x87-полином) численно корректны (×100, см. оговорки ниже) |
 | `busybox_tar_milestone` | `TAR_RT_OK` | tar create→extract round-trip: ustar-заголовок (octal-поля + checksum) + 512-байт блоки; оригинал удалён, маркер только из архива |
 | `busybox_stats_milestone` | `STAT_833` | sustained FP: awk считает дисперсию 100 чисел из pipe (`s+=x; q+=x*x; q/N - (s/N)^2`) = 833.25 → 833 — accumulate/mul/div/sub в double |
+| `busybox_grep_milestone` | `GREP_HIT_42` | grep compile BRE `HIT_[0-9]*` + line-filter из pipe (matching строка проходит, skipme отфильтрованы) |
 
 **Корневая причина (была):** **SYSEXIT CPL=3 баг**. CPUID рекламирует
 SEP → glibc идёт через vDSO `sysenter`; SYSEXIT возвращался с RPL=0, так

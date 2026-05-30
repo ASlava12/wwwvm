@@ -11841,6 +11841,55 @@ fn linux_userspace_busybox_stats_milestone() {
     );
 }
 
+/// GREP milestone: regex MATCHING + line filtering (distinct from sed's
+/// substitution). /init runs
+/// `sh -c 'printf "skipme\nGREP_HIT_42\nskipme\n" | busybox grep "HIT_[0-9]*"'`.
+/// grep compiles the BRE `HIT_[0-9]*` and prints only the lines that
+/// match — so "GREP_HIT_42" reaches the console (its line matches) while
+/// the two "skipme" lines are filtered out (the printf output goes into
+/// the pipe, not the console, so the marker can ONLY come from grep
+/// selecting the matching line). Asserts the marker with no segfault /
+/// loader / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_grep_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "printf 'skipme\\nGREP_HIT_42\\nskipme\\n' | busybox grep 'HIT_[0-9]*'",
+        ],
+        "GREP_HIT_42",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox grep milestone: GREP_HIT_42={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "grep-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for grep; {}",
+        dump_uart_on_failure(&cumulative, "grep-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox grep segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "grep-segv")
+    );
+    assert!(
+        found,
+        "busybox grep did not print the matching line GREP_HIT_42 \
+         (BRE match + line filter); {}",
+        dump_uart_on_failure(&cumulative, "grep-marker")
+    );
+    eprintln!("  ✓ GREP_HIT_42 — busybox grep (regex match + line filter) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
