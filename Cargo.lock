@@ -924,6 +924,7 @@ dependencies = [
 name = "wwwvm-vm"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "wwwvm-cpu",
  "wwwvm-devices",
  "wwwvm-mem",
