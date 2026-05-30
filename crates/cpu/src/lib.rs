@@ -6208,21 +6208,75 @@ impl Cpu {
                             let addr = self.linear_seg(ea.seg, ea.off);
                             match sub {
                                 0 => {
-                                    // FXSAVE m512 — write 512 bytes
-                                    // of zeros. We don't model an FPU
-                                    // or SSE register file, so an all-
-                                    // zero save image is the truth.
-                                    for off in 0..512u32 {
-                                        self.mem_write_u8(mem, addr.wrapping_add(off), 0);
+                                    // FXSAVE m512 — save the full x87 + SSE
+                                    // state. We DO model both (fpu_st/top/
+                                    // cw/sw + xmm), so an all-zero image would
+                                    // be wrong: a caller that FXSAVEs, uses the
+                                    // FPU, then FXRSTORs (e.g. glibc's lazy-PLT
+                                    // resolver bracketing) would lose the
+                                    // saved x87 stack/TOP — corrupting the
+                                    // restored register that holds a result.
+                                    let cw = self.fpu_cw;
+                                    let sw = self.fpu_status_word();
+                                    for off in (0..512u32).step_by(4) {
+                                        self.mem_write_u32(mem, addr.wrapping_add(off), 0);
+                                    }
+                                    self.mem_write_u16(mem, addr, cw);
+                                    self.mem_write_u16(mem, addr.wrapping_add(2), sw);
+                                    // abridged tag word (+4): 0xFF = all in
+                                    // use (our model doesn't track per-reg
+                                    // tags; FXRSTOR below reloads all 8).
+                                    self.mem_write_u8(mem, addr.wrapping_add(4), 0xFF);
+                                    // MXCSR (+24): default; not otherwise
+                                    // modeled.
+                                    self.mem_write_u32(mem, addr.wrapping_add(24), 0x0000_1F80);
+                                    // ST(i), logical order, 80-bit extended,
+                                    // at +32 + i*16.
+                                    for i in 0..8u32 {
+                                        let (mant, se) = Self::f64_to_f80(self.fpu_st(i as u8));
+                                        let foff = addr.wrapping_add(32 + i * 16);
+                                        self.mem_write_u32(mem, foff, mant as u32);
+                                        self.mem_write_u32(
+                                            mem,
+                                            foff.wrapping_add(4),
+                                            (mant >> 32) as u32,
+                                        );
+                                        self.mem_write_u16(mem, foff.wrapping_add(8), se);
+                                    }
+                                    // XMM0-7 at +160 + i*16.
+                                    for i in 0..8u32 {
+                                        let v = self.xmm[i as usize];
+                                        self.mem_write_u128(
+                                            mem,
+                                            addr.wrapping_add(160 + i * 16),
+                                            v,
+                                        );
                                     }
                                 }
                                 1 => {
-                                    // FXRSTOR m512 — read but discard
-                                    // 512 bytes. Touch the memory so
-                                    // an unmapped page faults the way
-                                    // a real FXRSTOR would.
-                                    for off in 0..512u32 {
-                                        let _ = self.mem_read_u8(mem, addr.wrapping_add(off));
+                                    // FXRSTOR m512 — restore the x87 + SSE
+                                    // state written by FXSAVE (CW/SW/TOP, the
+                                    // eight ST registers, and XMM0-7). This is
+                                    // the half that actually matters for the
+                                    // save/restore bracketing above.
+                                    let cw = self.mem_read_u16(mem, addr);
+                                    let sw = self.mem_read_u16(mem, addr.wrapping_add(2));
+                                    self.fpu_cw = cw;
+                                    self.fpu_top = ((sw >> 11) & 7) as u8;
+                                    self.fpu_sw = sw & !0x3800;
+                                    for i in 0..8u32 {
+                                        let foff = addr.wrapping_add(32 + i * 16);
+                                        let lo = self.mem_read_u32(mem, foff) as u64;
+                                        let hi =
+                                            self.mem_read_u32(mem, foff.wrapping_add(4)) as u64;
+                                        let se = self.mem_read_u16(mem, foff.wrapping_add(8));
+                                        let v = Self::f80_to_f64(lo | (hi << 32), se);
+                                        self.fpu_set_st(i as u8, v);
+                                    }
+                                    for i in 0..8u32 {
+                                        let v = self
+                                            .mem_read_u128(mem, addr.wrapping_add(160 + i * 16));
+                                        self.xmm[i as usize] = v;
                                     }
                                 }
                                 2 | 3 => {

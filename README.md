@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**639 тестов** зелёные (mem 30 + devices 77 + cpu 387 + vm 128 +
+**640 тестов** зелёные (mem 30 + devices 77 + cpu 388 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -1222,6 +1222,7 @@ milestone'ы ниже — **asserting** (не diag), `#[ignore]`, требуют
 | `busybox_sort_stress_milestone` | `SORTED_MAX_20000` | память под нагрузкой: `sort` буферит 20k строк (~120 KB) + полная сортировка |
 | `busybox_interactive_milestone` | `INTERACTIVE_OK` | интерактивный ввод с tty: `send_input` → UART RX → IRQ → line discipline → shell `read()` |
 | `busybox_interactive_session_milestone` | `PROD_42` | интерактивная СЕССИЯ: 3 команды через отдельные `read()`, состояние переменных persist'ит (`n=7;m=6;echo PROD_$((n*m))`) |
+| `busybox_libm_milestone` | `LIBM_699` | awk libm-математика: sin/cos/exp/log/atan2/sqrt (софтверный x87-полином) численно корректны (×100, см. оговорки ниже) |
 
 **Корневая причина (была):** **SYSEXIT CPL=3 баг**. CPUID рекламирует
 SEP → glibc идёт через vDSO `sysenter`; SYSEXIT возвращался с RPL=0, так
@@ -1254,6 +1255,19 @@ workload. Нашли и реализовали: x87 **DA memory integer-arith**
 libm `fcmove`). 5 teeth-confirmed unit-тестов. Низкорисковые находки
 (TSX `xbegin`/`xend`, PKU `rdpkru`, `xgetbv`) оставлены unimplemented —
 они CPUID-gated cold (leaf 7/OSXSAVE отключены, glibc идёт по fallback).
+
+**FXSAVE/FXRSTOR (0F AE /0,/1) были заглушками** (FXSAVE писал нули,
+FXRSTOR молча отбрасывал) — теперь реально сохраняют/восстанавливают x87
+(ST/TOP/CW/SW, 80-бит) + XMM0-7. teeth-confirmed round-trip unit-тест.
+
+**Известное ОТКРЫТОЕ ограничение (libm):** ПЕРВЫЙ вызов трансцендентной
+libm-функции в программе тихо возвращает ~0 (остальные корректны) —
+позиционный баг, не специфичный для sin; трассируется к коррапту x87-стека
+при ленивом PLT-резолве (`_dl_runtime_resolve`). FXSAVE исключён как
+причина. `busybox_libm_milestone` обходит это warmup-вызовом и проверяет
+численную корректность 6 трансцендентных (×100 — эмулированный x87 хранит
+регистры как f64, а не 80-бит, так что ~5-я значащая цифра отличается). См.
+memory `sin-silent-miscompute-bug.md`.
 
 ## Что НЕ работает (дорожная карта к Alpine)
 

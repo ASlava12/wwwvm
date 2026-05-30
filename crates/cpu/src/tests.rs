@@ -7720,6 +7720,47 @@ fn fpu_d9_fldenv_fnstenv_roundtrip() {
     assert_eq!(mem.read_u16(0x650), 0x0400, "FLDENV restores the stored CW");
 }
 
+/// 0F AE /0 FXSAVE + /1 FXRSTOR — full x87 (+SSE) state save/restore.
+/// glibc's lazy-PLT resolver brackets symbol resolution with these; a
+/// stub that dropped the state corrupted the x87 TOP across the first
+/// call to each libm function. Push 42 over 7, FXSAVE, FNINIT (wipes the
+/// stack), FXRSTOR — both values and the stack order must come back.
+#[test]
+fn fpu_fxsave_fxrstor_roundtrip() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 7);
+    mem.write_u32(0x604, 42);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 7
+            0xDB, 0x06, 0x04, 0x06, // FILD m32 [0x604] -> ST0 = 42, ST1 = 7
+            0x0F, 0xAE, 0x06, 0x00, 0x08, // FXSAVE [0x800]
+            0xDB, 0xE3, // FNINIT -> wipe the FPU stack (TOP = 0)
+            0x0F, 0xAE, 0x0E, 0x00, 0x08, // FXRSTOR [0x800] -> restore 42 over 7
+            0xDB, 0x1E, 0x00, 0x0A, // FISTP m32 [0xA00] -> store ST0 = 42
+            0xDB, 0x1E, 0x04, 0x0A, // FISTP m32 [0xA04] -> store ST0 = 7
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..24 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0xA00), 42, "FXRSTOR restores ST(0) = 42");
+    assert_eq!(
+        mem.read_u32(0xA04),
+        7,
+        "FXRSTOR restores ST(1) = 7 (stack order)"
+    );
+}
+
 /// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
 /// the "wrong" order, fix with FXCH, FSUBP.
 #[test]
@@ -8923,16 +8964,25 @@ fn rdmsr_for_ia32_bios_sign_id_returns_zero() {
     assert_eq!(cpu.read_r32(2), 0);
 }
 
-/// 0x0F 0xAE /0 — FXSAVE m512. Stub writes 512 zeros at EA.
+/// 0x0F 0xAE /0 — FXSAVE m512 writes the REAL x87 state (control word at
+/// offset 0, etc.), not zeros. The old all-zero stub was a bug: it dropped
+/// the FPU state across an FXSAVE/FXRSTOR bracket. (Full round-trip is
+/// covered by `fpu_fxsave_fxrstor_roundtrip`.)
 #[test]
-fn fxsave_writes_512_zero_bytes() {
+fn fxsave_writes_control_word() {
     let mut mem = Memory::new(0x10_0000);
-    // Pre-poison the region so we can see FXSAVE clear it.
+    mem.write_u16(0x600, 0x027F); // a known control word
     for off in 0..512 {
-        mem.write_u8(0x2000 + off, 0xFF);
+        mem.write_u8(0x2000 + off, 0xFF); // poison the image
     }
-    // FXSAVE [0x2000] — 0F AE 06 00 20 (mod=00 reg=0 rm=110 = 0x06 disp16)
-    mem.write_slice(0x7C00, &[0x0F, 0xAE, 0x06, 0x00, 0x20, 0xF4]);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xD9, 0x2E, 0x00, 0x06, // FLDCW [0x600] -> CW = 0x027F
+            0x0F, 0xAE, 0x06, 0x00, 0x20, // FXSAVE [0x2000]
+            0xF4,
+        ],
+    );
     let mut cpu = Cpu::new();
     cpu.reset_to_boot();
     let mut io = IoBus::new();
@@ -8943,13 +8993,17 @@ fn fxsave_writes_512_zero_bytes() {
         cpu.step(&mut mem, &mut io).expect("step");
     }
     assert!(cpu.halted);
-    for off in 0..512 {
-        assert_eq!(
-            mem.read_u8(0x2000 + off),
-            0,
-            "FXSAVE must zero offset {off}"
-        );
-    }
+    assert_eq!(
+        mem.read_u16(0x2000),
+        0x027F,
+        "FXSAVE stores the control word at +0"
+    );
+    // Reserved tail (offset 288+) stays zero, proving the image was written.
+    assert_eq!(
+        mem.read_u8(0x2000 + 300),
+        0,
+        "FXSAVE zeroes the reserved tail"
+    );
 }
 
 /// 0x0F 0xAE /6 with mod=11 — MFENCE no-op.
