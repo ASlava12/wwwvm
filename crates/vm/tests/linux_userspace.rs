@@ -10971,6 +10971,60 @@ fn linux_userspace_busybox_awk_milestone() {
     eprintln!("  ✓ AWK_OK_42 — busybox awk (FP math + string formatting) works!");
 }
 
+/// FILE-I/O milestone: a different layer than pipelines — persistent
+/// files on the rootfs (tmpfs). /init runs
+/// `busybox sh -c 'echo FILE_OK > /fmark; cat /fmark'`. The shell opens
+/// /fmark with O_WRONLY|O_CREAT|O_TRUNC, dup2's it onto stdout, runs
+/// echo (which writes to the *file*, NOT the console), closes it, then
+/// cat opens /fmark O_RDONLY, reads it back, and writes to the console.
+/// So the marker reaches the UART ONLY if the write actually landed in a
+/// tmpfs file and was read back — exercising open/write/read/close on a
+/// real path, not just a pipe. Asserts FILE_OK with no segfault / loader
+/// error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_file_io_milestone() {
+    // Use `busybox cat` (not bare `cat`): /init's execve env has no PATH,
+    // so the shell can't resolve a bare applet name — same convention the
+    // pipeline milestone uses. The point here is the file round-trip, not
+    // PATH resolution.
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo FILE_OK > /fmark; busybox cat /fmark",
+        ],
+        "FILE_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox file-I/O milestone: FILE_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "fileio-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the file-I/O shell; {}",
+        dump_uart_on_failure(&cumulative, "fileio-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the file-I/O shell segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "fileio-segv")
+    );
+    assert!(
+        found,
+        "`echo FILE_OK > /fmark; cat /fmark` never printed its marker — the \
+         write/read round-trip through a tmpfs file failed; {}",
+        dump_uart_on_failure(&cumulative, "fileio-marker")
+    );
+    eprintln!("  ✓ FILE_OK — file write+read round-trip on tmpfs works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
