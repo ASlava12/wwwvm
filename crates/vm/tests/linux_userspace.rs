@@ -11347,6 +11347,59 @@ fn linux_userspace_busybox_md5sum_milestone() {
     eprintln!("  ✓ {EXPECTED} — busybox md5sum matches host exactly (ROL/add bit path correct)!");
 }
 
+/// CONCURRENCY / job-control milestone: a different process-management
+/// path than the sequential pipelines — several children alive at once,
+/// reaped by one wait. /init runs
+/// `sh -c 'busybox sleep 0 & busybox sleep 0 & busybox sleep 0 & wait; echo ALL_REAPED'`.
+/// The shell forks THREE background jobs (each fork+execve's busybox),
+/// so three child processes exist concurrently, then `wait` (no args)
+/// blocks until ALL of them are reaped via wait4/waitpid. The marker
+/// prints only after every child has been collected — if reaping were
+/// broken (a zombie never harvested, wait4 not matching a child, the
+/// SIGCHLD bookkeeping wrong), `wait` would hang forever and the run
+/// would exhaust its step budget with no marker. So ALL_REAPED validates
+/// concurrent fork/exec + multi-child wait reaping. Asserts the marker
+/// with no segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_jobcontrol_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "busybox sleep 0 & busybox sleep 0 & busybox sleep 0 & wait; echo ALL_REAPED",
+        ],
+        "ALL_REAPED",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox job-control milestone: ALL_REAPED={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "job-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for a background job; {}",
+        dump_uart_on_failure(&cumulative, "job-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a background job segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "job-segv")
+    );
+    assert!(
+        found,
+        "the shell never printed ALL_REAPED — `wait` did not reap all three \
+         concurrent background children (fork/exec + wait4 multi-child); {}",
+        dump_uart_on_failure(&cumulative, "job-marker")
+    );
+    eprintln!("  ✓ ALL_REAPED — concurrent fork/exec + multi-child wait reaping works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
