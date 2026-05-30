@@ -8001,11 +8001,11 @@ impl Cpu {
                         }
                         // FXAM — classify ST(0) into C3:C2:C1:C0.
                         0xE5 => self.fpu_fxam(),
-                        // FSQRT — square root of ST(0). (Computed in f64 for
-                        // now; sqrt is not in the long-double dtoa path.)
+                        // FSQRT — square root of ST(0), correctly rounded to
+                        // the full 80-bit mantissa (F80::sqrt uses u128 isqrt).
                         0xFA => {
                             let v = self.fpu_st(0);
-                            self.fpu_set_st(0, F80::from_f64(v.to_f64().sqrt()));
+                            self.fpu_set_st(0, v.sqrt());
                         }
                         // FRNDINT — round ST(0) to an integer per the
                         // control-word rounding mode (default nearest-even).

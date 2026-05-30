@@ -18,9 +18,12 @@
 //! over/underflow the exponent. Arithmetic uses `u128` intermediates and
 //! rounds the 64-bit mantissa to nearest, ties-to-even.
 //!
-//! This is Phase 1: the type is standalone and unit-tested but NOT yet wired
-//! into the FPU (that swap is Phase 2). Pure Rust, no `f128`/libgcc, so it
-//! builds for the WASM target too.
+//! The x87 register stack (`Cpu::fpu_st`) is `[F80; 8]` and every FPU
+//! opcode routes through this type, so arithmetic carries the full 64-bit
+//! mantissa. Pure Rust, no `f128`/libgcc, so it builds for the WASM target
+//! too. (Transcendentals — FSIN/FCOS/FYL2X/… — still evaluate in f64 then
+//! promote; everything else, incl. add/sub/mul/div and now sqrt, is native
+//! 80-bit.)
 
 use core::cmp::Ordering;
 use core::ops::{Add, Div, Mul, Neg, Sub};
@@ -484,6 +487,59 @@ impl F80 {
             _ => self,
         }
     }
+
+    /// Square root, correctly rounded to the 64-bit mantissa (FSQRT).
+    /// Computed via a 128-bit integer square root, NOT f64 — so it keeps
+    /// full 80-bit precision.
+    pub fn sqrt(self) -> F80 {
+        match self.cls {
+            Cls::Nan => F80::nan(),
+            Cls::Zero => self, // sqrt(±0) = ±0
+            Cls::Inf => {
+                if self.sign {
+                    F80::nan() // sqrt(−∞)
+                } else {
+                    self
+                }
+            }
+            Cls::Normal => {
+                if self.sign {
+                    return F80::nan(); // sqrt of a negative
+                }
+                // value = mant · 2^(exp-63). Form M · 2^F with F even and
+                // M ∈ [2^126, 2^128), so floor(sqrt(M)) is a 64-bit integer.
+                let mut m = (self.mant as u128) << 63; // [2^126, 2^127)
+                let mut f = self.exp - 126;
+                if f & 1 != 0 {
+                    m <<= 1; // [2^127, 2^128)
+                    f -= 1;
+                }
+                let s = m.isqrt(); // floor(sqrt(M)) ∈ [2^63, 2^64)
+                let rem = m - s * s;
+                // round to nearest: round up iff sqrt(M) ≥ s+0.5 ⟺ rem > s
+                // (exact ties are impossible for integer M).
+                let mut sexp = f / 2 + 63;
+                let mant = if rem > s {
+                    let up = s + 1;
+                    if up >> 64 != 0 {
+                        // s was 2^64-1; carry to 2^64 → renormalize.
+                        sexp += 1;
+                        0x8000_0000_0000_0000
+                    } else {
+                        up as u64
+                    }
+                } else {
+                    s as u64
+                };
+                F80 {
+                    sign: false,
+                    cls: Cls::Normal,
+                    exp: sexp,
+                    mant,
+                }
+            }
+        }
+    }
 }
 
 // ---- arithmetic as operator traits (so the FPU reads like math) ---------
@@ -815,5 +871,64 @@ mod tests {
             0x8000,
             "NaN sign must survive the m80 round-trip"
         );
+    }
+
+    #[test]
+    fn sqrt_perfect_squares_are_exact() {
+        for (x, root) in [
+            (4.0, 2.0),
+            (9.0, 3.0),
+            (16.0, 4.0),
+            (0.25, 0.5),
+            (2.25, 1.5),
+            (100.0, 10.0),
+            (1.0, 1.0),
+            (1e8, 1e4),
+            (1e16, 1e8),
+        ] {
+            assert_eq!(F80::from_f64(x).sqrt().to_f64(), root, "sqrt({x})");
+            // sqrt(x)·sqrt(x) recovers x exactly for perfect squares.
+            let r = F80::from_f64(x).sqrt();
+            assert_eq!(r.mul(r).to_f64(), x, "sqrt({x})^2");
+        }
+    }
+
+    #[test]
+    fn sqrt_matches_f64_and_specials() {
+        for x in [
+            2.0,
+            3.0,
+            0.1,
+            1234.5678,
+            1e300,
+            1e-300,
+            std::f64::consts::PI,
+        ] {
+            let r = F80::from_f64(x).sqrt().to_f64();
+            let f = x.sqrt();
+            // F80 sqrt is correctly rounded to 64 bits, then demoted to f64;
+            // double rounding differs from a direct f64 sqrt by ≤1 ulp.
+            let ulp = (f64::from_bits(f.to_bits() + 1) - f).abs();
+            assert!((r - f).abs() <= ulp, "sqrt({x}): f80→{r}, f64 {f}");
+            assert!((r * r - x).abs() <= x * 1e-15, "sqrt({x})^2 ≈ x");
+        }
+        assert!(F80::from_f64(-1.0).sqrt().is_nan());
+        assert!(F80::from_f64(f64::NAN).sqrt().is_nan());
+        assert!(F80::inf(false).sqrt().is_inf());
+        assert!(F80::inf(true).sqrt().is_nan());
+        assert!(F80::ZERO.sqrt().is_zero());
+    }
+
+    #[test]
+    fn sqrt_keeps_80bit_precision() {
+        // sqrt(2) carries >53 mantissa bits, so squaring it back in F80 is
+        // ~2^-63 from 2.0 — far tighter than an f64 sqrt (~2^-52). Demote
+        // the F80 square: it rounds to exactly 2.0 (the error is well under
+        // half an f64 ULP), which an f64-precision sqrt would NOT achieve.
+        let r = F80::from_f64(2.0).sqrt();
+        assert_eq!(r.mul(r).to_f64(), 2.0, "sqrt(2)^2 rounds to exactly 2.0");
+        // f64 sqrt loses this: (f64 sqrt(2))^2 != 2.0 exactly.
+        let f = 2.0f64.sqrt();
+        assert_ne!(f * f, 2.0, "f64 sqrt(2)^2 is NOT exactly 2.0");
     }
 }
