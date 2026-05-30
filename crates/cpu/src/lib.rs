@@ -7805,6 +7805,20 @@ impl Cpu {
                     }
 
                     _ => {
+                        // WWWVM_DUMP_OP=1 dumps the raw instruction bytes (with
+                        // prefixes) at the faulting IP, to tell a genuinely
+                        // unimplemented 0F opcode from a decode desync.
+                        if std::env::var_os("WWWVM_DUMP_OP").is_some() {
+                            let mut bytes = [0u8; 12];
+                            for (i, b) in bytes.iter_mut().enumerate() {
+                                let a = self.linear_seg(sreg::CS, op_ip.wrapping_add(i as u32));
+                                *b = self.mem_fetch_u8(mem, a);
+                            }
+                            eprintln!(
+                                "[wwwvm op2=0F{op2:02X}] {op_cs:04X}:{op_ip:08X} 66={} bytes={bytes:02X?}",
+                                self.has_66()
+                            );
+                        }
                         return Err(CpuError::Unimplemented {
                             opcode: op2,
                             cs: op_cs,
