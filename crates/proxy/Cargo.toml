@@ -10,6 +10,7 @@ name = "wwwvm-proxy"
 path = "src/main.rs"
 
 [dependencies]
+wwwvm-net = { path = "../net" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
