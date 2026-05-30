@@ -18,3 +18,7 @@ wwwvm-devices = { path = "../devices" }
 # to put the HOST terminal into raw mode (termios) so keystrokes aren't
 # double-echoed and cursor-position-report replies don't leak onto the prompt.
 libc = "0.2"
+# The host-side networking bridge (DNS forwarder, allowlist) — used by the
+# alpine_console example's WWWVM_NET_STUB path. A dev-dependency so the vm
+# *library* stays free of the bridge's deps.
+wwwvm-net = { path = "../net" }

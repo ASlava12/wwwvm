@@ -87,6 +87,23 @@ impl Allowlist {
             AllowEntry::Host { host: h, .. } => h.eq_ignore_ascii_case(host),
         })
     }
+
+    /// The distinct named hosts in the allowlist — used to pre-resolve the
+    /// DNS cache at startup. A `*` entry contributes no name (nothing to
+    /// pre-resolve), so a wildcard allowlist yields no cache entries and the
+    /// forwarder simply answers NXDOMAIN until on-demand resolution exists.
+    pub fn hosts(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for e in &self.entries {
+            if let AllowEntry::Host { host, .. } = e {
+                let lc = host.to_ascii_lowercase();
+                if !names.contains(&lc) {
+                    names.push(lc);
+                }
+            }
+        }
+        names
+    }
 }
 
 #[cfg(test)]

@@ -20,5 +20,8 @@
 
 pub mod allow;
 pub mod dns;
+pub mod forwarder;
+pub mod util;
 
 pub use allow::Allowlist;
+pub use forwarder::DnsForwarder;

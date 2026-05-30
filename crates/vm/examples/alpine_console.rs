@@ -25,9 +25,11 @@
 //! queries don't leak `^[[…R` onto the prompt; it's restored on exit.
 
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use wwwvm_net::{Allowlist, DnsForwarder};
 use wwwvm_vm::{Stop, VirtualGateway, Vm};
 
 /// RAII guard that switches the host terminal to raw mode and restores the
@@ -149,9 +151,34 @@ fn main() {
     // stack: `ip neigh` resolves and `ping 10.0.2.2` succeeds.
     const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
     const HOST_IP: [u8; 4] = [10, 0, 2, 2];
-    let mut gateway = std::env::var_os("WWWVM_NET_STUB")
-        .is_some()
-        .then(|| VirtualGateway::new(HOST_IP, HOST_MAC));
+    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
+    let mut gateway = net_stub.then(|| VirtualGateway::new(HOST_IP, HOST_MAC));
+
+    // DNS forwarder: answer the guest's queries to 10.0.2.2:53 from a cache
+    // we pre-resolve here, ONCE, before the VM runs — so a slow getaddrinfo
+    // never freezes the single-threaded step loop, and we only ever vend IPs
+    // we resolved ourselves for allowlisted names. Configure the mirror with
+    // e.g. WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80'.
+    let dns = net_stub.then(|| {
+        let allow = Allowlist::from_env();
+        let mut fwd = DnsForwarder::new(HOST_IP, HOST_MAC, allow.clone());
+        for host in allow.hosts() {
+            match (host.as_str(), 0u16).to_socket_addrs() {
+                Ok(addrs) => {
+                    let v4: Vec<Ipv4Addr> = addrs
+                        .filter_map(|sa| match sa.ip() {
+                            IpAddr::V4(ip) => Some(ip),
+                            IpAddr::V6(_) => None,
+                        })
+                        .collect();
+                    let n = fwd.cache_resolution(&host, &v4);
+                    eprintln!("[wwwvm] DNS pre-resolved {host} → {n} A record(s)");
+                }
+                Err(e) => eprintln!("[wwwvm] DNS: cannot resolve {host}: {e}"),
+            }
+        }
+        fwd
+    });
 
     let mut stdout = std::io::stdout();
     let chunk = 5_000_000u32;
@@ -170,15 +197,22 @@ fn main() {
             if dump_tx {
                 eprint!("\r\n{}\r\n", describe_eth_frame(&frame));
             }
+            // Collect replies from the L2/L3 gateway (ARP/ICMP) and the DNS
+            // forwarder, then inject them into the guest's RX ring.
+            let mut replies: Vec<Vec<u8>> = Vec::new();
             if let Some(gw) = gateway.as_mut() {
-                for reply in gw.handle_frame(&frame) {
-                    let ok = vm.inject_rx_frame(&reply);
-                    if dump_tx {
-                        eprint!(
-                            "\r\n[wwwvm RX-inject {} bytes → eth0 ok={ok}]\r\n",
-                            reply.len()
-                        );
-                    }
+                replies.extend(gw.handle_frame(&frame));
+            }
+            if let Some(d) = dns.as_ref() {
+                replies.extend(d.handle_frame(&frame));
+            }
+            for reply in replies {
+                let ok = vm.inject_rx_frame(&reply);
+                if dump_tx {
+                    eprint!(
+                        "\r\n[wwwvm RX-inject {} bytes → eth0 ok={ok}]\r\n",
+                        reply.len()
+                    );
                 }
             }
         }
