@@ -7817,6 +7817,41 @@ fn fp_stack_rolls_back_on_faulting_fld_m64() {
     );
 }
 
+/// Same rollback for a faulting SSE read-modify-write. `MULSD xmm0,[mem]`
+/// (F2 0F 59) from a non-present page must leave xmm0 UNCHANGED. Without
+/// the rollback, the faulting read yields 0, `xmm0 = a*0 = 0` overwrites
+/// the original `a`, and the EIP-rewound retry computes `0*correct`. F2-
+/// prefixed SSE decodes with opcode 0xF2, so the FP-snapshot guard must
+/// cover F2/F3 too (not just 0x0F).
+#[test]
+fn sse_xmm_rolls_back_on_faulting_mulsd() {
+    let mut mem = Memory::new(0x10_0000);
+    // Identity-map the low 4 MiB except page 0xF (linear 0xF000).
+    mem.write_u32(0x2000, 0x3000 | 0x3);
+    for i in 0..1024u32 {
+        let pte = if i == 0xF { 0 } else { (i * 0x1000) | 0x3 };
+        mem.write_u32(0x3000 + i * 4, pte);
+    }
+    // MULSD xmm0, [0xF000] — F2 0F 59 /0 with [disp16] (modrm 0x06).
+    mem.write_slice(0x7C00, &[0xF2, 0x0F, 0x59, 0x06, 0x00, 0xF0, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // CR0.PG on (PE off keeps CPL=0)
+    cpu.cr3 = 0x0000_2000;
+    let orig = (5.0f64).to_bits() as u128;
+    cpu.xmm[0] = orig;
+    let mut io = IoBus::new();
+    cpu.step(&mut mem, &mut io).expect("MULSD step");
+    assert!(
+        cpu.pending_fault().is_some(),
+        "MULSD from a non-present page must raise #PF"
+    );
+    assert_eq!(
+        cpu.xmm[0], orig,
+        "xmm0 rolled back on faulting MULSD (no a*0 clobber)"
+    );
+}
+
 /// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
 /// the "wrong" order, fix with FXCH, FSUBP.
 #[test]

@@ -3749,16 +3749,25 @@ impl Cpu {
             }
         };
 
-        // FP instructions (x87 escapes D8-DF and the 0F SSE/two-byte map)
-        // can partially mutate the x87 stack / XMM before a #PF — e.g. an
-        // `FLD m64` of a libm constant on a demand-paged .rodata page
-        // pushes a garbage value, sets pending_fault, but the GP snapshot
-        // above does NOT cover fpu_top/fpu_st/xmm, so the EIP-rewound retry
-        // pushes a SECOND value onto the now-misaligned stack and the rest
-        // of the routine computes from garbage. Snapshot the FP state too,
-        // but only for these opcodes (keeps the common ALU path snapshot
-        // cheap). Restored on a pending fault at the end of step().
-        let fp_snap = if (0xD8..=0xDF).contains(&opcode) || opcode == 0x0F {
+        // FP instructions can partially mutate the x87 stack / XMM before a
+        // #PF — e.g. an `FLD m64` of a libm constant on a demand-paged
+        // .rodata page pushes a garbage value, sets pending_fault, but the
+        // GP snapshot above does NOT cover fpu_top/fpu_st/xmm, so the
+        // EIP-rewound retry re-runs from a corrupted state. A non-idempotent
+        // read-modify-write like `MULSD xmm,[mem]` is just as bad: the
+        // faulting read yields 0, `xmm = a*0 = 0` overwrites the original
+        // `a`, and the retry then computes `0*correct`. Snapshot the FP
+        // state too. Opcodes: x87 escapes D8-DF, the 0F SSE/two-byte map
+        // (incl. 66-prefixed SSE2 — 0x66 is consumed as a prefix), AND the
+        // F2/F3-prefixed scalar SSE (which decode with opcode F2/F3). For
+        // F2/F3 REP-string ops this snapshot is a harmless no-op (they touch
+        // neither the x87 stack nor XMM). Gated to keep the common ALU path
+        // cheap. Restored on a pending fault at the end of step().
+        let fp_snap = if (0xD8..=0xDF).contains(&opcode)
+            || opcode == 0x0F
+            || opcode == 0xF2
+            || opcode == 0xF3
+        {
             Some((
                 self.fpu_top,
                 self.fpu_sw,
