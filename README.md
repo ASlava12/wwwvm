@@ -1221,6 +1221,7 @@ milestone'ы ниже — **asserting** (не diag), `#[ignore]`, требуют
 | `busybox_jobcontrol_milestone` | `ALL_REAPED` | конкурентность: 3 фоновых fork/exec + один `wait` reap'ит всех через wait4 |
 | `busybox_sort_stress_milestone` | `SORTED_MAX_20000` | память под нагрузкой: `sort` буферит 20k строк (~120 KB) + полная сортировка |
 | `busybox_interactive_milestone` | `INTERACTIVE_OK` | интерактивный ввод с tty: `send_input` → UART RX → IRQ → line discipline → shell `read()` |
+| `busybox_interactive_session_milestone` | `PROD_42` | интерактивная СЕССИЯ: 3 команды через отдельные `read()`, состояние переменных persist'ит (`n=7;m=6;echo PROD_$((n*m))`) |
 
 **Корневая причина (была):** **SYSEXIT CPL=3 баг**. CPUID рекламирует
 SEP → glibc идёт через vDSO `sysenter`; SYSEXIT возвращался с RPL=0, так

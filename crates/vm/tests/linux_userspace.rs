@@ -11531,6 +11531,55 @@ fn linux_userspace_busybox_interactive_milestone() {
     eprintln!("  ✓ INTERACTIVE_OK — shell read a command from the tty and ran it!");
 }
 
+/// INTERACTIVE MULTI-COMMAND session milestone: extends the interactive
+/// shell to a real session — several commands across separate read()
+/// cycles, with shell state persisting between them. /init execve's
+/// `busybox sh` (no `-c`); the harness feeds THREE lines in one blob over
+/// the tty: "n=7\nm=6\necho PROD_$((n*m))\n". ash reads them one line at a
+/// time (canonical mode splits on '\n'): read #1 sets n=7, read #2 sets
+/// m=6, read #3 expands `$((n*m))` using BOTH earlier assignments → 42 and
+/// prints PROD_42. The marker proves variable state survives across
+/// independent tty reads (not just a single command) and that arithmetic
+/// expansion sees the accumulated environment — a genuine interactive
+/// session, not a one-shot. Asserts the marker with no segfault / loader
+/// error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_interactive_session_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic_stdin(
+        &["busybox", "sh"],
+        Some(b"n=7\nm=6\necho PROD_$((n*m))\n"),
+        "PROD_42",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox interactive multi-command milestone: PROD_42={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "session-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the interactive session; {}",
+        dump_uart_on_failure(&cumulative, "session-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the interactive session shell segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "session-segv")
+    );
+    assert!(
+        found,
+        "the interactive shell never printed PROD_42 — variable state did \
+         not persist across separate tty reads, or arithmetic over the \
+         accumulated environment was wrong; {}",
+        dump_uart_on_failure(&cumulative, "session-marker")
+    );
+    eprintln!("  ✓ PROD_42 — interactive session: state persists across tty reads + arithmetic!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
