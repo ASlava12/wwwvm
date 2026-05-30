@@ -12276,6 +12276,121 @@ fn linux_userspace_alpine_rootfs_milestone() {
     eprintln!("  ✓ ALPINE_ROOTFS_OK — the full Alpine minirootfs boots to a working shell!");
 }
 
+/// ALPINE LIVE CONSOLE (tested): boot the full Alpine minirootfs to an
+/// INTERACTIVE musl busybox shell and DRIVE it over the UART — the live,
+/// type-into-it Alpine counterpart of `busybox_interactive_milestone`
+/// (which uses the glibc rootfs). `/init` prints a READY sentinel, then
+/// `exec`s an interactive `busybox sh` whose stdin is the console; once the
+/// sentinel appears we feed `echo ALPINE_LIVE_$((6*7))` over stdin and
+/// assert `ALPINE_LIVE_42` comes back. That marker only appears if the
+/// musl shell actually READ our keystrokes from the tty, evaluated the
+/// arithmetic, and echoed the result — exercising the whole input chain
+/// (send_input → 16550 RX → RX IRQ → musl ash read() → $((…)) → write)
+/// on the Alpine/musl userspace, which every scripted `sh -c` milestone
+/// bypasses. The `alpine_console` example is the interactive (human-typed)
+/// version of this same boot.
+#[test]
+#[ignore = "Alpine live console: interactive musl sh driven over UART; needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_interactive_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // /init: announce readiness on its own line, then BECOME an interactive
+    // shell reading the console (exec, so the shell is what waits on read()).
+    let init = b"#!/bin/sh\necho ALPINE_CONSOLE_READY\nexec /bin/busybox sh\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    // What we "type" into the live shell once it's ready.
+    let feed: &[u8] = b"echo ALPINE_LIVE_$((6*7))\n";
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let mut fed = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        // Feed exactly once, after /init signalled the interactive shell is
+        // up. The bytes wait in the (unbounded) UART RX queue until the
+        // shell's read() consumes them, so we don't have to race the prompt.
+        if !fed && text.contains("ALPINE_CONSOLE_READY") {
+            vm.send_input(feed);
+            fed = true;
+        }
+        if text.contains("ALPINE_LIVE_42") {
+            found = true;
+            stop_reason = "found ALPINE_LIVE_42".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE live console: fed_input={fed} ALPINE_LIVE_42={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld-musl could not load the interactive shell; {}",
+        dump_uart_on_failure(&cumulative, "alpine-live-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a process segfaulted driving the interactive Alpine shell ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-live-segv")
+    );
+    assert!(
+        found,
+        "the interactive Alpine musl shell did not echo ALPINE_LIVE_42 for typed input ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-live-marker")
+    );
+    eprintln!("  ✓ ALPINE_LIVE_42 — typed `echo $((6*7))` into the live Alpine musl shell and it answered!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is

@@ -1482,9 +1482,34 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 шагов, ~120 c). То есть Alpine грузится до логина через свою родную
 init-систему OpenRC.
 
+**Живая Alpine-консоль (печатать команды в Alpine-шелл вживую):**
+
+```bash
+# нужны ассеты: /tmp/wwwvm-alpine/vmlinuz-lts + /tmp/alpine/root (см. стадию A/C)
+cargo run -p wwwvm-vm --release --example alpine_console
+```
+
+Грузит ядро Alpine `vmlinuz-lts` + полный minirootfs (musl + PIE-busybox с
+~335 апплет-симлинками), `/init` печатает строку готовности и `exec`'ает
+интерактивный `busybox sh` на консоли, после чего твой терминал соединён с
+UART гостя — печатаешь команды в **musl**-шелл Alpine и видишь реакцию (это
+Alpine-аналог `busybox_console`, который грузит glibc/Tinycore). PATH не
+задан → апплеты как `busybox ls`; builtin'ы работают напрямую. Ctrl-C
+выходит. Тестируемый (скриптованный) аналог — milestone
+`linux_userspace_alpine_interactive_milestone`: он печатает `echo
+$((6*7))` в живой musl-шелл по UART и ассертит, что обратно пришло
+`ALPINE_LIVE_42` — то есть весь tty-input-путь (send_input → 16550 RX →
+RX-IRQ → musl ash read() → арифметика → write) работает на Alpine/musl.
+
 Осталось: **apk внутри гостя** (нужна сетевая карта в эмуляторе + мост к
-хосту через proxy с безопасным allowlist'ом — `*` нельзя) — это большая
-отдельная фича.
+хосту через proxy с безопасным allowlist'ом — `*` нельзя). Подтверждено
+исследованием: NIC-драйверы (rtl8139/virtio-net/e1000) в Alpine
+`vmlinuz-lts` НЕ встроены — они модули в `modloop-lts` (squashfs `.ko`).
+Поэтому apk-в-госте требует: (1) устройство-NIC в эмуляторе, плюс (2) либо
+загрузку модуля в госте (mount squashfs + `finit_module` + релокация
+модуля — ничего из этого пока нет), либо своё ядро с драйвером,
+встроенным (`CONFIG_8139TOO=y`), плюс (3) host-side TCP/IP-мост через
+allowlist'нутый proxy. Это большая многосессионная фича.
 
 ### Throughput-бенчмарк
 
