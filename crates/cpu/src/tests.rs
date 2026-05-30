@@ -7169,6 +7169,117 @@ fn fpu_chained_identity() {
 }
 
 /// FLD m80 / FSTP m80 round-trip: an f64 stored as 80-bit extended
+/// Regression guard from the musl-printf-precision investigation
+/// (2026-05-30): each individual x87 op is CORRECT at f64 precision, so the
+/// musl float-formatting error (`printf '%.17g' 0.1` → 0.0999…) is the
+/// precision model (53-bit f64 stack vs real 80-bit / 64-bit mantissa)
+/// amplified through musl's long-double algorithms — NOT a broken opcode.
+/// This pins the ops that the dtoa path leans on so the upcoming 80-bit
+/// rework doesn't silently regress them.
+#[test]
+fn fpu_dtoa_path_ops_are_individually_correct() {
+    fn run(code: &[u8], setup: &[(u32, f64)]) -> Memory {
+        let mut mem = Memory::new(0x10_0000);
+        for &(a, v) in setup {
+            fpu_w64(&mut mem, a, v);
+        }
+        mem.write_slice(0x7C00, code);
+        let mut cpu = Cpu::new();
+        cpu.reset_to_boot();
+        let mut io = IoBus::new();
+        for _ in 0..40 {
+            if cpu.halted {
+                break;
+            }
+            cpu.step(&mut mem, &mut io).expect("step");
+        }
+        mem
+    }
+    // FSUB 1.6-1.0 (FLD[600];FLD[608];FSUBP ST1,ST0;FSTP[640]).
+    let m = run(
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDE, 0xE9, 0xDD, 0x1E, 0x40, 0x06,
+            0xF4,
+        ],
+        &[(0x600, 1.6), (0x608, 1.0)],
+    );
+    assert_eq!(
+        fpu_r64(&m, 0x640).to_bits(),
+        (1.6f64 - 1.0).to_bits(),
+        "FSUB"
+    );
+
+    // FMUL 0.6*1e9 (FMULP ST1,ST0).
+    let m = run(
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xDE, 0xC9, 0xDD, 0x1E, 0x40, 0x06,
+            0xF4,
+        ],
+        &[(0x600, 0.6), (0x608, 1e9)],
+    );
+    assert_eq!(
+        fpu_r64(&m, 0x640).to_bits(),
+        (0.6f64 * 1e9).to_bits(),
+        "FMUL"
+    );
+
+    // FXTRACT 0.1 → significand in ST(0), exponent in ST(1). FSTP[640]
+    // pops the significand, FSTP[648] then stores the exponent.
+    let m = run(
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xD9, 0xF4, 0xDD, 0x1E, 0x40, 0x06, 0xDD, 0x1E, 0x48, 0x06,
+            0xF4,
+        ],
+        &[(0x600, 0.1)],
+    );
+    assert_eq!(
+        fpu_r64(&m, 0x640).to_bits(),
+        (0.1f64 / 0.0625).to_bits(),
+        "FXTRACT sig"
+    );
+    assert_eq!(fpu_r64(&m, 0x648), -4.0, "FXTRACT exp");
+
+    // FSCALE: ST(0)=value, ST(1)=scale. Load -4 then 1.6 so ST(0)=1.6.
+    let m = run(
+        &[
+            0xDD, 0x06, 0x00, 0x06, 0xDD, 0x06, 0x08, 0x06, 0xD9, 0xFD, 0xDD, 0x1E, 0x40, 0x06,
+            0xF4,
+        ],
+        &[(0x600, -4.0), (0x608, 1.6)],
+    );
+    assert_eq!(
+        fpu_r64(&m, 0x640).to_bits(),
+        (1.6f64 * 2f64.powi(-4)).to_bits(),
+        "FSCALE"
+    );
+
+    // FLD m80 of a GENUINE full-64-bit-mantissa long double (musl .rodata
+    // form), 0.1L = mantissa 0xCCCCCCCCCCCCCCCD, se 0x3FFB → exact f64 0.1.
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(
+        0x620,
+        &[0xCD, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xFB, 0x3F],
+    );
+    mem.write_slice(
+        0x7C00,
+        &[0xDB, 0x2E, 0x20, 0x06, 0xDD, 0x1E, 0x40, 0x06, 0xF4],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..20 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(
+        fpu_r64(&mem, 0x640).to_bits(),
+        0.1f64.to_bits(),
+        "FLD m80 full-mantissa 0.1"
+    );
+}
+
 /// and reloaded must come back bit-identical (f80 strictly contains
 /// f64). Program: FLD m64 [0x600] ; FSTP m80 [0x620] ; FLD m80
 /// [0x620] ; FSTP m64 [0x640] ; HLT.
