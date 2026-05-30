@@ -1450,8 +1450,41 @@ applet-симлинков, musl, настоящие `/etc`, `/sbin`, apk) в cpi
 симлинками + /dev-нодами + `/init`-скриптом), грузит на ядре Alpine, и
 `/init` (`#!/bin/sh` → busybox) печатает маркер + `/etc/alpine-release` +
 `uname -a`. То есть **настоящий Alpine-userspace грузится до шелла** (ядро
-Alpine + полный rootfs Alpine), пока без OpenRC/apk. Дальше — OpenRC (init-
-система) и apk (пакеты, нужна сеть через proxy).
+Alpine + полный rootfs Alpine).
+
+**Стадия D — НАСТОЯЩАЯ init-система Alpine (OpenRC) → login-промпт:**
+
+В эмуляторе НЕТ сетевой карты, поэтому apk внутри гостя не работает; openrc
+ставим **на хосте** через `apk.static` (кросс-арч, т.к. хост aarch64):
+
+```bash
+cd /tmp/alpine
+# aarch64 apk.static (хост) ставит x86-пакеты в rootfs:
+A=$(curl -s https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/ | grep -oE 'apk-tools-static-[0-9][^"]*\.apk' | head -1)
+curl -sO "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/$A"; tar -xzf "$A"
+mkdir -p oroot
+./sbin/apk.static --arch x86 --root oroot \
+  --repository https://dl-cdn.alpinelinux.org/alpine/v3.21/main \
+  --update-cache --allow-untrusted --initdb --no-scripts add alpine-base openrc
+# смержить openrc поверх рабочего minirootfs (он держит busybox-симлинки):
+cp -a root aroot && cp -an oroot/. aroot/
+sed -i 's|^#ttyS0::respawn:.*|ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100|' aroot/etc/inittab
+ln -sf /bin/busybox aroot/init
+for s in mdev hwdrivers; do ln -sf /etc/init.d/$s aroot/etc/runlevels/sysinit/$s; done
+
+cd /home/slava/projects/wwwvm
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_openrc_milestone -- --ignored --nocapture
+```
+
+→ **настоящий init-flow Alpine**: busybox `init` (PID 1) → `/etc/inittab` →
+`/sbin/openrc sysinit/boot/default` → getty → **`login:` промпт** (~3.5 млрд
+шагов, ~120 c). То есть Alpine грузится до логина через свою родную
+init-систему OpenRC.
+
+Осталось: **apk внутри гостя** (нужна сетевая карта в эмуляторе + мост к
+хосту через proxy с безопасным allowlist'ом — `*` нельзя) — это большая
+отдельная фича.
 
 ### Throughput-бенчмарк
 

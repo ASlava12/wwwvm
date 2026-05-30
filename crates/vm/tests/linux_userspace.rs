@@ -12113,16 +12113,19 @@ fn assert_alpine_ok(found: bool, cumulative: &[u8], stop_reason: &str) {
 /// `/init` shell script that marks a successful boot, plus the /dev nodes
 /// the kernel needs (the minirootfs ships an empty /dev). Parents are
 /// emitted before children (a plain recursive walk).
-fn build_cpio_from_dir(root: &std::path::Path) -> std::io::Result<Vec<u8>> {
+fn build_cpio_from_dir(
+    root: &std::path::Path,
+    init_script: Option<&[u8]>,
+) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::PermissionsExt;
     let mut archive = Vec::new();
-    // /init: kernel execs this; it's a #!/bin/sh script (the rootfs has
-    // /bin/sh -> busybox), so binfmt_script runs busybox sh on it. Print a
-    // marker, the Alpine release, and uname — proving the full rootfs
-    // booted to a working shell with PATH applets.
-    let init_script: &[u8] =
-        b"#!/bin/sh\necho ALPINE_ROOTFS_OK\ncat /etc/alpine-release\nuname -a\n";
-    archive.extend_from_slice(&cpio_entry("init", init_script, 0o100_755, 0, 0));
+    // /init: the kernel execs this. With `Some(script)` we inject a
+    // #!/bin/sh marker script (the rootfs has /bin/sh -> busybox). With
+    // `None` the tree must provide its own /init (e.g. a symlink to busybox
+    // so the busybox `init` applet runs and reads /etc/inittab → OpenRC).
+    if let Some(script) = init_script {
+        archive.extend_from_slice(&cpio_entry("init", script, 0o100_755, 0, 0));
+    }
 
     fn walk(
         dir: &std::path::Path,
@@ -12197,7 +12200,8 @@ fn linux_userspace_alpine_rootfs_milestone() {
             return;
         }
     };
-    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot)) {
+    let init = b"#!/bin/sh\necho ALPINE_ROOTFS_OK\ncat /etc/alpine-release\nuname -a\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("skipping: pack {mroot}: {e}");
@@ -12270,6 +12274,105 @@ fn linux_userspace_alpine_rootfs_milestone() {
         dump_uart_on_failure(&cumulative, "alpine-rootfs-marker")
     );
     eprintln!("  ✓ ALPINE_ROOTFS_OK — the full Alpine minirootfs boots to a working shell!");
+}
+
+/// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
+/// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
+/// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
+/// the minirootfs merged with the openrc package (cross-installed on the
+/// host via apk.static --arch x86, since the guest has no NIC for apk),
+/// at WWWVM_ALPINE_OPENRC_ROOT (default /tmp/alpine/aroot); its /init is a
+/// symlink to busybox (so the `init` applet runs). Reports whether OpenRC
+/// started (its banner) and whether a login prompt was reached — i.e. how
+/// far the real Alpine init/OpenRC boot gets on the emulator.
+#[test]
+#[ignore = "Alpine stage D (OpenRC): busybox-init -> inittab -> openrc -> login; needs WWWVM_ALPINE_OPENRC_ROOT + WWWVM_ALPINE_KERNEL; ~120s"]
+fn linux_userspace_alpine_openrc_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let aroot = std::env::var("WWWVM_ALPINE_OPENRC_ROOT")
+        .unwrap_or_else(|_| "/tmp/alpine/aroot".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&aroot), None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {aroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        // A getty login prompt is the goal: init + openrc + getty all ran.
+        if text.contains("login:") {
+            stop_reason = "reached login: prompt".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    let openrc_ran = text.contains("OpenRC");
+    let login = text.contains("login:");
+    eprintln!("=== ALPINE stage D (OpenRC): OpenRC_started={openrc_ran} login_prompt={login} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "a process segfaulted during the OpenRC boot ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-openrc-segv")
+    );
+    assert!(
+        openrc_ran,
+        "OpenRC never started ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-openrc-start")
+    );
+    assert!(
+        login,
+        "Alpine's init/OpenRC boot did not reach a login prompt ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-openrc-login")
+    );
+    eprintln!("  ✓ Alpine's real init: busybox init → inittab → OpenRC → getty → login: prompt!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
