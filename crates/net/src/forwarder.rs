@@ -95,26 +95,33 @@ impl DnsForwarder {
             || ip.octets() == self.gw_ip)
     }
 
-    /// If `frame` is a DNS query to the gateway, return the response frame to
-    /// inject; otherwise None. A-records come from the cache (NXDOMAIN if the
-    /// name isn't cached/allowlisted); AAAA gets an empty NOERROR (v4-only LAN).
-    pub fn handle_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
-        let q = self.parse_dns_query_frame(frame)?;
-        let query = dns::parse_query(q.payload)?;
-
+    /// The pure DNS policy: given a query *payload*, return the response
+    /// *payload* (or None if it isn't a parseable query). A-records come from
+    /// the cache (NXDOMAIN if the name isn't cached/allowlisted), AAAA gets an
+    /// empty NOERROR (v4-only LAN), and ANY/TXT/etc. are refused (NXDOMAIN) so
+    /// the forwarder can't be an exfil channel. Used both by the hand-rolled
+    /// framing below and by the smoltcp UDP socket.
+    pub fn respond_to_query(&self, payload: &[u8]) -> Option<Vec<u8>> {
+        let query = dns::parse_query(payload)?;
         let answer = if query.qtype == QTYPE_AAAA {
-            DnsAnswer::Addrs(Vec::new()) // NOERROR, no v6 answer
+            DnsAnswer::Addrs(Vec::new())
         } else if query.qtype == QTYPE_A {
             match self.by_name.get(&query.name) {
                 Some(addrs) if !addrs.is_empty() => DnsAnswer::Addrs(addrs.clone()),
-                _ => DnsAnswer::NxDomain, // not allowlisted / not resolved
+                _ => DnsAnswer::NxDomain,
             }
         } else {
-            // ANY/TXT/etc. — refuse to be an exfil channel: NXDOMAIN.
             DnsAnswer::NxDomain
         };
+        Some(dns::build_response(&query, answer))
+    }
 
-        let dns_resp = dns::build_response(&query, answer);
+    /// If `frame` is a DNS query to the gateway, return the response frame to
+    /// inject; otherwise None. (Hand-rolled UDP/IP/Ethernet framing — used
+    /// before the bridge moves onto smoltcp, which does the framing itself.)
+    pub fn handle_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let q = self.parse_dns_query_frame(frame)?;
+        let dns_resp = self.respond_to_query(q.payload)?;
         Some(self.build_udp_frame(q.guest_mac, q.guest_ip, q.src_port, &dns_resp))
     }
 

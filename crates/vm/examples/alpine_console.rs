@@ -29,8 +29,10 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::Instant;
+use wwwvm_net::nat::NatStack;
 use wwwvm_net::{Allowlist, DnsForwarder};
-use wwwvm_vm::{Stop, VirtualGateway, Vm};
+use wwwvm_vm::{Stop, Vm};
 
 /// RAII guard that switches the host terminal to raw mode and restores the
 /// original settings on drop. Without this the host tty stays in cooked
@@ -144,22 +146,18 @@ fn main() {
     // `ip link set eth0 up` + an ARP actually puts a frame on the wire.
     let dump_tx = std::env::var_os("WWWVM_DUMP_TX").is_some();
 
-    // WWWVM_NET_STUB=1 turns on a tiny host-side virtual gateway that
-    // answers the guest's ARP ("who-has 10.0.2.2") and ICMP echo (`ping
-    // 10.0.2.2`) by injecting replies into the NIC's RX ring. Confirms the
-    // inbound (RX + IRQ 11) path end-to-end against the guest's real IP
-    // stack: `ip neigh` resolves and `ping 10.0.2.2` succeeds.
-    const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
-    const HOST_IP: [u8; 4] = [10, 0, 2, 2];
-    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
-    let mut gateway = net_stub.then(|| VirtualGateway::new(HOST_IP, HOST_MAC));
-
-    // DNS forwarder: answer the guest's queries to 10.0.2.2:53 from a cache
-    // we pre-resolve here, ONCE, before the VM runs — so a slow getaddrinfo
+    // WWWVM_NET_STUB=1 turns on the host-side networking stack (crates/net):
+    // a smoltcp interface that owns the gateway IP and answers the guest's
+    // ARP + ICMP (`ping 10.0.2.2`) and serves DNS on UDP/53. Names are
+    // pre-resolved here, ONCE, before the VM runs — so a slow getaddrinfo
     // never freezes the single-threaded step loop, and we only ever vend IPs
     // we resolved ourselves for allowlisted names. Configure the mirror with
     // e.g. WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80'.
-    let dns = net_stub.then(|| {
+    const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+    const HOST_IP: [u8; 4] = [10, 0, 2, 2];
+    const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
+    let mut nat = net_stub.then(|| {
         let allow = Allowlist::from_env();
         let mut fwd = DnsForwarder::new(HOST_IP, HOST_MAC, allow.clone());
         for host in allow.hosts() {
@@ -177,8 +175,9 @@ fn main() {
                 Err(e) => eprintln!("[wwwvm] DNS: cannot resolve {host}: {e}"),
             }
         }
-        fwd
+        NatStack::new(HOST_IP, HOST_MAC, GUEST_IP, fwd)
     });
+    let net_start = Instant::now();
 
     let mut stdout = std::io::stdout();
     let chunk = 5_000_000u32;
@@ -191,28 +190,34 @@ fn main() {
     let mut pending: Vec<u8> = Vec::new();
     'main: loop {
         let (steps, stop) = vm.run_steps_idle_aware(chunk);
-        // Always drain TX (else the host queue grows unbounded); print and/or
-        // answer ARP per the flags.
+        // Always drain TX (else the host queue grows unbounded); feed each
+        // frame to the host stack.
         for frame in vm.drain_tx_frames() {
             if dump_tx {
                 eprint!("\r\n{}\r\n", describe_eth_frame(&frame));
             }
-            // Collect replies from the L2/L3 gateway (ARP/ICMP) and the DNS
-            // forwarder, then inject them into the guest's RX ring.
-            let mut replies: Vec<Vec<u8>> = Vec::new();
-            if let Some(gw) = gateway.as_mut() {
-                replies.extend(gw.handle_frame(&frame));
+            if let Some(n) = nat.as_mut() {
+                n.push_guest_frame(frame);
             }
-            if let Some(d) = dns.as_ref() {
-                replies.extend(d.handle_frame(&frame));
-            }
-            for reply in replies {
-                let ok = vm.inject_rx_frame(&reply);
-                if dump_tx {
-                    eprint!(
-                        "\r\n[wwwvm RX-inject {} bytes → eth0 ok={ok}]\r\n",
-                        reply.len()
-                    );
+        }
+        // Drive the host stack and inject its replies — done unconditionally
+        // each turn (not nested under TX), so host-originated data still flows
+        // when the guest is silent. Bounded per turn; on a full RX ring the
+        // frame is requeued to the FRONT and retried next turn (preserving
+        // order so the guest doesn't see gaps).
+        if let Some(n) = nat.as_mut() {
+            n.poll(net_start.elapsed().as_millis() as i64);
+            let mut budget = 8;
+            while budget > 0 {
+                let Some(reply) = n.pop_egress() else { break };
+                if vm.inject_rx_frame(&reply) {
+                    if dump_tx {
+                        eprint!("\r\n[wwwvm RX-inject {} bytes → eth0]\r\n", reply.len());
+                    }
+                    budget -= 1;
+                } else {
+                    n.requeue_egress_front(reply); // RX ring full — retry next turn
+                    break;
                 }
             }
         }
