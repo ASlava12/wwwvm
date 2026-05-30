@@ -7484,6 +7484,75 @@ fn fpu_fild_fistp_int_conversion() {
     assert_eq!(mem.read_u32(0x608), 10, "(int)(7 * 1.5) = 10");
 }
 
+/// DF /5 FILD m64 + DF /7 FISTP m64 — 64-bit integer load/store. This is
+/// the x87 path glibc/awk use to convert between doubles and integers;
+/// busybox awk hit "unimplemented opcode 0xDF" here. The value is wider
+/// than 32 bits so the high dword genuinely matters.
+#[test]
+fn fpu_fild_fistp_m64_roundtrip() {
+    let mut mem = Memory::new(0x10_0000);
+    // 0x0000_0001_2345_6789 = 4_886_718_345  (does not fit in 32 bits)
+    mem.write_u32(0x600, 0x2345_6789);
+    mem.write_u32(0x604, 0x0000_0001);
+    // FILD m64 [0x600]  ; DF /5 → ST0 = 4886718345.0
+    // FISTP m64 [0x608] ; DF /7 → store as i64, pop
+    // HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDF, 0x2E, 0x00, 0x06, // FILD m64 [0x600]
+            0xDF, 0x3E, 0x08, 0x06, // FISTP m64 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x608), 0x2345_6789, "low dword round-trips");
+    assert_eq!(mem.read_u32(0x60C), 0x0000_0001, "high dword round-trips");
+}
+
+/// DF /0 FILD m16 + DF /2 FIST m16 — signed 16-bit integer load/store
+/// (non-popping store). Round-trips a negative value through the x87 stack.
+#[test]
+fn fpu_fild_fist_m16_signed() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u16(0x600, (-5i16) as u16);
+    // FILD m16 [0x600] ; DF /0 → ST0 = -5.0
+    // FIST m16 [0x608] ; DF /2 → store -5 (no pop)
+    // HLT
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDF, 0x06, 0x00, 0x06, // FILD m16 [0x600]
+            0xDF, 0x16, 0x08, 0x06, // FIST m16 [0x608]
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        mem.read_u16(0x608) as i16,
+        -5,
+        "FILD/FIST m16 round-trips -5"
+    );
+}
+
 /// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
 /// the "wrong" order, fix with FXCH, FSUBP.
 #[test]

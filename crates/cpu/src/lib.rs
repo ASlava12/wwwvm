@@ -7873,23 +7873,79 @@ impl Cpu {
             }
             0xDF => {
                 let modrm = self.fetch_u8(mem);
-                if modrm == 0xE0 {
-                    // FNSTSW AX — copy FPU status (incl. the TOP field)
-                    // into AX.
-                    self.regs[r16::AX] = self.fpu_status_word();
-                } else if (0xE8..=0xF7).contains(&modrm) {
-                    // FUCOMIP/FCOMIP ST(0),ST(i): set EFLAGS, then pop.
-                    let i = modrm & 7;
-                    let a = self.fpu_st(0);
-                    let b = self.fpu_st(i);
-                    self.fpu_set_eflags_compare(a, b);
-                    let _ = self.fpu_pop();
+                let mode = modrm >> 6;
+                if mode == 0b11 {
+                    if modrm == 0xE0 {
+                        // FNSTSW AX — copy FPU status (incl. the TOP field)
+                        // into AX.
+                        self.regs[r16::AX] = self.fpu_status_word();
+                    } else if (0xE8..=0xF7).contains(&modrm) {
+                        // FUCOMIP/FCOMIP ST(0),ST(i): set EFLAGS, then pop.
+                        let i = modrm & 7;
+                        let a = self.fpu_st(0);
+                        let b = self.fpu_st(i);
+                        self.fpu_set_eflags_compare(a, b);
+                        let _ = self.fpu_pop();
+                    } else {
+                        return Err(CpuError::Unimplemented {
+                            opcode,
+                            cs: op_cs,
+                            ip: op_ip,
+                        });
+                    }
                 } else {
-                    return Err(CpuError::Unimplemented {
-                        opcode,
-                        cs: op_cs,
-                        ip: op_ip,
-                    });
+                    // DF memory forms — integer load/store. The /5 FILD m64
+                    // and /7 FISTP m64 (64-bit int <-> double) are how glibc
+                    // math / awk convert between numbers and integers.
+                    let sub = (modrm >> 3) & 0x07;
+                    let ea = if self.addr_size_32 {
+                        self.compute_ea_32(mode, modrm & 0x07, mem)
+                    } else {
+                        self.compute_ea(mode, modrm & 0x07, mem)
+                    };
+                    let addr = self.linear_seg(ea.seg, ea.off);
+                    match sub {
+                        // FILD m16 — push a signed 16-bit integer as a float.
+                        0 => {
+                            let v = self.mem_read_u16(mem, addr) as i16;
+                            self.fpu_push(v as f64);
+                        }
+                        // FIST m16 — store ST(0) as a rounded signed i16.
+                        2 => {
+                            let st0 = self.fpu_st(0);
+                            let v = self.fpu_round_to_int(st0) as i64 as i16;
+                            self.mem_write_u16(mem, addr, v as u16);
+                        }
+                        // FISTP m16 — FIST m16 then pop.
+                        3 => {
+                            let st0 = self.fpu_pop();
+                            let v = self.fpu_round_to_int(st0) as i64 as i16;
+                            self.mem_write_u16(mem, addr, v as u16);
+                        }
+                        // FILD m64 — push a signed 64-bit integer as a float.
+                        5 => {
+                            let lo = self.mem_read_u32(mem, addr) as u64;
+                            let hi = self.mem_read_u32(mem, addr.wrapping_add(4)) as u64;
+                            let v = (lo | (hi << 32)) as i64;
+                            self.fpu_push(v as f64);
+                        }
+                        // FISTP m64 — store ST(0) as a rounded i64, then pop.
+                        7 => {
+                            let st0 = self.fpu_pop();
+                            let v = self.fpu_round_to_int(st0) as i64;
+                            let u = v as u64;
+                            self.mem_write_u32(mem, addr, u as u32);
+                            self.mem_write_u32(mem, addr.wrapping_add(4), (u >> 32) as u32);
+                        }
+                        // /4 FBLD, /6 FBSTP (80-bit packed BCD) — rare.
+                        _ => {
+                            return Err(CpuError::Unimplemented {
+                                opcode,
+                                cs: op_cs,
+                                ip: op_ip,
+                            });
+                        }
+                    }
                 }
             }
             0xD9 => {

@@ -10707,6 +10707,7 @@ fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
     let budget = 10_000_000_000u64;
     let mut steps = 0u64;
     let mut found = false;
+    let stop_reason: String;
     loop {
         let (s, stop) = vm.run_steps_idle_aware(chunk);
         steps += s as u64;
@@ -10716,18 +10717,27 @@ fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
         }
         if String::from_utf8_lossy(&cumulative).contains(marker) {
             found = true;
+            stop_reason = format!("found {marker}");
             break;
         }
         match stop {
-            wwwvm_vm::Stop::CpuError(_) | wwwvm_vm::Stop::Halted => break,
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
             wwwvm_vm::Stop::StepBudget => {
                 if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
                     break;
                 }
             }
         }
     }
-    eprintln!("  run_busybox_dynamic({argv:?}): steps={steps} {marker}={found}");
+    eprintln!("  run_busybox_dynamic({argv:?}): steps={steps} {marker}={found} stop={stop_reason}");
     Some((found, cumulative))
 }
 
@@ -10915,6 +10925,50 @@ fn linux_userspace_busybox_pipeline_milestone() {
         dump_uart_on_failure(&cumulative, "pipe-marker")
     );
     eprintln!("  ✓ PIPE_OK — shell pipeline (pipe+fork+dup2+exec) works!");
+}
+
+/// AWK milestone: a heavier real program. /init runs
+/// `busybox awk 'BEGIN{print "AWK_OK_" 6*7}'`. awk is a full interpreter
+/// — it parses the program, does floating-point arithmetic (awk numbers
+/// are doubles: 6*7 = 42.0), converts the double back to a string via
+/// its OFMT/`%g` path, and string-concatenates. So a clean `AWK_OK_42`
+/// exercises far more of glibc (and the FPU/printf number→string path)
+/// than the echo applets — a good stress test that a non-trivial
+/// dynamically-linked program runs correctly. Asserts AWK_OK_42 with no
+/// segfault / loader error / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_awk_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &["busybox", "awk", "BEGIN{print \"AWK_OK_\" 6*7}"],
+        "AWK_OK_42",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox awk milestone: AWK_OK_42={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox awk) failed; {}",
+        dump_uart_on_failure(&cumulative, "awk-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for busybox awk; {}",
+        dump_uart_on_failure(&cumulative, "awk-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox awk segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "awk-segv")
+    );
+    assert!(
+        found,
+        "busybox awk never printed AWK_OK_42 (double math + number->string \
+         formatting); {}",
+        dump_uart_on_failure(&cumulative, "awk-marker")
+    );
+    eprintln!("  ✓ AWK_OK_42 — busybox awk (FP math + string formatting) works!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
