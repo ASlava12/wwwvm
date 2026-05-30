@@ -11299,6 +11299,54 @@ fn linux_userspace_busybox_signal_milestone() {
     eprintln!("  ✓ TRAP_OK — signal delivery (frame + handler + rt_sigreturn) works!");
 }
 
+/// MD5SUM exact-value milestone: the sharpest bit-level CPU-correctness
+/// check so far. /init runs `sh -c 'echo MD5_INPUT | busybox md5sum'`.
+/// Unlike the gzip round-trip (where two errors could cancel), this pins
+/// the digest to an EXACT value computed on the host:
+///   printf 'MD5_INPUT\n' | md5sum  →  dacfc4c8b9f45aa2d7b1c0f2d9e526b9
+/// MD5 is built from per-round left-rotations (ROL by varying amounts) and
+/// 32-bit modular additions over a 64-entry sine constant table; any
+/// off-by-one rotate, wrong carry, or shift bug would change the digest
+/// completely (avalanche). So the emulated busybox reproducing the exact
+/// 128-bit hash is strong evidence the rotate/add ALU path is correct to
+/// the bit. Asserts the exact hex with no segfault / loader / execve fail.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_md5sum_milestone() {
+    // `echo MD5_INPUT` emits "MD5_INPUT\n", matching the host reference.
+    const EXPECTED: &str = "dacfc4c8b9f45aa2d7b1c0f2d9e526b9";
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &["busybox", "sh", "-c", "echo MD5_INPUT | busybox md5sum"],
+        EXPECTED,
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox md5sum milestone: exact-digest={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "md5-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for md5sum; {}",
+        dump_uart_on_failure(&cumulative, "md5-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox md5sum segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "md5-segv")
+    );
+    assert!(
+        found,
+        "busybox md5sum did not produce the exact host digest {EXPECTED} — \
+         MD5's rotate/add bit path computed a different hash; {}",
+        dump_uart_on_failure(&cumulative, "md5-digest")
+    );
+    eprintln!("  ✓ {EXPECTED} — busybox md5sum matches host exactly (ROL/add bit path correct)!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
