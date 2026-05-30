@@ -11641,6 +11641,44 @@ fn linux_userspace_busybox_libm_milestone() {
     eprintln!("  ✓ LIBM_699 — awk libm sin/cos/exp/log/atan2/sqrt numerically correct!");
 }
 
+/// DIAGNOSTIC (always passes): decides whether the first-libm-call bug is
+/// lazy-PLT resolution. Runs the SAME six-transcendental sum WITHOUT a
+/// warmup, but with `LD_BIND_NOW=1` so ld.so resolves every PLT entry
+/// EAGERLY at startup (no runtime _dl_runtime_resolve during the program).
+///   - If eager binding prints LIBM_699 → the first-call loss is gone →
+///     the bug IS in the lazy resolver path (narrows the search to the
+///     instructions ld.so runs between the PLT trampoline and the callee).
+///   - If it still prints LIBM_615 (first term lost) → NOT the resolver;
+///     look elsewhere (x87 stack depth, awk first-call init, …).
+#[test]
+#[ignore = "diagnostic: LD_BIND_NOW eager-binding probe for the first-libm-call bug; ~60s"]
+fn linux_userspace_libm_bindnow_diag() {
+    let Some((found699, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "LD_BIND_NOW=1 busybox awk 'BEGIN{printf \"LIBM_%d\\n\", int((sin(1)+cos(1)+exp(1)+log(2)+atan2(1,1)+sqrt(2))*100)}'",
+        ],
+        "LIBM_699",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    let lost = text.contains("LIBM_615");
+    eprintln!(
+        "=== LD_BIND_NOW eager-binding diag: LIBM_699(correct)={found699} LIBM_615(first-lost)={lost} ==="
+    );
+    if found699 {
+        eprintln!("  → eager binding FIXES it: the first-call bug IS the lazy PLT resolver.");
+    } else if lost {
+        eprintln!("  → still lost under eager binding: NOT the resolver — look elsewhere.");
+    } else {
+        eprintln!("  → inconclusive; see UART dump.");
+        eprintln!("{}", dump_uart_on_failure(&cumulative, "libm-bindnow"));
+    }
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
