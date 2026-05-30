@@ -42,6 +42,22 @@ fn host_bridge_config(reg: u32) -> u32 {
     }
 }
 
+/// Configuration-space dwords for the NIC at 00:01.0 — a Realtek RTL8139
+/// (vendor 0x10EC, device 0x8139), class 0x020000 (network / ethernet).
+/// Read-only for now: the device is enumerable (so the kernel lists it and
+/// the 8139 driver can match), but BAR0 reads 0 — the I/O register window
+/// and bus-master DMA come in a follow-up (Phase A2b/A3).
+fn rtl8139_config(reg: u32) -> u32 {
+    match reg {
+        0x00 => 0x8139_10EC,        // device 0x8139 << 16 | vendor 0x10EC
+        0x04 => 0x0000_0000,        // command / status
+        0x08 => 0x0200_0000 | 0x10, // class 0x020000 (ethernet), rev 0x10
+        0x0C => 0x0000_0000,        // header type 0
+        0x3C => 0x0000_010B,        // interrupt pin INTA (1), line 11
+        _ => 0x0000_0000,           // BAR0 (0x10) reads 0 until A2b
+    }
+}
+
 pub struct Pci {
     /// Latched address register (CF8..CFB). Bit 31 enable; bus/device/
     /// function/register in the lower bits.
@@ -66,6 +82,7 @@ impl Pci {
         let reg = self.addr & 0xFC; // dword-aligned register offset
         match (bus, dev, func) {
             (0, 0, 0) => host_bridge_config(reg),
+            (0, 1, 0) => rtl8139_config(reg),
             _ => 0xFFFF_FFFF,
         }
     }
@@ -157,10 +174,19 @@ mod tests {
     }
 
     #[test]
+    fn rtl8139_nic_present_at_00_01_0() {
+        let mut pci = Pci::new();
+        // device 1 (bit 11), reg 0 → vendor 0x10EC / device 0x8139.
+        assert_eq!(cfg_read(&mut pci, 0x8000_0800), 0x8139_10EC);
+        // class 0x0200 (ethernet) in the high word of reg 0x08.
+        assert_eq!(cfg_read(&mut pci, 0x8000_0808) >> 16, 0x0200);
+    }
+
+    #[test]
     fn absent_slot_reads_all_ones() {
         let mut pci = Pci::new();
-        // device 1 (bit 11) is empty → vendor 0xFFFF sentinel.
-        assert_eq!(cfg_read(&mut pci, 0x8000_0800), 0xFFFF_FFFF);
+        // device 2 (bit 12) is empty → vendor 0xFFFF sentinel.
+        assert_eq!(cfg_read(&mut pci, 0x8000_1000), 0xFFFF_FFFF);
     }
 
     #[test]
