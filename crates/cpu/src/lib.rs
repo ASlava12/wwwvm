@@ -1794,6 +1794,18 @@ impl Cpu {
         }
     }
 
+    /// Round an f64 to an integer value per the x87 control word's
+    /// rounding-control field (CW bits 10-11). FIST/FISTP use this; the
+    /// default CW=0x037F selects round-to-nearest-even, NOT truncation.
+    fn fpu_round_to_int(&self, v: f64) -> f64 {
+        match (self.fpu_cw >> 10) & 3 {
+            0 => v.round_ties_even(), // 00: round to nearest (even)
+            1 => v.floor(),           // 01: toward -inf
+            2 => v.ceil(),            // 10: toward +inf
+            _ => v.trunc(),           // 11: toward zero (truncate)
+        }
+    }
+
     /// Set the x87 condition-code bits C3/C2/C0 (status word bits
     /// 14/10/8) from a compare of `a` vs `b`, mirroring FCOM. Linux/
     /// glibc test these via FNSTSW + SAHF or `sahf; jcc`.
@@ -7687,11 +7699,13 @@ impl Cpu {
                             let v = self.mem_read_u32(mem, addr) as i32;
                             self.fpu_push(v as f64);
                         }
-                        // FISTP m32 — pop and store as truncated i32.
-                        // The `(int)double` conversion.
+                        // FISTP m32 — pop and store as i32, rounded per
+                        // the control word (default: nearest-even, NOT
+                        // truncation). The `(int)double` conversion.
                         3 => {
                             let v = self.fpu_pop();
-                            self.mem_write_u32(mem, addr, (v as i32) as u32);
+                            let r = self.fpu_round_to_int(v) as i32;
+                            self.mem_write_u32(mem, addr, r as u32);
                         }
                         // FLD m80 — load an 80-bit extended-precision
                         // value (long double) and push it (demoted to
@@ -8009,11 +8023,16 @@ impl Cpu {
                 let mode = modrm >> 6;
                 let op = (modrm >> 3) & 0x07;
                 if mode == 0b11 {
-                    // DC C0+i: ST(i) = ST(i) op ST(0).
+                    // DC C0+i: ST(i) = ST(i) op ST(0). The reg field's
+                    // SUB/DIV directions are REVERSED vs D8 (DC E0+i =
+                    // FSUBR, E8+i = FSUB, F0+i = FDIVR, F8+i = FDIV), so
+                    // pass (ST(0), ST(i)) to fpu_arith — its op=4 (a-b)
+                    // then yields ST(0)-ST(i) for FSUBR, op=5 (b-a) yields
+                    // ST(i)-ST(0) for FSUB, etc.
                     let i = modrm & 0x07;
                     let dst = self.fpu_st(i);
                     let st0 = self.fpu_st(0);
-                    if let Some(r) = Self::fpu_arith(op, dst, st0) {
+                    if let Some(r) = Self::fpu_arith(op, st0, dst) {
                         self.fpu_set_st(i, r);
                     }
                 } else {

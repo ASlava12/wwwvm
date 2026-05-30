@@ -7427,6 +7427,68 @@ fn fpu_fadd_load_add_store() {
     assert_eq!(cpu.fpu_top, 0, "stack balanced after load/load/addp/store");
 }
 
+/// DC reg-form FSUB has REVERSED operand order vs D8. DC E8+i = FSUB
+/// ST(i),ST(0) => ST(i) = ST(i) - ST(0). Regression: FSUB/FSUBR (and
+/// FDIV/FDIVR) were interchanged for the DC reg form.
+#[test]
+fn fpu_dc_reg_fsub_operand_order() {
+    // FLD 10.0 (ST0=10) ; FLD 2.0 (ST0=2, ST1=10) ; DC E9 = FSUB ST(1),ST(0)
+    //   => ST(1) = ST(1) - ST(0) = 10 - 2 = +8 (NOT 2-10=-8).
+    // n_results=2: result[0]=ST(0)=2.0 (unchanged), result[1]=ST(1)=8.0.
+    let r = run_fpu(&[10.0, 2.0], &[0xDC, 0xE9], 2);
+    assert!(fpu_close(r[0], 2.0), "ST(0) unchanged by DC E9");
+    assert!(
+        fpu_close(r[1], 8.0),
+        "FSUB ST(1),ST(0) = 10 - 2 = 8 (got {}), not -8",
+        r[1]
+    );
+}
+
+/// DC reg-form FDIV is likewise reversed: DC F8+i = FDIV ST(i),ST(0)
+/// => ST(i) = ST(i) / ST(0).
+#[test]
+fn fpu_dc_reg_fdiv_operand_order() {
+    // FLD 12.0 ; FLD 3.0 ; DC F9 = FDIV ST(1),ST(0) => ST(1)=12/3=4.
+    let r = run_fpu(&[12.0, 3.0], &[0xDC, 0xF9], 2);
+    assert!(fpu_close(r[0], 3.0), "ST(0) unchanged");
+    assert!(
+        fpu_close(r[1], 4.0),
+        "FDIV ST(1),ST(0) = 12/3 = 4 (got {})",
+        r[1]
+    );
+}
+
+/// FISTP must round per the control word (default = nearest-even), not
+/// truncate toward zero. Regression: it used `(v as i32)` (truncation).
+#[test]
+fn fpu_fistp_rounds_to_nearest_default() {
+    let mut mem = Memory::new(0x10_0000);
+    fpu_w64(&mut mem, 0x600, 2.7); // 2.7 -> nearest = 3, truncate = 2
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDD, 0x06, 0x00, 0x06, // FLD m64 [0x600]
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608]  (DB /3)
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(
+        mem.read_u32(0x608) as i32,
+        3,
+        "FISTP(2.7) must round to nearest (3), not truncate to 2"
+    );
+}
+
 /// FLD1 / FLDZ constant loads and FMULP.
 #[test]
 fn fpu_constants_and_fmulp() {
