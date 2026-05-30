@@ -12932,6 +12932,108 @@ fn linux_userspace_alpine_bzip2_milestone() {
     eprintln!("  ✓ BZIP2_BWT_OK — bzip2's Huffman + MTF + inverse-BWT + CRC32 decode bit-exactly!");
 }
 
+/// 80-bit x87 PRECISION milestone — `busybox printf '%.17g'` must format
+/// floats to the full ~17 significant figures. This is the capstone of the
+/// true-80-bit-x87 work: musl's printf/strtod do float<->string in
+/// `long double`, so before the x87 stack carried a real 64-bit mantissa
+/// (it was modeled as f64=53-bit) the cancellation-heavy dtoa drifted and
+/// `printf '%.17g' 0.1` printed `0.099999999999994315`. With the F80 FPU it
+/// now prints the correctly-rounded `0.10000000000000001` (and π →
+/// `3.1415926535897931`). Asserts both exact strings — a sharp guard
+/// against any regression in the 80-bit arithmetic. Alpine musl userspace;
+/// asset WWWVM_ALPINE_MINIROOT (default /tmp/alpine/root). Skips if absent.
+#[test]
+#[ignore = "Alpine 80-bit x87: printf %.17g full precision; needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_printf_dtoa_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // Correctly-rounded 17-significant-figure decimals of the nearest
+    // doubles to 0.1 and pi (host: `printf '%.17g'`).
+    const EXPECT_G: &str = "DTOA_G=[0.10000000000000001]";
+    const EXPECT_PI: &str = "DTOA_PI=[3.1415926535897931]";
+    let init = b"#!/bin/sh\nbusybox printf 'DTOA_G=[%.17g]\\n' 0.1\n\
+                 busybox printf 'DTOA_PI=[%.17g]\\n' 3.141592653589793\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT_G) && text.contains(EXPECT_PI) {
+            stop_reason = "found both exact dtoa markers".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    let g = text.contains(EXPECT_G);
+    let pi = text.contains(EXPECT_PI);
+    eprintln!(
+        "=== ALPINE 80-bit x87 printf: 0.1_ok={g} pi_ok={pi} steps={steps} stop={stop_reason} ==="
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox printf segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-dtoa-segv")
+    );
+    assert!(
+        g && pi,
+        "printf '%.17g' lost precision ({stop_reason}) — the 80-bit x87 mantissa is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-dtoa-marker")
+    );
+    eprintln!("  ✓ printf '%.17g' 0.1 → 0.10000000000000001, π → 3.1415926535897931 — 80-bit x87 precision works!");
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
