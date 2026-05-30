@@ -5672,10 +5672,12 @@ fn ata_identify_via_in_out_returns_signature_word() {
 /// End-to-end PCI Mechanism #1 probe via 32-bit OUT/IN under 0x66.
 /// Selects bus 0 / device 0 / register 0 with enable=1, then reads
 /// the 32-bit data window — the canonical "scan PCI for a device"
-/// idiom Linux uses. An empty bus returns 0xFFFFFFFF (vendor ID =
-/// 0xFFFF), and that's what we verify here.
+/// idiom Linux uses. 00:00.0 is the host bridge (vendor 0x8086 /
+/// device 0x1237), so the probe reads 0x12378086. This exercises the
+/// whole inl/outl(0xCF8/0xCFC) path that the kernel's enumeration and
+/// pci_sanity_check depend on.
 #[test]
-fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
+fn pci_config_read_returns_host_bridge_id() {
     let mut mem = Memory::new(0x10_0000);
     mem.write_slice(
         0x7C00,
@@ -5699,8 +5701,8 @@ fn pci_config_read_returns_no_device_sentinel_on_empty_bus() {
         cpu.step(&mut mem, &mut io).expect("step");
     }
     assert!(cpu.halted);
-    // Empty PCI bus → vendor/device ID = 0xFFFFFFFF.
-    assert_eq!(cpu.read_r32(0), 0xFFFF_FFFF);
+    // 00:00.0 host bridge → device 0x1237 << 16 | vendor 0x8086.
+    assert_eq!(cpu.read_r32(0), 0x1237_8086);
 }
 
 /// Software INT n against a kernel-only IDT gate (DPL=0) from

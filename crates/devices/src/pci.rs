@@ -8,13 +8,15 @@
 //!   * 0xCFC — data window. Reads/writes hit the dword at the latched
 //!     bus/device/function/register location.
 //!
-//! With no PCI devices behind the bus, every read returns 0xFFFFFFFF
-//! (the "no device present" sentinel — vendor ID = 0xFFFF). That's
-//! what the Linux kernel scans for during PCI enumeration: a vendor
-//! ID of 0xFFFF means "skip this slot". Without the dispatch this
-//! port pair was unmapped, so reads got 0xFF byte-by-byte — by accident
-//! the same answer, but writes to 0xCF8 went nowhere and any read
-//! that should have hit a real device returned the same sentinel.
+//! We model one device: a host bridge at 00:00.0 (Intel 440FX, class
+//! 0x0600). This is REQUIRED for PCI to work at all — Linux's Mechanism #1
+//! detection passes the CF8 read-back check but then runs
+//! `pci_sanity_check`, which scans bus 0 for at least one plausible device
+//! (a host bridge, a VGA, or an Intel/Compaq vendor). An empty bus (all
+//! 0xFFFFFFFF) fails that check, so the kernel prints "PCI: Fatal: No
+//! config space access function found" and disables PCI entirely. With the
+//! bridge present the bus is real and enumeration proceeds; other slots
+//! still answer 0xFFFFFFFF (vendor 0xFFFF = "no device, skip").
 //!
 //! Writes from the CPU come in as byte writes (via the 0x66-prefixed
 //! 32-bit OUT path's four consecutive byte-writes shim), so we
@@ -25,6 +27,20 @@ use crate::IoDevice;
 
 const PORT_ADDR_LO: u16 = 0xCF8;
 const PORT_LAST: u16 = 0xCFF;
+
+/// Configuration-space dwords for the host bridge at 00:00.0 — an Intel
+/// 440FX (vendor 0x8086, device 0x1237), class 0x060000 (bridge / host).
+/// `reg` is the dword-aligned register offset. Unimplemented registers
+/// read as 0 (a present device, not the 0xFFFFFFFF "absent" sentinel).
+fn host_bridge_config(reg: u32) -> u32 {
+    match reg {
+        0x00 => 0x1237_8086,        // device 0x1237 << 16 | vendor 0x8086
+        0x04 => 0x0000_0000,        // command / status
+        0x08 => 0x0600_0000 | 0x02, // class 0x060000 (host bridge), rev 0x02
+        0x0C => 0x0000_0000,        // BIST / header type 0 / latency / cacheline
+        _ => 0x0000_0000,           // no BARs, no capabilities
+    }
+}
 
 pub struct Pci {
     /// Latched address register (CF8..CFB). Bit 31 enable; bus/device/
@@ -37,14 +53,21 @@ impl Pci {
         Self { addr: 0 }
     }
 
-    /// Look up the dword at the currently-latched configuration
-    /// address. Always 0xFFFFFFFF in this skeleton — we have no
-    /// devices behind the bus yet.
+    /// Look up the dword at the currently-latched configuration address,
+    /// routing by bus/device/function. Only 00:00.0 (the host bridge) is
+    /// present; every other slot answers 0xFFFFFFFF ("no device").
     fn read_data(&self) -> u32 {
-        // Real bus: route by bus/device/function. We don't model any
-        // devices, so every slot answers "no device".
-        let _ = self.addr;
-        0xFFFF_FFFF
+        if self.addr & 0x8000_0000 == 0 {
+            return 0xFFFF_FFFF; // config cycle not enabled
+        }
+        let bus = (self.addr >> 16) & 0xFF;
+        let dev = (self.addr >> 11) & 0x1F;
+        let func = (self.addr >> 8) & 0x07;
+        let reg = self.addr & 0xFC; // dword-aligned register offset
+        match (bus, dev, func) {
+            (0, 0, 0) => host_bridge_config(reg),
+            _ => 0xFFFF_FFFF,
+        }
     }
 
     /// Serialize the latched address register (4 bytes). The bus
@@ -109,22 +132,35 @@ impl IoDevice for Pci {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_bus_reads_all_ones_at_data_port() {
-        let mut pci = Pci::new();
-        // Set address: enable=1, bus=0, device=0, function=0, reg=0.
-        // (Linux's first probe: bus 0 device 0 vendor/device ID at
-        // offset 0.)
-        for (i, b) in [0x00u8, 0x00, 0x00, 0x80].iter().enumerate() {
-            pci.write(0xCF8 + i as u16, *b);
+    fn cfg_read(pci: &mut Pci, addr: u32) -> u32 {
+        for i in 0..4u16 {
+            pci.write(0xCF8 + i, (addr >> (i * 8)) as u8);
         }
-        // Read four bytes from the data window — should give us
-        // 0xFFFFFFFF, the "no device" sentinel.
         let mut got = 0u32;
         for i in 0..4u16 {
             got |= (pci.read(0xCFC + i) as u32) << (i * 8);
         }
-        assert_eq!(got, 0xFFFF_FFFF);
+        got
+    }
+
+    #[test]
+    fn host_bridge_present_at_00_00_0() {
+        // Linux's pci_sanity_check needs a real device on bus 0, or it
+        // disables PCI. 00:00.0 must report the host-bridge ID + class.
+        let mut pci = Pci::new();
+        // enable=1, bus0, dev0, func0, reg0 → vendor/device.
+        assert_eq!(cfg_read(&mut pci, 0x8000_0000), 0x1237_8086);
+        // reg 0x08 → class 0x060000 in the high 24 bits; sanity_check
+        // reads the 16-bit class at offset 0x0A and wants 0x0600.
+        let classdw = cfg_read(&mut pci, 0x8000_0008);
+        assert_eq!(classdw >> 16, 0x0600, "class code = host bridge");
+    }
+
+    #[test]
+    fn absent_slot_reads_all_ones() {
+        let mut pci = Pci::new();
+        // device 1 (bit 11) is empty → vendor 0xFFFF sentinel.
+        assert_eq!(cfg_read(&mut pci, 0x8000_0800), 0xFFFF_FFFF);
     }
 
     #[test]
