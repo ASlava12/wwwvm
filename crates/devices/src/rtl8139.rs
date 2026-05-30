@@ -552,6 +552,58 @@ mod tests {
     }
 
     #[test]
+    fn rx_wraps_contiguously_past_ring_end() {
+        // A long transfer eventually writes a packet near the ring's end.
+        // With RxNoWrap the packet is laid down contiguously (spilling into
+        // the driver's slack) from the current offset, and CBR wraps for the
+        // next one — the behaviour 8139too relies on.
+        let rbstart = 0x6_0000u32;
+        let mut nic = rx_ready(rbstart);
+        let len = 8192u32; // default RCR → 8 KB ring
+                           // Put the write pointer 10 bytes from the end, read pointer alongside
+                           // it so there's room (CBR = rptr → empty).
+        nic.write_reg(0x3A, ((len - 10) & 0xFF) as u8);
+        nic.write_reg(0x3B, (((len - 10) >> 8) & 0xFF) as u8);
+        // CAPR = (len-10) - 16 so rx_rptr = (CAPR+16)%len = len-10 = CBR.
+        let capr = len - 26;
+        nic.write_reg(0x38, (capr & 0xFF) as u8);
+        nic.write_reg(0x39, ((capr >> 8) & 0xFF) as u8);
+
+        let frame = vec![0x7E; 64];
+        let (dest, bytes) = nic.accept_rx(&frame).expect("accepted");
+        // Written contiguously at the old offset (into the slack region).
+        assert_eq!(dest, rbstart + (len - 10));
+        assert_eq!(bytes.len(), 72);
+        // CBR wrapped: (len-10 + 72) mod len = 62.
+        let cbr = nic.read_reg(0x3A) as u32 | ((nic.read_reg(0x3B) as u32) << 8);
+        assert_eq!(cbr, 62);
+    }
+
+    #[test]
+    fn tx_multiple_descriptors_drain_in_order() {
+        // A burst uses all four TX descriptors round-robin; the VM must see
+        // each queued frame, in kick order.
+        let mut nic = Rtl8139::new();
+        for (i, (tsad, tsd)) in [(0x20, 0x10), (0x24, 0x14), (0x28, 0x18), (0x2C, 0x1C)]
+            .into_iter()
+            .enumerate()
+        {
+            wreg32(&mut nic, tsad as u16, 0x1000 * (i as u32 + 1));
+            wreg32(&mut nic, tsd as u16, 100 + i as u32);
+        }
+        let frames = nic.take_tx_frames();
+        assert_eq!(
+            frames,
+            vec![
+                (0x1000, 100u16),
+                (0x2000, 101),
+                (0x3000, 102),
+                (0x4000, 103),
+            ]
+        );
+    }
+
+    #[test]
     fn rx_accept_writes_header_and_marks_data_available() {
         let rbstart = 0x4_0000u32;
         let mut nic = rx_ready(rbstart);
