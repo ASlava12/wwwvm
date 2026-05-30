@@ -1435,8 +1435,23 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
 
 → `ALPINE_MUSL_OK`: эмулятор **грузит ядро Alpine 6.12 LTS И гоняет
 Alpine-musl-busybox** — то есть Alpine (ядро + userspace), пока без полного
-init. Стадия C (полный Alpine: OpenRC + apk + настоящий minirootfs) —
-следующая.
+init.
+
+**Стадия C — ВЕСЬ Alpine minirootfs → рабочий шелл:**
+
+```bash
+# minirootfs уже распакован в /tmp/alpine/root из стадии A
+cargo test -p wwwvm-vm --release --test linux_userspace \
+  linux_userspace_alpine_rootfs_milestone -- --ignored --nocapture
+```
+
+→ `ALPINE_ROOTFS_OK`: упаковывает **весь** дерево minirootfs (busybox + ~335
+applet-симлинков, musl, настоящие `/etc`, `/sbin`, apk) в cpio (с
+симлинками + /dev-нодами + `/init`-скриптом), грузит на ядре Alpine, и
+`/init` (`#!/bin/sh` → busybox) печатает маркер + `/etc/alpine-release` +
+`uname -a`. То есть **настоящий Alpine-userspace грузится до шелла** (ядро
+Alpine + полный rootfs Alpine), пока без OpenRC/apk. Дальше — OpenRC (init-
+система) и apk (пакеты, нужна сеть через proxy).
 
 ### Throughput-бенчмарк
 

@@ -12106,6 +12106,172 @@ fn assert_alpine_ok(found: bool, cumulative: &[u8], stop_reason: &str) {
     eprintln!("  ✓ ALPINE_MUSL_OK — Alpine's musl PIE busybox sh runs on the emulator!");
 }
 
+/// Pack a real on-disk directory tree (the extracted Alpine minirootfs)
+/// into a newc cpio initramfs — directories, regular files (with their
+/// modes), and SYMLINKS (the ~335 busybox-applet links, the musl libc
+/// link, …), which the flat `build_cpio_tree` can't represent. Adds an
+/// `/init` shell script that marks a successful boot, plus the /dev nodes
+/// the kernel needs (the minirootfs ships an empty /dev). Parents are
+/// emitted before children (a plain recursive walk).
+fn build_cpio_from_dir(root: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut archive = Vec::new();
+    // /init: kernel execs this; it's a #!/bin/sh script (the rootfs has
+    // /bin/sh -> busybox), so binfmt_script runs busybox sh on it. Print a
+    // marker, the Alpine release, and uname — proving the full rootfs
+    // booted to a working shell with PATH applets.
+    let init_script: &[u8] =
+        b"#!/bin/sh\necho ALPINE_ROOTFS_OK\ncat /etc/alpine-release\nuname -a\n";
+    archive.extend_from_slice(&cpio_entry("init", init_script, 0o100_755, 0, 0));
+
+    fn walk(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        out: &mut Vec<u8>,
+    ) -> std::io::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|e| e.path());
+        for e in entries {
+            let path = e.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let md = std::fs::symlink_metadata(&path)?;
+            let mode = md.permissions().mode() & 0o7777;
+            if md.file_type().is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                out.extend_from_slice(&cpio_entry(
+                    &rel,
+                    target.to_string_lossy().as_bytes(),
+                    0o120_000 | 0o777,
+                    0,
+                    0,
+                ));
+            } else if md.is_dir() {
+                out.extend_from_slice(&cpio_entry(&rel, &[], 0o040_000 | mode, 0, 0));
+                walk(&path, base, out)?;
+            } else {
+                let data = std::fs::read(&path)?;
+                out.extend_from_slice(&cpio_entry(&rel, &data, 0o100_000 | mode, 0, 0));
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut archive)?;
+
+    // The minirootfs's /dev is empty; give the kernel a console (+ null/zero).
+    archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    archive.extend_from_slice(&cpio_entry("dev/null", &[], 0o020_666, 1, 3));
+    archive.extend_from_slice(&cpio_entry("dev/zero", &[], 0o020_666, 1, 5));
+    archive.extend_from_slice(&cpio_entry("TRAILER!!!", &[], 0, 0, 0));
+    while archive.len() & 511 != 0 {
+        archive.push(0);
+    }
+    Ok(archive)
+}
+
+/// ALPINE STAGE C: boot the FULL Alpine minirootfs (the whole extracted
+/// tree — busybox + its ~335 applet symlinks, musl, the real /etc, /sbin,
+/// apk, …) as the initramfs and reach a working shell. /init is a
+/// `#!/bin/sh` script that prints ALPINE_ROOTFS_OK, the Alpine release, and
+/// uname; the kernel runs it via /bin/sh (a symlink to busybox), so PATH
+/// applets (cat, uname) resolve through the symlink farm. This is "real"
+/// Alpine userspace (minus OpenRC/apk). Kernel from WWWVM_ALPINE_KERNEL
+/// (default the Alpine vmlinuz-lts), tree from WWWVM_ALPINE_MINIROOT
+/// (default /tmp/alpine/root — the extracted alpine-minirootfs tarball).
+/// Asserts ALPINE_ROOTFS_OK with no segfault / loader error. Skips if
+/// assets are absent.
+#[test]
+#[ignore = "Alpine stage C: full minirootfs -> shell; needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_rootfs_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains("ALPINE_ROOTFS_OK") {
+            found = true;
+            stop_reason = "found ALPINE_ROOTFS_OK".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died/exited)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE stage C (full minirootfs): ALPINE_ROOTFS_OK={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld-musl could not load a binary from the full rootfs; {}",
+        dump_uart_on_failure(&cumulative, "alpine-rootfs-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a process segfaulted booting the full Alpine rootfs ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-rootfs-segv")
+    );
+    assert!(
+        found,
+        "the full Alpine minirootfs did not reach a shell / print ALPINE_ROOTFS_OK ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-rootfs-marker")
+    );
+    eprintln!("  ✓ ALPINE_ROOTFS_OK — the full Alpine minirootfs boots to a working shell!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
