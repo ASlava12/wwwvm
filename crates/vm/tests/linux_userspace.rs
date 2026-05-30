@@ -12599,6 +12599,108 @@ fn linux_userspace_alpine_sha512_milestone() {
     eprintln!("  ✓ exact SHA-512 digest — 64-bit shifts (SHLD/SHRD) + add-with-carry chains are bit-correct!");
 }
 
+/// INTEGER DIVISION/MODULO milestone — `busybox factor 600851475143`
+/// factors a 40-bit number and must print the exact line
+/// `600851475143: 71 839 1471 6857`. factor is trial division, so it runs
+/// thousands of 64-bit `n % d == 0` / `n / d` operations; on i386 (no
+/// 64-bit divide instruction) each one is libgcc's software
+/// `__umoddi3`/`__udivdi3`, built from the 32-bit `DIV` instruction. An
+/// exact factorization therefore pins `DIV` (quotient AND remainder, and
+/// the #DE-free 64/32 long-division path) to the bit — a distinct ALU area
+/// from sha512's shifts and md5sum's rotates. A wrong remainder would make
+/// factor miss a divisor or emit a composite, changing the printed line.
+/// Alpine musl busybox (the glibc build omits factor). Asset:
+/// WWWVM_ALPINE_MINIROOT (default /tmp/alpine/root). Skips if absent.
+#[test]
+#[ignore = "Alpine factor: exact factorization (64-bit DIV/MOD via __udivdi3); needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_factor_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // Exact factorization of 600851475143 (Project Euler #3's number).
+    const EXPECT: &str = "600851475143: 71 839 1471 6857";
+    let init = b"#!/bin/sh\nbusybox factor 600851475143\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(EXPECT) {
+            found = true;
+            stop_reason = "found exact factorization".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE factor (64-bit DIV/MOD): exact_factorization={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("segfault at"),
+        "busybox factor segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-factor-segv")
+    );
+    assert!(
+        found,
+        "busybox factor did not print the exact factorization ({stop_reason}) — a 64-bit \
+         DIV/MOD (__udivdi3/__umoddi3) path is wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-factor-marker")
+    );
+    eprintln!(
+        "  ✓ 600851475143 = 71·839·1471·6857 — 64-bit DIV/MOD (quotient+remainder) is bit-correct!"
+    );
+}
+
 /// ALPINE STAGE D (OpenRC, diagnostic, always passes): boot Alpine's REAL
 /// init flow — busybox `init` as PID 1 reading /etc/inittab, which runs
 /// `/sbin/openrc sysinit/boot/default` and spawns a getty. The rootfs is
