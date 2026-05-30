@@ -11386,14 +11386,15 @@ fn lidt_loads_idt_descriptor_independently() {
 fn unknown_opcode_reports_error() {
     let mut mem = Memory::new(0x10_0000);
     // 0x0F is now a real prefix. Use 0x0F + an unrecognised second
-    // byte to test the catch-all in the two-byte opcode space.
-    mem.write_slice(0x7C00, &[0x0F, 0x77]);
+    // byte to test the catch-all in the two-byte opcode space. (0x77 used
+    // to serve here but is now EMMS; 0xFF / UD0 is reserved-invalid.)
+    mem.write_slice(0x7C00, &[0x0F, 0xFF]);
     let mut cpu = Cpu::new();
     cpu.reset_to_boot();
     let mut io = IoBus::new();
     let err = cpu.step(&mut mem, &mut io).unwrap_err();
     match err {
-        CpuError::Unimplemented { opcode: 0x77, .. } => {}
+        CpuError::Unimplemented { opcode: 0xFF, .. } => {}
         other => panic!("unexpected: {other:?}"),
     }
 }
@@ -11575,4 +11576,48 @@ fn rtl8139_rx_dmas_frame_into_ring_and_raises_irq11() {
     // ROK unmasked → IRQ 11 (vector 0x73) pending through the cascade.
     io.refresh_irqs();
     assert_eq!(io.pending_irq_vector(), Some(0x73));
+}
+
+// --- MMX packed-integer lane helpers ---
+
+#[test]
+fn mmx_packed_add_sub_lanes() {
+    // Byte lanes wrap independently (0xFF + 0x02 = 0x01, no carry across).
+    let a = 0x01_02_03_04_05_06_07_FFu64;
+    let b = 0x10_10_10_10_10_10_10_02u64;
+    assert_eq!(mmx_padd(a, b, 1), 0x11_12_13_14_15_16_17_01);
+    // Word lanes (16-bit) carry within the lane.
+    let a = 0x0001_00FF_FFFF_0000u64;
+    let b = 0x0001_0001_0001_0001u64;
+    assert_eq!(mmx_padd(a, b, 2), 0x0002_0100_0000_0001);
+    // Dword subtract, lane-wise wrapping.
+    let a = 0x0000_0000_0000_0005u64;
+    let b = 0x0000_0000_0000_0009u64;
+    assert_eq!(mmx_psub(a, b, 4), 0x0000_0000_FFFF_FFFC);
+    // Qword add is the whole 64-bit value.
+    assert_eq!(mmx_padd(0xFFFF_FFFF_FFFF_FFFF, 1, 8), 0);
+}
+
+#[test]
+fn mmx_packed_compare_lanes() {
+    // PCMPEQB: equal bytes → 0xFF, others → 0x00.
+    let a = 0xAA_BB_CC_DD_11_22_33_44u64;
+    let b = 0xAA_00_CC_00_11_00_33_00u64;
+    assert_eq!(mmx_pcmpeq(a, b, 1), 0xFF_00_FF_00_FF_00_FF_00);
+    // PCMPGTW signed: -1 (0xFFFF) is NOT greater than 1.
+    let a = 0x0002_FFFF_0000_8000u64; //  2, -1,  0, -32768
+    let b = 0x0001_0001_0000_7FFFu64; //  1,  1,  0,  32767
+                                      // lane>: 2>1 yes; -1>1 no; 0>0 no; -32768>32767 no
+    assert_eq!(mmx_pcmpgt(a, b, 2), 0xFFFF_0000_0000_0000);
+}
+
+#[test]
+fn mmx_pmaddwd_multiplies_and_sums_pairs() {
+    // Low dword: words (2,3) · (4,5) → 2*4 + 3*5 = 23.
+    // High dword: words (1,1) · (1,1) → 1 + 1 = 2.
+    let a = 0x0001_0001_0003_0002u64; // hi: [1,1]   lo: [3,2]
+    let b = 0x0001_0001_0005_0004u64; // hi: [1,1]   lo: [5,4]
+    let r = mmx_pmaddwd(a, b);
+    assert_eq!(r & 0xFFFF_FFFF, 23, "low dword = 2*4 + 3*5");
+    assert_eq!(r >> 32, 2, "high dword = 1*1 + 1*1");
 }

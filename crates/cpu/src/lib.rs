@@ -208,6 +208,11 @@ pub struct Cpu {
     /// so data-movement (MOVD/MOVQ/MOVDQA) is exact; packed-arith ops
     /// reinterpret the lanes as needed.
     pub xmm: [u128; 8],
+    /// MMX register file: MM0..MM7, each 64 bits. Architecturally these
+    /// alias the x87 mantissas, but Alpine's MMX routines are self-contained
+    /// (EMMS before any x87), so a separate array is exact for them and far
+    /// simpler. Used by the integer-SIMD code in the guest's libcrypto/zlib.
+    pub mmx: [u64; 8],
     /// SYSENTER MSRs (IA32_SYSENTER_CS/ESP/EIP = 0x174/0x175/0x176).
     /// SYSENTER loads CS:EIP and SS:ESP from these; SYSEXIT derives
     /// the return selectors from `sysenter_cs`. Written via WRMSR.
@@ -435,6 +440,109 @@ impl Default for Cpu {
     }
 }
 
+// --- Packed-integer lane helpers (shared by MMX 64-bit and, in principle,
+// SSE forms). `lane` is the element width in bytes (1/2/4/8). ---
+
+/// Apply `f` to each `lane`-byte element of `a` and `b` independently.
+fn packed_map(a: u64, b: u64, lane: usize, f: impl Fn(u64, u64) -> u64) -> u64 {
+    let bits = lane * 8;
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let mut out = 0u64;
+    let mut sh = 0;
+    while sh < 64 {
+        let av = (a >> sh) & mask;
+        let bv = (b >> sh) & mask;
+        out |= (f(av, bv) & mask) << sh;
+        sh += bits;
+    }
+    out
+}
+
+fn mmx_padd(a: u64, b: u64, lane: usize) -> u64 {
+    packed_map(a, b, lane, |x, y| x.wrapping_add(y))
+}
+
+fn mmx_psub(a: u64, b: u64, lane: usize) -> u64 {
+    packed_map(a, b, lane, |x, y| x.wrapping_sub(y))
+}
+
+fn mmx_pcmpeq(a: u64, b: u64, lane: usize) -> u64 {
+    packed_map(a, b, lane, |x, y| if x == y { u64::MAX } else { 0 })
+}
+
+/// Packed logical right shift, per lane (count from a register/imm). A count
+/// at or beyond the lane width zeroes the lane.
+fn mmx_psrl(a: u64, count: u64, lane: usize) -> u64 {
+    let bits = (lane * 8) as u64;
+    packed_map(
+        a,
+        0,
+        lane,
+        move |x, _| if count >= bits { 0 } else { x >> count },
+    )
+}
+
+/// Packed logical left shift, per lane (out-of-lane bits dropped by the mask).
+fn mmx_psll(a: u64, count: u64, lane: usize) -> u64 {
+    let bits = (lane * 8) as u64;
+    packed_map(
+        a,
+        0,
+        lane,
+        move |x, _| if count >= bits { 0 } else { x << count },
+    )
+}
+
+/// Packed arithmetic (signed) right shift, per lane. A count at/beyond the
+/// lane width saturates to a full sign fill.
+fn mmx_psra(a: u64, count: u64, lane: usize) -> u64 {
+    let bits = (lane * 8) as u32;
+    let c = if count >= bits as u64 {
+        bits - 1
+    } else {
+        count as u32
+    };
+    packed_map(a, 0, lane, move |x, _| {
+        let sx = ((x << (64 - bits)) as i64) >> (64 - bits); // sign-extend the lane
+        (sx >> c) as u64
+    })
+}
+
+/// PMADDWD: signed 16-bit lanes multiplied, adjacent pairs summed into
+/// 32-bit results (4 words → 2 dwords for MMX).
+fn mmx_pmaddwd(a: u64, b: u64) -> u64 {
+    let mut out = 0u64;
+    for pair in 0..2 {
+        let sh = pair * 32;
+        let a0 = ((a >> sh) & 0xFFFF) as i16 as i32;
+        let a1 = ((a >> (sh + 16)) & 0xFFFF) as i16 as i32;
+        let b0 = ((b >> sh) & 0xFFFF) as i16 as i32;
+        let b1 = ((b >> (sh + 16)) & 0xFFFF) as i16 as i32;
+        let dword = (a0 * b0).wrapping_add(a1 * b1) as u32 as u64;
+        out |= dword << sh;
+    }
+    out
+}
+
+/// Signed greater-than, per lane → all-ones / zero. `bits` from `lane`.
+fn mmx_pcmpgt(a: u64, b: u64, lane: usize) -> u64 {
+    let bits = (lane * 8) as u32;
+    packed_map(a, b, lane, |x, y| {
+        // Sign-extend the lane to i64 before comparing.
+        let sx = ((x << (64 - bits)) as i64) >> (64 - bits);
+        let sy = ((y << (64 - bits)) as i64) >> (64 - bits);
+        if sx > sy {
+            u64::MAX
+        } else {
+            0
+        }
+    })
+}
+
 impl Cpu {
     pub fn new() -> Self {
         Self {
@@ -465,6 +573,7 @@ impl Cpu {
             fpu_st: [F80::ZERO; 8],
             fpu_top: 0,
             xmm: [0; 8],
+            mmx: [0; 8],
             sysenter_cs: 0,
             sysenter_esp: 0,
             sysenter_eip: 0,
@@ -1455,6 +1564,31 @@ impl Cpu {
                 let a = self.linear_seg(ea.seg, ea.off);
                 (self.mem_read_u32(mem, a) as u64)
                     | ((self.mem_read_u32(mem, a.wrapping_add(4)) as u64) << 32)
+            }
+        }
+    }
+
+    /// Read an MMX r/m operand: an MM register (mod=11) or a 64-bit memory
+    /// value (the no-66 packed-integer forms).
+    fn read_mm_rm(&self, rm: Rm, mem: &Memory) -> u64 {
+        match rm {
+            Rm::Reg(i) => self.mmx[i as usize],
+            Rm::Mem(ea) => {
+                let a = self.linear_seg(ea.seg, ea.off);
+                (self.mem_read_u32(mem, a) as u64)
+                    | ((self.mem_read_u32(mem, a.wrapping_add(4)) as u64) << 32)
+            }
+        }
+    }
+
+    /// Write an MMX r/m operand: an MM register or 64-bit memory.
+    fn write_mm_rm(&mut self, rm: Rm, mem: &mut Memory, value: u64) {
+        match rm {
+            Rm::Reg(i) => self.mmx[i as usize] = value,
+            Rm::Mem(ea) => {
+                let a = self.linear_seg(ea.seg, ea.off);
+                self.mem_write_u32(mem, a, value as u32);
+                self.mem_write_u32(mem, a.wrapping_add(4), (value >> 32) as u32);
             }
         }
     }
@@ -6724,6 +6858,146 @@ impl Cpu {
                         let v = self.xmm[reg as usize];
                         self.write_xmm_rm(rm, mem, v);
                     }
+
+                    // --- MMX (no 0x66 prefix): the 64-bit packed-integer
+                    // forms, on the separate MM register file. Guest
+                    // libcrypto/zlib use these (e.g. `movd mm0,[esp+x]` then
+                    // `pxor mm1,mm1`). The 66-prefixed twins above are the
+                    // 128-bit SSE2 versions; the `!has_66` guard keeps the two
+                    // families apart.
+                    0x6E if !self.has_66() => {
+                        // MOVD mm, r/m32 — load low dword, zero the high.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        self.mmx[reg as usize] = self.read_rm32(rm, mem) as u64;
+                    }
+                    0x7E if !self.has_66() => {
+                        // MOVD r/m32, mm — store the low dword.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.mmx[reg as usize] as u32;
+                        self.write_rm32(rm, mem, v);
+                    }
+                    0x6F if !self.has_66() => {
+                        // MOVQ mm, mm/m64.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        self.mmx[reg as usize] = self.read_mm_rm(rm, mem);
+                    }
+                    0x7F if !self.has_66() => {
+                        // MOVQ mm/m64, mm.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.mmx[reg as usize];
+                        self.write_mm_rm(rm, mem, v);
+                    }
+                    0x77 => {
+                        // EMMS — end MMX state. The MM file is separate from
+                        // our x87 stack, so there's nothing to retag.
+                    }
+                    // Bitwise logicals on the full 64 bits.
+                    0xDB | 0xDF | 0xEB | 0xEF if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem);
+                        let d = &mut self.mmx[reg as usize];
+                        *d = match op2 {
+                            0xDB => *d & s,  // PAND
+                            0xDF => !*d & s, // PANDN
+                            0xEB => *d | s,  // POR
+                            _ => *d ^ s,     // PXOR (0xEF)
+                        };
+                    }
+                    // Packed add / subtract (wrapping): b/w/d/q lanes.
+                    0xFC | 0xFD | 0xFE | 0xD4 | 0xF8 | 0xF9 | 0xFA | 0xFB if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem);
+                        let d = self.mmx[reg as usize];
+                        self.mmx[reg as usize] = match op2 {
+                            0xFC => mmx_padd(d, s, 1),
+                            0xFD => mmx_padd(d, s, 2),
+                            0xFE => mmx_padd(d, s, 4),
+                            0xD4 => mmx_padd(d, s, 8),
+                            0xF8 => mmx_psub(d, s, 1),
+                            0xF9 => mmx_psub(d, s, 2),
+                            0xFA => mmx_psub(d, s, 4),
+                            _ => mmx_psub(d, s, 8), // 0xFB PSUBQ
+                        };
+                    }
+                    // PMULUDQ mm, mm/m64 — unsigned 32×32→64 of the low
+                    // dwords. The core of OpenSSL's MMX bignum multiply
+                    // (PMULUDQ + PADDQ), used by libcrypto's RSA.
+                    0xF4 if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem) as u32 as u64;
+                        let d = self.mmx[reg as usize] as u32 as u64;
+                        self.mmx[reg as usize] = d * s;
+                    }
+                    // Packed 16-bit multiplies: PMULLW (low), PMULHW (signed
+                    // high), PMADDWD (multiply + add adjacent pairs → dwords).
+                    0xD5 | 0xE5 | 0xF5 if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem);
+                        let d = self.mmx[reg as usize];
+                        self.mmx[reg as usize] = match op2 {
+                            0xD5 => {
+                                packed_map(d, s, 2, |x, y| (x as u16).wrapping_mul(y as u16) as u64)
+                            }
+                            0xE5 => packed_map(d, s, 2, |x, y| {
+                                let p = (x as i16 as i32) * (y as i16 as i32);
+                                ((p >> 16) & 0xFFFF) as u64
+                            }),
+                            _ => mmx_pmaddwd(d, s), // 0xF5
+                        };
+                    }
+                    // Packed shift by imm8: 0F 71/72/73 group, where the
+                    // ModRM reg field is the sub-op (2=SRL, 4=SRA, 6=SLL) and
+                    // the rm field is the MM register shifted in place.
+                    0x71..=0x73 if !self.has_66() => {
+                        let (_, subop, rm) = self.fetch_modrm(mem);
+                        let imm = self.fetch_u8(mem) as u64;
+                        if let Rm::Reg(i) = rm {
+                            let lane = match op2 {
+                                0x71 => 2,
+                                0x72 => 4,
+                                _ => 8,
+                            };
+                            let d = self.mmx[i as usize];
+                            self.mmx[i as usize] = match subop {
+                                2 => mmx_psrl(d, imm, lane),
+                                6 => mmx_psll(d, imm, lane),
+                                4 => mmx_psra(d, imm, lane), // not encodable for qword
+                                _ => d,
+                            };
+                        }
+                    }
+                    // Packed shift by mm/m64 count: PSRL (D1/D2/D3), PSRA
+                    // (E1/E2), PSLL (F1/F2/F3) — word/dword/qword lanes.
+                    0xD1 | 0xD2 | 0xD3 | 0xE1 | 0xE2 | 0xF1 | 0xF2 | 0xF3 if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let count = self.read_mm_rm(rm, mem);
+                        let d = self.mmx[reg as usize];
+                        self.mmx[reg as usize] = match op2 {
+                            0xD1 => mmx_psrl(d, count, 2),
+                            0xD2 => mmx_psrl(d, count, 4),
+                            0xD3 => mmx_psrl(d, count, 8),
+                            0xE1 => mmx_psra(d, count, 2),
+                            0xE2 => mmx_psra(d, count, 4),
+                            0xF1 => mmx_psll(d, count, 2),
+                            0xF2 => mmx_psll(d, count, 4),
+                            _ => mmx_psll(d, count, 8), // 0xF3 PSLLQ
+                        };
+                    }
+                    // Packed compare: equal / signed-greater, b/w/d lanes.
+                    0x74 | 0x75 | 0x76 | 0x64 | 0x65 | 0x66 if !self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem);
+                        let d = self.mmx[reg as usize];
+                        self.mmx[reg as usize] = match op2 {
+                            0x74 => mmx_pcmpeq(d, s, 1),
+                            0x75 => mmx_pcmpeq(d, s, 2),
+                            0x76 => mmx_pcmpeq(d, s, 4),
+                            0x64 => mmx_pcmpgt(d, s, 1),
+                            0x65 => mmx_pcmpgt(d, s, 2),
+                            _ => mmx_pcmpgt(d, s, 4), // 0x66 PCMPGTD
+                        };
+                    }
+
                     // PUNPCKL/H {BW,WD,DQ,QDQ} (66 0F 60/61/62/6C and
                     // 68/69/6A/6D) — interleave the low / high elements of
                     // the destination (reg) and source (rm). SSE2 xmm form;
