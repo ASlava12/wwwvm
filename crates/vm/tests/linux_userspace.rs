@@ -10654,6 +10654,18 @@ fn linux_userspace_dynamic_single_lib_milestone() {
 /// Returns `(marker_found, full_uart)`, or None if the kernel/rootfs
 /// files are absent (caller should skip).
 fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
+    run_busybox_dynamic_stdin(argv, None, marker)
+}
+
+/// Like `run_busybox_dynamic`, but once `/init` has started it feeds
+/// `stdin` to the guest over the UART (the console/tty), so a no-`-c`
+/// interactive shell reads it as typed input. `stdin == None` behaves
+/// exactly like `run_busybox_dynamic`.
+fn run_busybox_dynamic_stdin(
+    argv: &[&str],
+    stdin: Option<&[u8]>,
+    marker: &str,
+) -> Option<(bool, Vec<u8>)> {
     let kpath =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
     let kbytes = match std::fs::read(&kpath) {
@@ -10707,6 +10719,11 @@ fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
     let budget = 10_000_000_000u64;
     let mut steps = 0u64;
     let mut found = false;
+    // When stdin is provided, feed it exactly once, after `/init` has
+    // started — by then the tty exists and a no-`-c` shell will be (or
+    // soon be) blocked in read(); the bytes wait in the UART RX queue
+    // until it reads them.
+    let mut fed = stdin.is_none();
     let stop_reason: String;
     loop {
         let (s, stop) = vm.run_steps_idle_aware(chunk);
@@ -10716,6 +10733,12 @@ fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
             cumulative.extend_from_slice(&out);
         }
         let text = String::from_utf8_lossy(&cumulative);
+        if !fed && text.contains("started with executable stack") {
+            if let Some(bytes) = stdin {
+                vm.send_input(bytes);
+            }
+            fed = true;
+        }
         if text.contains(marker) {
             found = true;
             stop_reason = format!("found {marker}");
@@ -11457,6 +11480,55 @@ fn linux_userspace_busybox_sort_stress_milestone() {
         dump_uart_on_failure(&cumulative, "sort-marker")
     );
     eprintln!("  ✓ SORTED_MAX_20000 — sort of 20k buffered lines (alloc/paging under load) works!");
+}
+
+/// INTERACTIVE-SHELL milestone: a genuinely new code path — the shell
+/// reads a command line from the tty (stdin), not from a `-c` argument.
+/// /init execve's `busybox sh` with NO `-c`, so the shell's REPL blocks
+/// in read() on fd 0 (the console). Once /init has started, the harness
+/// feeds "echo INTERACTIVE_OK\n" over the UART (send_input → 16550 RX →
+/// RX IRQ → the kernel's serial driver → the tty line discipline →
+/// canonical-mode line buffer). The shell's read() returns the line, ash
+/// parses and runs it, and "INTERACTIVE_OK" appears on the console. This
+/// exercises the whole keyboard-to-shell input chain that every prior
+/// `sh -c` milestone bypassed: UART receive, the RX interrupt, and tty
+/// input cooking. Asserts the marker with no segfault / loader error /
+/// execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_interactive_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic_stdin(
+        &["busybox", "sh"],
+        Some(b"echo INTERACTIVE_OK\n"),
+        "INTERACTIVE_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox interactive-shell milestone: INTERACTIVE_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "interactive-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the interactive shell; {}",
+        dump_uart_on_failure(&cumulative, "interactive-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the interactive shell segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "interactive-segv")
+    );
+    assert!(
+        found,
+        "the interactive shell never echoed INTERACTIVE_OK — a command typed \
+         over the tty (UART RX → IRQ → line discipline → shell read) was not \
+         executed; {}",
+        dump_uart_on_failure(&cumulative, "interactive-marker")
+    );
+    eprintln!("  ✓ INTERACTIVE_OK — shell read a command from the tty and ran it!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
