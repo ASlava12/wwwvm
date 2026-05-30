@@ -10628,27 +10628,29 @@ fn linux_userspace_dynamic_single_lib_milestone() {
     );
 }
 
-/// Diagnostic: attempt a real DYNAMICALLY-linked program end to end.
-/// A tiny hand-assembled /init `execve`s `/bin/busybox` with argv
-/// `["busybox", "echo", "DYNLINK_OK"]`; the kernel loads busybox, its
-/// interpreter `/lib/ld-linux.so.2` mmaps libc/libm/libcrypt,
-/// relocates, and (if it all works) runs busybox's `echo` applet,
-/// which prints `DYNLINK_OK`.
+/// MULTI-LIBRARY dynamic linking milestone — a real glibc binary that
+/// pulls in THREE shared objects runs end to end. A tiny hand-assembled
+/// /init `execve`s `/bin/busybox` with argv `["busybox", "echo",
+/// "DYNLINK_OK"]`; the kernel loads busybox, its interpreter
+/// `/lib/ld-linux.so.2` mmaps libc.so.6 + libm.so.6 + libcrypt.so.1,
+/// applies relocations, and runs busybox's `echo` applet, which prints
+/// `DYNLINK_OK`. The test asserts that marker appears with NO segfault,
+/// NO "error while loading shared libraries", and NO execve failure.
 ///
-/// STATUS (2026-05-29): NOT yet working — `ld.so` null-derefs during
-/// dynamic linking (`busybox[1]: segfault at 0 ip b7f21e9d`, faulting
-/// insn `mov eax,[eax]` with eax=0, in a relocation/list-walk loop).
-/// Static binaries run fine (`real_static_binary_milestone`); the
-/// dynamic path has a deeper bug — see the README blocker. This stays
-/// a diagnostic (ALWAYS PASSES, logs how far ld.so got) until fixed,
-/// so the --ignored regression sweep doesn't fail on a known gap.
+/// SOLVED 2026-05-30: the blocker was the SYSEXIT CPL=3 bug — glibc uses
+/// the vDSO `sysenter` path, and SYSEXIT was returning to CPL=0, so the
+/// page-fault U/S bit was wrong and the kernel mishandled busybox's
+/// (heavy) demand paging, corrupting control flow. Single-lib (rotdash)
+/// dodged it by demand-paging little; busybox + 3 libs did not. Forcing
+/// RPL=3 on SYSEXIT fixed it. (The earlier `rep ret` decode fix alone
+/// did not.) This is the capstone of the dynamic-linking work.
 ///
 /// busybox + the four libraries are read from `WWWVM_DYN_ROOTFS`
 /// (default `/tmp/wwwvm-linux/rootfs`); the test SKIPS if absent. See
 /// README build-deps for how to extract the Tinycore rootfs.
 #[test]
-#[ignore = "diagnostic: dynamic-linking attempt (known WIP); ~bounded"]
-fn linux_userspace_dynamic_exec_diag() {
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_dynamic_multilib_milestone() {
     let kpath =
         std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
     let kbytes = match std::fs::read(&kpath) {
@@ -10761,14 +10763,30 @@ fn linux_userspace_dynamic_exec_diag() {
         eprintln!("{}", String::from_utf8_lossy(tail));
     }
 
-    // Diagnostic, not an assertion: dynamic linking is known-WIP (ld.so
-    // null-derefs during relocation). When `found` becomes true this can
-    // be promoted to an asserting milestone.
-    if found {
-        eprintln!("  ✓ DYNLINK_OK — dynamic linking works end to end!");
-    } else {
-        eprintln!("  ✗ dynamic linking did not complete (see README blocker)");
-    }
+    // Assertions: busybox's echo applet must have run end to end through
+    // ld.so + the three libraries, with no loader/relocation failure.
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "the /init stub's execve(/bin/busybox) failed; {}",
+        dump_uart_on_failure(&cumulative, "multilib-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load one of the 3 libraries; {}",
+        dump_uart_on_failure(&cumulative, "multilib-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox/ld.so segfaulted during multi-library linking; {}",
+        dump_uart_on_failure(&cumulative, "multilib-segv")
+    );
+    assert!(
+        found,
+        "busybox `echo DYNLINK_OK` (via libc+libm+libcrypt) never printed \
+         its marker; {}",
+        dump_uart_on_failure(&cumulative, "multilib-dynlink")
+    );
+    eprintln!("  ✓ DYNLINK_OK — multi-library dynamic linking works end to end!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
