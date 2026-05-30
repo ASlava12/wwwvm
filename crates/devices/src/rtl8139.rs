@@ -1,17 +1,21 @@
 //! Realtek RTL8139 NIC — register file (the 256-byte PIO window behind
-//! BAR0). This is the minimum the in-guest `8139too` driver touches to
-//! probe the chip and register `eth0`:
+//! BAR0) plus the 93C46 serial EEPROM that holds the MAC.
 //!
-//!   * IDR0-5 (0x00-0x05) — the MAC address (read-only here).
-//!   * ChipCmd (0x37) — bit 4 = software reset; we auto-complete it (clear
-//!     the bit immediately) so the driver's reset poll terminates.
+//! The in-guest `8139too` driver touches, to probe the chip and register
+//! `eth0`:
+//!   * the 93C46 EEPROM (via Cmd9346, reg 0x50) — it reads the MAC from
+//!     EEPROM words 7-9, NOT from IDR0-5, so the EEPROM must be modeled or
+//!     the MAC comes out 00:00:00:00:00:00.
+//!   * IDR0-5 (0x00-0x05) — the MAC, also mirrored here (read-only).
+//!   * ChipCmd (0x37) — bit 4 = software reset; auto-completed (cleared
+//!     immediately) so the driver's reset poll terminates.
 //!   * TxConfig (0x40-0x43) — the high byte carries the hardware-version
 //!     ID; we report 0x74 (RTL-8139C) so the driver recognizes the chip.
 //!
-//! TX/RX descriptor rings, the interrupt, and link/MII state are NOT
-//! modeled yet (Phase A3) — unmodeled registers read/write as plain RAM,
-//! which is enough to get the driver bound and `eth0` created. The window
-//! is dispatched by `IoBus` at the kernel-assigned BAR0 base.
+//! TX/RX descriptor rings, the interrupt, and link state are NOT modeled
+//! yet (Phase A3b+). Unmodeled registers read/write as plain RAM, which is
+//! enough to get the driver bound and `eth0` created with a real MAC. The
+//! window is dispatched by `IoBus` at the kernel-assigned BAR0 base.
 
 /// Default MAC — a locally-administered address (the `52:54:00` QEMU-style
 /// prefix), so it's obviously a virtual NIC.
@@ -21,23 +25,63 @@ const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 /// "RTL-8139C" in the driver's chip table.
 const HW_VERSION_HI: u8 = 0x74;
 
+// Cmd9346 (reg 0x50) bits driving the 93C46 serial EEPROM.
+const EE_CS: u8 = 0x08; // chip select
+const EE_SK: u8 = 0x04; // serial clock
+const EE_DI: u8 = 0x02; // data in (host → eeprom)
+const EE_DO: u8 = 0x01; // data out (eeprom → host)
+
 pub struct Rtl8139 {
     regs: [u8; 256],
+    /// 93C46 EEPROM: 64 × 16-bit words. Word 0 = 0x8129 (the RTL8139
+    /// signature); words 7-9 hold the MAC (little-endian).
+    eeprom: [u16; 64],
+    // Microwire serial state for the EEPROM bit-bang on reg 0x50.
+    ee_prev_sk: bool,
+    ee_cs: bool,
+    ee_waiting_start: bool,
+    ee_reading: bool,
+    ee_cmd: u16,
+    ee_count: u8,
+    ee_shift: u16,
+    ee_dobit: u8,
 }
 
 impl Rtl8139 {
     pub fn new() -> Self {
+        Self::with_mac(DEFAULT_MAC)
+    }
+
+    pub fn with_mac(mac: [u8; 6]) -> Self {
         let mut regs = [0u8; 256];
-        regs[0..6].copy_from_slice(&DEFAULT_MAC);
-        Self { regs }
+        regs[0..6].copy_from_slice(&mac);
+        let mut eeprom = [0u16; 64];
+        eeprom[0] = 0x8129; // RTL8139 EEPROM signature
+        eeprom[7] = mac[0] as u16 | ((mac[1] as u16) << 8);
+        eeprom[8] = mac[2] as u16 | ((mac[3] as u16) << 8);
+        eeprom[9] = mac[4] as u16 | ((mac[5] as u16) << 8);
+        Self {
+            regs,
+            eeprom,
+            ee_prev_sk: false,
+            ee_cs: false,
+            ee_waiting_start: true,
+            ee_reading: false,
+            ee_cmd: 0,
+            ee_count: 0,
+            ee_shift: 0,
+            ee_dobit: 0,
+        }
     }
 
     /// Read one byte from the register window (offset within BAR0).
     pub fn read_reg(&self, off: u16) -> u8 {
         let off = (off & 0xFF) as usize;
         match off {
-            // TxConfig high byte: report the RTL-8139C hardware version so
-            // the driver's chip-ID match succeeds.
+            // Cmd9346: the EEPROM data-out bit lives in bit 0; the other
+            // bits read back what was last written (mode/CS/SK/DI).
+            0x50 => (self.regs[0x50] & !EE_DO) | self.ee_dobit,
+            // TxConfig high byte: report the RTL-8139C hardware version.
             0x43 => HW_VERSION_HI,
             _ => self.regs[off],
         }
@@ -47,6 +91,11 @@ impl Rtl8139 {
     pub fn write_reg(&mut self, off: u16, value: u8) {
         let off = (off & 0xFF) as usize;
         match off {
+            // Cmd9346 — drive the 93C46 serial state machine, then store.
+            0x50 => {
+                self.eeprom_clock(value);
+                self.regs[0x50] = value;
+            }
             // ChipCmd: the reset bit (0x10) auto-completes — clear it at
             // once so the driver's "wait for reset" poll terminates.
             0x37 => self.regs[0x37] = value & !0x10,
@@ -56,16 +105,79 @@ impl Rtl8139 {
         }
     }
 
+    /// Advance the 93C46 Microwire read protocol on a Cmd9346 write.
+    /// Command framing (a 93C46, 6-bit address): after CS rises, ignore
+    /// leading zeros until the start bit (1), then 2 opcode bits + 6
+    /// address bits; READ (opcode 10) then shifts the 16-bit word out MSB
+    /// first on EEDO, one bit per SK rising edge.
+    fn eeprom_clock(&mut self, value: u8) {
+        let cs = value & EE_CS != 0;
+        let sk = value & EE_SK != 0;
+        let di = value & EE_DI != 0;
+        if !cs {
+            self.ee_cs = false;
+            self.ee_waiting_start = true;
+            self.ee_reading = false;
+            self.ee_count = 0;
+            self.ee_prev_sk = sk;
+            return;
+        }
+        if !self.ee_cs {
+            // CS rising — begin a fresh command.
+            self.ee_waiting_start = true;
+            self.ee_reading = false;
+            self.ee_cmd = 0;
+            self.ee_count = 0;
+        }
+        self.ee_cs = true;
+        if sk && !self.ee_prev_sk {
+            // SK rising edge.
+            if self.ee_waiting_start {
+                if di {
+                    self.ee_waiting_start = false;
+                    self.ee_cmd = 0;
+                    self.ee_count = 0;
+                }
+            } else if !self.ee_reading {
+                self.ee_cmd = (self.ee_cmd << 1) | u16::from(di);
+                self.ee_count += 1;
+                if self.ee_count == 8 {
+                    let opcode = (self.ee_cmd >> 6) & 0x3;
+                    let addr = (self.ee_cmd & 0x3F) as usize;
+                    if opcode == 0b10 {
+                        // READ — latch the word; bits clock out next edges.
+                        self.ee_shift = self.eeprom[addr];
+                        self.ee_reading = true;
+                    }
+                    // Other opcodes (WRITE/EWEN/…) are no-ops — read-only.
+                }
+            } else {
+                // Shift out the next data bit (MSB first).
+                self.ee_dobit = ((self.ee_shift >> 15) & 1) as u8;
+                self.ee_shift <<= 1;
+            }
+        }
+        self.ee_prev_sk = sk;
+    }
+
     pub fn snapshot_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.regs);
+        for w in &self.eeprom {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
-        if bytes.len() < 256 {
+        // 256 register bytes + 64 EEPROM words (128 bytes) = 384.
+        if bytes.len() < 384 {
             return Err("rtl8139: truncated");
         }
         self.regs.copy_from_slice(&bytes[..256]);
-        Ok(256)
+        for (i, w) in self.eeprom.iter_mut().enumerate() {
+            let o = 256 + i * 2;
+            *w = u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        }
+        Ok(384)
     }
 }
 
@@ -79,8 +191,64 @@ impl Default for Rtl8139 {
 mod tests {
     use super::*;
 
+    /// Drive the 93C46 READ of `word` the way `8139too` does (a 93C46 with
+    /// a 6-bit address): leading zeros, start bit, opcode 10, 6 addr bits,
+    /// then clock out 16 bits — and return the assembled word.
+    fn eeprom_read(nic: &mut Rtl8139, word: u8) -> u16 {
+        let base = EE_CS; // programming mode bits omitted; CS is what matters
+        nic.write_reg(0x50, 0); // deselect
+        nic.write_reg(0x50, base); // CS high
+                                   // command bits MSB-first: 0,0,1(start),1,0(op=READ),a5..a0
+        let cmd_bits = [
+            0u8,
+            0,
+            1,
+            1,
+            0,
+            (word >> 5) & 1,
+            (word >> 4) & 1,
+            (word >> 3) & 1,
+            (word >> 2) & 1,
+            (word >> 1) & 1,
+            word & 1,
+        ];
+        for b in cmd_bits {
+            let di = if b != 0 { EE_DI } else { 0 };
+            nic.write_reg(0x50, base | di); // SK low, DI set
+            nic.write_reg(0x50, base | di | EE_SK); // SK high (rising edge)
+        }
+        nic.write_reg(0x50, base); // SK low between command and read (as the driver does)
+        let mut val = 0u16;
+        for _ in 0..16 {
+            nic.write_reg(0x50, base | EE_SK); // SK high → presents next bit
+            val = (val << 1) | (nic.read_reg(0x50) & EE_DO) as u16;
+            nic.write_reg(0x50, base); // SK low
+        }
+        nic.write_reg(0x50, 0); // CS low
+        val
+    }
+
     #[test]
-    fn mac_address_reads_back() {
+    fn eeprom_returns_mac_words() {
+        let mut nic = Rtl8139::new();
+        // Words 7-9 are the MAC (little-endian): 52:54:00:12:34:56.
+        assert_eq!(eeprom_read(&mut nic, 7), 0x5452);
+        assert_eq!(eeprom_read(&mut nic, 8), 0x1200);
+        assert_eq!(eeprom_read(&mut nic, 9), 0x5634);
+        // Word 0 is the signature.
+        assert_eq!(eeprom_read(&mut nic, 0), 0x8129);
+    }
+
+    #[test]
+    fn eeprom_custom_mac() {
+        let mut nic = Rtl8139::with_mac([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+        assert_eq!(eeprom_read(&mut nic, 7), 0xADDE);
+        assert_eq!(eeprom_read(&mut nic, 8), 0xEFBE);
+        assert_eq!(eeprom_read(&mut nic, 9), 0x0100);
+    }
+
+    #[test]
+    fn mac_address_reads_back_from_idr() {
         let nic = Rtl8139::new();
         for (i, &b) in DEFAULT_MAC.iter().enumerate() {
             assert_eq!(nic.read_reg(i as u16), b);
@@ -97,7 +265,6 @@ mod tests {
     #[test]
     fn chip_reset_bit_auto_clears() {
         let mut nic = Rtl8139::new();
-        // Driver writes CmdReset (bit 4) then polls until it clears.
         nic.write_reg(0x37, 0x10);
         assert_eq!(nic.read_reg(0x37) & 0x10, 0, "reset must auto-complete");
     }
@@ -121,10 +288,10 @@ mod tests {
         nic.write_reg(0x3C, 0x05);
         let mut buf = Vec::new();
         nic.snapshot_into(&mut buf);
-        assert_eq!(buf.len(), 256);
+        assert_eq!(buf.len(), 384);
         let mut nic2 = Rtl8139::new();
         nic2.restore(&buf).expect("restore");
         assert_eq!(nic2.read_reg(0x3C), 0x05);
-        assert_eq!(nic2.read_reg(0x00), DEFAULT_MAC[0]);
+        assert_eq!(eeprom_read(&mut nic2, 7), 0x5452);
     }
 }
