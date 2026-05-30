@@ -11188,6 +11188,62 @@ fn linux_userspace_busybox_shell_arith_milestone() {
     eprintln!("  ✓ SHELL_SUM_10 — shell for-loop + $(()) arithmetic + [ -eq ] test works!");
 }
 
+/// GZIP round-trip milestone: the heaviest CPU stress so far. /init runs
+/// `sh -c 'echo GZIP_RT_OK | busybox gzip -c | busybox gunzip -c'`. The
+/// data is DEFLATE-compressed (LZ77 + Huffman, plus a CRC32 of the input
+/// and an ISIZE trailer), piped to gunzip, which parses the gzip header,
+/// inflates, and VERIFIES the CRC32. CRC32 and the bit-level Huffman
+/// coder lean on table-driven XOR / shift / rotate sequences that the
+/// text and VFS applets never exercise — a subtly-wrong bit op would make
+/// gunzip report a CRC error and drop the data. So the marker surviving
+/// the compress→decompress round-trip validates that whole bit-manipulation
+/// path. Asserts the marker with no segfault / loader error / execve fail
+/// / "crc error".
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_gzip_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo GZIP_RT_OK | busybox gzip -c | busybox gunzip -c",
+        ],
+        "GZIP_RT_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox gzip round-trip milestone: GZIP_RT_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "gzip-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for gzip/gunzip; {}",
+        dump_uart_on_failure(&cumulative, "gzip-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox gzip/gunzip segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "gzip-segv")
+    );
+    assert!(
+        !text.to_lowercase().contains("crc error"),
+        "gunzip reported a CRC error — the DEFLATE/CRC32 bit path is wrong; {}",
+        dump_uart_on_failure(&cumulative, "gzip-crc")
+    );
+    assert!(
+        found,
+        "the gzip|gunzip round-trip never reproduced GZIP_RT_OK (DEFLATE \
+         encode/decode + CRC32); {}",
+        dump_uart_on_failure(&cumulative, "gzip-marker")
+    );
+    eprintln!("  ✓ GZIP_RT_OK — gzip|gunzip round-trip (DEFLATE + CRC32) works!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
