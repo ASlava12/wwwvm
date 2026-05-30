@@ -1255,7 +1255,9 @@ impl Cpu {
         // Diagnostic VALUE watchpoint (one-shot pf_trace dump).
         if bytes.len() == 4 {
             if let Some(wv) = *Self::watch_write_value() {
-                if u32::from_le_bytes(bytes.try_into().unwrap()) == wv {
+                if u32::from_le_bytes(bytes.try_into().unwrap()) == wv
+                    && linear >= Self::watch_write_value_min()
+                {
                     let eip = self.last_op_ip;
                     if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
                         if !t.fired {
@@ -1371,6 +1373,22 @@ impl Cpu {
         SPEC.get_or_init(|| {
             let spec = std::env::var("WWWVM_WATCH_VALUE").ok()?;
             u32::from_str_radix(spec.trim_start_matches("0x"), 16).ok()
+        })
+    }
+
+    /// Optional minimum target VA for the value watchpoint
+    /// (`WWWVM_WATCH_VALUE_MIN=0xNNNNNNNN`): the dump fires only on a
+    /// matching store whose destination VA is >= this, so benign
+    /// early-boot/low-address copies of the watched value can be skipped
+    /// to reach a later kernel-side write.
+    fn watch_write_value_min() -> u32 {
+        use std::sync::OnceLock;
+        static SPEC: OnceLock<u32> = OnceLock::new();
+        *SPEC.get_or_init(|| {
+            std::env::var("WWWVM_WATCH_VALUE_MIN")
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
         })
     }
 
