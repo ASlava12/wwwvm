@@ -38,6 +38,10 @@ pub enum CpuError {
     },
 }
 
+/// Software 80-bit extended-precision float for the x87 stack. Standalone
+/// for now (Phase 1); wired into the FPU in a follow-up.
+pub mod f80;
+
 /// Flags register bits we actually maintain.
 pub mod flag {
     pub const CF: u16 = 1 << 0;
