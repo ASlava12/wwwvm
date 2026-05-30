@@ -11788,6 +11788,59 @@ fn linux_userspace_busybox_tar_milestone() {
     eprintln!("  ✓ TAR_RT_OK — tar create+extract round-trip (ustar header/checksum) works!");
 }
 
+/// STATISTICS milestone: realistic sustained floating-point over piped
+/// data — a good broad check on the FP path (and the FP-rollback-on-fault
+/// fix) beyond the libm transcendentals. /init runs
+/// `sh -c 'busybox seq 1 100 | busybox awk
+///   "{s+=\$1; q+=\$1*\$1} END{m=s/NR; printf \"STAT_%d\n\", int(q/NR - m*m)}"'`.
+/// awk reads 100 numbers, accumulating the sum `s` and sum-of-squares `q`
+/// in doubles, then computes the population variance `q/NR - (s/NR)^2`.
+/// For 1..100 that is exactly (N^2-1)/12 = 833.25 → int 833, pinned to the
+/// host's awk. So "STAT_833" validates the whole double accumulate /
+/// multiply / divide / subtract pipeline over a stream. Asserts the marker
+/// with no segfault / loader / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_stats_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "busybox seq 1 100 | busybox awk '{s+=$1; q+=$1*$1} END{m=s/NR; printf \"STAT_%d\\n\", int(q/NR - m*m)}'",
+        ],
+        "STAT_833",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox statistics milestone: STAT_833={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "stats-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the statistics pipeline; {}",
+        dump_uart_on_failure(&cumulative, "stats-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "the statistics awk segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "stats-segv")
+    );
+    assert!(
+        found,
+        "awk did not produce STAT_833 — the double accumulate/multiply/ \
+         divide/subtract variance over 1..100 was mis-computed; {}",
+        dump_uart_on_failure(&cumulative, "stats-marker")
+    );
+    eprintln!(
+        "  ✓ STAT_833 — awk population variance over 100 piped numbers (sustained FP) works!"
+    );
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
