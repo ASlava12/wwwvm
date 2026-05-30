@@ -34,7 +34,12 @@ enum Cls {
 }
 
 /// 80-bit extended-precision float. See module docs for the representation.
-#[derive(Clone, Copy, Debug)]
+///
+/// `PartialEq`/`Eq` are STRUCTURAL (do the stored bits match) — used for
+/// snapshot/rollback checks. Values are always normalized so this coincides
+/// with numeric equality, except it treats the two signed zeros as distinct
+/// and any two NaNs as equal. For IEEE numeric ordering use [`F80::partial_cmp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct F80 {
     sign: bool,
     cls: Cls,
@@ -331,6 +336,145 @@ impl F80 {
                 }
             }
             o => o,
+        }
+    }
+
+    pub fn is_sign_negative(self) -> bool {
+        self.sign
+    }
+    /// True for an 80-bit *subnormal* (exponent below the normal minimum).
+    pub fn is_subnormal(self) -> bool {
+        self.cls == Cls::Normal && self.exp < -16382
+    }
+
+    // ---- 80-bit memory format (the `m80`/FXSAVE encoding) -------------
+
+    /// Decode the 80-bit memory form: `mant` is the 64-bit significand
+    /// (explicit integer bit at bit 63), `se` the sign+exponent word
+    /// (bit 15 = sign, bits 0..14 = biased exponent). Precision-preserving
+    /// — the full 64-bit mantissa is kept (unlike the old f64 demotion).
+    pub fn from_f80_parts(mant: u64, se: u16) -> F80 {
+        let sign = se & 0x8000 != 0;
+        let exp_field = (se & 0x7fff) as i32;
+        if exp_field == 0x7fff {
+            return if mant & 0x7fff_ffff_ffff_ffff == 0 {
+                F80::inf(sign)
+            } else {
+                F80::nan()
+            };
+        }
+        if mant == 0 {
+            return F80::zero(sign);
+        }
+        // value = mant · 2^(eff - 16383 - 63); subnormals use eff = 1.
+        let eff = if exp_field == 0 { 1 } else { exp_field };
+        F80::round_from(sign, eff - 16383 - 63, mant as u128, false)
+    }
+
+    /// Encode to the 80-bit memory form `(mantissa, sign+exponent)`.
+    /// Out-of-range exponents clamp to ∞ / subnormal / zero.
+    pub fn to_f80_parts(self) -> (u64, u16) {
+        let sign16 = if self.sign { 0x8000u16 } else { 0 };
+        match self.cls {
+            Cls::Zero => (0, sign16),
+            Cls::Inf => (0x8000_0000_0000_0000, sign16 | 0x7fff),
+            Cls::Nan => (0xC000_0000_0000_0000, sign16 | 0x7fff),
+            Cls::Normal => {
+                let biased = self.exp + 16383;
+                if biased >= 0x7fff {
+                    (0x8000_0000_0000_0000, sign16 | 0x7fff) // overflow → ∞
+                } else if biased <= 0 {
+                    let sh = 1 - biased;
+                    if sh >= 64 {
+                        (0, sign16)
+                    } else {
+                        (self.mant >> sh as u32, sign16) // subnormal (exp field 0)
+                    }
+                } else {
+                    (self.mant, sign16 | biased as u16)
+                }
+            }
+        }
+    }
+
+    // ---- integer rounding / x87 helpers -------------------------------
+
+    /// True if a `Normal` has a nonzero fractional part.
+    fn has_fraction(self) -> bool {
+        match self.cls {
+            Cls::Normal => {
+                if self.exp < 0 {
+                    true // 0 < |v| < 1
+                } else if self.exp >= 63 {
+                    false // integer
+                } else {
+                    let shift = 63 - self.exp as u32;
+                    (self.mant & ((1u64 << shift) - 1)) != 0
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Round to i64 per the x87 control-word rounding-control field
+    /// (0 = nearest-even, 1 = −∞, 2 = +∞, 3 = truncate).
+    pub fn to_i64_rc(self, rc: u8) -> i64 {
+        match rc & 3 {
+            0 => self.to_i64_round(),
+            3 => self.to_i64_trunc(),
+            1 => {
+                let t = self.to_i64_trunc();
+                if self.sign && self.has_fraction() {
+                    t - 1
+                } else {
+                    t
+                }
+            }
+            _ => {
+                let t = self.to_i64_trunc();
+                if !self.sign && self.has_fraction() {
+                    t + 1
+                } else {
+                    t
+                }
+            }
+        }
+    }
+
+    /// FRNDINT: round to an integer-valued F80 per the rounding mode.
+    pub fn round_to_integer(self, rc: u8) -> F80 {
+        match self.cls {
+            Cls::Normal if self.exp < 63 => F80::from_i64(self.to_i64_rc(rc)),
+            _ => self, // already integer, or zero/inf/nan
+        }
+    }
+
+    /// Multiply by 2^n exactly (FSCALE).
+    pub fn scale2(self, n: i32) -> F80 {
+        match self.cls {
+            Cls::Normal => F80 {
+                exp: self.exp.saturating_add(n),
+                ..self
+            },
+            _ => self,
+        }
+    }
+
+    /// FXTRACT exponent part: the unbiased exponent as an integer-valued
+    /// F80 (−∞ for zero, mirroring x87).
+    pub fn exponent_f80(self) -> F80 {
+        match self.cls {
+            Cls::Normal => F80::from_i64(self.exp as i64),
+            Cls::Zero => F80::inf(true),
+            Cls::Inf => F80::inf(false),
+            Cls::Nan => F80::nan(),
+        }
+    }
+    /// FXTRACT significand part: the mantissa scaled into [1, 2).
+    pub fn significand(self) -> F80 {
+        match self.cls {
+            Cls::Normal => F80 { exp: 0, ..self },
+            _ => self,
         }
     }
 }

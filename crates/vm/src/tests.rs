@@ -3856,8 +3856,8 @@ fn snapshot_v9_preserves_i386_state() {
     vm.cpu.sysenter_cs = 0x0008;
     vm.cpu.sysenter_esp = 0x0007_0000;
     vm.cpu.sysenter_eip = 0xC011_2233;
-    vm.cpu.fpu_st[0] = 1.875;
-    vm.cpu.fpu_st[3] = -2.5;
+    vm.cpu.fpu_st[0] = wwwvm_cpu::f80::F80::from_f64(1.875);
+    vm.cpu.fpu_st[3] = wwwvm_cpu::f80::F80::from_f64(-2.5);
     vm.cpu.fpu_top = 5;
     vm.cpu.xmm[0] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
     vm.cpu.xmm[7] = u128::MAX;
@@ -3885,8 +3885,8 @@ fn snapshot_v9_preserves_i386_state() {
     assert_eq!(vm2.cpu().sysenter_cs, 0x0008);
     assert_eq!(vm2.cpu().sysenter_esp, 0x0007_0000);
     assert_eq!(vm2.cpu().sysenter_eip, 0xC011_2233);
-    assert_eq!(vm2.cpu().fpu_st[0], 1.875);
-    assert_eq!(vm2.cpu().fpu_st[3], -2.5);
+    assert_eq!(vm2.cpu().fpu_st[0].to_f64(), 1.875);
+    assert_eq!(vm2.cpu().fpu_st[3].to_f64(), -2.5);
     assert_eq!(vm2.cpu().fpu_top, 5);
     assert_eq!(vm2.cpu().xmm[0], 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF);
     assert_eq!(vm2.cpu().xmm[7], u128::MAX);

@@ -1118,9 +1118,12 @@ impl Vm {
         buf.extend_from_slice(&self.cpu.sysenter_esp.to_le_bytes());
         buf.extend_from_slice(&self.cpu.sysenter_eip.to_le_bytes());
 
-        // v8 CPU extension — the x87 register stack.
+        // v8 CPU extension — the x87 register stack. Serialized as 8 × f64
+        // (the historical wire format; snapshots were always f64-precision).
+        // Live execution keeps full 80-bit F80 precision; only a
+        // snapshot/restore round-trip demotes through f64, as it always did.
         for st in &self.cpu.fpu_st {
-            buf.extend_from_slice(&st.to_bits().to_le_bytes());
+            buf.extend_from_slice(&st.to_f64().to_bits().to_le_bytes());
         }
         buf.push(self.cpu.fpu_top);
 
@@ -1515,7 +1518,8 @@ impl Vm {
         self.cpu.sysenter_cs = sysenter_cs;
         self.cpu.sysenter_esp = sysenter_esp;
         self.cpu.sysenter_eip = sysenter_eip;
-        self.cpu.fpu_st = fpu_st;
+        // Wire format is f64; promote each into the 80-bit F80 stack.
+        self.cpu.fpu_st = fpu_st.map(wwwvm_cpu::f80::F80::from_f64);
         self.cpu.fpu_top = fpu_top;
         self.cpu.xmm = xmm;
         // v12 — fields added after v9. Pre-v12 restores leave these
