@@ -746,6 +746,17 @@ impl Cpu {
                 limit: 0xFFFF,
                 access: 0x93,
             };
+            // Real mode is 16-bit: a CS/SS reload here must drop the
+            // operand/stack size back to 16 (otherwise a PE->real
+            // transition would leave a stale 32-bit default and decode
+            // real-mode code with the wrong width).
+            if idx == sreg::CS {
+                self.code_size_32 = false;
+                self.invalidate_fetch_tlb();
+            }
+            if idx == sreg::SS {
+                self.stack_size_32 = false;
+            }
             return;
         }
         // Protected mode — fetch and decode the descriptor.

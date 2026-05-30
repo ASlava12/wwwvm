@@ -2359,6 +2359,25 @@ fn write_sreg_ss_load_with_b_zero_keeps_stack_size_16() {
     );
 }
 
+/// A real-mode (CR0.PE=0) CS reload must drop code_size_32 back to 16-bit
+/// — otherwise a PE->real transition leaves a stale 32-bit default and
+/// decodes real-mode code with the wrong operand width.
+#[test]
+fn real_mode_cs_load_resets_code_size_to_16() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0; // real mode
+    cpu.code_size_32 = true; // stale 32-bit (as if left by a prior PM session)
+    let mem = Memory::new(0x10_0000);
+    cpu.write_sreg(sreg::CS, 0x1234, &mem);
+    assert!(!cpu.code_size_32, "real-mode CS load must reset to 16-bit");
+    assert_eq!(
+        cpu.seg_cache[sreg::CS].base,
+        0x1234 << 4,
+        "real-mode base = sel << 4"
+    );
+}
+
 /// Granularity bit (G=1) shifts limit left by 12 and fills the low
 /// 12 with ones — turning 0xFFFFF into 0xFFFF_FFFF (a 4 GiB segment).
 #[test]
