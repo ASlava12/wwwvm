@@ -29,6 +29,7 @@ mod keyboard;
 mod pci;
 mod pic;
 mod pit;
+mod rtl8139;
 mod uart;
 
 pub use ata::{Ata, PRIMARY_PORT_BASE, SECONDARY_PORT_BASE};
@@ -38,6 +39,7 @@ pub use keyboard::Keyboard;
 pub use pci::Pci;
 pub use pic::Pic;
 pub use pit::Pit;
+pub use rtl8139::Rtl8139;
 pub use uart::Uart;
 
 /// Concrete IO dispatcher. Owns one instance of each PC device,
@@ -72,6 +74,9 @@ pub struct IoBus {
     /// the 0xFFFFFFFF "no device" sentinel, which is what Linux
     /// expects to see when it walks an empty bus.
     pub pci: Pci,
+    /// RTL8139 NIC register file (00:01.0). Dispatched at the I/O base the
+    /// kernel assigns to BAR0 (see `pci.nic_io_base`).
+    pub rtl8139: Rtl8139,
 }
 
 impl IoBus {
@@ -101,6 +106,7 @@ impl IoBus {
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
+            rtl8139: Rtl8139::new(),
             pit_div_counter: 0,
         }
     }
@@ -118,6 +124,7 @@ impl IoBus {
             ata: Ata::new(),
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
+            rtl8139: Rtl8139::new(),
             pit_div_counter: 0,
         }
     }
@@ -221,6 +228,15 @@ impl IoBus {
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
+        // RTL8139 register window — a DYNAMIC range at the I/O base the
+        // kernel assigned to BAR0 (in the high I/O range, away from legacy
+        // ports). Checked first; if the NIC isn't I/O-enabled this is inert.
+        if self.pci.nic_io_enabled() {
+            let base = self.pci.nic_io_base();
+            if port >= base && (port - base) < pci::RTL8139_IO_SIZE as u16 {
+                return self.rtl8139.read_reg(port - base);
+            }
+        }
         // Port 0x61 (NMI Status & Control) lives in the keyboard's
         // claimed range but is logically a PIT/PPI register —
         // Linux's TSC-via-PIT calibration polls bit 5 (channel-2
@@ -278,6 +294,14 @@ impl IoBus {
     }
 
     pub fn write(&mut self, port: u16, value: u8) {
+        // RTL8139 register window (see `read`).
+        if self.pci.nic_io_enabled() {
+            let base = self.pci.nic_io_base();
+            if port >= base && (port - base) < pci::RTL8139_IO_SIZE as u16 {
+                self.rtl8139.write_reg(port - base, value);
+                return;
+            }
+        }
         // See `read` — port 0x61 is logically a PIT/PPI register.
         if port == 0x61 {
             self.pit.write_port_61(value);
@@ -367,6 +391,7 @@ impl IoBus {
     const DEV_ATA_PRIMARY: u8 = 7;
     const DEV_ATA_SECONDARY: u8 = 8;
     const DEV_PCI: u8 = 9;
+    const DEV_RTL8139: u8 = 10;
 
     pub fn snapshot(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
@@ -405,6 +430,9 @@ impl IoBus {
         buf.clear();
         self.pci.snapshot_into(&mut buf);
         emit(&mut out, Self::DEV_PCI, &buf);
+        buf.clear();
+        self.rtl8139.snapshot_into(&mut buf);
+        emit(&mut out, Self::DEV_RTL8139, &buf);
         out
     }
 
@@ -436,6 +464,7 @@ impl IoBus {
                 Self::DEV_ATA_PRIMARY => self.ata.restore(payload).map_err(str::to_string)?,
                 Self::DEV_ATA_SECONDARY => self.ata2.restore(payload).map_err(str::to_string)?,
                 Self::DEV_PCI => self.pci.restore(payload).map_err(str::to_string)?,
+                Self::DEV_RTL8139 => self.rtl8139.restore(payload).map_err(str::to_string)?,
                 // Unknown device — skip its payload.
                 _ => payload.len(),
             };

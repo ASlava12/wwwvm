@@ -42,31 +42,68 @@ fn host_bridge_config(reg: u32) -> u32 {
     }
 }
 
-/// Configuration-space dwords for the NIC at 00:01.0 — a Realtek RTL8139
-/// (vendor 0x10EC, device 0x8139), class 0x020000 (network / ethernet).
-/// Read-only for now: the device is enumerable (so the kernel lists it and
-/// the 8139 driver can match), but BAR0 reads 0 — the I/O register window
-/// and bus-master DMA come in a follow-up (Phase A2b/A3).
-fn rtl8139_config(reg: u32) -> u32 {
-    match reg {
-        0x00 => 0x8139_10EC,        // device 0x8139 << 16 | vendor 0x10EC
-        0x04 => 0x0000_0000,        // command / status
-        0x08 => 0x0200_0000 | 0x10, // class 0x020000 (ethernet), rev 0x10
-        0x0C => 0x0000_0000,        // header type 0
-        0x3C => 0x0000_010B,        // interrupt pin INTA (1), line 11
-        _ => 0x0000_0000,           // BAR0 (0x10) reads 0 until A2b
-    }
-}
+/// RTL8139 I/O register window size — 256 bytes (BAR0 is a PIO region).
+pub const RTL8139_IO_SIZE: u32 = 0x100;
 
 pub struct Pci {
     /// Latched address register (CF8..CFB). Bit 31 enable; bus/device/
     /// function/register in the lower bits.
     addr: u32,
+    /// RTL8139 (00:01.0) BAR0 — the kernel writes the assigned I/O base
+    /// here; we report it as a 256-byte PIO region. Low 8 bits are the
+    /// type/within-region bits, so the I/O base is `nic_bar0 & 0xFF00`.
+    nic_bar0: u32,
+    /// RTL8139 PCI command register (I/O-enable = bit 0, bus-master = bit 2).
+    nic_command: u16,
 }
 
 impl Pci {
     pub fn new() -> Self {
-        Self { addr: 0 }
+        Self {
+            addr: 0,
+            nic_bar0: 0,
+            nic_command: 0,
+        }
+    }
+
+    /// Config-space dwords for the RTL8139 at 00:01.0. BAR0 (0x10) is a
+    /// 256-byte I/O region: read-back masks to the assigned base with the
+    /// I/O-space indicator (bit 0), so the kernel can size it (write
+    /// 0xFFFFFFFF → read 0xFFFFFF01 = 256 bytes) and assign a base.
+    fn nic_config_read(&self, reg: u32) -> u32 {
+        match reg {
+            0x00 => 0x8139_10EC,                         // device 0x8139 | vendor 0x10EC
+            0x04 => self.nic_command as u32,             // command (status high = 0)
+            0x08 => 0x0200_0000 | 0x10,                  // class 0x020000 ethernet, rev 0x10
+            0x0C => 0x0000_0000,                         // header type 0
+            0x10 => (self.nic_bar0 & 0xFFFF_FF00) | 0x1, // BAR0: I/O, 256 bytes
+            0x3C => 0x0000_010B,                         // interrupt pin INTA (1), line 11
+            _ => 0x0000_0000,
+        }
+    }
+
+    /// Write one config byte for the RTL8139 (the writable registers:
+    /// command at 0x04-0x05 and BAR0 at 0x10-0x13).
+    fn nic_write_byte(&mut self, off: u32, value: u8) {
+        match off {
+            0x04 => self.nic_command = (self.nic_command & 0xFF00) | value as u16,
+            0x05 => self.nic_command = (self.nic_command & 0x00FF) | ((value as u16) << 8),
+            0x10..=0x13 => {
+                let sh = (off - 0x10) * 8;
+                self.nic_bar0 = (self.nic_bar0 & !(0xFFu32 << sh)) | ((value as u32) << sh);
+            }
+            _ => {}
+        }
+    }
+
+    /// The I/O base the kernel assigned to the RTL8139 (BAR0). Ports in
+    /// `[base, base + RTL8139_IO_SIZE)` route to the NIC register file.
+    pub fn nic_io_base(&self) -> u16 {
+        (self.nic_bar0 & 0xFF00) as u16
+    }
+    /// True once the kernel sets the NIC's I/O-space-enable command bit.
+    pub fn nic_io_enabled(&self) -> bool {
+        self.nic_command & 0x1 != 0 && self.nic_io_base() != 0
     }
 
     /// Look up the dword at the currently-latched configuration address,
@@ -82,15 +119,18 @@ impl Pci {
         let reg = self.addr & 0xFC; // dword-aligned register offset
         match (bus, dev, func) {
             (0, 0, 0) => host_bridge_config(reg),
-            (0, 1, 0) => rtl8139_config(reg),
+            (0, 1, 0) => self.nic_config_read(reg),
             _ => 0xFFFF_FFFF,
         }
     }
 
-    /// Serialize the latched address register (4 bytes). The bus
-    /// has no devices, so there's nothing else to preserve.
+    /// Serialize the latched address register (4 bytes) plus the RTL8139
+    /// BAR0 (4) and command (2) — the kernel-assigned NIC config that must
+    /// survive a snapshot. Total 10 bytes; older 4-byte blobs still restore.
     pub fn snapshot_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.addr.to_le_bytes());
+        out.extend_from_slice(&self.nic_bar0.to_le_bytes());
+        out.extend_from_slice(&self.nic_command.to_le_bytes());
     }
 
     pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
@@ -98,7 +138,14 @@ impl Pci {
             return Err("pci: truncated");
         }
         self.addr = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        Ok(4)
+        // NIC config (v-bump): present in newer snapshots, absent in old.
+        if bytes.len() >= 10 {
+            self.nic_bar0 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            self.nic_command = u16::from_le_bytes([bytes[8], bytes[9]]);
+            Ok(10)
+        } else {
+            Ok(4)
+        }
     }
 }
 
@@ -137,9 +184,17 @@ impl IoDevice for Pci {
             0xCF9 => self.addr = (self.addr & !0xFF00) | ((value as u32) << 8),
             0xCFA => self.addr = (self.addr & !0xFF_0000) | ((value as u32) << 16),
             0xCFB => self.addr = (self.addr & !0xFF00_0000) | ((value as u32) << 24),
-            // Writes to the data window land in non-existent
-            // devices — silently discarded.
-            0xCFC..=0xCFF => {}
+            // Data window — route writes to the selected device's writable
+            // config registers (only the RTL8139's command + BAR0 here).
+            0xCFC..=0xCFF if self.addr & 0x8000_0000 != 0 => {
+                let bus = (self.addr >> 16) & 0xFF;
+                let dev = (self.addr >> 11) & 0x1F;
+                let func = (self.addr >> 8) & 0x07;
+                if (bus, dev, func) == (0, 1, 0) {
+                    let off = (self.addr & 0xFC) + (port - 0xCFC) as u32;
+                    self.nic_write_byte(off, value);
+                }
+            }
             _ => {}
         }
     }
@@ -226,24 +281,77 @@ mod tests {
     /// wrong sub-system behavior. Companion to the CMOS/PIC/UART/
     /// keyboard round-trip tests in this series.
     #[test]
-    fn snapshot_round_trip_preserves_latched_address() {
+    fn snapshot_round_trip_preserves_latched_address_and_nic() {
         let mut pci = Pci::new();
+        // Assign the NIC an I/O base (BAR0) + enable I/O — must survive.
+        // (These config cycles drive the address latch, so set the latch we
+        // want to preserve AFTER them.)
+        assign_nic_bar0(&mut pci, 0xC000);
+        set_nic_command(&mut pci, 0x0005); // I/O + bus-master
         let want: u32 = 0x8000_4321;
         for i in 0..4u16 {
             pci.write(0xCF8 + i, (want >> (i * 8)) as u8);
         }
         let mut buf = Vec::new();
         pci.snapshot_into(&mut buf);
-        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.len(), 10);
 
         let mut pci2 = Pci::new();
         let consumed = pci2.restore(&buf).expect("restore");
-        assert_eq!(consumed, 4);
+        assert_eq!(consumed, 10);
         let mut got = 0u32;
         for i in 0..4u16 {
             got |= (pci2.read(0xCF8 + i) as u32) << (i * 8);
         }
         assert_eq!(got, want);
+        assert_eq!(pci2.nic_io_base(), 0xC000);
+        assert!(pci2.nic_io_enabled());
+
+        // An old 4-byte blob still restores the address (back-compat).
+        let mut pci3 = Pci::new();
+        assert_eq!(pci3.restore(&buf[..4]).expect("restore v1"), 4);
+    }
+
+    // Helpers: drive a config WRITE to the NIC's BAR0 / command register
+    // the way the kernel does (byte writes to the data window).
+    fn assign_nic_bar0(pci: &mut Pci, base: u16) {
+        for i in 0..4u16 {
+            pci.write(0xCF8 + i, (0x8000_0810u32 >> (i * 8)) as u8); // 00:01.0 reg 0x10
+        }
+        let val = (base as u32) | 0x1;
+        for i in 0..4u16 {
+            pci.write(0xCFC + i, (val >> (i * 8)) as u8);
+        }
+    }
+    fn set_nic_command(pci: &mut Pci, cmd: u16) {
+        for i in 0..4u16 {
+            pci.write(0xCF8 + i, (0x8000_0804u32 >> (i * 8)) as u8); // 00:01.0 reg 0x04
+        }
+        for i in 0..2u16 {
+            pci.write(0xCFC + i, (cmd >> (i * 8)) as u8);
+        }
+    }
+
+    #[test]
+    fn nic_bar0_sizes_and_assigns_as_256b_io() {
+        let mut pci = Pci::new();
+        // Size probe: write all-ones to BAR0, read back the size mask.
+        assign_nic_bar0(&mut pci, 0xFFFF); // low write; do full 0xFFFFFFFF:
+        for i in 0..4u16 {
+            pci.write(0xCF8 + i, (0x8000_0810u32 >> (i * 8)) as u8);
+        }
+        for i in 0..4u16 {
+            pci.write(0xCFC + i, 0xFF);
+        }
+        assert_eq!(
+            cfg_read(&mut pci, 0x8000_0810),
+            0xFFFF_FF01,
+            "256-byte I/O BAR"
+        );
+        // Assign base 0xC000.
+        assign_nic_bar0(&mut pci, 0xC000);
+        assert_eq!(cfg_read(&mut pci, 0x8000_0810) & 0xFF01, 0xC001);
+        assert_eq!(pci.nic_io_base(), 0xC000);
     }
 
     /// restore must reject a truncated blob rather than panic.
