@@ -653,6 +653,45 @@ fn rep_stosb_fills_buffer() {
     assert_eq!(mem.read_u8(0x904), 0);
 }
 
+/// `rep ret` / `repz ret` (F3 C3) — GCC's default function-return
+/// epilogue for ~a decade — must execute as a plain RET; the F3 prefix
+/// on a non-string opcode is meaningless and ignored. Regression: F3 C3
+/// fell into the string-rep loop and errored (CX!=0) or skipped the RET
+/// (CX==0).
+#[test]
+fn rep_ret_executes_as_plain_ret() {
+    //   B9 01 00  MOV CX,1            (CX nonzero — the error branch)
+    //   E8 02 00  CALL +2 -> 0x7C08   (pushes return IP 0x7C06)
+    //   F4        HLT        @0x7C06   (return target)
+    //   00        pad
+    //   F3 C3     REPZ RET   @0x7C08
+    let (cpu, _, _) = run_payload(
+        &[0xB9, 0x01, 0x00, 0xE8, 0x02, 0x00, 0xF4, 0x00, 0xF3, 0xC3],
+        10,
+    );
+    // RET popped the return address (SP back to boot) and reached the
+    // HLT at 0x7C06 (ip = 0x7C07 just past it).
+    assert!(cpu.halted, "rep ret must return to the HLT target");
+    assert_eq!(
+        cpu.regs[r16::SP],
+        0x7C00,
+        "rep ret must pop the return addr"
+    );
+    assert_eq!(cpu.ip, 0x7C07, "halted just past the HLT at 0x7C06");
+}
+
+/// Same, with CX==0 (the silent-skip branch of the old bug).
+#[test]
+fn rep_ret_executes_as_plain_ret_cx_zero() {
+    let (cpu, _, _) = run_payload(
+        &[0xB9, 0x00, 0x00, 0xE8, 0x02, 0x00, 0xF4, 0x00, 0xF3, 0xC3],
+        10,
+    );
+    assert!(cpu.halted, "rep ret with CX=0 must still pop and HLT");
+    assert_eq!(cpu.regs[r16::SP], 0x7C00, "RET must pop even when CX=0");
+    assert_eq!(cpu.ip, 0x7C07);
+}
+
 /// 0x66 0xF3 0xA5 → REP MOVSD. Copies CX *dwords* (4 bytes each)
 /// from DS:SI to ES:DI. Linux memcpy is shaped like this for the
 /// dword-aligned bulk path.

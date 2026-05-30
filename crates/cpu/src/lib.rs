@@ -3981,7 +3981,7 @@ impl Cpu {
                     // it constantly. Treat it as a no-op rather than
                     // falling into the string-op loop (which rejects
                     // 0x90).
-                } else {
+                } else if matches!(inner, 0xA4..=0xA7 | 0xAA..=0xAF | 0x6C..=0x6F) {
                     let conditional = matches!(inner, 0xA6 | 0xA7 | 0xAE | 0xAF);
                     let is_io = matches!(inner, 0x6C..=0x6F);
                     loop {
@@ -4049,6 +4049,16 @@ impl Cpu {
                             }
                         }
                     }
+                } else {
+                    // F2/F3 on a NON-string opcode (e.g. `rep ret` /
+                    // `repz ret` = F3 C3 — GCC's function-return epilogue
+                    // for ~a decade) is a meaningless, ignored prefix.
+                    // Rewind to the byte just past the prefix so the next
+                    // step() decodes the instruction normally (re-applying
+                    // any intervening 0x66/0x67/segment prefix). Without
+                    // this the byte fell into the string-rep loop, which
+                    // errored (CX!=0) or skipped the instruction (CX==0).
+                    self.ip = op_ip.wrapping_add(1);
                 }
             }
 
