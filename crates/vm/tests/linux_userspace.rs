@@ -578,17 +578,24 @@ fn build_cpio_tree(init_binary: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     archive
 }
 
-/// Hand-assembled /init that `execve("/bin/busybox", ["busybox",
-/// "echo", "DYNLINK_OK"], [])`s — a tiny static syscall stub whose
-/// only job is to hand off to a real dynamically-linked program so
-/// the kernel + ld.so run it. On execve failure it prints
+/// Hand-assembled /init that `execve("/bin/busybox", argv, [])`s with
+/// the given `argv` (each entry is NUL-terminated automatically) — a
+/// tiny static syscall stub whose only job is to hand off to a real
+/// dynamically-linked program so the kernel + ld.so run it. argv[0]
+/// should be "busybox" (or an applet name) so busybox's multi-call
+/// dispatch picks the applet. On execve failure it prints
 /// `[EXECVE-FAIL]` and exits 1.
-fn build_init_execve_busybox() -> Vec<u8> {
+fn build_init_execve_argv(argv: &[&str]) -> Vec<u8> {
     let path: &[u8] = b"/bin/busybox\0";
-    let s_busybox: &[u8] = b"busybox\0";
-    let s_echo: &[u8] = b"echo\0";
-    let s_dyn: &[u8] = b"DYNLINK_OK\0";
     let failmsg: &[u8] = b"[EXECVE-FAIL]\n";
+    let argv_strs: Vec<Vec<u8>> = argv
+        .iter()
+        .map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0); // NUL-terminate
+            v
+        })
+        .collect();
 
     let build_code =
         |path_addr: u32, argv_addr: u32, envp_addr: u32, failmsg_addr: u32| -> Vec<u8> {
@@ -618,26 +625,43 @@ fn build_init_execve_busybox() -> Vec<u8> {
 
     let code_len = build_code(0, 0, 0, 0).len() as u32;
     let base = INIT_LOAD_ADDR + INIT_ENTRY_OFFSET;
+    // Layout: code, path, each argv string, failmsg, the argv pointer
+    // array (N ptrs + a NULL), envp (one NULL).
     let path_addr = base + code_len;
-    let s_busybox_addr = path_addr + path.len() as u32;
-    let s_echo_addr = s_busybox_addr + s_busybox.len() as u32;
-    let s_dyn_addr = s_echo_addr + s_echo.len() as u32;
-    let failmsg_addr = s_dyn_addr + s_dyn.len() as u32;
-    let argv_addr = failmsg_addr + failmsg.len() as u32;
-    let envp_addr = argv_addr + 16; // argv = 4 u32 (3 ptrs + NULL)
-    let code = build_code(path_addr, argv_addr, envp_addr, failmsg_addr);
-    // argv = [&"busybox", &"echo", &"DYNLINK_OK", NULL]; envp = [NULL].
-    let mut argv = Vec::with_capacity(16);
-    argv.extend_from_slice(&s_busybox_addr.to_le_bytes());
-    argv.extend_from_slice(&s_echo_addr.to_le_bytes());
-    argv.extend_from_slice(&s_dyn_addr.to_le_bytes());
-    argv.extend_from_slice(&0u32.to_le_bytes());
+    let mut addr = path_addr + path.len() as u32;
+    let mut str_addrs = Vec::with_capacity(argv_strs.len());
+    for s in &argv_strs {
+        str_addrs.push(addr);
+        addr += s.len() as u32;
+    }
+    let failmsg_addr = addr;
+    addr += failmsg.len() as u32;
+    let argv_arr_addr = addr;
+    let argv_arr_len = ((argv_strs.len() + 1) * 4) as u32;
+    let envp_addr = argv_arr_addr + argv_arr_len;
+
+    let code = build_code(path_addr, argv_arr_addr, envp_addr, failmsg_addr);
+    let mut argv_arr = Vec::with_capacity(argv_arr_len as usize);
+    for a in &str_addrs {
+        argv_arr.extend_from_slice(&a.to_le_bytes());
+    }
+    argv_arr.extend_from_slice(&0u32.to_le_bytes()); // argv NULL terminator
     let envp = 0u32.to_le_bytes();
-    make_init_elf32_safe(
-        &code,
-        &[path, s_busybox, s_echo, s_dyn, failmsg, &argv, &envp],
-        7,
-    )
+
+    let mut segs: Vec<&[u8]> = Vec::with_capacity(argv_strs.len() + 4);
+    segs.push(path);
+    for s in &argv_strs {
+        segs.push(s);
+    }
+    segs.push(failmsg);
+    segs.push(&argv_arr);
+    segs.push(&envp);
+    make_init_elf32_safe(&code, &segs, 7)
+}
+
+/// `execve("/bin/busybox", ["busybox", "echo", "DYNLINK_OK"])`.
+fn build_init_execve_busybox() -> Vec<u8> {
+    build_init_execve_argv(&["busybox", "echo", "DYNLINK_OK"])
 }
 
 /// Build the same minimal newc cpio archive the linux_boot example
@@ -10787,6 +10811,119 @@ fn linux_userspace_dynamic_multilib_milestone() {
         dump_uart_on_failure(&cumulative, "multilib-dynlink")
     );
     eprintln!("  ✓ DYNLINK_OK — multi-library dynamic linking works end to end!");
+}
+
+/// Busybox SHELL milestone: /init `execve`s `/bin/busybox` with
+/// `["busybox", "sh", "-c", "echo SHELL_OK"]`. busybox's multi-call
+/// dispatch runs the `sh` applet, which parses the `-c` command line and
+/// runs its `echo` builtin, printing `SHELL_OK`. This goes a step beyond
+/// the bare-`echo` multilib milestone: it exercises the busybox shell
+/// (argument parsing, command-line `-c` handling, builtin dispatch) on
+/// top of the now-working multi-library dynamic loader. Asserts SHELL_OK
+/// appears with no segfault / loader error / execve failure. Reads
+/// busybox + libs from `WWWVM_DYN_ROOTFS`; SKIPS if absent.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_sh_milestone() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let root =
+        std::env::var("WWWVM_DYN_ROOTFS").unwrap_or_else(|_| "/tmp/wwwvm-linux/rootfs".to_string());
+    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (Some(busybox), Some(ld), Some(libc), Some(libm), Some(libcrypt)) = (
+        read_or_skip("bin/busybox"),
+        read_or_skip("lib/ld-linux.so.2"),
+        read_or_skip("lib/libc.so.6"),
+        read_or_skip("lib/libm.so.6"),
+        read_or_skip("lib/libcrypt.so.1"),
+    ) else {
+        return;
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    let init = build_init_execve_argv(&["busybox", "sh", "-c", "echo SHELL_OK"]);
+    let cpio = build_cpio_tree(
+        &init,
+        &[
+            ("bin/busybox", &busybox),
+            ("lib/ld-linux.so.2", &ld),
+            ("lib/libc.so.6", &libc),
+            ("lib/libm.so.6", &libm),
+            ("lib/libcrypt.so.1", &libcrypt),
+        ],
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        if !out.is_empty() {
+            cumulative.extend_from_slice(&out);
+        }
+        if String::from_utf8_lossy(&cumulative).contains("SHELL_OK") {
+            found = true;
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(_) | wwwvm_vm::Stop::Halted => break,
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    break;
+                }
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox sh milestone (steps {steps}, SHELL_OK={found}) ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "sh-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for busybox sh; {}",
+        dump_uart_on_failure(&cumulative, "sh-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "busybox sh segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "sh-segv")
+    );
+    assert!(
+        found,
+        "busybox `sh -c 'echo SHELL_OK'` never printed its marker; {}",
+        dump_uart_on_failure(&cumulative, "sh-marker")
+    );
+    eprintln!("  ✓ SHELL_OK — busybox shell runs a -c command end to end!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
