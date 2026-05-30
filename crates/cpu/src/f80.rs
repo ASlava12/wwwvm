@@ -360,7 +360,14 @@ impl F80 {
             return if mant & 0x7fff_ffff_ffff_ffff == 0 {
                 F80::inf(sign)
             } else {
-                F80::nan()
+                // Preserve the sign so a NaN round-trips through the m80
+                // encoding (NaN sign is otherwise architecturally inert).
+                F80 {
+                    sign,
+                    cls: Cls::Nan,
+                    exp: 0,
+                    mant: 0,
+                }
             };
         }
         if mant == 0 {
@@ -597,13 +604,21 @@ impl Div for F80 {
             (Zero, _) => F80::zero(sign),
             (Normal, Normal) => {
                 // quotient = (a.mant / b.mant) · 2^(a.exp-b.exp). Scale the
-                // numerator up by 64 bits for a 64-bit-plus quotient.
+                // numerator up by 64 bits, then append 2 guard bits from the
+                // remainder so the significand ALWAYS has ≥66 bits — the bare
+                // quotient can be exactly 64 bits (q ∈ [2^63,2^64)), where a
+                // boolean sticky can't express round-vs-sticky and the result
+                // would never round (audit finding). With the guard bits
+                // round_from sees a real round bit.
                 let num = (self.mant as u128) << 64;
                 let den = other.mant as u128;
-                let q = num / den;
+                let q = num / den; // ∈ [2^63, 2^65)
                 let rem = num % den;
-                // value = q · 2^(a.exp-63 - (b.exp-63) - 64) = q·2^(a.exp-b.exp-64)
-                F80::round_from(sign, self.exp - other.exp - 64, q, rem != 0)
+                let guard = (rem << 2) / den; // next 2 quotient bits, 0..3
+                let sig = (q << 2) | guard; // = floor(4·num/den), ≥ 2^65
+                let sticky = !(rem << 2).is_multiple_of(den);
+                // value = sig · 2^(a.exp-b.exp-64-2)
+                F80::round_from(sign, self.exp - other.exp - 66, sig, sticky)
             }
         }
     }
@@ -746,5 +761,59 @@ mod tests {
         assert!(F80::ZERO.div(F80::ZERO).is_nan());
         assert!(F80::inf(false).add(F80::inf(true)).is_nan());
         assert!(F80::inf(false).mul(F80::ZERO).is_nan());
+    }
+
+    // ---- regression cases from the adversarial F80 audit --------------
+
+    fn norm(mant: u64, exp: i32) -> F80 {
+        F80 {
+            sign: false,
+            cls: Cls::Normal,
+            exp,
+            mant,
+        }
+    }
+
+    #[test]
+    fn audit_div_rounds_exact_64bit_quotient() {
+        // a/b ∈ (0.5,1): the quotient fills exactly 64 bits and the
+        // remainder is > den/2, so it must round UP to all-ones. (Audit
+        // found round_from set round_bit=false for n=64 → no rounding.)
+        let r = norm(0xd555_5555_5555_5555, 0).div(norm(0xd555_5555_5555_5556, 0));
+        assert_eq!(r.cls, Cls::Normal);
+        assert_eq!(r.exp, -1);
+        assert_eq!(
+            r.mant, 0xffff_ffff_ffff_ffff,
+            "n=64 quotient with rem>den/2 must round up"
+        );
+    }
+
+    #[test]
+    fn audit_sub_borrow_is_correct() {
+        // 1.0 + (−(2^64−1)·2^-128) = 1 − 2^-64 + 2^-128, rounds to 1−2^-64
+        // (mant all-ones, exp −1). Exercises the `sig -= 1` borrow path
+        // (bsticky true via diff=65); the audit suspected it corrupts
+        // rounding — verify it doesn't (no cancellation when bsticky).
+        let r = norm(0x8000_0000_0000_0000, 0).add(F80 {
+            sign: true,
+            cls: Cls::Normal,
+            exp: -65,
+            mant: 0xffff_ffff_ffff_ffff,
+        });
+        assert_eq!(r.cls, Cls::Normal);
+        assert_eq!(r.exp, -1);
+        assert_eq!(r.mant, 0xffff_ffff_ffff_ffff);
+    }
+
+    #[test]
+    fn audit_nan_sign_roundtrips_through_m80() {
+        let n = F80::from_f80_parts(0xC000_0000_0000_0000, 0xFFFF); // signed NaN
+        assert!(n.is_nan());
+        let (_, se) = n.to_f80_parts();
+        assert_eq!(
+            se & 0x8000,
+            0x8000,
+            "NaN sign must survive the m80 round-trip"
+        );
     }
 }
