@@ -10830,6 +10830,9 @@ fn linux_userspace_busybox_direct_diag() {
     );
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
+    // Capture the instruction ring so the wild-jump #PF (EIP landing in
+    // data/ASCII) dumps the ret/call/jmp that produced the bad target.
+    vm.enable_cpu_pf_trace(96);
 
     let mut cumulative = Vec::<u8>::new();
     let chunk = 10_000_000u32;

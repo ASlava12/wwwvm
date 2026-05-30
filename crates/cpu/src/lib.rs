@@ -1102,11 +1102,22 @@ impl Cpu {
         if self.pf_trace.borrow().is_some() {
             let user_read = error_code & 0b110 == 0b100; // U=1, W=0
             let last_ip = self.last_op_ip;
+            // A wild control transfer (bad ret/call/jmp target) shows up
+            // as an instruction-FETCH fault: the address being faulted on
+            // is the current op_ip (flat user CS → linear == offset).
+            let fetch_fault = user_read && addr.wrapping_sub(last_ip) < 16;
             if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
                 if !t.fired && user_read && addr < 0x1000 {
                     t.fired = true;
                     t.dump(&format!(
                         "user read #PF addr={addr:#x} err={error_code:#x} faulting_eip={last_ip:#x}"
+                    ));
+                } else if !t.fired && fetch_fault && addr >= 0x1_0000 {
+                    // EIP jumped to an unmapped (often data/ASCII) address
+                    // — the trace ring shows the ret/call/jmp that set it.
+                    t.fired = true;
+                    t.dump(&format!(
+                        "user FETCH #PF (wild jump) addr={addr:#x} err={error_code:#x} eip={last_ip:#x}"
                     ));
                 }
             }

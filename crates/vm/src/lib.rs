@@ -979,6 +979,13 @@ impl Vm {
         self.mem.write_slice(addr, bytes);
     }
 
+    /// Enable the CPU's debug instruction-trace ring (see
+    /// `Cpu::enable_pf_trace`). Diagnostics use this to dump the last
+    /// `cap` instructions when a wild jump / null-deref #PF fires.
+    pub fn enable_cpu_pf_trace(&self, cap: usize) {
+        self.cpu.enable_pf_trace(cap);
+    }
+
     /// Write an IVT entry for the given vector. Vector `v` lives at
     /// linear address `v*4` as a 4-byte (offset, segment) record. JS
     /// callers use this to wire up handlers without emitting a string
