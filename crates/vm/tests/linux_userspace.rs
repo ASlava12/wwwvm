@@ -11947,6 +11947,131 @@ fn linux_userspace_busybox_fifo_milestone() {
     eprintln!("  ✓ FIFO_OK — named-pipe (mkfifo) cross-process rendezvous works!");
 }
 
+/// ALPINE STAGE A: run ALPINE's busybox — musl-linked and a PIE (ET_DYN),
+/// unlike Tinycore's glibc ET_EXEC — on the CURRENT kernel, to isolate the
+/// musl userspace from the kernel. This is the first step toward booting
+/// Alpine. /init execve's `busybox sh -c "echo ALPINE_MUSL_OK"`; the kernel
+/// sees busybox's PT_INTERP=/lib/ld-musl-i386.so.1 (musl's combined
+/// loader+libc, one file), mmaps + relocates the PIE, and runs it. Reads
+/// the Alpine rootfs from WWWVM_ALPINE_ROOTFS (default
+/// /tmp/wwwvm-alpine/rootfs): `bin/busybox`, `lib/ld-musl-i386.so.1`, and
+/// `lib/libc.musl-x86.so.1` (a copy of ld-musl, since busybox DT_NEEDED's
+/// that name — in Alpine it is a symlink to it). Asserts ALPINE_MUSL_OK
+/// with no segfault / loader error / execve failure. Set up the assets via
+/// `alpine-minirootfs-3.21-x86.tar.gz` (see README). Skips if absent.
+#[test]
+#[ignore = "Alpine stage A: musl PIE busybox on the current kernel; needs WWWVM_ALPINE_ROOTFS; ~60s"]
+fn linux_userspace_alpine_musl_milestone() {
+    let kpath =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let root = std::env::var("WWWVM_ALPINE_ROOTFS")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/rootfs".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let read_or_skip = |rel: &str| -> Option<Vec<u8>> {
+        match std::fs::read(format!("{root}/{rel}")) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("skipping: read {root}/{rel}: {e}");
+                None
+            }
+        }
+    };
+    let (Some(busybox), Some(ld_musl), Some(libc_musl)) = (
+        read_or_skip("bin/busybox"),
+        read_or_skip("lib/ld-musl-i386.so.1"),
+        read_or_skip("lib/libc.musl-x86.so.1"),
+    ) else {
+        return;
+    };
+
+    let init = build_init_execve_argv(&["busybox", "sh", "-c", "echo ALPINE_MUSL_OK"]);
+    let cpio = build_cpio_tree(
+        &init,
+        &[
+            ("bin/busybox", &busybox),
+            ("lib/ld-musl-i386.so.1", &ld_musl),
+            ("lib/libc.musl-x86.so.1", &libc_musl),
+        ],
+    );
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel",
+    );
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 10_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    let stop_reason: String;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        let out = vm.drain_output();
+        cumulative.extend_from_slice(&out);
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains("ALPINE_MUSL_OK") {
+            found = true;
+            stop_reason = "found ALPINE_MUSL_OK".to_string();
+            break;
+        }
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                stop_reason = format!("CpuError: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                stop_reason = "Halted".to_string();
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    stop_reason = "step budget exhausted".to_string();
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== ALPINE stage A (musl busybox): ALPINE_MUSL_OK={found} steps={steps} stop={stop_reason} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox) failed; {}",
+        dump_uart_on_failure(&cumulative, "alpine-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld-musl could not load busybox/libc; {}",
+        dump_uart_on_failure(&cumulative, "alpine-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "Alpine musl busybox segfaulted ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-segv")
+    );
+    assert!(
+        found,
+        "Alpine's musl PIE busybox did not print ALPINE_MUSL_OK ({stop_reason}); {}",
+        dump_uart_on_failure(&cumulative, "alpine-marker")
+    );
+    eprintln!("  ✓ ALPINE_MUSL_OK — Alpine's musl PIE busybox sh runs on the emulator!");
+}
+
 /// Diagnostic isolating the dynamic-linking failure: boots busybox
 /// DIRECTLY as /init (kernel-exec'd, not via an execve stub) with all
 /// four needed libs in /lib. Compared to `dynamic_exec_diag` (busybox
