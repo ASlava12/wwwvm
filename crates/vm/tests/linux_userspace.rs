@@ -10715,9 +10715,18 @@ fn run_busybox_dynamic(argv: &[&str], marker: &str) -> Option<(bool, Vec<u8>)> {
         if !out.is_empty() {
             cumulative.extend_from_slice(&out);
         }
-        if String::from_utf8_lossy(&cumulative).contains(marker) {
+        let text = String::from_utf8_lossy(&cumulative);
+        if text.contains(marker) {
             found = true;
             stop_reason = format!("found {marker}");
+            break;
+        }
+        // Once the kernel panics (e.g. init exited), nothing more useful
+        // runs — busybox is gone. Stop immediately instead of burning
+        // billions of steps on the post-panic reboot / reset-vector code
+        // (which itself trips unimplemented BIOS opcodes).
+        if text.contains("Kernel panic") {
+            stop_reason = "kernel panic (init died)".to_string();
             break;
         }
         match stop {
