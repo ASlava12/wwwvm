@@ -1375,9 +1375,24 @@ milestone'ы re-verified зелёными на Tinycore 15.x kernel'е при
 cargo test --workspace
 ```
 
-Должно вывести 632 пройденных теста на текущий момент. CI
+Должно вывести 643 пройденных теста на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
+
+### Живой интерактивный busybox-шелл (печатать команды вживую)
+
+```bash
+# нужны ассеты: /tmp/wwwvm-linux/vmlinuz + /tmp/wwwvm-linux/rootfs
+cargo run -p wwwvm-vm --release --example busybox_console
+```
+
+Грузит настоящее ядро Linux i386 + динамически слинкованный glibc
+`busybox sh` и соединяет твой терминал (stdin/stdout) с UART виртуалки.
+~30–60 с boot-лога → промпт `/ #` → печатаешь команды и видишь реакцию.
+PATH не задан, поэтому апплеты — как `busybox ls`, `busybox awk '...'`;
+builtin'ы (echo, cd, for/while/if, `$((...))`) работают напрямую.
+Ctrl-C выходит. Это «живой» аналог скриптованных milestone'ов из
+`tests/linux_userspace.rs` (там ввод подаётся фиксированный).
 
 ### Throughput-бенчмарк
 
