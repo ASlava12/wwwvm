@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**611 тестов** зелёные (mem 30 + devices 77 + cpu 359 + vm 128 +
+**625 тестов** зелёные (mem 30 + devices 77 + cpu 373 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -314,6 +314,28 @@ CMPXCHG/CMPXCHG8B/XADD/XCHG/LOCK + BT/BTS/BTR/BTC/BSF/BSR. Найдено все
 хранилище). Отложено: LOCK-префикс (0xF0) как отдельный no-op-шаг
 теряет префикс, стоящий ПЕРЕД ним (`66 F0 …`, неканонический порядок —
 ассемблеры так не генерят); канонический `F0 66 …` работает.
+
+**Четвёртый проход — x87 FPU + SSE (30 мая 2026):** condition-codes,
+стек, control-word, packed-arith. 12 находок, ВСЕ исправлены
+(teeth-confirmed). Главная — **системная инверсия SSE**: каждый
+0F-опкод с мандаторным `0x66` (COMISD/UCOMISD, ADD/MUL/SUB/DIV/MIN/MAX/SQRT
+PD, MOVD/MOVDQA, весь packed-integer PADD/PSUB/PCMP/PAND/PXOR/PMUL/PSHUFD/
+shifts/PMOVMSKB/…) выбирал PD-vs-PS форму по `op_size_32` (= 0x66 XOR
+code_size_32), а не по литеральному префиксу. В 32-битном PM (где идёт
+ВСЯ Linux-userspace SSE) это ИНВЕРТИРОВАЛО выбор: COMISD декодировался
+как COMISS, MOVDQA не распознавался, packed-double читал single-полосы.
+Работало только в real mode (где гоняются старые тесты). Фикс:
+`Cpu::has_66()` = `op_size_32 != code_size_32` (восстанавливает «был ли
+0x66» в обоих режимах), 37 SSE-сайтов переведены на него; genuine
+operand-size 0F-опкоды (MOVZX/MOVSX/CMOVcc/BT/…) не тронуты. НЕ повлияло
+на multi-lib busybox (та же ошибка) — значит SSE не был причиной
+коррапта. Остальные x87-фиксы: DC-форма FSUB/FDIV (операнды
+переставлены), FIST/FISTP (truncate→round-to-nearest по CW), FNINIT
+сбрасывает TOP, FNSTSW кодирует TOP в биты 11-13, FCOM чистит C1.
+Реализованы ранее НЕдекодированные (краш) compare/classify: FCOMI/FCOMIP/
+FUCOMI/FUCOMIP (ставят EFLAGS — современные компиляторы их генерят для
+float-сравнений), FXAM (libm-классификация), FUCOM/FUCOMP, FCOMPP,
+FUCOMPP (новый 0xDA-handler).
 
 ## Что уже работает (i386-ядро)
 
@@ -1227,7 +1249,7 @@ milestone'ы re-verified зелёными на Tinycore 15.x kernel'е при
 cargo test --workspace
 ```
 
-Должно вывести 604 пройденных теста на текущий момент. CI
+Должно вывести 625 пройденных тестов на текущий момент. CI
 (`.github/workflows/ci.yml`) дополнительно гоняет `cargo fmt --check`
 и `cargo clippy --workspace --all-targets -- -D warnings`.
 
