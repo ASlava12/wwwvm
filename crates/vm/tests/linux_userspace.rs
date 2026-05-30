@@ -11585,22 +11585,21 @@ fn linux_userspace_busybox_interactive_session_milestone() {
 /// classify, fcomp/fnstsw/sahf branches, fmul/faddp poly) the simpler
 /// workloads never reach. /init runs
 /// `busybox awk 'BEGIN{printf "LIBM_%d\n",
-///    int((sin(1)+cos(1)+exp(1)+log(2)+atan2(1,1)+sqrt(2))*100000)}'`.
+///    int((sin(1)+cos(1)+exp(1)+log(2)+atan2(1,1)+sqrt(2))*100)}'`.
 /// awk's sin/cos/exp/log/atan2 call into libm; the six results are summed
 /// (true value 6.99281) and the integer `int(sum*100)` = 699 validates
-/// that every transcendental is numerically correct.
+/// that every transcendental is numerically correct — INCLUDING the first
+/// call, which was once corrupted (the FP-rollback-on-fault fix: a faulting
+/// FLD m64 of a constant from a demand-paged .rodata page used to leave a
+/// garbage push on the x87 stack). So no warmup is needed any more; if the
+/// first-call regression returned, the leading sin() term would drop out
+/// and this would fail.
 ///
-/// Two deliberate accommodations, both for KNOWN limitations (not for the
-/// emulator being broken). (1) The leading `w=sin(0)` is a WARMUP: a
-/// separate open bug makes the FIRST libm transcendental call in a program
-/// silently return ~0 (the rest are correct), traced to glibc's lazy-PLT
-/// resolution corrupting the x87 stack (see memory
-/// `sin-silent-miscompute-bug.md`); the warmup absorbs that first-call
-/// loss. (2) The sum is scaled by 100, not 100000, because the emulated
-/// x87 keeps registers as f64, not 80-bit extended, so glibc's software
-/// transcendentals differ in the ~5th significant digit (emulated 6.99307
-/// vs true 6.99281); `int(sum*100)` = 699 is robust to that. Asserts the
-/// marker with no segfault / loader / execve failure.
+/// The sum is scaled by 100, not 100000, for a KNOWN precision limit: the
+/// emulated x87 keeps registers as f64, not 80-bit extended, so glibc's
+/// software transcendentals differ in the ~5th significant digit (emulated
+/// 6.99307 vs true 6.99281); `int(sum*100)` = 699 is robust to that.
+/// Asserts the marker with no segfault / loader / execve failure.
 #[test]
 #[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
 fn linux_userspace_busybox_libm_milestone() {
@@ -11608,7 +11607,7 @@ fn linux_userspace_busybox_libm_milestone() {
         &[
             "busybox",
             "awk",
-            "BEGIN{w=sin(0); printf \"LIBM_%d\\n\", int((sin(1)+cos(1)+exp(1)+log(2)+atan2(1,1)+sqrt(2))*100)}",
+            "BEGIN{printf \"LIBM_%d\\n\", int((sin(1)+cos(1)+exp(1)+log(2)+atan2(1,1)+sqrt(2))*100)}",
         ],
         "LIBM_699",
     ) else {
@@ -11712,10 +11711,14 @@ fn linux_userspace_libm_doublecall_diag() {
     eprintln!("=== minimal two-sin-call diag: both_ok={both_ok} got={got} ===");
     if both_ok {
         eprintln!(
-            "  → RES_8414_8414: minimal form does NOT reproduce — loss was an awk/sum artifact."
+            "  → RES_8414_8414: both calls correct — the FP-rollback-on-fault fix holds (a \
+             faulting FLD m64 of a demand-paged libm constant no longer corrupts the x87 stack)."
         );
     } else if got.starts_with("RES_0_") {
-        eprintln!("  → first sin() lost, second correct: model CONFIRMED. Trace the first call.");
+        eprintln!(
+            "  → REGRESSION: first sin() lost again — the FP-stack rollback on a faulting load \
+             broke (see fp_stack_rolls_back_on_faulting_fld_m64)."
+        );
     } else {
         eprintln!("  → unexpected ({got}); see dump.");
         eprintln!("{}", dump_uart_on_failure(&cumulative, "libm-doublecall"));

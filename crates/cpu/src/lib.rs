@@ -3749,6 +3749,27 @@ impl Cpu {
             }
         };
 
+        // FP instructions (x87 escapes D8-DF and the 0F SSE/two-byte map)
+        // can partially mutate the x87 stack / XMM before a #PF — e.g. an
+        // `FLD m64` of a libm constant on a demand-paged .rodata page
+        // pushes a garbage value, sets pending_fault, but the GP snapshot
+        // above does NOT cover fpu_top/fpu_st/xmm, so the EIP-rewound retry
+        // pushes a SECOND value onto the now-misaligned stack and the rest
+        // of the routine computes from garbage. Snapshot the FP state too,
+        // but only for these opcodes (keeps the common ALU path snapshot
+        // cheap). Restored on a pending fault at the end of step().
+        let fp_snap = if (0xD8..=0xDF).contains(&opcode) || opcode == 0x0F {
+            Some((
+                self.fpu_top,
+                self.fpu_sw,
+                self.fpu_cw,
+                self.fpu_st,
+                self.xmm,
+            ))
+        } else {
+            None
+        };
+
         match opcode {
             0x90 => { /* NOP */ }
             0xF4 => {
@@ -8538,6 +8559,19 @@ impl Cpu {
             self.regs_high = reg_high_snap;
             self.flags = flags_snap;
             self.flags_high = flags_high_snap;
+        }
+        // Roll back the x87 stack / XMM for a faulting FP instruction (see
+        // the fp_snap checkpoint above). This is what makes an `FLD m64`
+        // of a constant on a not-yet-paged libm page retry cleanly instead
+        // of leaving a garbage push on the stack.
+        if self.pending_fault.get().is_some() {
+            if let Some((top, sw, cw, st, xmm)) = fp_snap {
+                self.fpu_top = top;
+                self.fpu_sw = sw;
+                self.fpu_cw = cw;
+                self.fpu_st = st;
+                self.xmm = xmm;
+            }
         }
         Ok(())
     }

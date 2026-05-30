@@ -7761,6 +7761,62 @@ fn fpu_fxsave_fxrstor_roundtrip() {
     );
 }
 
+/// A faulting x87 memory LOAD must roll the FPU stack back, exactly like
+/// the GP-register rollback. An `FLD m64` whose operand page is not present
+/// (demand paging) pushes a garbage value and flags #PF; without rolling
+/// the x87 stack back, the EIP-rewound retry pushes a SECOND value onto the
+/// now-misaligned stack and the rest of the routine computes from garbage.
+/// This is exactly why the FIRST libm call (loading a constant from a
+/// not-yet-paged .rodata page) silently returned ~0. Here: FILD pushes 42,
+/// then FLD m64 from a non-present page faults — the x87 stack must be
+/// byte-for-byte what FILD left it.
+#[test]
+fn fp_stack_rolls_back_on_faulting_fld_m64() {
+    let mut mem = Memory::new(0x10_0000);
+    // Identity-map the low 4 MiB EXCEPT page 0xF (linear 0xF000), left
+    // non-present so an FLD m64 from it raises #PF. PD at 0x2000, PT at
+    // 0x3000 (walked physically, so they need no mapping themselves).
+    mem.write_u32(0x2000, 0x3000 | 0x3); // PDE[0] -> PT (present, rw)
+    for i in 0..1024u32 {
+        let pte = if i == 0xF { 0 } else { (i * 0x1000) | 0x3 };
+        mem.write_u32(0x3000 + i * 4, pte);
+    }
+    mem.write_u32(0x600, 42); // FILD source (page 0, present)
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 42
+            0xDD, 0x06, 0x00, 0xF0, // FLD m64 [0xF000] -> page not present -> #PF
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 0x8000_0000; // CR0.PG on (PE off keeps CPL=0)
+    cpu.cr3 = 0x0000_2000;
+    let mut io = IoBus::new();
+    // Step 1: FILD pushes 42.
+    cpu.step(&mut mem, &mut io).expect("FILD");
+    let top_snap = cpu.fpu_top;
+    let st_snap = cpu.fpu_st;
+    // Step 2: FLD m64 from the non-present page faults; step() returns Ok
+    // and latches the pending #PF.
+    cpu.step(&mut mem, &mut io).expect("FLD m64 step");
+    assert!(
+        cpu.pending_fault().is_some(),
+        "FLD m64 from a non-present page must raise #PF"
+    );
+    // The faulting load must have committed NOTHING to the x87 stack.
+    assert_eq!(
+        cpu.fpu_top, top_snap,
+        "fpu_top rolled back (no garbage push)"
+    );
+    assert_eq!(
+        cpu.fpu_st, st_snap,
+        "x87 register file rolled back on fault"
+    );
+}
+
 /// FXCH swaps ST(0) and ST(1): compute 10.0 - 3.0 with operands in
 /// the "wrong" order, fix with FXCH, FSUBP.
 #[test]
