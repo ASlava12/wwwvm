@@ -4236,6 +4236,64 @@ fn sse_comisd_sets_ordering_flags() {
     assert_eq!(compare(f64::NAN, 1.0), (true, true, true));
 }
 
+/// COMISD/COMISS must select double vs single precision by the LITERAL
+/// 0x66 prefix, not the effective operand size — in 32-bit protected
+/// mode (code_size_32=true, where Linux userspace SSE runs) those
+/// disagree. Regression: the handler keyed on op_size_32, inverting the
+/// precision (COMISD read as f32) in 32-bit PM.
+#[test]
+fn sse_comisd_pm32_uses_double_precision() {
+    let mut mem = Memory::new(0x10_0000);
+    // 66 0F 2F C1 = COMISD XMM0, XMM1 ; HLT
+    mem.write_slice(0x7C00, &[0x66, 0x0F, 0x2F, 0xC1, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true; // 32-bit code segment (D bit) -> op_size_32 default true
+    cpu.xmm[0] = 0x4000_0000_0000_0000u128; // 2.0 as f64 (low64)
+    cpu.xmm[1] = 0x3FF0_0000_0000_0000u128; // 1.0 as f64
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    // True COMISD: 2.0 > 1.0 -> ZF=0, PF=0, CF=0. (The buggy f32 branch
+    // read low32 of each lane = 0.0 vs 0.0 -> ZF=1.)
+    assert!(!cpu.has(flag::ZF), "2.0 != 1.0 (must compare as f64)");
+    assert!(!cpu.has(flag::PF), "ordered");
+    assert!(!cpu.has(flag::CF), "2.0 not < 1.0");
+}
+
+/// MOVDQA (66 0F 6F) — a 0x66-mandatory-prefix SSE dispatch guard —
+/// must move all 128 bits in 32-bit protected mode. Regression: the
+/// guard keyed on op_size_32, so in 32-bit PM the 0x66 form was not
+/// recognized (fell through to MMX / Unimplemented).
+#[test]
+fn sse_movdqa_pm32_moves_128_bits() {
+    let mut mem = Memory::new(0x10_0000);
+    // 66 0F 6F C1 = MOVDQA XMM0, XMM1 ; HLT
+    mem.write_slice(0x7C00, &[0x66, 0x0F, 0x6F, 0xC1, 0xF4]);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.code_size_32 = true;
+    cpu.xmm[1] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00u128;
+    cpu.xmm[0] = 0;
+    cpu.ip = 0x7C00;
+    let mut io = IoBus::new();
+    for _ in 0..8 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert_eq!(
+        cpu.xmm[0], 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00u128,
+        "MOVDQA must copy all 128 bits in 32-bit PM"
+    );
+}
+
 /// Packed SQRTPS then MINPS: sqrt four lanes, then clamp each to a
 /// per-lane ceiling. Confirms the unary (SQRT) and binary (MIN)
 /// packed-float paths and the x86 MIN tie rule.

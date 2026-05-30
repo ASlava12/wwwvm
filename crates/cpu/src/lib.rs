@@ -1938,6 +1938,17 @@ impl Cpu {
         self.flags & mask != 0
     }
 
+    /// True iff a literal `0x66` prefix preceded this instruction. For
+    /// the 0F SSE map the `0x66` is a MANDATORY prefix selecting the
+    /// PD / packed-integer form (not an operand-size override), so the
+    /// selection must key on the literal prefix, NOT the effective
+    /// operand size. `op_size_32` defaults to `code_size_32` and `0x66`
+    /// flips it, so `op_size_32 != code_size_32` exactly recovers
+    /// "0x66 was present" in both real and 32-bit protected mode.
+    fn has_66(&self) -> bool {
+        self.op_size_32 != self.code_size_32
+    }
+
     /// Update ZF/SF/PF after an 8-bit logical op. Clears CF and OF.
     fn flags_logic8(&mut self, result: u8) {
         self.set_flag(flag::ZF, result == 0);
@@ -6519,7 +6530,7 @@ impl Cpu {
                     // Compilers emit these for `if (x < y)` on floats.
                     0x2E | 0x2F => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
-                        let ord = if self.op_size_32 {
+                        let ord = if self.has_66() {
                             let a = f64::from_bits(self.xmm[reg as usize] as u64);
                             let b = f64::from_bits(self.read_xmm_rm64(rm, mem));
                             a.partial_cmp(&b)
@@ -6541,22 +6552,22 @@ impl Cpu {
                     //   66 0F 7E  MOVD r/m32, xmm   (low dword → GP/mem)
                     //   66 0F 6F  MOVDQA xmm, xmm/m128
                     //   66 0F 7F  MOVDQA xmm/m128, xmm
-                    0x6E if self.op_size_32 => {
+                    0x6E if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_rm32(rm, mem) as u128;
                         self.xmm[reg as usize] = v; // zero-extends upper 96 bits
                     }
-                    0x7E if self.op_size_32 => {
+                    0x7E if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.xmm[reg as usize] as u32;
                         self.write_rm32(rm, mem, v);
                     }
-                    0x6F if self.op_size_32 => {
+                    0x6F if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_xmm_rm(rm, mem);
                         self.xmm[reg as usize] = v;
                     }
-                    0x7F if self.op_size_32 => {
+                    0x7F if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.xmm[reg as usize];
                         self.write_xmm_rm(rm, mem, v);
@@ -6564,17 +6575,17 @@ impl Cpu {
                     // Packed-integer logicals (66 0F): PAND/POR/PXOR.
                     // Lane-independent, so they're plain 128-bit bitops.
                     // `pxor xmm, xmm` is the canonical XMM-zeroing idiom.
-                    0xDB if self.op_size_32 => {
+                    0xDB if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_xmm_rm(rm, mem);
                         self.xmm[reg as usize] &= v;
                     }
-                    0xEB if self.op_size_32 => {
+                    0xEB if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_xmm_rm(rm, mem);
                         self.xmm[reg as usize] |= v;
                     }
-                    0xEF if self.op_size_32 => {
+                    0xEF if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_xmm_rm(rm, mem);
                         self.xmm[reg as usize] ^= v;
@@ -6585,7 +6596,7 @@ impl Cpu {
                     //   D4 PADDQ (64)
                     //   F8 PSUBB      F9 PSUBW       FA PSUBD
                     //   FB PSUBQ
-                    0xFC | 0xFD | 0xFE | 0xD4 if self.op_size_32 => {
+                    0xFC | 0xFD | 0xFE | 0xD4 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6597,7 +6608,7 @@ impl Cpu {
                         };
                         self.xmm[reg as usize] = packed_add(a, b, lane);
                     }
-                    0xF8..=0xFB if self.op_size_32 => {
+                    0xF8..=0xFB if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6613,7 +6624,7 @@ impl Cpu {
                     // result lane is all-ones on equal, all-zeros
                     // otherwise. The classic SIMD primitive for
                     // strchr / memcmp / vectorized branching.
-                    0x74..=0x76 if self.op_size_32 => {
+                    0x74..=0x76 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6627,7 +6638,7 @@ impl Cpu {
                     // PCMPGTB/W/D (66 0F 64/65/66) — signed greater-than;
                     // result lane all-ones if (signed) a > b. Pairs
                     // with PCMPEQ to derive {<, ≤, ≥, ≠} via masks.
-                    0x64..=0x66 if self.op_size_32 => {
+                    0x64..=0x66 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6648,7 +6659,7 @@ impl Cpu {
                     // rm.is_reg() encodes the target XMM (no memory).
                     // Compilers emit `psrad xmm, 31` constantly for
                     // sign-extension across a vector.
-                    0x71..=0x73 if self.op_size_32 => {
+                    0x71..=0x73 if self.has_66() => {
                         let (_, ext, rm) = self.fetch_modrm(mem);
                         let count = self.fetch_u8(mem) as u32;
                         let target = match rm {
@@ -6692,7 +6703,7 @@ impl Cpu {
                     // are handled identically to the imm form (logical
                     // shifts clear, arithmetic clamps to width-1), so
                     // we just cap into u32 and reuse the helpers.
-                    0xD1..=0xD3 | 0xE1 | 0xE2 | 0xF1..=0xF3 if self.op_size_32 => {
+                    0xD1..=0xD3 | 0xE1 | 0xE2 | 0xF1..=0xF3 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let src = self.read_xmm_rm(rm, mem);
                         let count_full = src as u64;
@@ -6718,19 +6729,19 @@ impl Cpu {
                     //   D5  PMULLW   — low 16 of each 16×16 product
                     //   E5  PMULHW   — high 16 of signed 16×16 product
                     //   F5  PMADDWD  — signed 16×16 + pair-sum → dword
-                    0xD5 if self.op_size_32 => {
+                    0xD5 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
                         self.xmm[reg as usize] = pmullw(a, b);
                     }
-                    0xE5 if self.op_size_32 => {
+                    0xE5 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
                         self.xmm[reg as usize] = pmulhw(a, b);
                     }
-                    0xF5 if self.op_size_32 => {
+                    0xF5 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6743,7 +6754,7 @@ impl Cpu {
                     //   EC/ED  PADDSB  / PADDSW
                     // Clamps instead of wraps — what audio mixers and
                     // colour blends actually want.
-                    0xD8 | 0xD9 | 0xDC | 0xDD | 0xE8 | 0xE9 | 0xEC | 0xED if self.op_size_32 => {
+                    0xD8 | 0xD9 | 0xDC | 0xDD | 0xE8 | 0xE9 | 0xEC | 0xED if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6764,7 +6775,7 @@ impl Cpu {
                     //   6B  PACKSSDW  (dwords → words, signed-saturate)
                     // The destination's lanes occupy the low half of
                     // the result; the source's lanes the high half.
-                    0x63 | 0x67 | 0x6B if self.op_size_32 => {
+                    0x63 | 0x67 | 0x6B if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6776,7 +6787,7 @@ impl Cpu {
                     }
                     // Packed unsigned-byte / signed-word min/max
                     // (66 0F): DA PMINUB, DE PMAXUB, EA PMINSW, EE PMAXSW.
-                    0xDA | 0xDE | 0xEA | 0xEE if self.op_size_32 => {
+                    0xDA | 0xDE | 0xEA | 0xEE if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6805,7 +6816,7 @@ impl Cpu {
                     // PAVGB (E0) / PAVGW (E3) — packed rounded average:
                     // (a + b + 1) / 2 per lane (byte / word). Common in
                     // pixel blends and motion-compensation filters.
-                    0xE0 | 0xE3 if self.op_size_32 => {
+                    0xE0 | 0xE3 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6816,7 +6827,7 @@ impl Cpu {
                     // PMULHUW (E4) — unsigned 16×16 multiply, keep high
                     // 16 of each product. Counterpart to PMULHW for
                     // unsigned data (no sign extension before multiply).
-                    0xE4 if self.op_size_32 => {
+                    0xE4 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6826,7 +6837,7 @@ impl Cpu {
                     // PMULUDQ (F4) — unsigned 32×32 → 64 multiply on the
                     // low dword of each 64-bit lane. Used for 64-bit
                     // multi-precision arithmetic on top of SSE2.
-                    0xF4 if self.op_size_32 => {
+                    0xF4 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6838,7 +6849,7 @@ impl Cpu {
                     // each 8-byte half; the result is a 16-bit value
                     // in the low word of each 64-bit lane (upper bits
                     // zero). Vectorized memcmp / decoder cost metric.
-                    0xF6 if self.op_size_32 => {
+                    0xF6 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
@@ -6856,7 +6867,7 @@ impl Cpu {
                     }
                     // MOVQ xmm/m64, xmm1 (66 0F D6) — store low qword.
                     // Reg-form zeroes the destination's upper 64.
-                    0xD6 if self.op_size_32 => {
+                    0xD6 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.xmm[reg as usize] as u64;
                         match rm {
@@ -6873,7 +6884,7 @@ impl Cpu {
                     // of a GP register; upper 16 cleared. The canonical
                     // SIMD-to-branch primitive: pair with PCMPEQB to
                     // hunt for a byte in a 16-byte chunk.
-                    0xD7 if self.op_size_32 => {
+                    0xD7 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let src = match rm {
                             Rm::Reg(i) => self.xmm[i as usize],
@@ -6913,7 +6924,7 @@ impl Cpu {
                             });
                         }
                     }
-                    0xE7 if self.op_size_32 => {
+                    0xE7 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         if let Rm::Mem(ea) = rm {
                             let a = self.linear_seg(ea.seg, ea.off);
@@ -6944,7 +6955,7 @@ impl Cpu {
                     // its high bit set, store the byte to DS:[(E)DI+i].
                     // Reg form only; the destination address is
                     // implicit (no ModR/M.rm encoded for the dest).
-                    0xF7 if self.op_size_32 => {
+                    0xF7 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let mask_idx = match rm {
                             Rm::Reg(i) => i as usize,
@@ -6979,7 +6990,7 @@ impl Cpu {
                     // Scalar (F3/F2) variants go through sse_scalar.
                     0x5A => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             let src = self.read_xmm_rm(rm, mem);
                             let lo = f64::from_bits(src as u64) as f32;
                             let hi = f64::from_bits((src >> 64) as u64) as f32;
@@ -6998,7 +7009,7 @@ impl Cpu {
                     0x5B => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let src = self.read_xmm_rm(rm, mem);
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             packed_lanes(src, 0, 32, |x, _, _| {
                                 let f = f32::from_bits(x as u32);
                                 (f.round_ties_even() as i32) as u32 as u128
@@ -7014,7 +7025,7 @@ impl Cpu {
                     // in the low 64 bits; upper 64 of dest is zero.
                     // The F2/F3 variants (CVTPD2DQ round / CVTDQ2PD)
                     // route through sse_scalar.
-                    0xE6 if self.op_size_32 => {
+                    0xE6 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let src = self.read_xmm_rm(rm, mem);
                         let lo = f64::from_bits(src as u64).trunc() as i32 as u32 as u128;
@@ -7030,7 +7041,7 @@ impl Cpu {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             match op2 {
                                 0x58 => packed_f64(a, b, |x, y| x + y),
                                 0x59 => packed_f64(a, b, |x, y| x * y),
@@ -7055,7 +7066,7 @@ impl Cpu {
                         let b = self.read_xmm_rm(rm, mem);
                         let a = self.xmm[reg as usize];
                         let is_min = op2 == 0x5D;
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             packed_f64(a, b, |x, y| fmin_max(x, y, is_min))
                         } else {
                             packed_f32(a, b, |x, y| fmin_max_f32(x, y, is_min))
@@ -7067,7 +7078,7 @@ impl Cpu {
                     0x51 => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let s = self.read_xmm_rm(rm, mem);
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             packed_f64(s, s, |x, _| x.sqrt())
                         } else {
                             packed_f32(s, s, |x, _| x.sqrt())
@@ -7097,7 +7108,7 @@ impl Cpu {
                         let src2 = self.read_xmm_rm(rm, mem);
                         let src1 = self.xmm[reg as usize];
                         let high = op2 == 0x15;
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             unpck_pd(src1, src2, high)
                         } else {
                             unpck_ps(src1, src2, high)
@@ -7186,7 +7197,7 @@ impl Cpu {
                     // for SSE2 integer code. The F3/F2 0F 70 variants
                     // (PSHUFHW/PSHUFLW) go through sse_scalar — they
                     // are not implemented here yet.
-                    0x70 if self.op_size_32 => {
+                    0x70 if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let imm = self.fetch_u8(mem);
                         let src = self.read_xmm_rm(rm, mem);
@@ -7210,7 +7221,7 @@ impl Cpu {
                         let imm = self.fetch_u8(mem);
                         let src1 = self.xmm[reg as usize];
                         let src2 = self.read_xmm_rm(rm, mem);
-                        self.xmm[reg as usize] = if self.op_size_32 {
+                        self.xmm[reg as usize] = if self.has_66() {
                             let qw = |v: u128, i: u32| (v >> (i * 64)) & 0xFFFF_FFFF_FFFF_FFFF;
                             qw(src1, (imm & 1) as u32) | (qw(src2, ((imm >> 1) & 1) as u32) << 64)
                         } else {
