@@ -7935,6 +7935,20 @@ impl Cpu {
                             let v = self.mem_read_u32(mem, addr) as i32;
                             self.fpu_push(v as f64);
                         }
+                        // FISTTP m32 (SSE3) — truncate ST(0) toward zero,
+                        // store as i32, then pop.
+                        1 => {
+                            let v = self.fpu_pop().trunc();
+                            self.mem_write_u32(mem, addr, v as i64 as i32 as u32);
+                        }
+                        // FIST m32 — store ST(0) as a rounded i32 (control-
+                        // word rounding), WITHOUT popping. busybox's
+                        // float->int paths (e.g. sleep's strtod) emit this.
+                        2 => {
+                            let st0 = self.fpu_st(0);
+                            let r = self.fpu_round_to_int(st0) as i64 as i32;
+                            self.mem_write_u32(mem, addr, r as u32);
+                        }
                         // FISTP m32 — pop and store as i32, rounded per
                         // the control word (default: nearest-even, NOT
                         // truncation). The `(int)double` conversion.

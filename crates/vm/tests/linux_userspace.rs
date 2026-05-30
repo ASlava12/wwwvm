@@ -557,6 +557,11 @@ fn build_cpio_tree(init_binary: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
     archive.extend_from_slice(&cpio_entry("init", init_binary, 0o100_755, 0, 0));
     archive.extend_from_slice(&cpio_entry("dev", &[], 0o040_755, 0, 0));
     archive.extend_from_slice(&cpio_entry("dev/console", &[], 0o020_600, 5, 1));
+    // /dev/null (CHR 1:3) and /dev/zero (CHR 1:5): the shell redirects a
+    // backgrounded job's stdin to /dev/null, and many programs expect both
+    // to exist. Without /dev/null ash prints "can't open '/dev/null'".
+    archive.extend_from_slice(&cpio_entry("dev/null", &[], 0o020_666, 1, 3));
+    archive.extend_from_slice(&cpio_entry("dev/zero", &[], 0o020_666, 1, 5));
     archive.extend_from_slice(&cpio_entry("proc", &[], 0o040_755, 0, 0));
     // Create each unique single-level parent dir before its files.
     let mut made = std::collections::BTreeSet::new();
@@ -11888,6 +11893,58 @@ fn linux_userspace_busybox_grep_milestone() {
         dump_uart_on_failure(&cumulative, "grep-marker")
     );
     eprintln!("  ✓ GREP_HIT_42 — busybox grep (regex match + line filter) works!");
+}
+
+/// NAMED-PIPE (FIFO) milestone: a different IPC mechanism than the
+/// anonymous pipe — a filesystem object two unrelated processes rendezvous
+/// through. /init runs
+/// `sh -c 'busybox mkfifo /f; (echo FIFO_OK > /f) & busybox cat /f'`.
+/// `mkfifo` creates /f as a FIFO (mknod S_IFIFO). A backgrounded subshell
+/// opens it O_WRONLY (blocks until a reader appears) and writes FIFO_OK;
+/// `cat` opens it O_RDONLY (blocks until a writer appears), so the two
+/// processes rendezvous at the FIFO, the data streams across, and cat
+/// prints it. The echo's bytes go INTO the FIFO (not the console), so the
+/// marker reaching the console proves it flowed through the named pipe —
+/// exercising mkfifo + FIFO open-blocking + cross-process data transfer.
+/// Asserts the marker with no segfault / loader / execve failure.
+#[test]
+#[ignore = "requires WWWVM_DYN_ROOTFS (busybox + 3 libs); ~60s"]
+fn linux_userspace_busybox_fifo_milestone() {
+    let Some((found, cumulative)) = run_busybox_dynamic(
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "busybox mkfifo /f; (echo FIFO_OK > /f) & busybox cat /f",
+        ],
+        "FIFO_OK",
+    ) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&cumulative);
+    eprintln!("=== busybox FIFO milestone: FIFO_OK={found} ===");
+    assert!(
+        !text.contains("[EXECVE-FAIL]"),
+        "execve(/bin/busybox sh) failed; {}",
+        dump_uart_on_failure(&cumulative, "fifo-execve")
+    );
+    assert!(
+        !text.contains("error while loading shared libraries"),
+        "ld.so could not load a library for the FIFO test; {}",
+        dump_uart_on_failure(&cumulative, "fifo-liberr")
+    );
+    assert!(
+        !text.contains("segfault at"),
+        "a FIFO-test process segfaulted; {}",
+        dump_uart_on_failure(&cumulative, "fifo-segv")
+    );
+    assert!(
+        found,
+        "the named-pipe rendezvous never delivered FIFO_OK (mkfifo + FIFO \
+         open-blocking + cross-process transfer); {}",
+        dump_uart_on_failure(&cumulative, "fifo-marker")
+    );
+    eprintln!("  ✓ FIFO_OK — named-pipe (mkfifo) cross-process rendezvous works!");
 }
 
 /// Diagnostic isolating the dynamic-linking failure: boots busybox

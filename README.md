@@ -262,7 +262,7 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 
 ### Качество
 
-**641 тест** зелёный (mem 30 + devices 77 + cpu 389 + vm 128 +
+**643 теста** зелёные (mem 30 + devices 77 + cpu 391 + vm 128 +
 tutorial-anchor 2 + wasm 7 + proxy 8). Снапшот v15.
 CI gates: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace
@@ -1226,6 +1226,7 @@ milestone'ы ниже — **asserting** (не diag), `#[ignore]`, требуют
 | `busybox_tar_milestone` | `TAR_RT_OK` | tar create→extract round-trip: ustar-заголовок (octal-поля + checksum) + 512-байт блоки; оригинал удалён, маркер только из архива |
 | `busybox_stats_milestone` | `STAT_833` | sustained FP: awk считает дисперсию 100 чисел из pipe (`s+=x; q+=x*x; q/N - (s/N)^2`) = 833.25 → 833 — accumulate/mul/div/sub в double |
 | `busybox_grep_milestone` | `GREP_HIT_42` | grep compile BRE `HIT_[0-9]*` + line-filter из pipe (matching строка проходит, skipme отфильтрованы) |
+| `busybox_fifo_milestone` | `FIFO_OK` | named pipe: `mkfifo /f`, фоновый writer + foreground `cat` рандеву'ятся через FIFO (mknod S_IFIFO + open-blocking + cross-process transfer) |
 
 **Корневая причина (была):** **SYSEXIT CPL=3 баг**. CPUID рекламирует
 SEP → glibc идёт через vDSO `sysenter`; SYSEXIT возвращался с RPL=0, так
@@ -1246,6 +1247,18 @@ int↔double-конверсия), которых не было в декодер
 unit-теста. Урок: реальные workload'ы ходят по путям, которых нет у
 простых applet'ов — стресс-тестирование настоящими программами находит
 дыры, недостижимые синтетикой.
+
+**FIFO-milestone → /dev/null → FIST m32 (цепочка находок):** named-pipe
+milestone завис; причина — в minimal initramfs не было `/dev/null`, а ash
+редиректит stdin фонового job'а туда, и subshell `(echo>/f)&` падал →
+writer не открывал FIFO → cat блокировался навечно. Добавили `/dev/null` +
+`/dev/zero` (CHR 1:3 / 1:5) в cpio. Это вскрыло латентный баг: с рабочим
+backgrounding'ом busybox `sleep`'s float→int парсинг (strtod) дошёл до
+`FIST m32` (DB /2 — store-без-pop), которого не было в декодере (были /0 /3
+/5 /7) → `unimplemented opcode 0xDB`. Реализованы DB /2 (FIST) и /1 (FISTTP,
+SSE3) + teeth-confirmed `fpu_fist_m32_stores_without_pop`. NB: jobcontrol-
+milestone раньше проходил по НЕВЕРНОЙ причине (сломанный backgrounding без
+/dev/null обходил FP-путь); теперь — по верной.
 
 **Проактивный аудит декодера (workflow):** дизассемблировали РЕАЛЬНЫЕ
 busybox/libc/libm/ld.so/libcrypt через `llvm-objdump`, извлекли все

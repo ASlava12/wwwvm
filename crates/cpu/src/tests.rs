@@ -7484,6 +7484,41 @@ fn fpu_fild_fistp_int_conversion() {
     assert_eq!(mem.read_u32(0x608), 10, "(int)(7 * 1.5) = 10");
 }
 
+/// DB /2 FIST m32 — store ST(0) as an integer WITHOUT popping (vs DB /3
+/// FISTP which pops). busybox's float->int paths (e.g. sleep's strtod) emit
+/// it; it was Unimplemented. Verify both that the value stores AND that the
+/// stack is untouched: FIST then FISTP must store the same value twice.
+#[test]
+fn fpu_fist_m32_stores_without_pop() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 7);
+    mem.write_slice(
+        0x7C00,
+        &[
+            0xDB, 0x06, 0x00, 0x06, // FILD m32 [0x600] -> ST0 = 7
+            0xDB, 0x16, 0x04, 0x06, // FIST m32 [0x604]  (store 7, NO pop)
+            0xDB, 0x1E, 0x08, 0x06, // FISTP m32 [0x608] (store 7, pop)
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted);
+    assert_eq!(mem.read_u32(0x604), 7, "FIST m32 stored ST(0)");
+    assert_eq!(
+        mem.read_u32(0x608),
+        7,
+        "FIST did not pop — FISTP found the same 7 still on top"
+    );
+}
+
 /// DF /5 FILD m64 + DF /7 FISTP m64 — 64-bit integer load/store. This is
 /// the x87 path glibc/awk use to convert between doubles and integers;
 /// busybox awk hit "unimplemented opcode 0xDF" here. The value is wider
