@@ -1495,7 +1495,10 @@ cargo run -p wwwvm-vm --release --example alpine_console
 UART гостя — печатаешь команды в **musl**-шелл Alpine и видишь реакцию (это
 Alpine-аналог `busybox_console`, который грузит glibc/Tinycore). PATH не
 задан → апплеты как `busybox ls`; builtin'ы работают напрямую. Ctrl-C
-выходит. Тестируемый (скриптованный) аналог — milestone
+выходит. Хост-терминал переводится в raw-режим на время сессии (без
+двойного эха и без утечки `^[[…R` от запросов позиции курсора), а часы
+гостя засеваются реальным временем хоста (`set_cmos_time_from_host`), так
+что `date` показывает «сейчас». Тестируемый (скриптованный) аналог — milestone
 `linux_userspace_alpine_interactive_milestone`: он печатает `echo
 $((6*7))` в живой musl-шелл по UART и ассертит, что обратно пришло
 `ALPINE_LIVE_42` — то есть весь tty-input-путь (send_input → 16550 RX →
