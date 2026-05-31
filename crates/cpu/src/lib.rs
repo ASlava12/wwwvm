@@ -3913,6 +3913,7 @@ impl Cpu {
                 self.fpu_cw,
                 self.fpu_st,
                 self.xmm,
+                self.mmx,
             ))
         } else {
             None
@@ -8949,17 +8950,22 @@ impl Cpu {
             self.flags = flags_snap;
             self.flags_high = flags_high_snap;
         }
-        // Roll back the x87 stack / XMM for a faulting FP instruction (see
-        // the fp_snap checkpoint above). This is what makes an `FLD m64`
+        // Roll back the x87 stack / XMM / MMX for a faulting FP instruction
+        // (see the fp_snap checkpoint above). This is what makes an `FLD m64`
         // of a constant on a not-yet-paged libm page retry cleanly instead
-        // of leaving a garbage push on the stack.
+        // of leaving a garbage push on the stack. MMX matters for the same
+        // reason: a read-modify-write like `PMULUDQ mm,[m64]` (OpenSSL's RSA
+        // bignum core) on a demand-paged operand would otherwise commit
+        // `mm*0`, then retry from the now-zeroed register — a silent
+        // miscompute, since the destination is also a source.
         if self.pending_fault.get().is_some() {
-            if let Some((top, sw, cw, st, xmm)) = fp_snap {
+            if let Some((top, sw, cw, st, xmm, mmx)) = fp_snap {
                 self.fpu_top = top;
                 self.fpu_sw = sw;
                 self.fpu_cw = cw;
                 self.fpu_st = st;
                 self.xmm = xmm;
+                self.mmx = mmx;
             }
         }
         Ok(())

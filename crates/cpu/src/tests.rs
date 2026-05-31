@@ -11708,3 +11708,65 @@ fn mmx_pinsrw_pextrw_dispatch() {
     assert_eq!(cpu.mmx[0] >> 32 & 0xFFFF, 0xCAFE);
     assert_eq!(cpu.read_r32(3), 0xCAFE); // ebx zero-extended
 }
+
+#[test]
+fn pm_demand_paging_mmx_pand_rolls_back_register_on_fault() {
+    let mut mem = Memory::new(0x0080_0000);
+    mem.write_slice(
+        0x0500,
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+        ],
+    );
+    mem.write_slice(
+        0x1000 + 14 * 8,
+        &[0x00, 0x08, 0x08, 0x00, 0x00, 0x8E, 0x00, 0x00],
+    );
+    mem.write_u32(0x0001_0000, 0x0000_0083);
+    mem.write_slice(0x2000, &[0xFF; 8]);
+    mem.write_slice(
+        0x0040_0000,
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    mem.write_slice(
+        0x0800,
+        &[
+            0x83, 0xC4, 0x04, 0xC7, 0x05, 0x04, 0x00, 0x01, 0x00, 0x83, 0x00, 0x40, 0x00, 0xCF,
+        ],
+    );
+    mem.write_slice(
+        0x0010_0000,
+        &[
+            0x0F, 0x6F, 0x05, 0x00, 0x20, 0x00, 0x00, 0x0F, 0xDB, 0x05, 0x00, 0x00, 0x40, 0x00,
+            0x0F, 0x7F, 0x05, 0x00, 0x30, 0x00, 0x00, 0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE on BEFORE loading CS, so it's read as a PM selector (D=1 → 32-bit)
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x1000;
+    cpu.idtr.limit = 0x07FF;
+    cpu.write_sreg(sreg::CS, 0x08, &mem);
+    cpu.write_sreg(sreg::DS, 0x10, &mem);
+    cpu.write_sreg(sreg::SS, 0x10, &mem);
+    cpu.write_sreg(sreg::ES, 0x10, &mem);
+    cpu.stack_size_32 = true;
+    cpu.write_r32(r16::SP as u8, 0x0008_0000);
+    cpu.cr3 = 0x0001_0000;
+    cpu.cr4 = 0x10;
+    cpu.cr0 = 0x8000_0001;
+    cpu.ip = 0x0010_0000;
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "kernel must reach HLT after the retry");
+    assert_eq!(mem.read_u32(0x3000), 0x4433_2211, "low dword = sentinel");
+    assert_eq!(mem.read_u32(0x3004), 0x8877_6655, "high dword = sentinel");
+}
