@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration as SmolDuration, Instant};
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
 };
@@ -36,6 +36,10 @@ const TCP_ACK: u8 = 0x10;
 const TCP_BUF: usize = 64 * 1024;
 /// Max payload we move per direction per flow per poll, to bound work.
 const PUMP_CHUNK: usize = 8 * 1024;
+/// Max concurrent NATed flows. Each costs a smoltcp socket (2×64 KiB), a
+/// relay thread, and a host FD, so cap it to bound resource use against a
+/// guest that opens connections faster than they close.
+const MAX_FLOWS: usize = 64;
 
 /// Identifies one guest TCP flow (the guest IP is fixed, so it's omitted).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -60,6 +64,8 @@ struct Flow {
     host_done: bool,
     /// We've seen the connection established (guards premature half-close).
     established: bool,
+    /// Tripped on reap so the relay threads shut the host socket down.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How a permitted guest connection is opened to the outside world. The
@@ -157,6 +163,14 @@ impl NatStack {
     }
 
     fn try_open_flow(&mut self, key: FlowKey) {
+        // Bound concurrent flows: each one holds a smoltcp socket (2×64 KiB)
+        // + a relay thread + a host FD. A guest cycling source ports (the
+        // FlowKey includes the guest port) would otherwise grow these without
+        // limit. Past the cap, drop the SYN (the guest retries/backs off).
+        if self.flows.len() >= MAX_FLOWS {
+            eprintln!("[wwwvm net] flow cap ({MAX_FLOWS}) reached — dropping new SYN");
+            return;
+        }
         // Allowlist by recovered hostname; an unknown/denied destination is
         // simply not listened for (the guest's SYN goes unanswered → it gives
         // up). Deny-by-default.
@@ -178,6 +192,10 @@ impl NatStack {
         let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut sock = tcp::Socket::new(rx, tx);
+        // An abandoned half-open (guest SYNs then vanishes) would otherwise
+        // sit in SynReceived forever; a timeout makes smoltcp abort it → it
+        // reaches Closed → pump_flows reaps it. Also guards a stalled flow.
+        sock.set_timeout(Some(SmolDuration::from_secs(30)));
         // Listen on the EXACT destination so smoltcp accepts only this SYN.
         let listen = IpListenEndpoint {
             addr: Some(IpAddress::Ipv4(key.dst_ip.into())),
@@ -198,6 +216,7 @@ impl NatStack {
                 pending_to_guest: None,
                 host_done: false,
                 established: false,
+                stop: conn.stop,
             },
         );
     }
@@ -235,12 +254,19 @@ impl NatStack {
         for (key, flow) in flows.iter_mut() {
             let sock = sockets.get_mut::<tcp::Socket>(flow.handle);
             pump_flow(sock, flow);
-            if sock.state() == tcp::State::Closed && flow.established {
+            // Reap on Closed regardless of `established`: a half-open that
+            // never completed (abandoned SYN) reaches Closed via the socket
+            // timeout set in try_open_flow, and must be freed too — otherwise
+            // its smoltcp socket + relay thread leak forever.
+            if sock.state() == tcp::State::Closed {
                 dead.push(*key);
             }
         }
         for key in dead {
             if let Some(flow) = flows.remove(&key) {
+                // Tell the relay threads to shut the host socket down (the
+                // reader may be parked in read()); then free the smoltcp socket.
+                flow.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 sockets.remove(flow.handle);
             }
         }
@@ -344,9 +370,16 @@ fn pump_flow(sock: &mut tcp::Socket, flow: &mut Flow) {
             break;
         }
     }
-    // Guest closed its write side (we got its FIN) and we've drained it →
-    // half-close the host write side by dropping the sender.
-    if matches!(sock.state(), tcp::State::CloseWait) && flow.pending_to_host.is_none() {
+    // Guest closed its write side (we got its FIN) and we've fully drained
+    // it — half-close the host write side by dropping the sender. The
+    // `!can_recv()` guard matters: with >PUMP_CHUNK bytes still buffered the
+    // loop above exits early (cap reached) with pending_to_host empty but the
+    // socket still readable; half-closing then would TRUNCATE the upload.
+    // Deferring until the buffer is drained lets the next poll finish it.
+    if matches!(sock.state(), tcp::State::CloseWait)
+        && flow.pending_to_host.is_none()
+        && !sock.can_recv()
+    {
         flow.to_host = None;
     }
 }
@@ -443,7 +476,11 @@ mod tests {
             log.borrow_mut().push((ip, port));
             let (to_host, _rx) = sync_channel(1);
             let (_tx, from_host) = sync_channel(1);
-            HostConn { to_host, from_host }
+            HostConn {
+                to_host,
+                from_host,
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
         })
     }
 
