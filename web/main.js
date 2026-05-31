@@ -214,7 +214,15 @@ function pumpNet() {
   setNetStatus(`live — ${vm.net_conn_count()} flow(s), ${netConns.size} socket(s)`);
 }
 function pump() {
-  const steps = idleAware ? vm.run_idle_aware(stepBudget) : vm.run(stepBudget);
+  // When the guest is idle (parked in HLT waiting for an IRQ — e.g. a
+  // keystroke), a full step budget would just spin through HLT burning the
+  // UI thread. Use a small budget then: enough to tick timers and pick up
+  // injected input, cheap when nothing's happening. Active work (boot,
+  // running a command) clears the halt, so the next frame uses the full
+  // budget again.
+  const idleNow = idleAware && vm.is_halted();
+  const budget = idleNow ? 250_000 : stepBudget;
+  const steps = idleAware ? vm.run_idle_aware(budget) : vm.run(budget);
   const out = vm.read_output();
   if (out) {
     term.write(out);
@@ -254,8 +262,16 @@ function pump() {
   pumpNet();
   if (++fbFrame % FB_EVERY === 0) blitFramebuffer();
   if (vm.is_halted()) {
-    setStatus("halted", "");
-    return;
+    // A built-in demo's HLT is terminal — really done. But a booted Linux
+    // guest parks in HLT whenever it's idle (waiting for a keystroke or the
+    // next timer tick); that is NOT the end — keep pumping so injected input
+    // and timer IRQs wake it. Otherwise the loop stops and the shell goes
+    // dead to the keyboard.
+    if (!idleAware) {
+      setStatus("halted", "");
+      return;
+    }
+    setStatus("idle — waiting for input", "running");
   }
   rafHandle = requestAnimationFrame(pump);
 }
@@ -375,6 +391,7 @@ $("boot-linux").addEventListener("click", async () => {
       "running"
     );
     setStatus("running", "running");
+    term.focus(); // so keystrokes reach the guest without an extra click
     pump();
   } catch (e) {
     setLinuxStatus(`boot failed: ${e.message || e}`, "error");
