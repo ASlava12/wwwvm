@@ -92,9 +92,21 @@ fn main() {
     });
 
     // /init: print a readiness line we can gate keystroke-forwarding on,
-    // then BECOME an interactive shell reading the console (exec, so the
-    // shell — not a wrapper — is what waits on read()).
+    // then run an interactive shell with JOB CONTROL so Ctrl+C interrupts the
+    // foreground program (e.g. `ping`) instead of doing nothing. The shell
+    // must be a session leader owning a controlling terminal for the tty layer
+    // to deliver SIGINT to the foreground process group; a bare `exec sh` as
+    // PID 1 gets no controlling tty ("can't access tty; job control turned
+    // off"). So launch it via `setsid -c` (new session + ctty = stdin) on a
+    // real tty device, in a respawn loop that keeps PID 1 alive (a plain
+    // `exec setsid` would have setsid's parent — PID 1 — exit → kernel panic).
     const READY_LINE: &str = "[wwwvm] alpine shell ready — type away";
+    // Prefer the concrete /dev/ttyS0 (a real tty that cleanly becomes the
+    // controlling terminal); fall back to /dev/console. devtmpfs is mounted
+    // defensively in case the kernel didn't auto-mount it.
+    const SHELL_LAUNCH: &str = "mount -t devtmpfs dev /dev 2>/dev/null\n\
+         TTY=/dev/ttyS0; [ -c \"$TTY\" ] || TTY=/dev/console\n\
+         while :; do setsid -c /bin/busybox sh <\"$TTY\" >\"$TTY\" 2>&1; done\n";
     let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
     // When the host net stack is on (WWWVM_NET_STUB=1), have /init bring the
     // guest's networking up for you — load the NIC modules, assign the static
@@ -115,7 +127,7 @@ fn main() {
     } else {
         ""
     };
-    let init = format!("#!/bin/sh\n{net_setup}echo '{READY_LINE}'\nexec /bin/busybox sh\n");
+    let init = format!("#!/bin/sh\n{net_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}");
     let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
