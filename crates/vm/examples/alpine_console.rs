@@ -95,7 +95,27 @@ fn main() {
     // then BECOME an interactive shell reading the console (exec, so the
     // shell — not a wrapper — is what waits on read()).
     const READY_LINE: &str = "[wwwvm] alpine shell ready — type away";
-    let init = format!("#!/bin/sh\necho '{READY_LINE}'\nexec /bin/busybox sh\n");
+    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
+    // When the host net stack is on (WWWVM_NET_STUB=1), have /init bring the
+    // guest's networking up for you — load the NIC modules, assign the static
+    // IP + default route, point the resolver at the gateway, and rewrite the
+    // apk repos to http (https needs a CA bundle we don't ship yet). So a
+    // plain run just works: `apk update` / `apk add <pkg>` with no manual
+    // setup. The insmods are silent no-ops on a rootfs that lacks the .ko
+    // files (the standard minirootfs vs the modroot). PATH is exported so
+    // applets — and your interactive commands — resolve by bare name.
+    let net_setup = if net_stub {
+        "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
+         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
+         ip link set eth0 up 2>/dev/null\n\
+         ip addr add 10.0.2.15/24 dev eth0 2>/dev/null\n\
+         ip route add default via 10.0.2.2 2>/dev/null\n\
+         echo 'nameserver 10.0.2.2' > /etc/resolv.conf\n\
+         sed -i 's,https://,http://,g' /etc/apk/repositories 2>/dev/null\n"
+    } else {
+        ""
+    };
+    let init = format!("#!/bin/sh\n{net_setup}echo '{READY_LINE}'\nexec /bin/busybox sh\n");
     let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
@@ -156,7 +176,6 @@ fn main() {
     const HOST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
     const HOST_IP: [u8; 4] = [10, 0, 2, 2];
     const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
-    let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
     let mut nat = net_stub.then(|| {
         let allow = Allowlist::from_env();
         let mut fwd = DnsForwarder::new(HOST_IP, HOST_MAC, allow.clone());
