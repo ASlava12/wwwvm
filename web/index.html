@@ -19,6 +19,13 @@
 
       <aside id="controls">
         <fieldset>
+          <legend>Engine</legend>
+          <label title="Runs the VM off the UI thread so a slow boot or a backgrounded tab can't freeze the page. Uncheck to run on the main thread.">
+            <input type="checkbox" id="worker-enable" checked />
+            Web Worker (recommended — doesn't freeze the tab)
+          </label>
+        </fieldset>
+        <fieldset>
           <legend>Guest</legend>
           <label>
             <input type="radio" name="guest" value="default" checked />

@@ -27,14 +27,74 @@ term.writeln("\x1b[90m(boot the VM to start)\x1b[0m");
 await init();
 // `vm` is reassignable: the Linux/Alpine boot path swaps in a fresh
 // larger-RAM instance. Closures below capture this module-scoped binding,
-// so they always see the current VM.
+// so they always see the current VM. NOTE: `vm` is only used by the
+// main-thread (inline) fallback; by default the VM runs in a Web Worker
+// (see vm-worker.js) so a slow boot / backgrounded tab can't freeze the UI.
 let vm = new WwwVm();
 window.__wwwvm = vm;
 
-// Forward terminal keystrokes to the guest UART.
+// The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
+// on) can switch boots to the inline main-thread path. `active` tracks which
+// engine currently owns the live VM, so input/snapshot route to the right one.
+const worker = new Worker(new URL("./vm-worker.js", import.meta.url), { type: "module" });
+let active = "inline"; // "inline" | "worker"
+let useWorker = true;
+let workerBooted = false;
+let snapshotResolve = null;
+
+function renderDiag(m) {
+  $("diag").textContent =
+    `booted=${m.booted}  halted=${m.halted}  (worker)\n` +
+    `EIP=${m.eip}  EAX=${m.eax}  EFLAGS=${m.eflags}  CR0=${m.cr0}  CR3=${m.cr3}  TSC=${m.tsc}\n` +
+    `LAPIC_CURR=${m.lapic}  HPET=${m.hpet}`;
+}
+
+worker.onmessage = (e) => {
+  const m = e.data;
+  switch (m.t) {
+    case "booted":
+      workerBooted = true;
+      break;
+    case "output":
+      if (m.text) {
+        term.write(m.text);
+        for (const l of outputListeners) l(m.text);
+      }
+      break;
+    case "status":
+      workerBooted = m.booted;
+      renderDiag(m);
+      if (m.vga && m.vga.trim().length > 0) $("vga").textContent = m.vga;
+      if (m.net != null) setNetStatus(m.net);
+      setStatus(m.halted ? "idle — waiting for input" : "running", "running");
+      break;
+    case "fb":
+      paintFb(m.w, m.h, m.stride, new Uint8Array(m.buf));
+      break;
+    case "net":
+      setNetStatus(m.text);
+      break;
+    case "error":
+      setStatus(`cpu error: ${m.message}`, "error");
+      $("diag").textContent = m.message;
+      break;
+    case "snapshot":
+      if (snapshotResolve) {
+        snapshotResolve(m.buf ? new Uint8Array(m.buf) : null);
+        snapshotResolve = null;
+      }
+      break;
+  }
+};
+
+// Forward terminal keystrokes to the guest UART (worker or inline VM).
 term.onData((data) => {
-  if (!vm.is_booted()) return;
   const bytes = new TextEncoder().encode(data);
+  if (active === "worker") {
+    if (workerBooted) worker.postMessage({ t: "input", bytes }, [bytes.buffer]);
+    return;
+  }
+  if (!vm.is_booted()) return;
   vm.send_input(bytes);
 });
 
@@ -56,14 +116,10 @@ const hex = (v, w = 8) => v.toString(16).padStart(w, "0").toUpperCase();
 let fbFrame = 0;
 const FB_EVERY = 6; // blit roughly every 6th animation frame
 let fbImage = null;
-function blitFramebuffer() {
-  if (!vm.has_framebuffer || !vm.has_framebuffer()) return;
-  const w = vm.framebuffer_width();
-  const h = vm.framebuffer_height();
-  const stride = vm.framebuffer_stride();
-  if (!w || !h) return;
-  const bytes = vm.framebuffer_bytes();
-  if (bytes.length < stride * h) return;
+// Paint a 32bpp B,G,R,X framebuffer onto the canvas (swap to R,G,B,A). Shared
+// by the worker (which posts the pixel buffer) and the inline blit below.
+function paintFb(w, h, stride, bytes) {
+  if (!w || !h || bytes.length < stride * h) return;
   const cv = $("fb");
   if (cv.width !== w || cv.height !== h) {
     cv.width = w;
@@ -90,6 +146,14 @@ function blitFramebuffer() {
   ctx.putImageData(fbImage, 0, 0);
   const fbStatus = $("fb-status");
   if (fbStatus) fbStatus.textContent = `${w}×${h}×32 efifb — live`;
+}
+function blitFramebuffer() {
+  if (!vm.has_framebuffer || !vm.has_framebuffer()) return;
+  const w = vm.framebuffer_width();
+  const h = vm.framebuffer_height();
+  const stride = vm.framebuffer_stride();
+  if (!w || !h) return;
+  paintFb(w, h, stride, vm.framebuffer_bytes());
 }
 
 // --- Networking relay ---
@@ -279,14 +343,25 @@ function pump() {
 $("boot").addEventListener("click", () => {
   if (rafHandle) cancelAnimationFrame(rafHandle);
   term.reset();
-  // Built-in demos use the small HLT-terminal stepper.
-  idleAware = false;
-  stepBudget = 50_000;
   const autorun = $("autorun").value
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
   const guestKind = document.querySelector('input[name="guest"]:checked')?.value || "default";
+  useWorker = $("worker-enable")?.checked ?? true;
+  if (useWorker) {
+    active = "worker";
+    workerBooted = false;
+    worker.postMessage({ t: "boot", linux: false, builtin: { kind: guestKind, autorun } });
+    setStatus("running", "running");
+    term.focus();
+    return;
+  }
+  // ---- inline (main-thread) fallback ----
+  active = "inline";
+  // Built-in demos use the small HLT-terminal stepper.
+  idleAware = false;
+  stepBudget = 50_000;
   if (guestKind === "interactive") {
     vm.load_interactive_demo();
   } else if (guestKind === "calculator") {
@@ -331,6 +406,66 @@ $("boot-linux").addEventListener("click", async () => {
     return;
   }
   if (rafHandle) cancelAnimationFrame(rafHandle);
+  useWorker = $("worker-enable")?.checked ?? true;
+
+  // ---- Web Worker path (default): hand the VM off the UI thread ----
+  if (useWorker) {
+    try {
+      setLinuxStatus("reading kernel…");
+      const kbuf = await kfile.arrayBuffer();
+      const ifile = $("initrd-file").files?.[0];
+      const ibuf = ifile ? await ifile.arrayBuffer() : null;
+      const kLen = kbuf.byteLength;
+      const iLen = ibuf ? ibuf.byteLength : 0;
+      term.reset();
+      active = "worker";
+      workerBooted = false;
+
+      let fb = null;
+      if ($("fb-enable").checked) {
+        const [w, h] = ($("fb-res").value || "800x600").split("x").map(Number);
+        const cv = $("fb");
+        cv.width = w;
+        cv.height = h;
+        fbImage = null;
+        $("fb-status").textContent = `${w}×${h}×32 efifb — waiting for kernel…`;
+        fb = { w, h };
+      }
+      let net = null;
+      if ($("net-enable").checked) {
+        net = {
+          proxyUrl: $("net-proxy").value.trim() || "ws://localhost:8080",
+          allow: $("net-allow").value.trim(),
+        };
+        setNetStatus("enabled — resolving hosts…");
+      } else {
+        setNetStatus("(off)");
+      }
+
+      const transfer = [kbuf];
+      if (ibuf) transfer.push(ibuf);
+      worker.postMessage(
+        { t: "boot", linux: true, kernel: kbuf, initrd: ibuf, cmdline: $("cmdline").value, fb, net },
+        transfer
+      );
+      const kib = (n) => `${(n >> 10).toLocaleString()} KiB`;
+      setLinuxStatus(
+        `booting in worker — kernel ${kib(kLen)}` +
+          (iLen ? `, initramfs ${kib(iLen)}` : "") +
+          " (off the UI thread)",
+        "running"
+      );
+      setStatus("running", "running");
+      term.focus();
+    } catch (e) {
+      setLinuxStatus(`boot failed: ${e.message || e}`, "error");
+      setStatus("idle", "");
+    }
+    return;
+  }
+
+  // ---- inline (main-thread) fallback ----
+  active = "inline";
   try {
     setLinuxStatus("reading kernel…");
     const kbytes = new Uint8Array(await kfile.arrayBuffer());
@@ -404,12 +539,14 @@ $("boot-linux").addEventListener("click", async () => {
 // without writing their own pump loop. Uses a tap into pump()'s output
 // stream so it does not steal data from the terminal.
 async function runCommand(text, timeoutMs = 1500) {
-  if (!vm.is_booted()) throw new Error("VM not booted");
+  const booted = active === "worker" ? workerBooted : vm.is_booted();
+  if (!booted) throw new Error("VM not booted");
   let collected = "";
   const listener = (chunk) => { collected += chunk; };
   outputListeners.add(listener);
   try {
-    vm.send_command(text);
+    if (active === "worker") worker.postMessage({ t: "command", text });
+    else vm.send_command(text);
     const start = performance.now();
     let lastLen = -1;
     while (performance.now() - start < timeoutMs) {
@@ -457,13 +594,37 @@ const setSnapshotStatus = (text, cls = "") => {
   }
 })();
 
+// Snapshot/restore work against whichever engine owns the VM. In worker mode
+// the bytes come back asynchronously over postMessage.
+const isBooted = () => (active === "worker" ? workerBooted : vm.is_booted());
+async function getSnapshot() {
+  if (active === "worker") {
+    return await new Promise((resolve) => {
+      snapshotResolve = resolve;
+      worker.postMessage({ t: "snapshot" });
+    });
+  }
+  return vm.snapshot();
+}
+function restoreSnapshot(bytes) {
+  if (active === "worker") {
+    worker.postMessage({ t: "restore", buf: bytes.buffer }, [bytes.buffer]);
+    term.reset();
+  } else {
+    vm.restore(bytes);
+    term.reset();
+    resumePump();
+  }
+}
+
 $("save").addEventListener("click", async () => {
-  if (!vm.is_booted()) {
+  if (!isBooted()) {
     setSnapshotStatus("can't snapshot before boot", "error");
     return;
   }
   try {
-    const bytes = vm.snapshot();
+    const bytes = await getSnapshot();
+    if (!bytes) throw new Error("no snapshot returned");
     await saveSnapshot("latest", bytes);
     setSnapshotStatus(`saved ${bytes.length.toLocaleString()} bytes to IndexedDB`);
   } catch (e) {
@@ -484,21 +645,23 @@ $("load").addEventListener("click", async () => {
       setSnapshotStatus("no snapshot stored", "error");
       return;
     }
-    vm.restore(bytes);
-    term.reset();
+    restoreSnapshot(bytes);
     setSnapshotStatus(`restored ${bytes.length.toLocaleString()} bytes`);
-    resumePump();
   } catch (e) {
     setSnapshotStatus(`load failed: ${e.message || e}`, "error");
   }
 });
 
-$("download").addEventListener("click", () => {
-  if (!vm.is_booted()) {
+$("download").addEventListener("click", async () => {
+  if (!isBooted()) {
     setSnapshotStatus("can't snapshot before boot", "error");
     return;
   }
-  const bytes = vm.snapshot();
+  const bytes = await getSnapshot();
+  if (!bytes) {
+    setSnapshotStatus("no snapshot returned", "error");
+    return;
+  }
   const blob = new Blob([bytes], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -516,10 +679,8 @@ $("upload").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
-    vm.restore(bytes);
-    term.reset();
+    restoreSnapshot(bytes);
     setSnapshotStatus(`uploaded + restored ${bytes.length.toLocaleString()} bytes`);
-    resumePump();
   } catch (err) {
     setSnapshotStatus(`upload failed: ${err.message || err}`, "error");
   } finally {
