@@ -1072,6 +1072,7 @@ name = "wwwvm-wasm"
 version = "0.0.1"
 dependencies = [
  "wasm-bindgen",
+ "wwwvm-net",
  "wwwvm-vm",
 ]
 

@@ -283,7 +283,26 @@ reserved. Teeth: `linux_efifb_framebuffer_renders_pixels_milestone`
 Standalone Rust-бинарь на tokio + tokio-tungstenite. Принимает
 WebSocket, первое сообщение JSON `{"host","port"}`, дальше байты в
 обе стороны. Allow-list — env var `WWWVM_PROXY_ALLOWLIST`
-(`*` / `host:port` / `host:*`, comma-separated).
+(`*` / `host:port` / `host:*`, comma-separated; `*` = OPEN RELAY,
+только loopback). `WWWVM_PROXY_ORIGINS` запирает WebSocket-handshake на
+конкретные браузерные Origin'ы (защита от Cross-Site WebSocket Hijacking).
+Хост резолвится на стороне прокси и пинится globally-routable IP (SSRF-guard).
+
+**Сеть в браузере — TCP NAT в wasm → WebSocket-relay.** Тот же smoltcp-NAT,
+что в нативе, крутится в wasm; меняется только транспорт per-flow:
+вместо `std::thread`+`TcpStream` (невозможно в wasm) — `QueueConnector`
+(`crates/net/src/queue.rs`), который строит тот же `HostConn`, что
+потребляет NAT, но отдаёт встраивателю (JS) очереди байт. JS туннелит
+каждый flow по WebSocket в `crates/proxy`. wasm-API: `net_enable(allow)`,
+`net_pump(now)` (мостит NIC-кадры VM ⇄ NAT), `net_cache_dns(name, ips)`
+(JS резолвит имена через DoH), `net_take_new_connections()`,
+`net_conn_outbound/send/closed()`. Half-close корректен: `drain_outbound`
+закрывает flow по reap-флагу (`stop`), а НЕ по дисконнекту `out_rx` (тот
+срабатывает и на write-half-close гостя — иначе хвост ответа терялся бы).
+Teeth: `queue::tests::guest_tcp_through_queue_nat_echoes` — настоящий
+гостевой smoltcp-клиент через NAT (handshake + данные в обе стороны) +
+half-close/reap различение. Браузерный e2e (WebSocket+DoH) — только в
+реальном браузере (см. `docs/BROWSER_NET.md`).
 
 ### Веб-демо (`web/`)
 
@@ -293,7 +312,8 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 - **Save/Load** через IndexedDB (`storage.js`);
 - **Download .bin / Upload .bin** — портативный экспорт-импорт;
 - **Boot Linux / Alpine** — пикеры bzImage + initramfs, чекбокс
-  «Graphics framebuffer (efifb → canvas)» + выбор разрешения;
+  «Graphics framebuffer (efifb → canvas)» + выбор разрешения, чекбокс
+  «Networking» + proxy-URL + allowlist (TCP NAT → WebSocket-relay);
 - pane с VGA-snapshot 80×25 + **canvas с efifb-пикселями** (fbcon).
 
 ### Качество

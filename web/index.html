@@ -73,6 +73,18 @@
             </select>
           </label>
           <br />
+          <label>
+            <input type="checkbox" id="net-enable" />
+            Networking (TCP NAT → WebSocket proxy)
+          </label>
+          <br />
+          <label>proxy ws:
+            <input id="net-proxy" type="text" value="ws://localhost:8080" size="22" />
+          </label>
+          <label>allow:
+            <input id="net-allow" type="text" value="dl-cdn.alpinelinux.org:80" size="26" />
+          </label>
+          <br />
           <button id="boot-linux">Boot Linux</button>
           <small id="linux-status" class="status">pick a kernel (+ initramfs) to boot</small>
         </fieldset>
@@ -100,6 +112,11 @@
             <input type="file" id="upload" hidden accept=".bin" />
           </div>
           <small id="snapshot-status" class="status">no snapshot saved yet</small>
+        </fieldset>
+
+        <fieldset>
+          <legend>Networking</legend>
+          <small id="net-status" class="status">(off — tick "Networking" before Boot Linux)</small>
         </fieldset>
 
         <fieldset>

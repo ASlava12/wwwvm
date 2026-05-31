@@ -1,6 +1,11 @@
 # Networking in the browser (wasm)
 
-**Status: foundation in place, WebSocket relay is the remaining piece.**
+**Status: implemented (option A) — needs a real browser + running proxy to
+confirm end-to-end.** The smoltcp TCP NAT now runs *inside* wasm with a
+thread/socket-free connector ([`QueueConnector`](../crates/net/src/queue.rs));
+JS tunnels each guest flow over a WebSocket to `crates/proxy`. The NAT logic is
+unit/loopback-tested natively (`crates/net`); the WebSocket relay + DoH
+resolver are the browser-only parts.
 
 The native build reaches the internet via `crates/net` — a smoltcp TCP NAT
 that opens real `std::net::TcpStream`s on background `std::thread`s (see
@@ -30,46 +35,49 @@ connect frame `{"host":"…","port":N}` then raw bytes both ways, see
 `crates/proxy`). Something must bridge L2→L4 — that's the NAT, and in the
 browser it lives above the wasm frame API.
 
-## What's done
+## How it works (option A — smoltcp-in-wasm)
 
-`crates/wasm` now exposes the NIC frame stream (the native build's
-`drain_tx_frames`/`inject_rx_frame`, plus an idle-aware step):
+The NAT runs in wasm; only the per-connection *transport* changed. The native
+relay backs each flow with a `std::thread` + `TcpStream` (impossible in wasm),
+injected via the NAT's existing `Connect` seam. The browser swaps in
+[`QueueConnector`](../crates/net/src/queue.rs): it builds the same
+`HostConn{to_host, from_host, stop}` the NAT consumes, but retains the *opposite*
+ends of those channels in a registry. The NAT is byte-for-byte unchanged; JS
+drains/fills the registry and shuttles bytes over a WebSocket.
+
+`crates/wasm` exposes:
 
 ```js
-vm.run_until_idle(maxSteps);          // step until the guest blocks on I/O
-let f;                                 // drain everything the guest sent
-while ((f = vm.drain_tx_frame())) bridge.onGuestFrame(f);   // Uint8Array
-const accepted = vm.inject_rx_frame(frame);   // false ⇒ ring full, retry next tick
+vm.net_enable("dl-cdn.alpinelinux.org:80");   // deny-by-default allowlist
+vm.net_cache_dns("dl-cdn.alpinelinux.org", packedIPv4);  // JS pre-resolves (DoH)
+// each tick, after stepping the CPU:
+vm.net_pump(performance.now());               // VM NIC frames ⇄ smoltcp NAT
+for (const c of JSON.parse(vm.net_take_new_connections())) openWebSocket(c); // {id,host,ip,port}
+const out = vm.net_conn_outbound(id);         // Uint8Array | undefined(=closed) → ws.send
+const ok  = vm.net_conn_send(id, wsBytes);    // host→guest; false ⇒ re-queue & retry
+vm.net_conn_closed(id);                        // ws closed/errored → guest FIN
 ```
 
-This is the necessary seam; with it the VM core needs no further change.
+`net_pump` bridges the VM's NIC frame stream (`drain_tx_frames` /
+`inject_rx_frame`) into the in-wasm NAT itself, so JS only handles the
+per-connection WebSocket payload + DNS — it never parses Ethernet/IP/TCP. The
+demo wiring lives in `web/main.js` (`pumpNet` / `netOpenConn` / `netPreResolve`).
 
-## What remains (the bridge)
+DNS: the browser can't do raw DNS, so `netPreResolve` resolves each allowlisted
+host via **Cloudflare DoH** and seeds `net_cache_dns` before the guest queries.
 
-Two ways to implement the L2↔L4 NAT in the browser:
-
-- **(A) smoltcp-in-wasm (recommended, max reuse).** Compile `crates/net`'s
-  `nat.rs` + `device.rs` to wasm and replace `relay.rs` (threads + std sockets)
-  with a **web-sys `WebSocket`** relay: when the NAT accepts a SYN, open a
-  WebSocket to the proxy, send the connect frame, then pipe the byte stream
-  through the per-connection channels. The NAT logic, the catch-all SYN
-  handling, the DNS forwarder, and the allowlist all carry over unchanged.
-  smoltcp itself is wasm-friendly; the time source comes from `Date.now()`.
-  `relay.rs` would become `#[cfg(not(target_arch = "wasm32"))]` with a wasm
-  twin.
-- **(B) JS NAT.** Parse ARP/IPv4/TCP in JS and NAT to WebSockets. More code,
-  no Rust reuse — not recommended.
-
-The proxy already exists and is exactly this gateway; deploy it with a
-**specific** allowlist, never `*`:
+The proxy is the gateway; deploy it with a **specific** allowlist, never `*`
+(an open relay is dangerous). It receives the *hostname* (re-resolves + pins, so
+a poisoned wasm-side DNS answer can't redirect it to an internal IP):
 
 ```
-WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:443' cargo run -p wwwvm-proxy -- 0.0.0.0:9000
+WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80' cargo run -p wwwvm-proxy -- 0.0.0.0:8080
 ```
 
 ## Testing
 
-The end-to-end path needs a real browser + a running proxy, so it can't be
-teeth-confirmed headless like the native milestones. The NAT logic is already
-covered by the native `wwwvm-net` unit/integration tests; the browser-specific
-work to verify is the WebSocket relay + the `Date.now()` time source.
+The byte path is teeth-tested natively: `queue::tests::guest_tcp_through_queue_nat_echoes`
+drives a real guest-side smoltcp TCP client THROUGH the NAT (handshake + data
+both ways) with the `QueueConnector` as the echoing host. The end-to-end
+browser path (WebSocket relay + DoH + `performance.now()` time source) needs a
+real browser + a running proxy and can't be confirmed headless.

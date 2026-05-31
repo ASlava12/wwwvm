@@ -91,6 +91,128 @@ function blitFramebuffer() {
   const fbStatus = $("fb-status");
   if (fbStatus) fbStatus.textContent = `${w}×${h}×32 efifb — live`;
 }
+
+// --- Networking relay ---
+//
+// The wasm side runs the smoltcp TCP NAT (same crate as native). It hands us
+// per-connection byte queues; we tunnel each over a WebSocket to crates/proxy
+// (WebSocket↔TCP, deny-by-default allowlist). DNS the guest asks for is
+// pre-resolved here via DNS-over-HTTPS and pushed into the NAT's cache, since
+// the browser can't do raw DNS. SECURITY: never run the proxy with a "*"
+// allowlist on a reachable host — it's an open relay.
+let netEnabled = false;
+let netProxyUrl = "ws://localhost:8080";
+const netConns = new Map(); // id -> { ws, open, pendingOut: [Uint8Array], pendingIn: [Uint8Array] }
+const setNetStatus = (t) => { const el = $("net-status"); if (el) el.textContent = t; };
+
+// Resolve each allowlisted host via Cloudflare DoH and seed the NAT's cache.
+async function netPreResolve(allowlist) {
+  const hosts = [...new Set(allowlist.split(",")
+    .map((s) => s.trim().split(":")[0]).filter(Boolean))];
+  for (const host of hosts) {
+    // A bare IPv4 literal needs no lookup.
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+      const ip = Uint8Array.from(host.split(".").map(Number));
+      vm.net_cache_dns(host, ip);
+      continue;
+    }
+    try {
+      const r = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
+        { headers: { accept: "application/dns-json" } });
+      const j = await r.json();
+      const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+      const packed = new Uint8Array(ips.length * 4);
+      ips.forEach((ip, i) => ip.split(".").forEach((o, k) => (packed[i * 4 + k] = +o)));
+      const kept = vm.net_cache_dns(host, packed);
+      setNetStatus(`resolved ${host} → ${ips.join(", ") || "(none)"} (${kept} cached)`);
+    } catch (e) {
+      setNetStatus(`DoH resolve failed for ${host}: ${e.message || e}`);
+    }
+  }
+}
+
+function netOpenConn({ id, host, port }) {
+  // hostClosed: the WebSocket ended — stop reading, but keep the slot until
+  // every buffered inbound chunk has been handed to the guest (else the tail
+  // of a response is dropped and the guest is FIN'd early).
+  const c = { ws: null, open: false, hostClosed: false, pendingIn: [] };
+  netConns.set(id, c);
+  let ws;
+  try {
+    ws = new WebSocket(netProxyUrl);
+  } catch (e) {
+    vm.net_conn_closed(id);
+    netConns.delete(id);
+    return;
+  }
+  ws.binaryType = "arraybuffer";
+  c.ws = ws;
+  ws.onopen = () => {
+    c.open = true;
+    ws.send(JSON.stringify({ host, port })); // proxy handshake header
+  };
+  ws.onmessage = (ev) => {
+    // The proxy sends TCP payload as BINARY frames; a TEXT frame is a control
+    // message (e.g. "ERR …") — never inject it into the guest's byte stream
+    // (that would corrupt TLS / the response). Fail the connection cleanly.
+    if (typeof ev.data === "string") {
+      console.warn("wwwvm proxy:", ev.data);
+      c.hostClosed = true;
+      try { ws.close(); } catch {}
+      return;
+    }
+    c.pendingIn.push(new Uint8Array(ev.data)); // delivered to the guest in pumpNet()
+  };
+  ws.onclose = ws.onerror = () => {
+    c.hostClosed = true; // drained + torn down in pumpNet once pendingIn empties
+  };
+}
+
+function pumpNet() {
+  if (!netEnabled) return;
+  vm.net_pump(performance.now());
+
+  // New flows → open a WebSocket each.
+  let news;
+  try { news = JSON.parse(vm.net_take_new_connections()); } catch { news = []; }
+  for (const conn of news) netOpenConn(conn);
+
+  // Shuttle bytes for each live connection.
+  for (const [id, c] of netConns) {
+    // host → guest: flush what the WebSocket delivered (respect backpressure).
+    while (c.pendingIn.length) {
+      if (vm.net_conn_send(id, c.pendingIn[0])) c.pendingIn.shift();
+      else break; // NAT queue full — retry next tick
+    }
+
+    // WebSocket closed/errored: finish the teardown only once every buffered
+    // inbound byte has been accepted by the guest, so the response tail isn't
+    // truncated and the guest's FIN comes after the data.
+    if (c.hostClosed) {
+      if (c.pendingIn.length === 0) {
+        vm.net_conn_closed(id);
+        netConns.delete(id);
+      }
+      continue;
+    }
+
+    // guest → host: drain the NAT only once the WebSocket is OPEN — before
+    // that, unflushed bytes stay queued in the NAT (real backpressure) rather
+    // than a JS array that could be discarded if the flow dies first. This is
+    // also where we learn the NAT reaped the flow (outbound === undefined).
+    if (!c.open || c.ws.readyState !== WebSocket.OPEN) continue;
+    const out = vm.net_conn_outbound(id);
+    if (out === undefined) {
+      try { c.ws.close(); } catch {}
+      vm.net_conn_closed(id);
+      netConns.delete(id);
+      continue;
+    }
+    if (out.length) c.ws.send(out);
+  }
+  setNetStatus(`live — ${vm.net_conn_count()} flow(s), ${netConns.size} socket(s)`);
+}
 function pump() {
   const steps = idleAware ? vm.run_idle_aware(stepBudget) : vm.run(stepBudget);
   const out = vm.read_output();
@@ -127,7 +249,9 @@ function pump() {
   if (vga.trim().length > 0) {
     $("vga").textContent = vga;
   }
-  // Repaint the framebuffer canvas every few frames (cheap throttle).
+  // Drive the network relay (no-op until enabled), then repaint the
+  // framebuffer canvas every few frames (cheap throttle).
+  pumpNet();
   if (++fbFrame % FB_EVERY === 0) blitFramebuffer();
   if (vm.is_halted()) {
     setStatus("halted", "");
@@ -205,6 +329,27 @@ $("boot-linux").addEventListener("click", async () => {
     const entry = vm.load_bzimage(kbytes);
     vm.set_kernel_cmdline($("cmdline").value);
     if (ibytes) vm.set_ramdisk(ibytes);
+    // Host networking: spin up the in-wasm TCP NAT, pre-resolve the allowed
+    // hosts over DoH, and relay each flow over a WebSocket to crates/proxy.
+    // Tear down any sockets from a previous boot FIRST, with their handlers
+    // detached, so a late onclose can't touch the fresh NAT's (reset) ids.
+    for (const c of netConns.values()) {
+      if (c.ws) {
+        c.ws.onopen = c.ws.onmessage = c.ws.onclose = c.ws.onerror = null;
+        try { c.ws.close(); } catch {}
+      }
+    }
+    netConns.clear();
+    netEnabled = $("net-enable").checked;
+    if (netEnabled) {
+      netProxyUrl = $("net-proxy").value.trim() || "ws://localhost:8080";
+      const allow = $("net-allow").value.trim();
+      vm.net_enable(allow);
+      setNetStatus("enabled — resolving hosts…");
+      netPreResolve(allow); // async; cache fills before the guest queries
+    } else {
+      setNetStatus("(off)");
+    }
     // Advertise a linear framebuffer so the kernel's efifb binds and
     // fbcon renders the console as pixels (needs `console=tty0` on the
     // cmdline, which the default value includes). Enable BEFORE the PM

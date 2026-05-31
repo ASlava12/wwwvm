@@ -90,6 +90,15 @@ impl Allowlist {
         self.entries.is_empty()
     }
 
+    /// True if a `*` (anything) entry is present — i.e. this permits every
+    /// host:port. Callers (the proxy) warn loudly about this open-relay
+    /// configuration, especially combined with a non-loopback bind.
+    pub fn allows_anything(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e, AllowEntry::Anything))
+    }
+
     /// Whether a `host:port` connection is permitted. OR semantics across
     /// entries; host match is case-insensitive.
     pub fn permits(&self, host: &str, port: u16) -> bool {

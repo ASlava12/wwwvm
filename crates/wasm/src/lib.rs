@@ -24,12 +24,26 @@
 #![forbid(unsafe_code)]
 
 use wasm_bindgen::prelude::*;
+use wwwvm_net::nat::NatStack;
+use wwwvm_net::{Allowlist, DnsForwarder, QueueConnector};
 use wwwvm_vm::{Stop, Vm};
+
+/// The in-wasm host network stack: the same smoltcp TCP NAT the native build
+/// runs, but with the [`QueueConnector`] (no threads/sockets) so each guest
+/// flow is tunnelled over a JS WebSocket to `crates/proxy` instead of a real
+/// host socket. `Some` once [`WwwVm::net_enable`] is called.
+struct NetBridge {
+    nat: NatStack,
+    conns: QueueConnector,
+    /// Monotonic ms clock we feed smoltcp (advanced by the JS pump).
+    now_ms: i64,
+}
 
 #[wasm_bindgen]
 pub struct WwwVm {
     inner: Vm,
     last_error: Option<String>,
+    net: Option<NetBridge>,
 }
 
 #[wasm_bindgen]
@@ -39,6 +53,7 @@ impl WwwVm {
         Self {
             inner: Vm::new(),
             last_error: None,
+            net: None,
         }
     }
 
@@ -49,6 +64,7 @@ impl WwwVm {
         Self {
             inner: Vm::with_ram_size(size),
             last_error: None,
+            net: None,
         }
     }
 
@@ -513,6 +529,138 @@ impl WwwVm {
     /// the caller should retry the same frame on the next tick.
     pub fn inject_rx_frame(&mut self, frame: &[u8]) -> bool {
         self.inner.inject_rx_frame(frame)
+    }
+
+    // --- In-wasm host network stack (smoltcp NAT → WebSocket relay) ---
+    //
+    // net_enable spins up the SAME smoltcp TCP NAT the native build runs, but
+    // with the QueueConnector (no threads/sockets): each guest flow becomes a
+    // byte queue JS tunnels over a WebSocket to crates/proxy. net_pump bridges
+    // the VM's NIC frames into/out of the NAT (both live in wasm); the JS side
+    // only shuttles per-connection payload over WebSockets and resolves names.
+
+    /// Turn on host networking. `allowlist` is the deny-by-default policy
+    /// ("host:port", comma-separated; "*" / "host:*" allowed but use specific
+    /// hosts in any real deployment — an open relay is dangerous). Gateway is
+    /// 10.0.2.2, guest 10.0.2.15 (matching the native console).
+    pub fn net_enable(&mut self, allowlist: &str) {
+        const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+        const GW_IP: [u8; 4] = [10, 0, 2, 2];
+        const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+        let conns = QueueConnector::new();
+        let dns = DnsForwarder::new(GW_IP, GW_MAC, Allowlist::parse(allowlist));
+        let nat = NatStack::with_connect(GW_IP, GW_MAC, GUEST_IP, dns, conns.connector());
+        self.net = Some(NetBridge {
+            nat,
+            conns,
+            now_ms: 0,
+        });
+    }
+
+    /// Whether host networking has been enabled.
+    pub fn net_enabled(&self) -> bool {
+        self.net.is_some()
+    }
+
+    /// Seed the DNS cache so the guest can resolve `name` → `ips` (packed as
+    /// 4-byte IPv4 groups). JS resolves names host-side (proxy / DoH) and
+    /// pushes the answers in before the guest queries. Returns how many were
+    /// kept (non-routable addresses are dropped). No-op if net isn't enabled.
+    pub fn net_cache_dns(&mut self, name: &str, ips: &[u8]) -> usize {
+        let Some(net) = self.net.as_mut() else {
+            return 0;
+        };
+        let addrs: Vec<std::net::Ipv4Addr> = ips
+            .chunks_exact(4)
+            .map(|c| std::net::Ipv4Addr::new(c[0], c[1], c[2], c[3]))
+            .collect();
+        net.nat.cache_dns(name, &addrs)
+    }
+
+    /// Pump the NAT one tick at monotonic host time `now_ms`: move the guest's
+    /// transmitted frames into the stack, advance smoltcp, and inject its
+    /// replies into the guest NIC. Call each tick after stepping the CPU.
+    pub fn net_pump(&mut self, now_ms: f64) {
+        let WwwVm { inner, net, .. } = self;
+        let Some(net) = net.as_mut() else {
+            return;
+        };
+        net.now_ms = now_ms as i64;
+        while let Some(frame) = inner.drain_tx_frames_one() {
+            net.nat.push_guest_frame(frame);
+        }
+        net.nat.poll(net.now_ms);
+        // Stack → guest, bounded; requeue to the front on a full RX ring so
+        // ordering is preserved and we retry next tick.
+        let mut guard = 1024;
+        while guard > 0 {
+            let Some(frame) = net.nat.pop_egress() else {
+                break;
+            };
+            if !inner.inject_rx_frame(&frame) {
+                net.nat.requeue_egress_front(frame);
+                break;
+            }
+            guard -= 1;
+        }
+    }
+
+    /// Connections the guest just opened, as JSON:
+    /// `[{"id":<n>,"host":"name","ip":"a.b.c.d","port":<n>}, …]` (`"[]"` if
+    /// none / disabled). JS opens one WebSocket per id to the proxy and sends
+    /// `{host,port}` — `host` is the resolved name (the proxy re-resolves +
+    /// allowlists by name); it falls back to the IP if the name is unknown.
+    pub fn net_take_new_connections(&self) -> String {
+        let Some(net) = self.net.as_ref() else {
+            return "[]".into();
+        };
+        let mut s = String::from("[");
+        for (i, (id, ip, port)) in net.conns.take_new().into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let host = net.nat.host_for_ip(ip).map(str::to_string);
+            let host = host.unwrap_or_else(|| ip.to_string());
+            s.push_str(&format!(
+                "{{\"id\":{id},\"host\":\"{host}\",\"ip\":\"{ip}\",\"port\":{port}}}"
+            ));
+        }
+        s.push(']');
+        s
+    }
+
+    /// Guest→host bytes queued for connection `id` (to `ws.send`), or
+    /// `undefined` once the NAT has closed the flow — then close the WebSocket
+    /// and call `net_conn_closed`. An empty array means "open, nothing yet".
+    pub fn net_conn_outbound(&self, id: u64) -> Option<Vec<u8>> {
+        let net = self.net.as_ref()?;
+        let (bytes, closed) = net.conns.drain_outbound(id);
+        if closed && bytes.is_empty() {
+            None
+        } else {
+            Some(bytes)
+        }
+    }
+
+    /// Feed host→guest bytes received on connection `id`'s WebSocket. Returns
+    /// false under backpressure (re-queue and retry) or for an unknown id.
+    pub fn net_conn_send(&self, id: u64, bytes: &[u8]) -> bool {
+        self.net
+            .as_ref()
+            .is_some_and(|n| n.conns.push_inbound(id, bytes))
+    }
+
+    /// Tell the NAT that connection `id`'s WebSocket closed or errored — the
+    /// guest gets a FIN and the slot is freed. Idempotent.
+    pub fn net_conn_closed(&self, id: u64) {
+        if let Some(net) = self.net.as_ref() {
+            net.conns.host_closed(id);
+        }
+    }
+
+    /// Live NATed flow count (diagnostics).
+    pub fn net_conn_count(&self) -> u32 {
+        self.net.as_ref().map_or(0, |n| n.conns.conn_count() as u32)
     }
 }
 

@@ -9,10 +9,17 @@
 //! Hosts are matched against an allowlist read from the
 //! `WWWVM_PROXY_ALLOWLIST` env var (comma-separated `host:port`,
 //! `host:*`, or `*`). Default is empty — deny everything — so a
-//! misconfigured deployment fails closed rather than open.
+//! misconfigured deployment fails closed rather than open. `*` is an
+//! OPEN RELAY and must never be used on a reachable bind.
 //!
-//! Run:
-//!     WWWVM_PROXY_ALLOWLIST='*' cargo run -p wwwvm-proxy -- 0.0.0.0:9000
+//! `WWWVM_PROXY_ORIGINS` (comma-separated) locks WebSocket handshakes to
+//! specific browser Origins (guards against Cross-Site WebSocket Hijacking);
+//! unset accepts any Origin (fine for a loopback dev demo only).
+//!
+//! Run (specific host, bound to loopback — the safe default):
+//!     WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80' \
+//!     WWWVM_PROXY_ORIGINS='http://localhost:8080' \
+//!       cargo run -p wwwvm-proxy -- 127.0.0.1:8080
 
 #![forbid(unsafe_code)]
 
@@ -55,6 +62,42 @@ async fn main() -> Result<()> {
              Set it to e.g. `*` (any) or `example.com:443,localhost:*` (specific)."
         );
     }
+    // An open relay (`*`) is dangerous; on a non-loopback bind it lets ANY
+    // reachable client tunnel TCP to ANY host through this process. Warn hard.
+    if allow.allows_anything() {
+        let public = !bind.ip().is_loopback();
+        log::warn!(
+            "WWWVM_PROXY_ALLOWLIST permits `*` (ANY host:port) — this is an OPEN RELAY.{}",
+            if public {
+                " Bound to a NON-loopback address: anyone who can reach this port can \
+                 tunnel through you. Use a SPECIFIC allowlist (e.g. dl-cdn.alpinelinux.org:443) \
+                 and/or bind to 127.0.0.1. `*` is for throwaway local testing only."
+            } else {
+                " (Bound to loopback — local testing only; never expose this.)"
+            }
+        );
+    }
+
+    // Cross-Site WebSocket Hijacking guard: a browser lets any page open a
+    // WebSocket to us, sending that page's Origin. With a permissive allowlist
+    // a malicious page could drive the relay. If WWWVM_PROXY_ORIGINS is set
+    // (comma-separated), only those Origins are accepted; otherwise any Origin
+    // is allowed (fine for a loopback dev demo) and we say so once.
+    let origins: Arc<Option<Vec<String>>> = Arc::new(match env::var("WWWVM_PROXY_ORIGINS") {
+        Ok(s) if !s.trim().is_empty() => {
+            let list: Vec<String> = s.split(',').map(|o| o.trim().to_string()).collect();
+            log::info!("accepting WebSocket Origins: {}", list.join(", "));
+            Some(list)
+        }
+        _ => {
+            log::warn!(
+                "WWWVM_PROXY_ORIGINS unset — accepting WebSocket handshakes from ANY Origin \
+                 (Cross-Site WebSocket Hijacking possible). Set it to the page's origin \
+                 (e.g. http://localhost:8080) to lock this down."
+            );
+            None
+        }
+    });
 
     let listener = TcpListener::bind(bind).await.context("bind")?;
     log::info!("wwwvm-proxy listening on {bind}");
@@ -62,18 +105,44 @@ async fn main() -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let allow = allow.clone();
+        let origins = origins.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, peer, allow).await {
+            if let Err(e) = handle(stream, peer, allow, origins).await {
                 log::warn!("{peer}: {e:#}");
             }
         });
     }
 }
 
-async fn handle(stream: TcpStream, peer: SocketAddr, allow: Arc<Allowlist>) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .context("websocket handshake")?;
+// The tungstenite handshake callback returns Result<Response, ErrorResponse>,
+// and ErrorResponse (an http::Response) is large — that's the library's
+// signature, not ours, so silence the size lint here.
+#[allow(clippy::result_large_err)]
+async fn handle(
+    stream: TcpStream,
+    peer: SocketAddr,
+    allow: Arc<Allowlist>,
+    origins: Arc<Option<Vec<String>>>,
+) -> Result<()> {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    // Reject disallowed Origins during the handshake (before any TCP connect).
+    let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
+        if let Some(allowed) = origins.as_ref() {
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !allowed.iter().any(|o| o == origin) {
+                let mut err = ErrorResponse::new(Some(format!("origin {origin:?} not allowed")));
+                *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                return Err(err);
+            }
+        }
+        Ok(resp)
+    })
+    .await
+    .context("websocket handshake")?;
     let (mut ws_sink, mut ws_stream) = ws.split();
 
     let frame_msg = tokio::time::timeout(Duration::from_secs(10), ws_stream.next())

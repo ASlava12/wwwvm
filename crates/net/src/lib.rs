@@ -23,8 +23,10 @@ pub mod device;
 pub mod dns;
 pub mod forwarder;
 pub mod nat;
+pub mod queue;
 pub mod relay;
 pub mod util;
 
 pub use allow::Allowlist;
 pub use forwarder::DnsForwarder;
+pub use queue::QueueConnector;

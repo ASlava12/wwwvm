@@ -301,6 +301,23 @@ impl NatStack {
     pub fn guest_ip(&self) -> Ipv4Addr {
         self.guest_ip
     }
+
+    /// Seed the DNS forwarder's name→IP cache (and allowlist gate) so the guest
+    /// can resolve `name`. The browser build calls this — it resolves names
+    /// host-side (the proxy / a DoH lookup) and pushes the answers in, exactly
+    /// as the native `alpine_console` pre-resolves before the VM runs. Returns
+    /// how many of `ips` were kept (non-routable ones are dropped).
+    pub fn cache_dns(&mut self, name: &str, ips: &[Ipv4Addr]) -> usize {
+        self.dns.cache_resolution(name, ips)
+    }
+
+    /// The hostname the guest's destination `ip` resolved from, if any. The
+    /// browser relay sends this (not the bare IP) to `crates/proxy`, which
+    /// re-resolves + allowlists by name and pins the address — so the proxy's
+    /// own deny-by-default gate keys on the same hostnames as ours.
+    pub fn host_for_ip(&self, ip: Ipv4Addr) -> Option<&str> {
+        self.dns.name_for_ip(ip)
+    }
 }
 
 /// Move bytes both ways between the guest's smoltcp socket and the host relay,
