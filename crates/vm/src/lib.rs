@@ -10,11 +10,9 @@
 
 pub mod bzimage;
 pub mod elf;
-pub mod lan;
 
 pub use bzimage::{parse as parse_bzimage, BzImage, BzImageError};
 pub use elf::{load_elf, ElfError};
-pub use lan::VirtualGateway;
 use wwwvm_cpu::{flag, Cpu, CpuError};
 use wwwvm_devices::IoBus;
 use wwwvm_mem::Memory;
