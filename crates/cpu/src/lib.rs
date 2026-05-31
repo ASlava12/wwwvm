@@ -512,6 +512,75 @@ fn mmx_psra(a: u64, count: u64, lane: usize) -> u64 {
     })
 }
 
+/// MMX PUNPCKL/H: interleave `elem_bytes`-sized elements from the low
+/// (`high=false`) or high (`high=true`) 32 bits of `d` and `s`, dst first.
+fn mmx_punpck(d: u64, s: u64, elem_bytes: u64, high: bool) -> u64 {
+    let bits = elem_bytes * 8;
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let base = if high { 32 } else { 0 };
+    let n = 32 / bits; // elements taken from each operand's selected half
+    let mut out = 0u64;
+    for i in 0..n {
+        let de = (d >> (base + i * bits)) & mask;
+        let se = (s >> (base + i * bits)) & mask;
+        out |= de << (2 * i * bits);
+        out |= se << ((2 * i + 1) * bits);
+    }
+    out
+}
+
+fn sat_s8(v: i32) -> u64 {
+    (v.clamp(-128, 127) as i8 as u8) as u64
+}
+fn sat_u8(v: i32) -> u64 {
+    (v.clamp(0, 255) as u8) as u64
+}
+fn sat_s16(v: i32) -> u64 {
+    (v.clamp(-32768, 32767) as i16 as u16) as u64
+}
+
+/// MMX PACKSSWB / PACKUSWB: saturate the 4 signed words of `d` then `s` to
+/// bytes (`signed` picks signed vs unsigned saturation) → 8 bytes.
+fn mmx_packwb(d: u64, s: u64, signed: bool) -> u64 {
+    let sat = |w: i32| if signed { sat_s8(w) } else { sat_u8(w) };
+    let mut out = 0u64;
+    for (half, src) in [d, s].into_iter().enumerate() {
+        for i in 0..4u64 {
+            let w = ((src >> (i * 16)) & 0xFFFF) as u16 as i16 as i32;
+            out |= sat(w) << ((half as u64 * 4 + i) * 8);
+        }
+    }
+    out
+}
+
+/// MMX PACKSSDW: signed-saturate the 2 dwords of `d` then `s` to words → 4 words.
+fn mmx_packssdw(d: u64, s: u64) -> u64 {
+    let mut out = 0u64;
+    for (half, src) in [d, s].into_iter().enumerate() {
+        for i in 0..2u64 {
+            let dw = ((src >> (i * 32)) & 0xFFFF_FFFF) as u32 as i32;
+            out |= sat_s16(dw) << ((half as u64 * 2 + i) * 16);
+        }
+    }
+    out
+}
+
+/// PSHUFW: select each of the 4 result words from the source per a 2-bit
+/// field of `imm` (bits [2i+1:2i] pick the source word for result word i).
+fn mmx_pshufw(src: u64, imm: u8) -> u64 {
+    let mut out = 0u64;
+    for i in 0..4 {
+        let sel = (imm >> (2 * i)) & 3;
+        let w = (src >> (sel as u64 * 16)) & 0xFFFF;
+        out |= w << (i as u64 * 16);
+    }
+    out
+}
+
 /// PMADDWD: signed 16-bit lanes multiplied, adjacent pairs summed into
 /// 32-bit results (4 words → 2 dwords for MMX).
 fn mmx_pmaddwd(a: u64, b: u64) -> u64 {
@@ -6890,6 +6959,56 @@ impl Cpu {
                     0x77 => {
                         // EMMS — end MMX state. The MM file is separate from
                         // our x87 stack, so there's nothing to retag.
+                    }
+                    0x70 if !self.has_66() => {
+                        // PSHUFW mm, mm/m64, imm8 — word shuffle (the no-66
+                        // form; 66/F2/F3 are the SSE PSHUFD/LW/HW handled
+                        // elsewhere). Used by openssl's MMX SHA path.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_mm_rm(rm, mem);
+                        let imm = self.fetch_u8(mem);
+                        self.mmx[reg as usize] = mmx_pshufw(src, imm);
+                    }
+                    0xC4 if !self.has_66() => {
+                        // PINSRW mm, r32/m16, imm8 — insert a 16-bit value
+                        // into word slot (imm8 & 3) of the MM register.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let w = match rm {
+                            Rm::Reg(i) => self.read_r16(i),
+                            Rm::Mem(_) => self.read_rm16(rm, mem),
+                        } as u64;
+                        let slot = (self.fetch_u8(mem) & 3) as u64 * 16;
+                        let d = &mut self.mmx[reg as usize];
+                        *d = (*d & !(0xFFFFu64 << slot)) | (w << slot);
+                    }
+                    0xC5 if !self.has_66() => {
+                        // PEXTRW r32, mm, imm8 — extract word (imm8 & 3) from
+                        // the MM register, zero-extended into the GPR.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_mm_rm(rm, mem);
+                        let slot = (self.fetch_u8(mem) & 3) as u64 * 16;
+                        self.write_r32(reg, ((src >> slot) & 0xFFFF) as u32);
+                    }
+                    // MMX PUNPCKL/H {BW,WD,DQ} (60/61/62 low, 68/69/6A high)
+                    // and PACK {SSWB,USWB,SSDW} (63/67/6B). The no-66 MMX
+                    // forms; the 66 SSE2 twins are handled below.
+                    0x60 | 0x61 | 0x62 | 0x68 | 0x69 | 0x6A | 0x63 | 0x67 | 0x6B
+                        if !self.has_66() =>
+                    {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_mm_rm(rm, mem);
+                        let d = self.mmx[reg as usize];
+                        self.mmx[reg as usize] = match op2 {
+                            0x60 => mmx_punpck(d, s, 1, false),
+                            0x61 => mmx_punpck(d, s, 2, false),
+                            0x62 => mmx_punpck(d, s, 4, false),
+                            0x68 => mmx_punpck(d, s, 1, true),
+                            0x69 => mmx_punpck(d, s, 2, true),
+                            0x6A => mmx_punpck(d, s, 4, true),
+                            0x63 => mmx_packwb(d, s, true), // PACKSSWB
+                            0x67 => mmx_packwb(d, s, false), // PACKUSWB
+                            _ => mmx_packssdw(d, s),        // 0x6B PACKSSDW
+                        };
                     }
                     // Bitwise logicals on the full 64 bits.
                     0xDB | 0xDF | 0xEB | 0xEF if !self.has_66() => {
