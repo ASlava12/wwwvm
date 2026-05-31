@@ -98,15 +98,10 @@ impl DnsForwarder {
 
     /// Reject non-globally-routable destinations so an allowlisted name that
     /// (mis)resolves to an internal address can't be used to reach the host
-    /// or its LAN.
+    /// or its LAN. Delegates to the shared policy (also excludes CGNAT /
+    /// reserved ranges) plus our own gateway IP.
     fn is_routable(&self, ip: Ipv4Addr) -> bool {
-        !(ip.is_loopback()
-            || ip.is_private()
-            || ip.is_link_local()
-            || ip.is_multicast()
-            || ip.is_broadcast()
-            || ip.is_unspecified()
-            || ip.octets() == self.gw_ip)
+        crate::allow::is_globally_routable(ip) && ip.octets() != self.gw_ip
     }
 
     /// The pure DNS policy: given a query *payload*, return the response

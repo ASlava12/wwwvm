@@ -10,6 +10,30 @@
 //! a misconfigured deployment fails closed rather than open. `*` must never
 //! be the shipped default — an open proxy is dangerous.
 
+use std::net::Ipv4Addr;
+
+/// True if `ip` is a globally-routable destination — i.e. NOT loopback,
+/// RFC1918 private, RFC6598 CGNAT (100.64/10), link-local, the 0.0.0.0/8 or
+/// 240.0.0.0/4 reserved blocks, multicast, broadcast, or unspecified.
+///
+/// Both the proxy and the in-process bridge gate outbound connections on
+/// this so an allowlisted *name* can't be pointed (via its A record, or DNS
+/// rebinding) at the host itself or its LAN — the allowlist authorizes a
+/// host, never an internal address. `Ipv4Addr::is_global` is unstable at our
+/// MSRV, so the reserved ranges are spelled out.
+pub fn is_globally_routable(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || o[0] == 0                               // 0.0.0.0/8
+        || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10 CGNAT
+        || o[0] >= 240) // 240.0.0.0/4 reserved (incl. 255 broadcast)
+}
+
 /// A parsed allowlist. Empty means deny-all.
 #[derive(Debug, Clone, Default)]
 pub struct Allowlist {
@@ -190,5 +214,28 @@ mod tests {
         let a = Allowlist::parse("dl-cdn.alpinelinux.org:443");
         assert!(a.permits_host("dl-cdn.alpinelinux.org"));
         assert!(!a.permits_host("evil.example.com"));
+    }
+
+    #[test]
+    fn is_globally_routable_rejects_internal_and_reserved() {
+        let r = |a, b, c, d| is_globally_routable(Ipv4Addr::new(a, b, c, d));
+        // Public addresses are routable.
+        assert!(r(93, 184, 216, 34)); // example.com
+        assert!(r(151, 101, 2, 132)); // Fastly
+                                      // Loopback / private / link-local / unspecified / broadcast.
+        assert!(!r(127, 0, 0, 1));
+        assert!(!r(10, 0, 2, 2));
+        assert!(!r(192, 168, 1, 1));
+        assert!(!r(172, 16, 5, 9));
+        assert!(!r(169, 254, 169, 254)); // cloud metadata
+        assert!(!r(0, 0, 0, 0));
+        assert!(!r(255, 255, 255, 255));
+        assert!(!r(224, 0, 0, 1)); // multicast
+                                   // CGNAT 100.64/10 and reserved 240/4 (the gaps the review flagged).
+        assert!(!r(100, 64, 0, 1));
+        assert!(!r(100, 127, 255, 255));
+        assert!(r(100, 63, 0, 1), "100.63 is public, just below CGNAT");
+        assert!(r(100, 128, 0, 1), "100.128 is public, just above CGNAT");
+        assert!(!r(240, 0, 0, 1));
     }
 }

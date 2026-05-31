@@ -17,7 +17,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,10 +100,38 @@ async fn handle(stream: TcpStream, peer: SocketAddr, allow: Arc<Allowlist>) -> R
         ));
     }
 
-    log::info!("{peer} -> {}:{}", connect.host, connect.port);
-    let tcp = TcpStream::connect((connect.host.as_str(), connect.port))
+    // Resolve the host OURSELVES and pin a vetted, globally-routable address.
+    // Passing the hostname to connect() would re-resolve at connect time
+    // (reopening a DNS-rebinding window) and could reach a loopback/private/
+    // internal IP (SSRF). The allowlist authorizes a *name*; the IP it points
+    // at must still be a real external address. (v4-only — the bridge is v4.)
+    let addr = tokio::net::lookup_host((connect.host.as_str(), connect.port))
         .await
-        .context("upstream connect")?;
+        .context("resolve")?
+        .find(|sa| match sa.ip() {
+            IpAddr::V4(ip) => wwwvm_net::allow::is_globally_routable(ip),
+            IpAddr::V6(_) => false,
+        });
+    let Some(addr) = addr else {
+        let _ = ws_sink
+            .send(Message::Text(format!(
+                "ERR {}:{} no globally-routable address",
+                connect.host, connect.port
+            )))
+            .await;
+        return Err(anyhow!(
+            "{peer}: refused {} — no globally-routable address (SSRF guard)",
+            connect.host
+        ));
+    };
+
+    log::info!(
+        "{peer} -> {} [{}]:{}",
+        connect.host,
+        addr.ip(),
+        connect.port
+    );
+    let tcp = TcpStream::connect(addr).await.context("upstream connect")?;
     let (mut tcp_rd, mut tcp_wr) = tcp.into_split();
 
     // ws -> tcp
