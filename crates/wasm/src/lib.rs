@@ -632,7 +632,7 @@ impl WwwVm {
     /// Guest→host bytes queued for connection `id` (to `ws.send`), or
     /// `undefined` once the NAT has closed the flow — then close the WebSocket
     /// and call `net_conn_closed`. An empty array means "open, nothing yet".
-    pub fn net_conn_outbound(&self, id: u64) -> Option<Vec<u8>> {
+    pub fn net_conn_outbound(&self, id: u32) -> Option<Vec<u8>> {
         let net = self.net.as_ref()?;
         let (bytes, closed) = net.conns.drain_outbound(id);
         if closed && bytes.is_empty() {
@@ -644,7 +644,7 @@ impl WwwVm {
 
     /// Feed host→guest bytes received on connection `id`'s WebSocket. Returns
     /// false under backpressure (re-queue and retry) or for an unknown id.
-    pub fn net_conn_send(&self, id: u64, bytes: &[u8]) -> bool {
+    pub fn net_conn_send(&self, id: u32, bytes: &[u8]) -> bool {
         self.net
             .as_ref()
             .is_some_and(|n| n.conns.push_inbound(id, bytes))
@@ -652,7 +652,7 @@ impl WwwVm {
 
     /// Tell the NAT that connection `id`'s WebSocket closed or errored — the
     /// guest gets a FIN and the slot is freed. Idempotent.
-    pub fn net_conn_closed(&self, id: u64) {
+    pub fn net_conn_closed(&self, id: u32) {
         if let Some(net) = self.net.as_ref() {
             net.conns.host_closed(id);
         }

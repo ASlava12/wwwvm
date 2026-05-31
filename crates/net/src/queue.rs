@@ -59,9 +59,13 @@ struct QueueConn {
 
 #[derive(Default)]
 struct QueueState {
-    next_id: u64,
-    new: Vec<u64>,
-    conns: HashMap<u64, QueueConn>,
+    // Connection ids are u32, not u64: wasm-bindgen marshals a u64 parameter
+    // as a JS BigInt, but the embedder passes plain Numbers (from JSON), which
+    // throws "can't convert N to BigInt". u32 marshals as a Number — and we'll
+    // never have 4 billion concurrent flows.
+    next_id: u32,
+    new: Vec<u32>,
+    conns: HashMap<u32, QueueConn>,
 }
 
 /// Shareable driver handle. Pass [`connector`](Self::connector) to
@@ -111,7 +115,7 @@ impl QueueConnector {
 
     /// Connections requested since the last call, each as `(id, dst_ip,
     /// dst_port)`. The embedder opens one WebSocket per id.
-    pub fn take_new(&self) -> Vec<(u64, Ipv4Addr, u16)> {
+    pub fn take_new(&self) -> Vec<(u32, Ipv4Addr, u16)> {
         let mut s = self.state.borrow_mut();
         let ids = std::mem::take(&mut s.new);
         ids.into_iter()
@@ -130,7 +134,7 @@ impl QueueConnector {
     /// dropping `to_host` ends only the writer thread — relay.rs). Treating a
     /// half-close as a full close would tear the WebSocket down and truncate
     /// the response the guest is still waiting to read.
-    pub fn drain_outbound(&self, id: u64) -> (Vec<u8>, bool) {
+    pub fn drain_outbound(&self, id: u32) -> (Vec<u8>, bool) {
         let s = self.state.borrow();
         let Some(conn) = s.conns.get(&id) else {
             return (Vec::new(), true);
@@ -145,7 +149,7 @@ impl QueueConnector {
     /// Feed host→guest bytes received on the WebSocket for `id`. Returns
     /// `false` if the per-connection queue is full (back-pressure — re-queue
     /// the bytes and retry next tick) or the connection is gone.
-    pub fn push_inbound(&self, id: u64, bytes: &[u8]) -> bool {
+    pub fn push_inbound(&self, id: u32, bytes: &[u8]) -> bool {
         let s = self.state.borrow();
         let Some(conn) = s.conns.get(&id) else {
             return false;
@@ -159,7 +163,7 @@ impl QueueConnector {
     /// The WebSocket for `id` closed or errored. Drops the connection's
     /// channels — the NAT sees `from_host` disconnect and sends the guest a
     /// FIN — and frees the slot. Idempotent.
-    pub fn host_closed(&self, id: u64) {
+    pub fn host_closed(&self, id: u32) {
         let mut s = self.state.borrow_mut();
         if let Some(conn) = s.conns.remove(&id) {
             conn.stop.store(true, Ordering::Relaxed);
@@ -291,7 +295,7 @@ mod tests {
         }
 
         // Open connections the queue surfaces; echo any guest→host bytes back.
-        let mut open: Vec<u64> = Vec::new();
+        let mut open: Vec<u32> = Vec::new();
         let mut got = Vec::<u8>::new();
         let mut sent_request = false;
         let mut t_ms: i64 = 0;

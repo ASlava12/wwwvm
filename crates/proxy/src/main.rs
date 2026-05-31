@@ -203,30 +203,48 @@ async fn handle(
     let tcp = TcpStream::connect(addr).await.context("upstream connect")?;
     let (mut tcp_rd, mut tcp_wr) = tcp.into_split();
 
-    // ws -> tcp
+    // ws -> tcp (guest → upstream). Log the first chunk + total so a stalled
+    // relay is diagnosable (did the guest's request reach the server at all?).
     let ws_to_tcp = async move {
+        let mut total = 0u64;
         while let Some(msg) = ws_stream.next().await {
             match msg? {
-                Message::Binary(b) => tcp_wr.write_all(&b).await?,
-                Message::Text(t) => tcp_wr.write_all(t.as_bytes()).await?,
+                Message::Binary(b) => {
+                    if total == 0 {
+                        log::info!("{peer} ws→tcp: first {} bytes", b.len());
+                    }
+                    total += b.len() as u64;
+                    tcp_wr.write_all(&b).await?
+                }
+                Message::Text(t) => {
+                    total += t.len() as u64;
+                    tcp_wr.write_all(t.as_bytes()).await?
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
         }
+        log::info!("{peer} ws→tcp: done, {total} bytes total");
         let _ = tcp_wr.shutdown().await;
         Ok::<_, anyhow::Error>(())
     };
 
-    // tcp -> ws
+    // tcp -> ws (upstream → guest).
     let tcp_to_ws = async move {
         let mut buf = vec![0u8; 4096];
+        let mut total = 0u64;
         loop {
             let n = tcp_rd.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
+            if total == 0 {
+                log::info!("{peer} tcp→ws: first {n} bytes");
+            }
+            total += n as u64;
             ws_sink.send(Message::Binary(buf[..n].to_vec())).await?;
         }
+        log::info!("{peer} tcp→ws: done, {total} bytes total");
         let _ = ws_sink.send(Message::Close(None)).await;
         Ok::<_, anyhow::Error>(())
     };
