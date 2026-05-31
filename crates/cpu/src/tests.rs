@@ -11621,3 +11621,90 @@ fn mmx_pmaddwd_multiplies_and_sums_pairs() {
     assert_eq!(r & 0xFFFF_FFFF, 23, "low dword = 2*4 + 3*5");
     assert_eq!(r >> 32, 2, "high dword = 1*1 + 1*1");
 }
+
+// --- MMX opcode dispatch (movd/movq/pxor/punpck/pshufw/pinsrw/pextrw via step) ---
+
+/// Run a real-mode byte sequence at 0x7C00 with EAX/EDX preset, return the cpu.
+fn run_mmx(bytes: &[u8], eax: u32, edx: u32) -> Cpu {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_slice(0x7C00, bytes);
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.write_r32(0, eax);
+    cpu.write_r32(2, edx);
+    let mut io = IoBus::new();
+    for _ in 0..bytes.len() {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    cpu
+}
+
+#[test]
+fn mmx_movd_pxor_movq_dispatch() {
+    // movd mm0,eax; movd mm1,edx; pxor mm0,mm1; movq mm2,mm0; hlt
+    let cpu = run_mmx(
+        &[
+            0x0F, 0x6E, 0xC0, 0x0F, 0x6E, 0xCA, 0x0F, 0xEF, 0xC1, 0x0F, 0x6F, 0xD0, 0xF4,
+        ],
+        0xF0F0_FF00,
+        0x0F0F_00FF,
+    );
+    // movd zero-extends to 64 bits; pxor of the low dwords; movq copies.
+    assert_eq!(cpu.mmx[0], 0x0000_0000_FFFF_FFFF);
+    assert_eq!(cpu.mmx[2], 0x0000_0000_FFFF_FFFF);
+}
+
+#[test]
+fn mmx_movd_back_to_gpr_dispatch() {
+    // movd mm0,eax; movd ebx,mm0; hlt  → ebx == eax low dword
+    let cpu = run_mmx(&[0x0F, 0x6E, 0xC0, 0x0F, 0x7E, 0xC3, 0xF4], 0xDEAD_BEEF, 0);
+    assert_eq!(cpu.read_r32(3), 0xDEAD_BEEF); // ebx
+}
+
+#[test]
+fn mmx_punpckldq_dispatch() {
+    // movd mm0,eax; movd mm1,edx; punpckldq mm0,mm1; hlt
+    // PUNPCKLDQ mm0,mm1 (0F 62 C1): low dword of mm0 in low, low dword of mm1 in high.
+    let cpu = run_mmx(
+        &[0x0F, 0x6E, 0xC0, 0x0F, 0x6E, 0xCA, 0x0F, 0x62, 0xC1, 0xF4],
+        0x1111_2222,
+        0x3333_4444,
+    );
+    assert_eq!(cpu.mmx[0], 0x3333_4444_1111_2222);
+}
+
+#[test]
+fn mmx_pshufw_dispatch() {
+    // movd mm0,eax; punpckldq mm0,mm0 (broadcast low dword); pshufw mm1,mm0,0x1B; hlt
+    // 0x1B = 00_01_10_11 → reverse the 4 words.
+    let cpu = run_mmx(
+        &[
+            0x0F, 0x6E, 0xC0, 0x0F, 0x62, 0xC0, 0x0F, 0x70, 0xC8, 0x1B, 0xF4,
+        ],
+        0xAAAA_BBBB,
+        0,
+    );
+    // mm0 = 0xAAAABBBB_AAAABBBB → words low→high [BBBB,AAAA,BBBB,AAAA].
+    // pshufw imm 0x1B selects src words [3,2,1,0] → [AAAA,BBBB,AAAA,BBBB]
+    // low→high, i.e. the u64 0xBBBB_AAAA_BBBB_AAAA.
+    assert_eq!(cpu.mmx[1], 0xBBBB_AAAA_BBBB_AAAA);
+}
+
+#[test]
+fn mmx_pinsrw_pextrw_dispatch() {
+    // movd mm0,eax; pinsrw mm0,edx,2; pextrw ebx,mm0,2; hlt
+    // 0F C4 C2 02 = pinsrw mm0, edx, 2 ; 0F C5 D8 02 = pextrw ebx, mm0, 2
+    let cpu = run_mmx(
+        &[
+            0x0F, 0x6E, 0xC0, 0x0F, 0xC4, 0xC2, 0x02, 0x0F, 0xC5, 0xD8, 0x02, 0xF4,
+        ],
+        0,
+        0x0000_CAFE,
+    );
+    // word slot 2 of mm0 set to 0xCAFE, then extracted into ebx.
+    assert_eq!(cpu.mmx[0] >> 32 & 0xFFFF, 0xCAFE);
+    assert_eq!(cpu.read_r32(3), 0xCAFE); // ebx zero-extended
+}
