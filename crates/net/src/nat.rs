@@ -62,6 +62,13 @@ struct Flow {
     established: bool,
 }
 
+/// How a permitted guest connection is opened to the outside world. The
+/// default (native) uses [`crate::relay::spawn`] — a real host socket on a
+/// background thread. A browser build would supply a WebSocket-to-proxy
+/// connector here, and tests supply an in-memory fake; the NAT logic above
+/// is identical for all three.
+pub type Connect = Box<dyn FnMut(Ipv4Addr, u16) -> crate::relay::HostConn>;
+
 /// Host stack for the guest's virtual LAN.
 pub struct NatStack {
     iface: Interface,
@@ -71,12 +78,26 @@ pub struct NatStack {
     dns_handle: SocketHandle,
     guest_ip: Ipv4Addr,
     flows: HashMap<FlowKey, Flow>,
+    connect: Connect,
 }
 
 impl NatStack {
     /// Build the stack on `gw_ip`/`gw_mac`, serving the guest at `guest_ip`.
-    /// `dns` carries the (pre-resolved) name cache + allowlist.
+    /// `dns` carries the (pre-resolved) name cache + allowlist. Permitted
+    /// connections are opened with the native thread+socket relay.
     pub fn new(gw_ip: [u8; 4], gw_mac: [u8; 6], guest_ip: [u8; 4], dns: DnsForwarder) -> Self {
+        Self::with_connect(gw_ip, gw_mac, guest_ip, dns, Box::new(crate::relay::spawn))
+    }
+
+    /// Like [`new`](Self::new) but with a custom connector — a WebSocket
+    /// relay (browser) or an in-memory fake (tests).
+    pub fn with_connect(
+        gw_ip: [u8; 4],
+        gw_mac: [u8; 6],
+        guest_ip: [u8; 4],
+        dns: DnsForwarder,
+        connect: Connect,
+    ) -> Self {
         let mut device = GuestDevice::new();
         let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(gw_mac)));
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
@@ -117,6 +138,7 @@ impl NatStack {
             dns_handle,
             guest_ip: Ipv4Addr::from(guest_ip),
             flows: HashMap::new(),
+            connect,
         }
     }
 
@@ -165,7 +187,7 @@ impl NatStack {
             return;
         }
         let handle = self.sockets.add(sock);
-        let conn = crate::relay::spawn(key.dst_ip, key.dst_port);
+        let conn = (self.connect)(key.dst_ip, key.dst_port);
         self.flows.insert(
             key,
             Flow {
@@ -400,5 +422,105 @@ mod tests {
         assert!(parse_initial_syn(&syn_frame([1, 2, 3, 4], 80, 1, true)).is_none());
         // A short/ARP-ish frame.
         assert!(parse_initial_syn(&[0u8; 30]).is_none());
+    }
+
+    // --- TCP connect gate: deny-by-default at SYN, headless ---
+
+    use crate::relay::HostConn;
+    use crate::Allowlist;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc::sync_channel;
+
+    const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+    const PUBLIC_IP: [u8; 4] = [93, 184, 216, 34]; // example.com, globally routable
+
+    /// A connector that records each (ip, port) it's asked to open and hands
+    /// back dummy (undriven) channels — so a test can see whether the NAT
+    /// decided to connect, without any real socket.
+    fn recording_connect(log: Rc<RefCell<Vec<(Ipv4Addr, u16)>>>) -> Connect {
+        Box::new(move |ip, port| {
+            log.borrow_mut().push((ip, port));
+            let (to_host, _rx) = sync_channel(1);
+            let (_tx, from_host) = sync_channel(1);
+            HostConn { to_host, from_host }
+        })
+    }
+
+    fn dns_with(allow: &str, name: &str, ip: [u8; 4]) -> DnsForwarder {
+        let mut d = DnsForwarder::new([10, 0, 2, 2], GW_MAC, Allowlist::parse(allow));
+        d.cache_resolution(name, &[Ipv4Addr::from(ip)]);
+        d
+    }
+
+    fn nat_with(dns: DnsForwarder, log: Rc<RefCell<Vec<(Ipv4Addr, u16)>>>) -> NatStack {
+        NatStack::with_connect(
+            [10, 0, 2, 2],
+            GW_MAC,
+            [10, 0, 2, 15],
+            dns,
+            recording_connect(log),
+        )
+    }
+
+    #[test]
+    fn syn_to_allowlisted_host_opens_a_flow() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let dns = dns_with(
+            "dl-cdn.alpinelinux.org:80",
+            "dl-cdn.alpinelinux.org",
+            PUBLIC_IP,
+        );
+        let mut nat = nat_with(dns, log.clone());
+        nat.push_guest_frame(syn_frame(PUBLIC_IP, 80, 50000, false));
+        assert_eq!(nat.flow_count(), 1, "flow opened");
+        assert_eq!(
+            *log.borrow(),
+            vec![(Ipv4Addr::from(PUBLIC_IP), 80)],
+            "connected once"
+        );
+    }
+
+    #[test]
+    fn syn_to_non_allowlisted_port_is_denied() {
+        // Name allowlisted on :80; a SYN to :443 must be refused (no flow, no
+        // connect) — the per-port check at connect time.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let dns = dns_with(
+            "dl-cdn.alpinelinux.org:80",
+            "dl-cdn.alpinelinux.org",
+            PUBLIC_IP,
+        );
+        let mut nat = nat_with(dns, log.clone());
+        nat.push_guest_frame(syn_frame(PUBLIC_IP, 443, 50000, false));
+        assert_eq!(nat.flow_count(), 0, "denied → no flow");
+        assert!(log.borrow().is_empty(), "connector never invoked");
+    }
+
+    #[test]
+    fn syn_to_unresolved_ip_is_denied() {
+        // A SYN straight to an IP our DNS never vended (literal-IP escape) is
+        // denied even though the allowlist names a host — closes the bypass.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let dns = dns_with(
+            "dl-cdn.alpinelinux.org:80",
+            "dl-cdn.alpinelinux.org",
+            PUBLIC_IP,
+        );
+        let mut nat = nat_with(dns, log.clone());
+        nat.push_guest_frame(syn_frame([8, 8, 8, 8], 80, 50000, false));
+        assert_eq!(nat.flow_count(), 0, "unknown IP → no flow");
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn empty_allowlist_denies_all_tcp() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        // Empty allowlist → cache_resolution keeps nothing → every SYN denied.
+        let dns = dns_with("", "dl-cdn.alpinelinux.org", PUBLIC_IP);
+        let mut nat = nat_with(dns, log.clone());
+        nat.push_guest_frame(syn_frame(PUBLIC_IP, 80, 50000, false));
+        assert_eq!(nat.flow_count(), 0);
+        assert!(log.borrow().is_empty());
     }
 }
