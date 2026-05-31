@@ -426,6 +426,41 @@ impl WwwVm {
         let bytes = self.inner.drain_output();
         String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    /// Like `run`, but returns as soon as the guest goes idle (blocked
+    /// waiting for an external event such as a NIC frame or a keystroke).
+    /// The browser networking loop uses this so it can feed the guest the
+    /// next inbound frame promptly instead of letting it spin its whole
+    /// budget on the idle HLT.
+    pub fn run_until_idle(&mut self, max: u32) -> u32 {
+        let (steps, stop) = self.inner.run_steps_until_idle(max);
+        if let Stop::CpuError(e) = stop {
+            self.last_error = Some(e.to_string());
+        }
+        steps
+    }
+
+    // --- NIC frame bridge (browser networking) ---
+    //
+    // The guest runs its own TCP/IP over the emulated RTL8139. These expose
+    // the L2 frame stream so a browser host can bridge it to the outside
+    // world — typically by terminating the guest's TCP and relaying through
+    // the WebSocket↔TCP proxy (`crates/proxy`), the same allowlisted path the
+    // native build uses with smoltcp. (Native code does the NAT in-process;
+    // in the browser it lives in JS/WebAssembly above these calls.)
+
+    /// Take the next Ethernet frame the guest transmitted, or `undefined`
+    /// when the TX queue is empty. Call in a loop each tick to drain it.
+    pub fn drain_tx_frame(&mut self) -> Option<Vec<u8>> {
+        self.inner.drain_tx_frames_one()
+    }
+
+    /// Deliver one inbound Ethernet frame (L2, no CRC) to the guest's NIC.
+    /// Returns false if RX is disabled or the ring is full (frame dropped) —
+    /// the caller should retry the same frame on the next tick.
+    pub fn inject_rx_frame(&mut self, frame: &[u8]) -> bool {
+        self.inner.inject_rx_frame(frame)
+    }
 }
 
 impl Default for WwwVm {

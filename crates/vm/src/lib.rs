@@ -2004,6 +2004,12 @@ impl Vm {
         self.io.drain_nic_tx()
     }
 
+    /// Pop a single transmitted frame (oldest first), or None when none are
+    /// queued. For one-frame-at-a-time hosts (the wasm/browser bridge).
+    pub fn drain_tx_frames_one(&mut self) -> Option<Vec<u8>> {
+        self.io.pop_nic_tx()
+    }
+
     /// Deliver one inbound Ethernet frame (L2, no CRC) to the guest's NIC.
     /// The device lays out the RX-ring header and tells us where to DMA it;
     /// we (holding the `Memory`) write the bytes into guest RAM and the

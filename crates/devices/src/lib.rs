@@ -269,6 +269,17 @@ impl IoBus {
         core::mem::take(&mut self.nic_tx_frames)
     }
 
+    /// Pop a single transmitted frame (oldest first), or None if the queue is
+    /// empty — for hosts that consume one frame at a time (the wasm bridge,
+    /// where returning a Vec-of-Vec across the JS boundary is awkward).
+    pub fn pop_nic_tx(&mut self) -> Option<Vec<u8>> {
+        if self.nic_tx_frames.is_empty() {
+            None
+        } else {
+            Some(self.nic_tx_frames.remove(0))
+        }
+    }
+
     pub fn read(&mut self, port: u16) -> u8 {
         // RTL8139 register window — a DYNAMIC range at the I/O base the
         // kernel assigned to BAR0 (in the high I/O range, away from legacy
