@@ -8092,6 +8092,88 @@ fn linux_userspace_milestone() {
     eprintln!("panic exit code seen after {panic_steps} additional steps");
 }
 
+/// Graphics milestone: advertise a linear framebuffer via the boot
+/// protocol's `screen_info` and confirm the kernel's `efifb` binds to
+/// it and `fbcon` renders the console as real RGB pixels — the
+/// foundation for graphics in the browser (the demo blits this same
+/// framebuffer onto a `<canvas>`).
+///
+/// Teeth: (1) the serial log must show efifb claiming *our* advertised
+/// base + dimensions, and the VT switching to the frame buffer device;
+/// (2) the framebuffer region in guest RAM must come back with a
+/// non-trivial number of non-zero pixels (fbcon drew the boot text /
+/// logo). A blank framebuffer would mean efifb bound but nothing
+/// rendered — so we assert on actual pixel content, not just the log.
+#[test]
+#[ignore = "requires /tmp/wwwvm-linux/vmlinuz; boots a real kernel with efifb; ~60s"]
+fn linux_efifb_framebuffer_renders_pixels_milestone() {
+    let path =
+        std::env::var("WWWVM_KERNEL").unwrap_or_else(|_| "/tmp/wwwvm-linux/vmlinuz".to_string());
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {path}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&bytes).expect("load_bzimage");
+    // 800x600x32 console framebuffer (≈100x37 cells with an 8x16 font).
+    vm.enable_linear_framebuffer(800, 600, wwwvm_vm::VIDEO_TYPE_EFI);
+    let cfg = vm.framebuffer_config().expect("fb enabled");
+    eprintln!(
+        "framebuffer: {}x{}x{} @ {:#X} ({} bytes reserved)",
+        cfg.width, cfg.height, cfg.bpp, cfg.base, cfg.size
+    );
+    // console=tty0 routes the console to the VT (→ fbcon → framebuffer)
+    // while console=ttyS0 keeps the boot log on serial for the marker.
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 \
+         lpj=1000000 loglevel=8 ignore_loglevel",
+    );
+    let cpio = build_initramfs_hello();
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    // Wait for the VT to switch to the framebuffer console — printed
+    // once fbcon has taken over fb0 and is rendering text as pixels.
+    let mut cumulative = Vec::<u8>::new();
+    let steps = run_until_marker(
+        &mut vm,
+        b"frame buffer device",
+        16_000_000_000,
+        &mut cumulative,
+    )
+    .unwrap_or_else(|()| {
+        panic!(
+            "no 'frame buffer device' line — efifb did not bind to the \
+             advertised framebuffer; {}",
+            dump_uart_on_failure(&cumulative, "efifb")
+        )
+    });
+    let log = String::from_utf8_lossy(&cumulative);
+    eprintln!("framebuffer console up after {steps} steps");
+    // efifb must have claimed OUR base, not some other region.
+    let base_hex = format!("{:x}", cfg.base);
+    assert!(
+        log.contains("efifb") && log.to_lowercase().contains(&base_hex),
+        "efifb should report our framebuffer base {base_hex}; serial:\n{log}"
+    );
+
+    // Keep stepping briefly so fbcon paints the accumulated boot text,
+    // then confirm the framebuffer actually holds rendered pixels.
+    let _ = vm.run_steps_idle_aware(2_000_000_000);
+    let fb = vm.framebuffer_bytes().expect("fb bytes");
+    let nonzero = fb.iter().filter(|&&b| b != 0).count();
+    eprintln!("framebuffer non-zero bytes: {nonzero} / {}", fb.len());
+    assert!(
+        nonzero > 5_000,
+        "framebuffer should hold rendered pixels (fbcon text); only {nonzero} \
+         non-zero bytes — efifb bound but nothing drew"
+    );
+}
+
 /// Wider-syscall-surface milestone: /init mounts procfs, opens
 /// /proc/version, reads it, and prints it bracketed by markers.
 /// Pins five distinct syscalls — mount (5-arg!), open, read,

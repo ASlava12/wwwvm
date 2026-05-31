@@ -47,8 +47,31 @@ stays usable; the serial console (`console=ttyS0`) streams into the xterm.
   threads, absent in wasm. The frame API is exposed (`drain_tx_frame` /
   `inject_rx_frame`); the WebSocket-relay-to-proxy is the remaining piece
   (see `docs/BROWSER_NET.md`).
-- **Graphics:** text-mode VGA only (the demo's snapshot pane); no pixel
-  framebuffer yet.
+- **Graphics:** **yes — linear framebuffer (efifb) → canvas.** Tick the
+  "Graphics framebuffer" box (on by default) before **Boot Linux**: the demo
+  calls `vm.enable_framebuffer(w, h)`, which advertises a framebuffer via the
+  boot-protocol `screen_info`. The kernel's `efifb` binds to it (no real EFI
+  firmware — just the `screen_info` fields), `fbcon` renders the console as
+  RGB pixels into a reserved region of guest RAM, and the page reads those
+  bytes back (`framebuffer_bytes()`) and blits them onto a `<canvas>`. The
+  default cmdline includes `console=tty0` so the VT (and thus fbcon) gets the
+  boot log. Alpine's `vmlinuz-lts` has only `efifb` built in (legacy `vesafb`
+  was dropped), so the demo uses `VIDEO_TYPE_EFI`. This is text-as-pixels
+  (a graphical console); a true GUI (X/Wayland) additionally needs 2D/DRM
+  devices the kernel can drive.
 
-A Web Worker (to move the VM off the UI thread) and a linear framebuffer for
-true graphics are the next steps.
+Confirm the framebuffer path natively (no browser) against the real Alpine
+kernel:
+
+```
+WWWVM_FB=800x600 WWWVM_FB_PROBE=1 \
+WWWVM_ALPINE_KERNEL=/tmp/wwwvm-alpine/vmlinuz-lts \
+WWWVM_ALPINE_MINIROOT=/tmp/alpine/root \
+  cargo run -p wwwvm-vm --release --example alpine_console
+```
+
+It boots headlessly, waits for fbcon to take over, then prints the efifb log
+line and how many framebuffer bytes are non-zero (pixels fbcon drew).
+
+A Web Worker (to move the VM off the UI thread so boot doesn't freeze the tab)
+is the next step.

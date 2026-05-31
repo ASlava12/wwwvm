@@ -58,7 +58,19 @@
           <br />
           <label>cmdline:
             <input id="cmdline" type="text"
-              value="earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
+              value="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
+          </label>
+          <br />
+          <label>
+            <input type="checkbox" id="fb-enable" checked />
+            Graphics framebuffer (efifb → canvas)
+          </label>
+          <label>res:
+            <select id="fb-res">
+              <option value="800x600">800×600</option>
+              <option value="1024x768">1024×768</option>
+              <option value="640x480">640×480</option>
+            </select>
           </label>
           <br />
           <button id="boot-linux">Boot Linux</button>
@@ -88,6 +100,13 @@
             <input type="file" id="upload" hidden accept=".bin" />
           </div>
           <small id="snapshot-status" class="status">no snapshot saved yet</small>
+        </fieldset>
+
+        <fieldset>
+          <legend>Framebuffer (efifb pixels)</legend>
+          <canvas id="fb" width="800" height="600"
+                  style="width:100%;height:auto;background:#000;image-rendering:pixelated;border:1px solid #30363d"></canvas>
+          <small id="fb-status" class="status">(enable the framebuffer + boot a kernel)</small>
         </fieldset>
 
         <fieldset>

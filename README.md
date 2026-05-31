@@ -207,6 +207,7 @@ ModR/M полный — все 16-битные формы адресации с 
 | PS/2 keyboard            | 0x60/0x64    | 1  | level (rx queue non-empty) |
 | MC146818 CMOS/RTC        | 0x70/0x71    | —  | (alarm IRQ 8 не реализован) |
 | VGA text mode (RAM)      | mem 0xB8000  | —  | — |
+| Linear framebuffer (efifb) | reserved RAM, top of mem | — | screen_info VLFB/EFI |
 | PCI host bridge + RTL8139 NIC | 0xCF8/0xCFC + BAR0 | 11 → slave bit 3 | level (ISR & IMR) |
 
 `IoBus::refresh_irqs` на каждом шаге CPU перекладывает все pending
@@ -258,7 +259,24 @@ per-timer period + length-prefixed device-state блок. `restore`
 
 `WwwVm` через wasm-bindgen экспортирует весь lifecycle Vm плюс
 `snapshot/restore` (как `Vec<u8>` / `&[u8]`) и `vga_text_snapshot()`.
+Для графики — `enable_framebuffer(w,h)` (efifb) + `framebuffer_bytes()`
+/ `framebuffer_width/height/stride()`: демо блитит пиксели на canvas.
 Ошибки CPU surface как `last_error: Option<String>`.
+
+**Графика — линейный framebuffer (efifb).** `Vm::enable_linear_framebuffer`
+резервирует регион RAM наверху памяти и прописывает в boot-protocol
+`screen_info` (`lfb_base/size/width/height/depth/linelength` + RGB-поля,
+`orig_video_isVGA` = `VIDEO_TYPE_EFI` 0x70 для efifb или `VIDEO_TYPE_VLFB`
+0x23 для vesafb). Ядро биндит efifb/vesafb прямо из `screen_info` (без
+настоящего VESA BIOS / EFI firmware), fbcon рисует консоль пикселями в
+этот регион, а хост читает байты обратно (`framebuffer_bytes()`) и блитит
+на `<canvas>`. У Alpine `vmlinuz-lts` встроен только efifb (vesafb выпилен),
+поэтому дефолт — EFI. `start_protected_mode_at` заодно строит чистую
+zero-page (зануляет `boot_params[0..0x1F1]` — как настоящий загрузчик,
+вместо verbatim-копии boot-сектора) и вырезает регион FB из e820 как
+reserved. Teeth: `linux_efifb_framebuffer_renders_pixels_milestone`
+(efifb биндится к нашему base + 230 KB ненулевых пикселей на Tinycore;
+на Alpine — `WWWVM_FB=800x600 WWWVM_FB_PROBE=1` в `alpine_console`).
 
 ### Сеть (`crates/proxy`)
 
@@ -274,7 +292,9 @@ WebSocket, первое сообщение JSON `{"host","port"}`, дальше 
 - `window.runCommand(text) -> Promise<string>` для DevTools;
 - **Save/Load** через IndexedDB (`storage.js`);
 - **Download .bin / Upload .bin** — портативный экспорт-импорт;
-- pane с VGA-snapshot 80×25.
+- **Boot Linux / Alpine** — пикеры bzImage + initramfs, чекбокс
+  «Graphics framebuffer (efifb → canvas)» + выбор разрешения;
+- pane с VGA-snapshot 80×25 + **canvas с efifb-пикселями** (fbcon).
 
 ### Качество
 
@@ -1331,7 +1351,7 @@ workload (RES_0→RES_8414). Затрагивает ЛЮБОЙ FP-код, гру
 | IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
 | HPET таймер-IRQ / реалистичный PIT-тайминг | малый | LAPIC периодический таймер уже доставляет; HPET — только probe-stub без доставки. Linux в большинстве конфигов берёт LAPIC, так что HPET-доставка — second-tier. |
 | ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
-| VGA graphics, framebuffer | средний | fbcon, графические гости |
+| ✅ **РЕШЕНО (31 мая 2026)** — VGA graphics, framebuffer | — | `Vm::enable_linear_framebuffer` прописывает boot-protocol `screen_info` (efifb/vesafb) + резервирует регион RAM в e820; ядро биндит efifb прямо из `screen_info` (без VESA BIOS/EFI firmware), fbcon рисует консоль пикселями, хост читает байты обратно и блитит на `<canvas>`. Teeth: `linux_efifb_framebuffer_renders_pixels_milestone` (efifb клеймит наш base, 230 KB ненулевых пикселей). У Alpine `vmlinuz-lts` встроен только efifb (vesafb выпилен) → дефолт EFI; для true-GUI (X/Wayland) ещё нужны 2D/DRM-устройства. |
 | ✅ **РЕШЕНО (30 мая 2026)** — boot stall при /init size {213,600,602} | — | Старое: на прежнем ядре /init размером ровно 213/600/602 байт хэнгался в pata_legacy probe loop, не доходя до `Run /init as init process`. **Re-тест 30 мая (`linux_userspace_bad_init_sizes_diag`): все три размера ГРУЗЯТСЯ чисто** (HELLO на 2.1 B шагов каждый) на Tinycore 15.x kernel'е — с недавними CPU-фиксами (reg-rollback-on-fault, far-call-width). Stall больше не воспроизводится. `KNOWN_BAD_INIT_SIZES` опустошён (dodge в `make_init_elf32_safe` стал no-op passthrough, готов к ре-армингу если размер когда-нибудь регрессирует); `bad_init_sizes_diag` оставлен как regression-guard. Вероятно тот же класс багов (faulting-instruction reg corruption / far-call), что чинились для ld.so, проявлялся в pata_legacy probe при определённых раскладках памяти. |
 | ✅ **ИСПРАВЛЕНО (29 мая 2026)** — `sys_rt_sigreturn` «segfault'ил» после handler return (это был **баг теста**, не эмулятора) | — | Записывалось как «sigreturn segfault'ит, exitcode=0x0b». Расследование 29 мая 2026 (через сырой дамп signal frame'а — `linux_userspace_sigframe_dump_diag`) показало: **эмулятор всё делает правильно**, баг был в тесте. Дамп frame'а доказал, что kernel'ский `setup_rt_frame` корректно сохранил ВЕСЬ контекст: pretcode=restorer, sig=10, saved eip=0x0804808a, esp=0xbf9cd6f0, ebx=1 (pid init), ecx=10, eax=0 (kill ret), cs=0x73, eflags=0x244, ss=0x7b — всё на месте. НО layout оказался **legacy `sigframe`** (sigcontext сразу после `sig`, на offset +8), а НЕ `rt_sigframe`. Причина: handler регистрировался с `sa_flags = SA_RESTORER` БЕЗ `SA_SIGINFO`, поэтому kernel строит legacy frame; а наш restorer звал `rt_sigreturn(173)`, который читает `uc.uc_mcontext` с offset'а rt-frame'а (+164) — в legacy frame'е там нули → restore'ится eip=0/esp=0 → `segfault at 0 ip 0 sp 0` → SIGSEGV. **Фикс:** выставить `SA_SIGINFO` (`sa_flags = 0x04000004`), чтобы kernel построил rt_sigframe, совпадающий с rt_sigreturn-restorer'ом (так и делает glibc: `__restore_rt` для SA_SIGINFO, `__restore` для legacy). После фикса полный round-trip работает: HANDLER → ret → restorer → rt_sigreturn → main resume'ит → `[USERSPACE DONE]` → clean exit (exitcode=0). **Регрессионный guard:** `linux_userspace_sigreturn_milestone` (asserts handler ran + НЕ segv + DONE). Reentrant signal handlers (shell job control, Ctrl-C resume) теперь работают. |
 | ✅ **ИСПРАВЛЕНО (29 мая 2026)** — `copy_to_user` в нетронутую user-страницу терял данные (был: «`sys_pipe2` populate fd-пары layout-зависим») | — | **Root cause (CPU-баг, не kernel и не layout):** прошлая гипотеза «layout/address-зависимая аномалия» оказалась НЕВЕРНОЙ. Реальная причина в эмуляторе CPU. `copy_to_user` ядра делает `rep movsl`; когда destination — свежая COW / demand-zero user-страница, **первая** запись брала #PF. Модель page-fault'а в `step()` дописывает faulting-доступ как запись в физический 0, ставит `pending_fault`, и на следующем шаге диспатчит #PF, перематывая EIP на `last_op_ip` (чтобы инструкция переисполнилась после IRETD). **Но REP-цикл не откатывал частичную итерацию**: он гнал ECX→0, записывая всё в phys 0, и только потом ловил #PF. Перемотанный retry находил ECX==0 → копировал НОЛЬ байт. Итог: `pipe2` возвращал 0, но `fds` оставались `[0,0]`; round-trip молча падал (fd 0 = bidirectional /dev/console → read блокировался). **Подтверждение:** pre-touch эксперимент (записать байт в fds-страницу ДО pipe2, сделав её present) чинил populate → fds=[3,4], BUF="PIPE". **Фикс** (`crates/cpu/src/lib.rs`): и в REP-цикле, и в single-shot string-op пути снимаем снапшот ESI/EDI перед итерацией; если после `step_string` выставлен `pending_fault` — восстанавливаем ESI/EDI и выходим из цикла **до** декремента ECX. После того как #PF-handler (`do_wp_page`) маппит страницу, IRETD возвращается в тот же REP с тем же ECX и докопирует данные. Затрагивает ВСЕ пути через `copy_to_user`/`copy_from_user`/`memcpy`/`memset` в faulting-страницы. **Регрессионный guard:** `linux_userspace_pipe_milestone` (полный round-trip pipe2→write→read, asserts fds=[3,4], write=4, read=4, BUF="PIPE"). Диагностики оставлены: `linux_userspace_pipe_diag` + `linux_userspace_pipe_rt_diag`. |

@@ -28,6 +28,13 @@ pub const VGA_TEXT_BASE: u32 = 0xB8000;
 pub const VGA_TEXT_COLS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
 
+/// `screen_info.orig_video_isVGA` values from the Linux boot protocol
+/// (`<uapi/linux/screen_info.h>`). A linear framebuffer is advertised
+/// with one of these; the matching driver (`efifb` / `vesafb`) then
+/// binds off the `lfb_*` fields without any real firmware.
+pub const VIDEO_TYPE_VLFB: u8 = 0x23; // VESA VGA in graphic mode → vesafb
+pub const VIDEO_TYPE_EFI: u8 = 0x70; // EFI graphic mode → efifb
+
 /// BIOS Data Area cursor location for active page 0:
 /// linear `0x450` = column, `0x451` = row. Real BIOS keeps all 8
 /// pages in `0x450..0x460` (2 bytes each); we just touch page 0
@@ -953,12 +960,41 @@ pub enum Stop {
     CpuError(CpuError),
 }
 
+/// A linear framebuffer advertised to the guest kernel via the Linux
+/// boot-protocol `screen_info` (part of `boot_params`). The "device"
+/// is just a reserved region of guest RAM: the kernel's framebuffer
+/// driver (efifb / vesafb) maps `base` and draws RGB pixels there, and
+/// the host reads those bytes back out ([`Vm::framebuffer_bytes`]) to
+/// blit onto a canvas. No real VESA BIOS or EFI firmware is involved —
+/// `screen_info` alone is enough for `efifb`/`vesafb` to bind.
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferConfig {
+    /// Physical base address of the framebuffer in guest RAM (also the
+    /// `screen_info.lfb_base` we hand the kernel). E820-reserved.
+    pub base: u32,
+    /// Reserved byte span at `base` (`>= stride * height`, page-rounded).
+    pub size: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per scanline (`width * 4` for our 32bpp layout).
+    pub stride: u32,
+    /// Bits per pixel (always 32 here: little-endian B,G,R,X bytes).
+    pub bpp: u8,
+    /// `screen_info.orig_video_isVGA` — [`VIDEO_TYPE_EFI`] (efifb) or
+    /// [`VIDEO_TYPE_VLFB`] (vesafb). Alpine's `vmlinuz-lts` only has
+    /// efifb built in, so EFI is the default.
+    pub video_type: u8,
+}
+
 pub struct Vm {
     cpu: Cpu,
     mem: Memory,
     io: IoBus,
     autorun: Vec<u8>,
     booted: bool,
+    /// `Some` once [`Vm::enable_linear_framebuffer`] is called; drives
+    /// the `screen_info` + e820 reservation in [`start_protected_mode_at`].
+    fb: Option<FramebufferConfig>,
 }
 
 impl Default for Vm {
@@ -989,6 +1025,7 @@ impl Vm {
             io: IoBus::new(),
             autorun: Vec::new(),
             booted: false,
+            fb: None,
         }
     }
 
@@ -1689,6 +1726,58 @@ impl Vm {
     /// memory. We seed it to 0x7C00 (the historic bootloader
     /// scratch address, below the bzImage setup block at 0x90000
     /// and well above anything the kernel writes).
+    /// Reserve a linear framebuffer in guest RAM and advertise it to
+    /// the kernel via `screen_info`, so `efifb` (or `vesafb`) binds and
+    /// fbcon renders the text console as real RGB pixels. Call before
+    /// [`start_protected_mode_at`], which writes the `screen_info`
+    /// fields and carves the region out of the e820 map as reserved
+    /// (so neither the page allocator nor the fb driver's
+    /// `request_mem_region` hands it out twice).
+    ///
+    /// The framebuffer is 32 bits-per-pixel, byte order B,G,R,X (the
+    /// efifb default): pixel `u32 = red<<16 | green<<8 | blue`. It is
+    /// placed at the top of RAM, page-aligned; give the VM enough RAM
+    /// that the region sits well above the kernel + initramfs (256 MiB
+    /// is plenty for any console resolution). `video_type` selects the
+    /// driver — [`VIDEO_TYPE_EFI`] (efifb; the only built-in fb driver
+    /// in Alpine's `vmlinuz-lts`) or [`VIDEO_TYPE_VLFB`] (vesafb).
+    pub fn enable_linear_framebuffer(&mut self, width: u32, height: u32, video_type: u8) {
+        let bpp = 32u8;
+        let stride = width.saturating_mul(4);
+        let raw = stride.saturating_mul(height);
+        let size = (raw + 0xFFF) & !0xFFF; // page-round the reservation
+        let ram = self.mem.size() as u32;
+        let base = ram.saturating_sub(size) & !0xFFF; // top of RAM, page-aligned
+        self.fb = Some(FramebufferConfig {
+            base,
+            size,
+            width,
+            height,
+            stride,
+            bpp,
+            video_type,
+        });
+    }
+
+    /// The linear framebuffer's geometry, once
+    /// [`enable_linear_framebuffer`] has run (else `None`).
+    pub fn framebuffer_config(&self) -> Option<FramebufferConfig> {
+        self.fb
+    }
+
+    /// Copy the framebuffer's current pixels out of guest RAM —
+    /// `stride * height` bytes in the 32bpp B,G,R,X layout — or `None`
+    /// if no framebuffer is enabled. Callers (canvas blit) byte-swap
+    /// B,G,R,X → R,G,B,A as needed.
+    pub fn framebuffer_bytes(&self) -> Option<Vec<u8>> {
+        let fb = self.fb?;
+        let start = fb.base as usize;
+        let len = (fb.stride as usize) * (fb.height as usize);
+        let ram = self.mem.as_slice();
+        let end = (start + len).min(ram.len());
+        Some(ram[start..end].to_vec())
+    }
+
     pub fn start_protected_mode_at(&mut self, entry: u32) {
         // Flat-segments GDT: null + ring-0 code + ring-0 data, all
         // base 0 / limit 4 GiB. Placed at 0x500 (between the BIOS
@@ -1727,28 +1816,77 @@ impl Vm {
         self.cpu.write_r32(wwwvm_cpu::r16::SP as u8, 0x0000_7C00);
         // Protocol §4.1: interrupts must be disabled at entry.
         self.cpu.flags &= !wwwvm_cpu::flag::IF;
-        // Populate boot_params.e820_table with a memory map that
-        // covers our entire RAM. Without this Linux's early-init
-        // memblock_alloc_node_data() sees zero usable RAM and
-        // panics with "Failed to allocate %ld bytes for node %d
-        // memory map". The BIOS INT 0x15 E820 shim only matters
-        // for real-mode setup; a PM-direct entry never runs that.
-        //
-        // Layout: 0x0..0x9FC00 usable (DOS/conventional), 0x9FC00..
-        // 0xA0000 reserved (EBDA), 0xA0000..0x100000 reserved
-        // (video + BIOS ROM), 0x100000..ram_size usable (extended
-        // memory holding the kernel + everything past 1 MiB).
-        // 3 entries fit inside boot_params at offsets 0x1E8 (count)
-        // and 0x2D0 (table). Each entry is 20 bytes packed.
         let bp = 0x9_0000u32;
         const OFF_E820_ENTRIES: u32 = 0x1E8;
         const OFF_E820_TABLE: u32 = 0x2D0;
+
+        // Build a clean zero page. `load_bzimage` copies the whole
+        // setup blob (boot sector + setup) verbatim to 0x90000, so
+        // boot_params[0..0x1F1] — the pre-header region holding
+        // screen_info, the legacy hd*_info, and the sentinel — still
+        // contains the bzImage's boot-sector stub bytes. A real
+        // bootloader hands the kernel a *zeroed* page with only the
+        // setup header (0x1F1+) populated. Match that: zero everything
+        // before the setup header so screen_info starts clean (we fill
+        // it below) and the sentinel reads 0 ("all fields initialized").
+        self.mem.write_slice(bp, &[0u8; 0x1F1]);
+
+        // Advertise a linear framebuffer in screen_info if one was
+        // enabled (field offsets per struct screen_info,
+        // <uapi/linux/screen_info.h>). The kernel's efifb/vesafb binds
+        // off these and fbcon then renders the console as RGB pixels
+        // into the reserved region carved out of e820 just below.
+        if let Some(fb) = self.fb {
+            self.mem.write_u8(bp + 0x0F, fb.video_type); // orig_video_isVGA
+            self.mem.write_u16(bp + 0x12, fb.width as u16); // lfb_width
+            self.mem.write_u16(bp + 0x14, fb.height as u16); // lfb_height
+            self.mem.write_u16(bp + 0x16, fb.bpp as u16); // lfb_depth
+            self.mem.write_u32(bp + 0x18, fb.base); // lfb_base
+            self.mem.write_u32(bp + 0x1C, fb.size); // lfb_size (bytes)
+            self.mem.write_u16(bp + 0x24, fb.stride as u16); // lfb_linelength
+            self.mem.write_u8(bp + 0x26, 8); // red_size (32bpp B,G,R,X: pixel = R<<16|G<<8|B)
+            self.mem.write_u8(bp + 0x27, 16); // red_pos
+            self.mem.write_u8(bp + 0x28, 8); // green_size
+            self.mem.write_u8(bp + 0x29, 8); // green_pos
+            self.mem.write_u8(bp + 0x2A, 8); // blue_size
+            self.mem.write_u8(bp + 0x2B, 0); // blue_pos
+            self.mem.write_u8(bp + 0x2C, 8); // rsvd_size
+            self.mem.write_u8(bp + 0x2D, 24); // rsvd_pos
+        }
+
+        // Populate boot_params.e820_table with a memory map that
+        // covers our entire RAM. Without this Linux's early-init
+        // memblock_alloc_node_data() sees zero usable RAM and panics
+        // with "Failed to allocate %ld bytes for node %d memory map".
+        // The BIOS INT 0x15 E820 shim only matters for real-mode
+        // setup; a PM-direct entry never runs that.
+        //
+        // Layout: 0x0..0x9FC00 usable (DOS/conventional), 0x9FC00..
+        // 0x100000 reserved (EBDA + video + BIOS ROM), 0x100000..
+        // ram_size usable (extended memory holding the kernel +
+        // everything past 1 MiB). When a framebuffer is enabled, the
+        // reserved fb region splits that last usable span so neither
+        // the page allocator nor the fb driver's request_mem_region
+        // can hand it out twice. Each entry is 20 bytes packed; up to
+        // 128 fit in boot_params.
         let ram_size = self.mem.size() as u64;
-        let entries: [(u64, u64, u32); 3] = [
+        let mut entries: Vec<(u64, u64, u32)> = vec![
             (0x0000_0000, 0x0009_FC00, 1), // usable conventional
             (0x0009_FC00, 0x0006_0400, 2), // reserved BIOS / video
-            (0x0010_0000, ram_size.saturating_sub(0x10_0000), 1),
         ];
+        match self.fb {
+            Some(fb) if (fb.base as u64) > 0x0010_0000 => {
+                let fb_base = fb.base as u64;
+                let fb_size = fb.size as u64;
+                entries.push((0x0010_0000, fb_base - 0x0010_0000, 1)); // usable
+                entries.push((fb_base, fb_size, 2)); // reserved framebuffer
+                let tail = fb_base + fb_size;
+                if tail < ram_size {
+                    entries.push((tail, ram_size - tail, 1)); // usable tail
+                }
+            }
+            _ => entries.push((0x0010_0000, ram_size.saturating_sub(0x10_0000), 1)),
+        }
         self.mem
             .write_u8(bp + OFF_E820_ENTRIES, entries.len() as u8);
         for (i, (base, size, kind)) in entries.iter().enumerate() {

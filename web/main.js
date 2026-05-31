@@ -47,6 +47,50 @@ const outputListeners = new Set();
 let stepBudget = 50_000;
 let idleAware = false;
 const hex = (v, w = 8) => v.toString(16).padStart(w, "0").toUpperCase();
+
+// Framebuffer → canvas blitter. The guest's efifb draws 32bpp pixels
+// (little-endian B,G,R,X) into a reserved region of guest RAM; we copy
+// them out and swap to the canvas's R,G,B,A byte order. Throttled —
+// the console repaints rarely and the copy is ~2 MiB — and only after
+// the kernel has actually brought up the framebuffer.
+let fbFrame = 0;
+const FB_EVERY = 6; // blit roughly every 6th animation frame
+let fbImage = null;
+function blitFramebuffer() {
+  if (!vm.has_framebuffer || !vm.has_framebuffer()) return;
+  const w = vm.framebuffer_width();
+  const h = vm.framebuffer_height();
+  const stride = vm.framebuffer_stride();
+  if (!w || !h) return;
+  const bytes = vm.framebuffer_bytes();
+  if (bytes.length < stride * h) return;
+  const cv = $("fb");
+  if (cv.width !== w || cv.height !== h) {
+    cv.width = w;
+    cv.height = h;
+    fbImage = null;
+  }
+  const ctx = cv.getContext("2d");
+  if (!fbImage || fbImage.width !== w || fbImage.height !== h) {
+    fbImage = ctx.createImageData(w, h);
+  }
+  const out = fbImage.data;
+  for (let y = 0; y < h; y++) {
+    let si = y * stride;
+    let di = y * w * 4;
+    for (let x = 0; x < w; x++) {
+      out[di] = bytes[si + 2]; // R
+      out[di + 1] = bytes[si + 1]; // G
+      out[di + 2] = bytes[si]; // B
+      out[di + 3] = 255; // A (ignore X)
+      si += 4;
+      di += 4;
+    }
+  }
+  ctx.putImageData(fbImage, 0, 0);
+  const fbStatus = $("fb-status");
+  if (fbStatus) fbStatus.textContent = `${w}×${h}×32 efifb — live`;
+}
 function pump() {
   const steps = idleAware ? vm.run_idle_aware(stepBudget) : vm.run(stepBudget);
   const out = vm.read_output();
@@ -83,6 +127,8 @@ function pump() {
   if (vga.trim().length > 0) {
     $("vga").textContent = vga;
   }
+  // Repaint the framebuffer canvas every few frames (cheap throttle).
+  if (++fbFrame % FB_EVERY === 0) blitFramebuffer();
   if (vm.is_halted()) {
     setStatus("halted", "");
     return;
@@ -159,6 +205,19 @@ $("boot-linux").addEventListener("click", async () => {
     const entry = vm.load_bzimage(kbytes);
     vm.set_kernel_cmdline($("cmdline").value);
     if (ibytes) vm.set_ramdisk(ibytes);
+    // Advertise a linear framebuffer so the kernel's efifb binds and
+    // fbcon renders the console as pixels (needs `console=tty0` on the
+    // cmdline, which the default value includes). Enable BEFORE the PM
+    // hand-off, which writes screen_info + reserves the e820 region.
+    if ($("fb-enable").checked) {
+      const [fbw, fbh] = ($("fb-res").value || "800x600").split("x").map(Number);
+      vm.enable_framebuffer(fbw, fbh);
+      const cv = $("fb");
+      cv.width = fbw;
+      cv.height = fbh;
+      fbImage = null;
+      $("fb-status").textContent = `${fbw}×${fbh}×32 efifb — waiting for kernel…`;
+    }
     vm.start_protected_mode_at(entry); // sets booted=true itself
 
     idleAware = true;

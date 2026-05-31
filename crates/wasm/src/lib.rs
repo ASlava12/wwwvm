@@ -142,6 +142,45 @@ impl WwwVm {
         self.inner.start_protected_mode_at(entry);
     }
 
+    /// Advertise a linear framebuffer to the kernel (efifb) so fbcon
+    /// renders the console as real RGB pixels — call before
+    /// `start_protected_mode_at`. Pair with `console=tty0` on the
+    /// cmdline so the VT (and thus fbcon) gets the boot log. The host
+    /// reads pixels back with `framebuffer_bytes()` and blits onto a
+    /// canvas. 32bpp, 800x600 ≈ 100x37 text cells; pick dims that fit
+    /// the VM's RAM near the top (256 MiB is plenty).
+    pub fn enable_framebuffer(&mut self, width: u32, height: u32) {
+        self.inner
+            .enable_linear_framebuffer(width, height, wwwvm_vm::VIDEO_TYPE_EFI);
+    }
+
+    /// Whether a framebuffer has been enabled.
+    pub fn has_framebuffer(&self) -> bool {
+        self.inner.framebuffer_config().is_some()
+    }
+
+    /// Framebuffer width in pixels (0 if none enabled).
+    pub fn framebuffer_width(&self) -> u32 {
+        self.inner.framebuffer_config().map_or(0, |c| c.width)
+    }
+
+    /// Framebuffer height in pixels (0 if none enabled).
+    pub fn framebuffer_height(&self) -> u32 {
+        self.inner.framebuffer_config().map_or(0, |c| c.height)
+    }
+
+    /// Bytes per framebuffer scanline (`width * 4`; 0 if none).
+    pub fn framebuffer_stride(&self) -> u32 {
+        self.inner.framebuffer_config().map_or(0, |c| c.stride)
+    }
+
+    /// Snapshot the framebuffer pixels (32bpp, little-endian B,G,R,X;
+    /// `stride * height` bytes). Empty when no framebuffer is enabled.
+    /// The canvas blitter swaps B,G,R,X → R,G,B,A.
+    pub fn framebuffer_bytes(&self) -> Vec<u8> {
+        self.inner.framebuffer_bytes().unwrap_or_default()
+    }
+
     /// Write an IVT entry. Vector `v` lives at linear `v*4`. Use this
     /// from JS to install an interrupt handler without emitting MOV
     /// WORD instructions in the guest.

@@ -147,9 +147,72 @@ fn main() {
     let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
     vm.set_cmos_time_from_host(); // so the guest's `date` is the real time
     let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
-    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4");
+    // WWWVM_FB=WxH (e.g. 800x600) advertises a linear framebuffer so the
+    // kernel's efifb binds and fbcon renders the console as pixels — the
+    // same path the browser demo uses. Adds console=tty0 so the VT (→
+    // fbcon) gets the boot log. Off by default (serial-only).
+    let fb = std::env::var("WWWVM_FB").ok().and_then(|s| {
+        let (w, h) = s.split_once('x')?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    if let Some((w, h)) = fb {
+        vm.enable_linear_framebuffer(w, h, wwwvm_vm::VIDEO_TYPE_EFI);
+        vm.set_kernel_cmdline(
+            "earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4",
+        );
+        eprintln!("[wwwvm] framebuffer {w}x{h}x32 enabled (efifb)");
+    } else {
+        vm.set_kernel_cmdline(
+            "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4",
+        );
+    }
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
+
+    // WWWVM_FB_PROBE=1 (with WWWVM_FB) is a non-interactive teeth-check:
+    // boot headlessly, wait for fbcon to take over the framebuffer, then
+    // report the efifb log line + how many framebuffer bytes are non-zero
+    // (proof the kernel rendered pixels), and exit. Lets us confirm
+    // Alpine's efifb binds without a browser.
+    if fb.is_some() && std::env::var_os("WWWVM_FB_PROBE").is_some() {
+        let mut log: Vec<u8> = Vec::new();
+        let mut total = 0u64;
+        let budget = 8_000_000_000u64;
+        while total < budget {
+            let (s, _) = vm.run_steps_idle_aware(20_000_000);
+            total += s as u64;
+            log.extend_from_slice(&vm.drain_output());
+            if log.windows(19).any(|w| w == b"frame buffer device") {
+                break;
+            }
+        }
+        // Let fbcon paint the accumulated text.
+        let _ = vm.run_steps_idle_aware(1_000_000_000);
+        let px = vm.framebuffer_bytes().unwrap_or_default();
+        let nonzero = px.iter().filter(|&&b| b != 0).count();
+        let text = String::from_utf8_lossy(&log);
+        let efifb_line = text
+            .lines()
+            .find(|l| l.contains("efifb") && l.contains("framebuffer at"))
+            .unwrap_or("(no efifb 'framebuffer at' line)");
+        eprintln!("[wwwvm] FB PROBE after {total} steps:");
+        eprintln!("[wwwvm]   {efifb_line}");
+        eprintln!(
+            "[wwwvm]   framebuffer non-zero bytes: {nonzero} / {} ({}%)",
+            px.len(),
+            if px.is_empty() {
+                0
+            } else {
+                nonzero * 100 / px.len()
+            }
+        );
+        if nonzero > 5_000 {
+            eprintln!("[wwwvm]   RESULT: efifb rendered pixels — graphics works on Alpine ✓");
+        } else {
+            eprintln!("[wwwvm]   RESULT: framebuffer is (near-)blank — efifb did NOT render ✗");
+        }
+        return;
+    }
 
     eprintln!(
         "[wwwvm] booting Alpine (vmlinuz-lts + full minirootfs)… (~30-60s, then a musl shell)"
