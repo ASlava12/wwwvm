@@ -79,9 +79,14 @@ pub struct IoBus {
     pub rtl8139: Rtl8139,
     /// Ethernet frames the guest transmitted, copied out of guest RAM by
     /// the CPU step's bus-master TX service. The host (run loop / bridge)
-    /// drains this with `drain_nic_tx`. Ephemeral — not snapshotted.
-    nic_tx_frames: Vec<Vec<u8>>,
+    /// drains this with `drain_nic_tx`. Ephemeral — not snapshotted. Capped
+    /// (drop-oldest, like a real NIC's TX-overrun) so an embedder that
+    /// forgets to drain can't grow host memory without bound.
+    nic_tx_frames: std::collections::VecDeque<Vec<u8>>,
 }
+
+/// Max buffered guest TX frames before we drop the oldest (TX overrun).
+const NIC_TX_CAP: usize = 1024;
 
 impl IoBus {
     /// Convenience accessor for code paths (the BIOS shim, the
@@ -111,7 +116,7 @@ impl IoBus {
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
             rtl8139: Rtl8139::new(),
-            nic_tx_frames: Vec::new(),
+            nic_tx_frames: std::collections::VecDeque::new(),
             pit_div_counter: 0,
         }
     }
@@ -130,7 +135,7 @@ impl IoBus {
             ata2: Ata::with_port_base(SECONDARY_PORT_BASE),
             pci: Pci::new(),
             rtl8139: Rtl8139::new(),
-            nic_tx_frames: Vec::new(),
+            nic_tx_frames: std::collections::VecDeque::new(),
             pit_div_counter: 0,
         }
     }
@@ -258,26 +263,27 @@ impl IoBus {
     }
 
     /// Store one Ethernet frame copied out of guest RAM, ready for the
-    /// host bridge to pick up with `drain_nic_tx`.
+    /// host bridge to pick up with `drain_nic_tx`. Drops the oldest frame if
+    /// the queue is at `NIC_TX_CAP` (TX overrun — a real NIC drops too) so an
+    /// embedder that never drains can't grow host memory without bound.
     pub fn record_nic_tx_frame(&mut self, frame: Vec<u8>) {
-        self.nic_tx_frames.push(frame);
+        if self.nic_tx_frames.len() >= NIC_TX_CAP {
+            self.nic_tx_frames.pop_front();
+        }
+        self.nic_tx_frames.push_back(frame);
     }
 
     /// Take every Ethernet frame the guest has transmitted since the last
     /// drain. The host networking bridge calls this each run-loop batch.
     pub fn drain_nic_tx(&mut self) -> Vec<Vec<u8>> {
-        core::mem::take(&mut self.nic_tx_frames)
+        self.nic_tx_frames.drain(..).collect()
     }
 
     /// Pop a single transmitted frame (oldest first), or None if the queue is
     /// empty — for hosts that consume one frame at a time (the wasm bridge,
-    /// where returning a Vec-of-Vec across the JS boundary is awkward).
+    /// where returning a Vec-of-Vec across the JS boundary is awkward). O(1).
     pub fn pop_nic_tx(&mut self) -> Option<Vec<u8>> {
-        if self.nic_tx_frames.is_empty() {
-            None
-        } else {
-            Some(self.nic_tx_frames.remove(0))
-        }
+        self.nic_tx_frames.pop_front()
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
