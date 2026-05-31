@@ -1561,11 +1561,23 @@ cargo test -p wwwvm-vm --release --test linux_userspace \
   allowlist'у открываем реальный host-сокет к destination, шлём байты
   (TLS остался бы end-to-end). `wget` тянет полный APKINDEX (485109 байт).
 - **MMX** ✅ — `apk` (libcrypto) использует MMX (x86-32 baseline без SSE2):
-  реализованы mm0-7 + MOVD/MOVQ/PXOR/PADD/PMULUDQ/сдвиги/… → RSA-подпись
-  проверяется. Всё через allowlist (`WWWVM_PROXY_ALLOWLIST`,
-  deny-by-default, `*` в проде нельзя).
-- **Осталось** — `apk add <pkg>` (полная установка из сети); HTTPS (Phase D:
-  CA-bundle в cpio + https-репозитории; relay уже прозрачный).
+  реализованы mm0-7 + MOVD/MOVQ/PXOR/PADD/PMULUDQ/PSHUFW/PUNPCK/PACK/
+  PINSRW/сдвиги/… → и RSA-подпись, и TLS-хеши считаются.
+- **`apk add tree` ✅** — ставится из сети и запускается (`tree v2.2.1`,
+  «OK: 6 MiB in 16 packages»). Turnkey: при `WWWVM_NET_STUB=1` гость
+  настраивается сам (модули/IP/маршрут/resolv.conf), достаточно
+  `apk update`/`apk add`.
+- **HTTPS (Phase D) ✅** — `apk update`/`apk add` поверх **https://** тоже
+  работают: TLS терминируется В ГОСТЕ против настоящего сертификата
+  Let's Encrypt, relay гоняет только шифртекст → **end-to-end, без MITM**.
+  CA-бандл уже есть в minirootfs. Всё через allowlist
+  (`WWWVM_PROXY_ALLOWLIST`, deny-by-default, `*` в проде нельзя).
+- **Браузер** — нативный мост (`crates/net`) использует std-сокеты/потоки,
+  которых в wasm нет, поэтому в браузере сеть пока НЕ работает. Заложен
+  фундамент: `crates/wasm` экспонирует кадры NIC
+  (`drain_tx_frame`/`inject_rx_frame`/`run_until_idle`); осталось собрать
+  браузерный мост (smoltcp-NAT в wasm + WebSocket-relay к `crates/proxy`) —
+  см. `docs/BROWSER_NET.md`.
 
 **Бит-точность 64-битного ALU (sha512):**
 
