@@ -25,7 +25,10 @@ term.open($("terminal"));
 term.writeln("\x1b[90m(boot the VM to start)\x1b[0m");
 
 await init();
-const vm = new WwwVm();
+// `vm` is reassignable: the Linux/Alpine boot path swaps in a fresh
+// larger-RAM instance. Closures below capture this module-scoped binding,
+// so they always see the current VM.
+let vm = new WwwVm();
 window.__wwwvm = vm;
 
 // Forward terminal keystrokes to the guest UART.
@@ -37,10 +40,15 @@ term.onData((data) => {
 
 let rafHandle = 0;
 const outputListeners = new Set();
+// Per-frame step budget + stepping mode. The tiny built-in guests use a
+// small polling budget with the HLT-terminal `run`; booting a real kernel
+// (Linux/Alpine) needs the idle-aware stepper (Linux idles on HLT all
+// through boot) and a much larger budget so it makes progress per frame.
+let stepBudget = 50_000;
+let idleAware = false;
 const hex = (v, w = 8) => v.toString(16).padStart(w, "0").toUpperCase();
 function pump() {
-  // Each frame: budget for ~50k CPU steps, then read output.
-  const steps = vm.run(50_000);
+  const steps = idleAware ? vm.run_idle_aware(stepBudget) : vm.run(stepBudget);
   const out = vm.read_output();
   if (out) {
     term.write(out);
@@ -85,6 +93,9 @@ function pump() {
 $("boot").addEventListener("click", () => {
   if (rafHandle) cancelAnimationFrame(rafHandle);
   term.reset();
+  // Built-in demos use the small HLT-terminal stepper.
+  idleAware = false;
+  stepBudget = 50_000;
   const autorun = $("autorun").value
     .split("\n")
     .map((s) => s.trim())
@@ -114,6 +125,57 @@ $("boot").addEventListener("click", () => {
   vm.boot();
   setStatus("running", "running");
   pump();
+});
+
+// Boot a real Linux/Alpine kernel: fresh 256 MiB VM, load the bzImage +
+// (optional) initramfs, hand off to protected mode, then pump with the
+// idle-aware stepper. The guest's serial console (console=ttyS0) streams to
+// the terminal. Boot is slow in wasm (a kernel is hundreds of millions of
+// steps); the page stays usable but the frame budget makes it churn.
+const setLinuxStatus = (text, cls = "") => {
+  const el = $("linux-status");
+  el.textContent = text;
+  el.className = "status" + (cls ? ` ${cls}` : "");
+};
+
+$("boot-linux").addEventListener("click", async () => {
+  const kfile = $("kernel-file").files?.[0];
+  if (!kfile) {
+    setLinuxStatus("pick a kernel (vmlinuz bzImage) first", "error");
+    return;
+  }
+  if (rafHandle) cancelAnimationFrame(rafHandle);
+  try {
+    setLinuxStatus("reading kernel…");
+    const kbytes = new Uint8Array(await kfile.arrayBuffer());
+    const ifile = $("initrd-file").files?.[0];
+    const ibytes = ifile ? new Uint8Array(await ifile.arrayBuffer()) : null;
+
+    // Fresh VM with the headroom Alpine needs (the default demo VM is tiny).
+    vm = WwwVm.new_with_ram_size(256 * 1024 * 1024);
+    window.__wwwvm = vm;
+    term.reset();
+
+    const entry = vm.load_bzimage(kbytes);
+    vm.set_kernel_cmdline($("cmdline").value);
+    if (ibytes) vm.set_ramdisk(ibytes);
+    vm.start_protected_mode_at(entry); // sets booted=true itself
+
+    idleAware = true;
+    stepBudget = 1_500_000;
+    const kib = (b) => `${(b >> 10).toLocaleString()} KiB`;
+    setLinuxStatus(
+      `booting — kernel ${kib(kbytes.length)}` +
+        (ibytes ? `, initramfs ${kib(ibytes.length)}` : "") +
+        " (slow in wasm; watch the terminal)",
+      "running"
+    );
+    setStatus("running", "running");
+    pump();
+  } catch (e) {
+    setLinuxStatus(`boot failed: ${e.message || e}`, "error");
+    setStatus("idle", "");
+  }
 });
 
 // `runCommand()` — send a line, collect output until it stops growing

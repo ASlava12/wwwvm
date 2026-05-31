@@ -124,6 +124,26 @@ fn main() {
         }
     };
 
+    // WWWVM_DUMP_INITRAMFS=<path> writes the packed initramfs cpio and exits,
+    // instead of booting — for feeding the browser demo (which can't pack a
+    // directory itself): pick this file + a vmlinuz in the "Boot Linux" panel.
+    // Run WITHOUT WWWVM_NET_STUB so /init just drops to a shell (the browser
+    // has no host net bridge).
+    if let Some(path) = std::env::var_os("WWWVM_DUMP_INITRAMFS") {
+        match std::fs::write(&path, &cpio) {
+            Ok(()) => eprintln!(
+                "[wwwvm] wrote initramfs cpio ({} KiB) to {}",
+                cpio.len() >> 10,
+                Path::new(&path).display()
+            ),
+            Err(e) => {
+                eprintln!("error: cannot write initramfs to {:?}: {e}", path);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
     vm.set_cmos_time_from_host(); // so the guest's `date` is the real time
     let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");

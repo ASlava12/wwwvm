@@ -47,6 +47,25 @@
         <button id="boot">Boot VM</button>
 
         <fieldset>
+          <legend>Boot Linux / Alpine (real kernel)</legend>
+          <label>kernel (vmlinuz bzImage):
+            <input type="file" id="kernel-file" />
+          </label>
+          <br />
+          <label>initramfs (cpio, optional):
+            <input type="file" id="initrd-file" />
+          </label>
+          <br />
+          <label>cmdline:
+            <input id="cmdline" type="text"
+              value="earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
+          </label>
+          <br />
+          <button id="boot-linux">Boot Linux</button>
+          <small id="linux-status" class="status">pick a kernel (+ initramfs) to boot</small>
+        </fieldset>
+
+        <fieldset>
           <legend>Send command</legend>
           <input id="cmd" type="text" placeholder="type and press Enter" />
           <button id="send">runCommand()</button>

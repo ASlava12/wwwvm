@@ -362,6 +362,20 @@ impl WwwVm {
         steps
     }
 
+    /// Step the CPU up to `cycles` times, treating a `STI; HLT` as an idle
+    /// wait rather than a terminal halt (the timer keeps ticking and the next
+    /// IRQ resumes it). This is the form needed to BOOT a real kernel: Linux
+    /// idles on HLT all through boot, so plain `run` would stop immediately.
+    /// Returns steps executed; a HLT with interrupts disabled is still
+    /// terminal (nothing can wake the CPU).
+    pub fn run_idle_aware(&mut self, cycles: u32) -> u32 {
+        let (steps, stop) = self.inner.run_steps_idle_aware(cycles);
+        if let Stop::CpuError(e) = stop {
+            self.last_error = Some(e.to_string());
+        }
+        steps
+    }
+
     /// True if the CPU is parked on HLT.
     pub fn is_halted(&self) -> bool {
         self.inner.is_halted()
