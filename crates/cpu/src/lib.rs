@@ -8389,6 +8389,13 @@ impl Cpu {
                             let v = self.mem_read_u16(mem, addr) as i16;
                             self.fpu_push(F80::from_i16(v));
                         }
+                        // FISTTP m16 (SSE3) — truncate ST(0) toward zero,
+                        // store as i16, then pop. (Sibling of the DB /1 m32
+                        // and DD /1 m64 forms; CPython's float code emits it.)
+                        1 => {
+                            let v = self.fpu_pop().to_i64_trunc() as i16;
+                            self.mem_write_u16(mem, addr, v as u16);
+                        }
                         // FIST m16 — store ST(0) as a rounded signed i16.
                         2 => {
                             let st0 = self.fpu_st(0);
@@ -8894,6 +8901,13 @@ impl Cpu {
                             let lo = self.mem_read_u32(mem, addr) as u64;
                             let hi = self.mem_read_u32(mem, addr.wrapping_add(4)) as u64;
                             self.fpu_push(F80::from_f64(f64::from_bits(lo | (hi << 32))));
+                        }
+                        // FISTTP m64 (SSE3) — truncate ST(0) toward zero,
+                        // store as i64, then pop.
+                        1 => {
+                            let v = self.fpu_pop().to_i64_trunc();
+                            self.mem_write_u32(mem, addr, v as u32);
+                            self.mem_write_u32(mem, addr.wrapping_add(4), (v >> 32) as u32);
                         }
                         2 | 3 => {
                             // FST/FSTP m64.

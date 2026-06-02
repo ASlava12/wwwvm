@@ -7028,6 +7028,53 @@ fn fpu_close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-12 || (a - b).abs() < 1e-12 * a.abs().max(b.abs())
 }
 
+/// FISTTP (SSE3) — float→int store with TRUNCATION toward zero (not the
+/// control word's round-to-nearest) plus a pop. CPython's prebuilt Alpine
+/// binary emits the m16 (DF /1) and m64 (DD /1) forms; before this they hit
+/// "unimplemented opcode 0xDF" mid-run. The test uses non-integers whose
+/// truncation differs from rounding (−3.9→−3 not −4; 2.7→2 not 3) so it pins
+/// truncation specifically, and checks both sizes + that the value popped.
+#[test]
+fn fpu_fisttp_truncates_toward_zero_and_pops() {
+    let mut mem = Memory::new(0x10_0000);
+    let mut code = Vec::new();
+    fpu_w64(&mut mem, 0x600, -3.9);
+    fpu_w64(&mut mem, 0x608, 2.7);
+    // FLD m64 [0x600]; FISTTP m16 [0x700] (DF /1, modrm 0x0E disp16).
+    code.extend_from_slice(&[0xDD, 0x06]);
+    code.extend_from_slice(&0x600u16.to_le_bytes());
+    code.extend_from_slice(&[0xDF, 0x0E]);
+    code.extend_from_slice(&0x700u16.to_le_bytes());
+    // FLD m64 [0x608]; FISTTP m64 [0x710] (DD /1, modrm 0x0E disp16).
+    code.extend_from_slice(&[0xDD, 0x06]);
+    code.extend_from_slice(&0x608u16.to_le_bytes());
+    code.extend_from_slice(&[0xDD, 0x0E]);
+    code.extend_from_slice(&0x710u16.to_le_bytes());
+    code.push(0xF4); // HLT
+    mem.write_slice(0x7C00, &code);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..64 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    assert_eq!(
+        mem.read_u16(0x700) as i16,
+        -3,
+        "FISTTP m16 truncates -3.9 → -3"
+    );
+    assert_eq!(mem.read_u32(0x710), 2, "FISTTP m64 truncates 2.7 → 2 (low)");
+    assert_eq!(mem.read_u32(0x714), 0, "FISTTP m64 high dword");
+    // Both pushes were popped → the x87 stack is back to empty (top wrapped
+    // around to its reset value), proving the pop side of FISTTP.
+    assert_eq!(cpu.fpu_top, 0, "both FISTTPs popped → stack empty");
+}
+
 /// FSIN / FCOS over a few exact-ish angles.
 #[test]
 fn fpu_fsin_fcos() {
