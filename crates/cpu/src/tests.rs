@@ -6845,6 +6845,32 @@ fn sse_pxor_self_zeroes_register() {
     assert_eq!(cpu.xmm[0], 0);
 }
 
+/// SSE2 PANDN (66 0F DF): dest = (NOT dest) AND src. It was the one packed
+/// logical missing next to PAND/POR/PXOR; CPython's SSE2 code hit it as
+/// "unimplemented opcode 0xDF" (the 0F-map second byte). XMM0=0x0F0F0F0F,
+/// XMM1=0xFFFFFFFF → (~0x0F0F0F0F)&0xFFFFFFFF = 0xF0F0F0F0; the upper 96 bits
+/// (0) become (~0)&0 = 0, so the whole register is 0xF0F0F0F0.
+#[test]
+fn sse2_pandn_xmm() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0xB8, 0x0F, 0x0F, 0x0F, 0x0F, // MOV EAX, 0x0F0F0F0F
+            0x66, 0x0F, 0x6E, 0xC0, // MOVD XMM0, EAX
+            0x66, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // MOV EAX, 0xFFFFFFFF
+            0x66, 0x0F, 0x6E, 0xC8, // MOVD XMM1, EAX
+            0x66, 0x0F, 0xDF, 0xC1, // PANDN XMM0, XMM1
+            0x66, 0x0F, 0x7E, 0xC3, // MOVD EBX, XMM0
+            0xF4,
+        ],
+        24,
+    );
+    assert_eq!(cpu.read_r32(3), 0xF0F0_F0F0, "PANDN low dword");
+    assert_eq!(
+        cpu.xmm[0], 0xF0F0_F0F0_u128,
+        "PANDN clears the upper 96 bits"
+    );
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]

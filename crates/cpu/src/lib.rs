@@ -7140,13 +7140,22 @@ impl Cpu {
                         };
                         self.xmm[reg as usize] = punpck(dst, src, elem, high);
                     }
-                    // Packed-integer logicals (66 0F): PAND/POR/PXOR.
+                    // Packed-integer logicals (66 0F): PAND/PANDN/POR/PXOR.
                     // Lane-independent, so they're plain 128-bit bitops.
                     // `pxor xmm, xmm` is the canonical XMM-zeroing idiom.
                     0xDB if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
                         let v = self.read_xmm_rm(rm, mem);
                         self.xmm[reg as usize] &= v;
+                    }
+                    // PANDN xmm: dest = (NOT dest) AND src. CPython's SSE2
+                    // code emits it (it was the one logical op missing here,
+                    // surfacing as "unimplemented opcode 0xDF").
+                    0xDF if self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        let d = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = !d & v;
                     }
                     0xEB if self.has_66() => {
                         let (_, reg, rm) = self.fetch_modrm(mem);
