@@ -101,11 +101,18 @@ fn main() {
     // real tty device, in a respawn loop that keeps PID 1 alive (a plain
     // `exec setsid` would have setsid's parent — PID 1 — exit → kernel panic).
     const READY_LINE: &str = "[wwwvm] alpine shell ready — type away";
+    // Kernel pseudo-filesystems. The kernel auto-mounts devtmpfs on /dev
+    // (CONFIG_DEVTMPFS_MOUNT) but does NOT auto-mount /proc or /sys, and a
+    // lot of userspace breaks without them — notably udev (and therefore
+    // Xorg) enumerates devices through /sys, so without sysfs X finds no
+    // screens even though /dev/dri/card0 exists. Mount all three early,
+    // defensively (`2>/dev/null` if already mounted or unsupported).
+    const BASE_MOUNTS: &str = "mount -t devtmpfs dev /dev 2>/dev/null\n\
+         mount -t proc proc /proc 2>/dev/null\n\
+         mount -t sysfs sys /sys 2>/dev/null\n";
     // Prefer the concrete /dev/ttyS0 (a real tty that cleanly becomes the
-    // controlling terminal); fall back to /dev/console. devtmpfs is mounted
-    // defensively in case the kernel didn't auto-mount it.
-    const SHELL_LAUNCH: &str = "mount -t devtmpfs dev /dev 2>/dev/null\n\
-         TTY=/dev/ttyS0; [ -c \"$TTY\" ] || TTY=/dev/console\n\
+    // controlling terminal); fall back to /dev/console.
+    const SHELL_LAUNCH: &str = "TTY=/dev/ttyS0; [ -c \"$TTY\" ] || TTY=/dev/console\n\
          while :; do setsid -c /bin/busybox sh <\"$TTY\" >\"$TTY\" 2>&1; done\n";
     let net_stub = std::env::var_os("WWWVM_NET_STUB").is_some();
     // When the host net stack is on (WWWVM_NET_STUB=1), have /init bring the
@@ -144,7 +151,9 @@ fn main() {
     } else {
         ""
     };
-    let init = format!("#!/bin/sh\n{net_setup}{gui_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}");
+    let init = format!(
+        "#!/bin/sh\n{BASE_MOUNTS}{net_setup}{gui_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
+    );
     let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
