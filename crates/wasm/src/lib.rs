@@ -471,6 +471,23 @@ impl WwwVm {
         self.inner.push_scancode(code);
     }
 
+    /// Inject a PS/2 mouse packet (port 0x60 / IRQ 12) so a graphical
+    /// guest (Xorg via libinput) sees pointer movement and clicks.
+    /// `dx`/`dy` are signed deltas in PS/2 convention (+x right, +y up —
+    /// the caller negates the canvas y-delta); `buttons` is a bitmask
+    /// (bit0 left, bit1 right, bit2 middle). `i32` params keep JS callers
+    /// on plain Numbers (no BigInt marshalling). No-op until the guest
+    /// enables mouse reporting.
+    pub fn push_mouse_packet(&mut self, dx: i32, dy: i32, buttons: u8) {
+        self.inner.push_mouse_packet(
+            dx as i16,
+            dy as i16,
+            buttons & 1 != 0,
+            buttons & 2 != 0,
+            buttons & 4 != 0,
+        );
+    }
+
     /// Seed the CMOS clock with binary date/time. Year is two-digit
     /// (00..99). Useful from JS when you want the guest to read a
     /// specific wall-clock time on boot.

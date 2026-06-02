@@ -238,6 +238,14 @@ self.onmessage = async (e) => {
       case "command":
         if (vm) vm.send_command(m.text);
         break;
+      case "scancodes":
+        // PS/2 keyboard bytes (Set-1) for a graphical guest's 8042/evdev path.
+        if (vm && vm.is_booted()) for (const c of m.codes) vm.push_scancode(c);
+        break;
+      case "mouse":
+        // PS/2 mouse packet (dx/dy in PS/2 convention; buttons bitmask).
+        if (vm && vm.is_booted()) vm.push_mouse_packet(m.dx | 0, m.dy | 0, m.buttons | 0);
+        break;
       case "snapshot":
         if (vm && vm.is_booted()) {
           const b = vm.snapshot();

@@ -72,6 +72,37 @@ Harmless noise: `(EE) FBDEV(0): FBIOPUTCMAP: Invalid argument` — the fbdev
 driver tries to load a palette, which the truecolor (32bpp) framebuffer has no
 use for; the guest kernel rejects it and X carries on.
 
+## In the browser
+
+The browser runs the same guest, so the same recipe applies inside it; two extra
+pieces wire it to the page:
+
+- **Input.** The terminal feeds the guest UART; a graphical guest instead needs
+  PS/2 events. `web/main.js` (+ `web/ps2-keymap.js`) captures keyboard and mouse
+  on the framebuffer `<canvas>` and turns them into Set-1 scan codes
+  (`push_scancode`) and mouse packets (`push_mouse_packet`). **Click the canvas
+  to focus it**, then typing and pointer motion go to the guest. (Mouse motion
+  uses relative `movementX/Y`; without pointer lock the guest cursor tracks
+  deltas, which is enough to drive a WM.) Rebuild the wasm bundle
+  (`wasm-pack …`) so `push_mouse_packet` is exported.
+
+- **Init.** The guest's initramfs `/init` must mount `/proc`, `/sys`,
+  `/dev/pts`, load the GUI modules, and start udev + X. The easiest way to get a
+  matching initramfs is to dump the one the native example builds (it already
+  does the mounts + `--with-gui` module loads):
+
+  ```sh
+  WWWVM_FB=1280x800 WWWVM_NET_STUB=1 WWWVM_DUMP_INITRAMFS=/tmp/initramfs.cpio \
+    cargo run -p wwwvm-vm --release --example alpine_console
+  ```
+
+  then upload that initramfs (and `vmlinuz-lts`) in the web UI, enable the
+  framebuffer, boot, and run the apk/udev/X steps above in the guest.
+
+> Status: the input plumbing (canvas → PS/2) is in place but **not yet
+> confirmed end-to-end in a real browser** — that needs eyes on the canvas
+> (like the networking + Web-Worker milestones were user-confirmed).
+
 ## Why `fbdev`, not `modesetting`
 
 The modern `modesetting` driver is the usual choice on a DRM device

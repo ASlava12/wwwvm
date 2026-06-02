@@ -2086,6 +2086,16 @@ impl Vm {
         self.io.kbd.push_scancode(code);
     }
 
+    /// Inject a PS/2 mouse movement/button packet (raises IRQ 12 to a
+    /// guest that has enabled the aux port + reporting). `dx`/`dy` are
+    /// signed deltas in PS/2 convention: +x = right, **+y = up**. The
+    /// host feeds these from canvas pointer events, negating the screen
+    /// y-delta (screen y grows downward). No-op until the guest enables
+    /// mouse reporting.
+    pub fn push_mouse_packet(&mut self, dx: i16, dy: i16, left: bool, right: bool, middle: bool) {
+        self.io.kbd.push_mouse_packet(dx, dy, left, right, middle);
+    }
+
     /// Seed the CMOS clock with a date/time. Arguments are natural decimal
     /// values, year two-digit (00..99); the device stores them BCD-encoded
     /// (Status B is BCD + 24-hour), which is what a guest probing 0x70/0x71

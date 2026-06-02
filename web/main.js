@@ -6,6 +6,7 @@
 
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
 import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
+import { makeBytes, breakBytes } from "./ps2-keymap.js";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -97,6 +98,62 @@ term.onData((data) => {
   if (!vm.is_booted()) return;
   vm.send_input(bytes);
 });
+
+// PS/2 input → the framebuffer canvas. The terminal path above feeds the UART
+// console; a graphical guest (Xorg) instead reads the 8042 keyboard + PS/2
+// mouse via /dev/input/event*. Click the canvas to focus it, then keystrokes
+// and pointer motion over it become Set-1 scan codes + mouse packets. Routes
+// to whichever engine (worker / inline) owns the live VM.
+function sendScancodes(codes) {
+  if (!codes) return;
+  if (active === "worker") {
+    if (workerBooted) worker.postMessage({ t: "scancodes", codes });
+    return;
+  }
+  if (vm.is_booted()) for (const c of codes) vm.push_scancode(c);
+}
+function sendMouse(dx, dy, buttons) {
+  if (active === "worker") {
+    if (workerBooted) worker.postMessage({ t: "mouse", dx, dy, buttons });
+    return;
+  }
+  if (vm.is_booted()) vm.push_mouse_packet(dx, dy, buttons);
+}
+
+(function wireCanvasInput() {
+  const cv = $("fb");
+  if (!cv) return;
+  cv.tabIndex = 0; // focusable, so it can receive key events
+  let buttons = 0; // bit0 left, bit1 right, bit2 middle
+  const BTN = { 0: 1, 1: 4, 2: 2 }; // DOM button (0/1/2) → our bitmask
+
+  cv.addEventListener("keydown", (e) => {
+    const b = makeBytes(e.code);
+    if (b) { e.preventDefault(); sendScancodes(b); }
+  });
+  cv.addEventListener("keyup", (e) => {
+    const b = breakBytes(e.code);
+    if (b) { e.preventDefault(); sendScancodes(b); }
+  });
+  cv.addEventListener("mousemove", (e) => {
+    const dx = e.movementX | 0;
+    const dy = -(e.movementY | 0); // screen y grows down; PS/2 +y is up
+    if (dx || dy) sendMouse(dx, dy, buttons);
+  });
+  cv.addEventListener("mousedown", (e) => {
+    cv.focus();
+    buttons |= BTN[e.button] || 0;
+    sendMouse(0, 0, buttons);
+    e.preventDefault();
+  });
+  cv.addEventListener("mouseup", (e) => {
+    buttons &= ~(BTN[e.button] || 0);
+    sendMouse(0, 0, buttons);
+    e.preventDefault();
+  });
+  // Let right-click reach the guest instead of opening the page context menu.
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+})();
 
 let rafHandle = 0;
 const outputListeners = new Set();
