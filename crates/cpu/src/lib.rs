@@ -1976,6 +1976,29 @@ impl Cpu {
                     }
                 }
             }
+            // SSE3 duplicating moves. MOVDDUP (F2 0F 12) broadcasts the low
+            // f64 to both lanes ([lo,lo]) — OpenBLAS dgemm broadcasts scalars
+            // this way; MOVSLDUP (F3 0F 12) duplicates even f32 lanes
+            // ([s0,s0,s2,s2]); MOVSHDUP (F3 0F 16) the odd lanes ([s1,s1,s3,s3]).
+            0x12 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                self.xmm[reg as usize] = if is_f3 {
+                    let v = self.read_xmm_rm(rm, mem);
+                    let s0 = v & 0xFFFF_FFFF;
+                    let s2 = (v >> 64) & 0xFFFF_FFFF;
+                    s0 | (s0 << 32) | (s2 << 64) | (s2 << 96)
+                } else {
+                    let lo = self.read_xmm_rm64(rm, mem) as u128;
+                    lo | (lo << 64)
+                };
+            }
+            0x16 if is_f3 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let v = self.read_xmm_rm(rm, mem);
+                let s1 = (v >> 32) & 0xFFFF_FFFF;
+                let s3 = (v >> 96) & 0xFFFF_FFFF;
+                self.xmm[reg as usize] = s1 | (s1 << 32) | (s3 << 64) | (s3 << 96);
+            }
             // SSE3 horizontal add/sub + add-sub, PS forms (F2 prefix):
             // HADDPS (F2 0F 7C), HSUBPS (F2 0F 7D), ADDSUBPS (F2 0F D0) over
             // 4×f32 lanes. (The 66-prefixed PD forms live in the 0F map.)

@@ -7018,6 +7018,42 @@ fn sse2_pinsrw_pextrw_xmm() {
     assert_eq!(cpu.read_r32(1), 0, "PEXTRW slot 0 = still zero");
 }
 
+/// SSE3 MOVDDUP (F2 0F 12) — broadcast the low f64 to both lanes. OpenBLAS's
+/// dgemm broadcasts a scalar double this way; numpy's matmul hit it
+/// ("unimplemented opcode 0x12"). XMM1=[1.0,2.0] → MOVDDUP XMM0,XMM1 = [1.0,1.0].
+#[test]
+fn sse3_movddup() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 0);
+    mem.write_u32(0x604, 0x3FF0_0000); // 1.0
+    mem.write_u32(0x608, 0);
+    mem.write_u32(0x60C, 0x4000_0000); // 2.0
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x0E, 0x00, 0x06, // MOVDQA XMM1, [0x600]
+            0xF2, 0x0F, 0x12, 0xC1, // MOVDDUP XMM0, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    let r = |m: &Memory, a: u32| {
+        f64::from_bits((m.read_u32(a) as u64) | ((m.read_u32(a + 4) as u64) << 32))
+    };
+    assert_eq!(r(&mem, 0x620), 1.0, "MOVDDUP lane0 = low f64");
+    assert_eq!(r(&mem, 0x628), 1.0, "MOVDDUP lane1 = low f64 (duplicated)");
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]
