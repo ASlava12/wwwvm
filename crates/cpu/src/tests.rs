@@ -6997,6 +6997,27 @@ fn sse3_haddpd_addsubpd() {
     assert_eq!(r(&mem, 0x638), 22.0, "ADDSUBPD lane1 = 2+20");
 }
 
+/// SSE2 PINSRW (66 0F C4) / PEXTRW (66 0F C5) — insert/extract a 16-bit word
+/// at slot (imm8 & 7) of an XMM (8 word slots). numpy's import hit PEXTRW xmm
+/// ("unimplemented opcode 0xC5"). Insert 0xBEEF at slot 3, read it back; slot 0
+/// stays zero.
+#[test]
+fn sse2_pinsrw_pextrw_xmm() {
+    let (cpu, _, _) = run_payload(
+        &[
+            0x66, 0x0F, 0xEF, 0xC0, // PXOR XMM0, XMM0  (zero it)
+            0x66, 0xB8, 0xEF, 0xBE, 0x00, 0x00, // MOV EAX, 0x0000BEEF
+            0x66, 0x0F, 0xC4, 0xC0, 0x03, // PINSRW XMM0, EAX, 3
+            0x66, 0x0F, 0xC5, 0xD8, 0x03, // PEXTRW EBX, XMM0, 3
+            0x66, 0x0F, 0xC5, 0xC8, 0x00, // PEXTRW ECX, XMM0, 0
+            0xF4,
+        ],
+        24,
+    );
+    assert_eq!(cpu.read_r32(3), 0xBEEF, "PEXTRW slot 3 = inserted word");
+    assert_eq!(cpu.read_r32(1), 0, "PEXTRW slot 0 = still zero");
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]

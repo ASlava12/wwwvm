@@ -7027,6 +7027,27 @@ impl Cpu {
                         let slot = (self.fetch_u8(mem) & 3) as u64 * 16;
                         self.write_r32(reg, ((src >> slot) & 0xFFFF) as u32);
                     }
+                    // SSE2 twins (66 prefix) of PINSRW/PEXTRW — the XMM forms
+                    // have 8 word slots (imm8 & 7). numpy's import hit the
+                    // PEXTRW xmm form ("unimplemented opcode 0xC5").
+                    0xC4 if self.has_66() => {
+                        // PINSRW xmm, r32/m16, imm8.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let w = match rm {
+                            Rm::Reg(i) => self.read_r16(i) as u128,
+                            Rm::Mem(_) => self.read_rm16(rm, mem) as u128,
+                        };
+                        let slot = (self.fetch_u8(mem) & 7) as u32 * 16;
+                        let d = &mut self.xmm[reg as usize];
+                        *d = (*d & !(0xFFFFu128 << slot)) | (w << slot);
+                    }
+                    0xC5 if self.has_66() => {
+                        // PEXTRW r32, xmm, imm8.
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let src = self.read_xmm_rm(rm, mem);
+                        let slot = (self.fetch_u8(mem) & 7) as u32 * 16;
+                        self.write_r32(reg, ((src >> slot) & 0xFFFF) as u32);
+                    }
                     // MMX PUNPCKL/H {BW,WD,DQ} (60/61/62 low, 68/69/6A high)
                     // and PACK {SSWB,USWB,SSDW} (63/67/6B). The no-66 MMX
                     // forms; the 66 SSE2 twins are handled below.
