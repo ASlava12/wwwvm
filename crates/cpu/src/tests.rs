@@ -6916,6 +6916,40 @@ fn sse2_cmppd_packed_compare_eq() {
     assert_eq!(mem.read_u32(0x62C), 0, "lane1 high");
 }
 
+/// MOVMSKPD (66 0F 50) / MOVMSKPS (0F 50) — gather per-lane sign bits into a
+/// GP register. XMM0 = [f64 0x8000…0000, f64 0x0000…0001]:
+///   PD lanes' sign bits (bit63/bit127) = [1, 0] → EAX = 0b01 = 1.
+///   PS lanes' sign bits (bit31 of each 32-bit lane) = [0,1,0,0] → EBX = 0b0010 = 2.
+#[test]
+fn sse2_movmskpd_movmskps_extract_sign_bits() {
+    let mut mem = Memory::new(0x10_0000);
+    mem.write_u32(0x600, 0x0000_0000);
+    mem.write_u32(0x604, 0x8000_0000); // lane0 = 0x8000000000000000
+    mem.write_u32(0x608, 0x0000_0001);
+    mem.write_u32(0x60C, 0x0000_0000); // lane1 = 0x0000000000000001
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x50, 0xC0, // MOVMSKPD EAX, XMM0
+            0x0F, 0x50, 0xD8, // MOVMSKPS EBX, XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..12 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    assert_eq!(cpu.read_r32(0), 0b01, "MOVMSKPD sign bits [1,0]");
+    assert_eq!(cpu.read_r32(3), 0b0010, "MOVMSKPS sign bits [0,1,0,0]");
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]

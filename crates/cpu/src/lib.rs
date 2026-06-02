@@ -7628,6 +7628,27 @@ impl Cpu {
                         let hi = f64::from_bits((src >> 64) as u64).trunc() as i32 as u32 as u128;
                         self.xmm[reg as usize] = lo | (hi << 32);
                     }
+                    // MOVMSKPS (0F 50) / MOVMSKPD (66 0F 50): gather the
+                    // per-lane sign bits of an XMM into the low bits of a GP
+                    // register (PS → 4 bits from the f32 lanes' bit31; PD → 2
+                    // bits from the f64 lanes' bit63), zero-extended. The
+                    // canonical way to test a packed-compare result
+                    // (CMPPD → MOVMSKPD → branch), so SSE-heavy code (numpy/
+                    // BLAS/libm) leans on it. Source is a register only.
+                    0x50 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let v = self.read_xmm_rm(rm, mem);
+                        let mask = if self.has_66() {
+                            (((v >> 63) & 1) as u32) | ((((v >> 127) & 1) as u32) << 1)
+                        } else {
+                            let mut m = 0u32;
+                            for lane in 0..4 {
+                                m |= (((v >> (lane * 32 + 31)) & 1) as u32) << lane;
+                            }
+                            m
+                        };
+                        self.write_r32(reg, mask);
+                    }
                     // CMPPS (0F C2) / CMPPD (66 0F C2): per-lane float compare
                     // with an imm8 predicate (0 EQ,1 LT,2 LE,3 UNORD,4 NEQ,
                     // 5 NLT,6 NLE,7 ORD), producing an all-ones/all-zeros mask
