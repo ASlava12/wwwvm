@@ -170,6 +170,15 @@ impl IoBus {
         } else {
             self.pic.irr &= !irq1_bit;
         }
+        // PS/2 mouse (AUX) — level-triggered on IRQ 12, which lives on the
+        // slave PIC (IRQ 8..15 → slave IRR bits 0..7, so IRQ 12 = bit 4).
+        // The cascade block below propagates it to master IRQ 2.
+        let mouse_slave_bit = 1u8 << 4;
+        if self.kbd.aux_irq_pending() {
+            self.slave_pic.irr |= mouse_slave_bit;
+        } else {
+            self.slave_pic.irr &= !mouse_slave_bit;
+        }
         // PIT — prescaler-divided tick. One CPU step ≠ one PIT
         // cycle: at our ~17 MIPS effective throughput, ticking PIT
         // once per step gives Linux a HZ=250 latch (~4773 PIT
