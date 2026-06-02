@@ -6950,6 +6950,53 @@ fn sse2_movmskpd_movmskps_extract_sign_bits() {
     assert_eq!(cpu.read_r32(3), 0b0010, "MOVMSKPS sign bits [0,1,0,0]");
 }
 
+/// SSE3 HADDPD (66 0F 7C) + ADDSUBPD (66 0F D0). XMM0=[1.0,2.0], XMM1=[10.0,20.0]:
+///   HADDPD  XMM0,XMM1 → [1+2, 10+20]  = [3.0, 30.0]
+///   ADDSUBPD XMM2,XMM1 → [1-10, 2+20] = [-9.0, 22.0]  (even lane sub, odd add)
+#[test]
+fn sse3_haddpd_addsubpd() {
+    let mut mem = Memory::new(0x10_0000);
+    let w = |m: &mut Memory, a: u32, v: f64| {
+        let b = v.to_bits();
+        m.write_u32(a, b as u32);
+        m.write_u32(a + 4, (b >> 32) as u32);
+    };
+    w(&mut mem, 0x600, 1.0);
+    w(&mut mem, 0x608, 2.0); // XMM0 = [1.0, 2.0]
+    w(&mut mem, 0x610, 10.0);
+    w(&mut mem, 0x618, 20.0); // XMM1 = [10.0, 20.0]
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0x6F, 0x0E, 0x10, 0x06, // MOVDQA XMM1, [0x610]
+            0x66, 0x0F, 0x6F, 0xD0, // MOVDQA XMM2, XMM0
+            0x66, 0x0F, 0x7C, 0xC1, // HADDPD  XMM0, XMM1
+            0x66, 0x0F, 0xD0, 0xD1, // ADDSUBPD XMM2, XMM1
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0x66, 0x0F, 0x7F, 0x16, 0x30, 0x06, // MOVDQA [0x630], XMM2
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..20 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    let r = |m: &Memory, a: u32| {
+        f64::from_bits((m.read_u32(a) as u64) | ((m.read_u32(a + 4) as u64) << 32))
+    };
+    assert_eq!(r(&mem, 0x620), 3.0, "HADDPD lane0 = 1+2");
+    assert_eq!(r(&mem, 0x628), 30.0, "HADDPD lane1 = 10+20");
+    assert_eq!(r(&mem, 0x630), -9.0, "ADDSUBPD lane0 = 1-10");
+    assert_eq!(r(&mem, 0x638), 22.0, "ADDSUBPD lane1 = 2+20");
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]

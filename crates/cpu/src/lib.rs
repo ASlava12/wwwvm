@@ -1976,6 +1976,24 @@ impl Cpu {
                     }
                 }
             }
+            // SSE3 horizontal add/sub + add-sub, PS forms (F2 prefix):
+            // HADDPS (F2 0F 7C), HSUBPS (F2 0F 7D), ADDSUBPS (F2 0F D0) over
+            // 4×f32 lanes. (The 66-prefixed PD forms live in the 0F map.)
+            0x7C => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let s = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = hadd_f32(self.xmm[reg as usize], s, false);
+            }
+            0x7D => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let s = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = hadd_f32(self.xmm[reg as usize], s, true);
+            }
+            0xD0 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                let s = self.read_xmm_rm(rm, mem);
+                self.xmm[reg as usize] = addsub_f32(self.xmm[reg as usize], s);
+            }
             // CMPSS (F3 0F C2) / CMPSD (F2 0F C2) — scalar float compare with
             // an imm8 predicate; the low lane becomes an all-ones/all-zeros
             // mask, the upper bits of the destination are preserved.
@@ -7649,6 +7667,28 @@ impl Cpu {
                         };
                         self.write_r32(reg, mask);
                     }
+                    // SSE3 horizontal add/sub + add-sub-alternating, PD forms
+                    // (66 prefix). PS forms are F2-prefixed → sse_scalar.
+                    // HADDPD (66 0F 7C) / HSUBPD (66 0F 7D) reduce f64 pairs
+                    // across the register (dot-product/reduction kernels);
+                    // ADDSUBPD (66 0F D0) is the complex-multiply add/sub.
+                    // Alpine binaries emit SSE3 despite CPUID not advertising
+                    // it (cf. the FISTTP find).
+                    0x7C if self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = hadd_f64(self.xmm[reg as usize], s, false);
+                    }
+                    0x7D if self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = hadd_f64(self.xmm[reg as usize], s, true);
+                    }
+                    0xD0 if self.has_66() => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let s = self.read_xmm_rm(rm, mem);
+                        self.xmm[reg as usize] = addsub_f64(self.xmm[reg as usize], s);
+                    }
                     // CMPPS (0F C2) / CMPPD (66 0F C2): per-lane float compare
                     // with an imm8 predicate (0 EQ,1 LT,2 LE,3 UNORD,4 NEQ,
                     // 5 NLT,6 NLE,7 ORD), producing an all-ones/all-zeros mask
@@ -9386,6 +9426,59 @@ fn packed_cmp_f32(a: u128, b: u128, pred: u8) -> u128 {
         if sse_cmp(x, y, pred) {
             out |= (u32::MAX as u128) << shift;
         }
+    }
+    out
+}
+
+fn f64_lane(v: u128, i: u32) -> f64 {
+    f64::from_bits((v >> (i * 64)) as u64)
+}
+fn f32_lane(v: u128, i: u32) -> f32 {
+    f32::from_bits((v >> (i * 32)) as u32)
+}
+fn pack_f64(lo: f64, hi: f64) -> u128 {
+    (lo.to_bits() as u128) | ((hi.to_bits() as u128) << 64)
+}
+
+/// HADDPD (sub=false) / HSUBPD (sub=true): horizontal add/sub of f64 pairs —
+/// dest = [d0±d1, s0±s1]. Used in dot-product/reduction kernels (BLAS/numpy).
+fn hadd_f64(d: u128, s: u128, sub: bool) -> u128 {
+    let op = |x: f64, y: f64| if sub { x - y } else { x + y };
+    pack_f64(
+        op(f64_lane(d, 0), f64_lane(d, 1)),
+        op(f64_lane(s, 0), f64_lane(s, 1)),
+    )
+}
+/// HADDPS/HSUBPS: dest = [d0±d1, d2±d3, s0±s1, s2±s3] over f32 lanes.
+fn hadd_f32(d: u128, s: u128, sub: bool) -> u128 {
+    let op = |x: f32, y: f32| if sub { x - y } else { x + y };
+    let l = [
+        op(f32_lane(d, 0), f32_lane(d, 1)),
+        op(f32_lane(d, 2), f32_lane(d, 3)),
+        op(f32_lane(s, 0), f32_lane(s, 1)),
+        op(f32_lane(s, 2), f32_lane(s, 3)),
+    ];
+    let mut out: u128 = 0;
+    for (i, v) in l.iter().enumerate() {
+        out |= (v.to_bits() as u128) << (i * 32);
+    }
+    out
+}
+/// ADDSUBPD: dest = [d0-s0, d1+s1] (subtract even lanes, add odd) — complex math.
+fn addsub_f64(d: u128, s: u128) -> u128 {
+    pack_f64(
+        f64_lane(d, 0) - f64_lane(s, 0),
+        f64_lane(d, 1) + f64_lane(s, 1),
+    )
+}
+/// ADDSUBPS: even f32 lanes subtract, odd lanes add.
+fn addsub_f32(d: u128, s: u128) -> u128 {
+    let mut out: u128 = 0;
+    for i in 0..4u32 {
+        let x = f32_lane(d, i);
+        let y = f32_lane(s, i);
+        let r = if i % 2 == 0 { x - y } else { x + y };
+        out |= (r.to_bits() as u128) << (i * 32);
     }
     out
 }
