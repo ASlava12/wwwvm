@@ -1457,6 +1457,11 @@ Ctrl-C выходит. Это «живой» аналог скриптованн
 ET_DYN, а не ET_EXEC). Стадия A проверяет, что эмулятор гоняет musl-PIE-
 busybox из Alpine на текущем ядре:
 
+**Ассеты (ядро + minirootfs) живут в `/tmp` и вычищаются между сессиями** —
+восстановить одной командой: `scripts/fetch-alpine-assets.sh` (добавьте
+`--with-net`, чтобы доложить NIC-модули `mii.ko`/`8139too.ko` из `modloop-lts`
+для apk-по-сети в госте). Ручные шаги ниже — что скрипт делает под капотом.
+
 ```bash
 # подготовить Alpine musl-rootfs (один раз):
 mkdir -p /tmp/alpine && cd /tmp/alpine
