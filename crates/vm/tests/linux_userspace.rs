@@ -12388,6 +12388,98 @@ fn linux_userspace_alpine_rootfs_milestone() {
     eprintln!("  ✓ ALPINE_ROOTFS_OK — the full Alpine minirootfs boots to a working shell!");
 }
 
+/// ALPINE COMPUTE CORRECTNESS: boot the minirootfs and have `/init` run a
+/// spread of pure-userspace computations whose answers are known a priori —
+/// musl `libm` transcendentals via busybox awk (atan2/sin/exp/sqrt/log, the
+/// x87 FP path where the old first-libm-call miscompute lived), SHA-256/512
+/// (integer rotates/shifts), and a gzip round-trip (DEFLATE/CRC32) — then
+/// assert the exact outputs. This guards the CPU against a *silent* miscompute
+/// regression that boots fine but computes wrong (the worst kind): every value
+/// is bit-checked, not just "did it run". No network; busybox builtins only.
+/// (Codifies the ad-hoc 2026-06-02 probe sweep into a repeatable teeth-test.)
+#[test]
+#[ignore = "Alpine compute: libm/crypto/zlib correctness in-guest; needs WWWVM_ALPINE_MINIROOT + WWWVM_ALPINE_KERNEL; ~60s"]
+fn linux_userspace_alpine_compute_correctness_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let mroot =
+        std::env::var("WWWVM_ALPINE_MINIROOT").unwrap_or_else(|_| "/tmp/alpine/root".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    // libm via awk (%.15f), the two SHA digests of "abc", and a gzip
+    // round-trip — each tagged so the assertions can pin the exact value.
+    let init = b"#!/bin/sh\n\
+        busybox awk 'BEGIN{ printf \"LIBM %.15f %.15f %.15f %.15f %.15f\\n\", atan2(0,-1), sin(1), exp(1), sqrt(2), log(2) }'\n\
+        printf abc | busybox sha256sum\n\
+        printf abc | busybox sha512sum\n\
+        printf 'hello wwwvm' | busybox gzip -c | busybox gunzip -c; echo\n\
+        echo COMPUTE_OK\n";
+    let cpio = match build_cpio_from_dir(std::path::Path::new(&mroot), Some(init)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: pack {mroot}: {e}");
+            return;
+        }
+    };
+
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+    vm.set_kernel_cmdline("earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4");
+    vm.set_ramdisk(&cpio).expect("set_ramdisk");
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let r = run_until_marker(&mut vm, b"COMPUTE_OK", 12_000_000_000, &mut cumulative);
+    let text = String::from_utf8_lossy(&cumulative).into_owned();
+    r.unwrap_or_else(|()| {
+        panic!(
+            "COMPUTE_OK marker never appeared; {}",
+            dump_uart_on_failure(&cumulative, "alpine-compute")
+        )
+    });
+
+    // libm transcendentals (musl, awk %.15f) — the FP miscompute guard.
+    for (name, val) in [
+        ("atan2(0,-1)=PI", "3.141592653589793"),
+        ("sin(1)", "0.841470984807897"),
+        ("exp(1)", "2.718281828459045"),
+        ("sqrt(2)", "1.414213562373095"),
+        ("log(2)", "0.693147180559945"),
+    ] {
+        assert!(
+            text.contains(val),
+            "libm {name} miscomputed (expected {val}); {}",
+            dump_uart_on_failure(&cumulative, "alpine-compute-libm")
+        );
+    }
+    // SHA-256 / SHA-512 of "abc" (NIST test vectors).
+    assert!(
+        text.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "sha256(\"abc\") wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-compute-sha256")
+    );
+    assert!(
+        text.contains(
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        ),
+        "sha512(\"abc\") wrong; {}",
+        dump_uart_on_failure(&cumulative, "alpine-compute-sha512")
+    );
+    // gzip → gunzip round-trip (DEFLATE + CRC32).
+    assert!(
+        text.contains("hello wwwvm"),
+        "gzip|gunzip round-trip lost data; {}",
+        dump_uart_on_failure(&cumulative, "alpine-compute-gzip")
+    );
+    eprintln!("  ✓ ALPINE COMPUTE — libm (5 transcendentals), SHA-256/512, and gzip round-trip all bit-correct in-guest.");
+}
+
 /// ALPINE LIVE CONSOLE (tested): boot the full Alpine minirootfs to an
 /// INTERACTIVE musl busybox shell and DRIVE it over the UART — the live,
 /// type-into-it Alpine counterpart of `busybox_interactive_milestone`
