@@ -1,10 +1,11 @@
 # Running X (a graphical desktop) in the guest
 
-Status (2026-06-03): **Xorg runs in-guest at 1280×800**, rendering to the
-linear framebuffer (`/dev/fb0`) — i.e. to the same pixels the host blits to the
-`<canvas>`. `xsetroot -solid` paints the root window successfully. Keyboard and
-mouse input devices (`/dev/input/event0`, `event1`) are present (see the 8042
-controller in `crates/devices/src/keyboard.rs`).
+Status (2026-06-03): **a minimal desktop runs in-guest** — Xorg at 1280×800 on
+the linear framebuffer (`/dev/fb0`, the same pixels the host blits to the
+`<canvas>`), with the `twm` window manager and an `xterm` terminal (both appear
+in `xwininfo -root -tree`). `xsetroot -solid` paints the root window. Keyboard
+and mouse input devices (`/dev/input/event0`, `event1`) are present (see the
+8042 controller in `crates/devices/src/keyboard.rs`).
 
 This is the reference recipe, validated on the native `alpine_console` example
 with the Alpine netboot `vmlinuz-lts`. The browser path follows the same steps
@@ -22,9 +23,11 @@ inside its guest.
    ```
 
    `/init` loads `simpledrm` (→ `/dev/dri/card0` **and** `/dev/fb0`), `evdev`,
-   `psmouse`, and mounts `/proc` + `/sys`. **`/sys` is essential**: udev (and
-   therefore Xorg) enumerates devices through sysfs — without it X aborts with
-   "no screens found" before it even probes the GPU.
+   `psmouse`, and mounts `/proc`, `/sys`, and `/dev/pts`. **`/sys` is
+   essential**: udev (and therefore Xorg) enumerates devices through sysfs —
+   without it X aborts with "no screens found" before it even probes the GPU.
+   **`/dev/pts` (devpts)** is needed for pseudo-terminals — without it `xterm`
+   (and `ssh`/`tmux`/`script`) can't allocate a pty and exits immediately.
 
 2. **Input.** The 8042 controller binds the keyboard (`atkbd` → `event0`) and
    PS/2 mouse (`psmouse` → `event1`); the host injects events via
@@ -53,8 +56,17 @@ DISPLAY=:0 xrandr                       # → "1280x800" connected
 DISPLAY=:0 xsetroot -solid '#1020ff'    # paints the framebuffer blue
 ```
 
-Then launch a window manager / client on `DISPLAY=:0` (e.g. `apk add ...` a
-tiny WM + `xterm`).
+Then launch a window manager / client on `DISPLAY=:0`:
+
+```sh
+apk add twm xterm font-misc-misc
+DISPLAY=:0 twm &
+DISPLAY=:0 xterm &
+```
+
+`xwininfo -root -tree` then lists the `xterm` and `TWM Icon Manager` windows.
+(twm defaults to manual mouse placement for new windows, so `xterm` starts 1×1
+until placed — set `RandomPlacement` in `~/.twmrc` to auto-place.)
 
 Harmless noise: `(EE) FBDEV(0): FBIOPUTCMAP: Invalid argument` — the fbdev
 driver tries to load a palette, which the truecolor (32bpp) framebuffer has no
@@ -84,3 +96,4 @@ an (accelerated) alternative.
 | `/dev/dri/card0` / `/dev/fb0` absent | display drivers are modloop modules | `--with-gui` + `/init` insmod (commit `bf60f9c`) |
 | X "no screens found", no probe lines | `/sys` not mounted → udev finds nothing | mount `proc` + `sysfs` in `/init` |
 | X "no drivers available" (`libgallium`) | modesetting needs an absent mesa lib | use the `fbdev` driver on `/dev/fb0` |
+| `xterm` exits immediately | `/dev/pts` not mounted → no pty | mount `devpts` in `/init` |

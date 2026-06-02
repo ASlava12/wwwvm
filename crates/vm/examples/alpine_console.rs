@@ -107,9 +107,14 @@ fn main() {
     // Xorg) enumerates devices through /sys, so without sysfs X finds no
     // screens even though /dev/dri/card0 exists. Mount all three early,
     // defensively (`2>/dev/null` if already mounted or unsupported).
+    // devpts is needed for pseudo-terminals — without it any pty allocation
+    // fails (xterm exits "can't open pseudo-terminal", and so would ssh/tmux/
+    // script). /dev/pts must exist as a mountpoint first.
     const BASE_MOUNTS: &str = "mount -t devtmpfs dev /dev 2>/dev/null\n\
          mount -t proc proc /proc 2>/dev/null\n\
-         mount -t sysfs sys /sys 2>/dev/null\n";
+         mount -t sysfs sys /sys 2>/dev/null\n\
+         mkdir -p /dev/pts 2>/dev/null\n\
+         mount -t devpts devpts /dev/pts 2>/dev/null\n";
     // Prefer the concrete /dev/ttyS0 (a real tty that cleanly becomes the
     // controlling terminal); fall back to /dev/console.
     const SHELL_LAUNCH: &str = "TTY=/dev/ttyS0; [ -c \"$TTY\" ] || TTY=/dev/console\n\
