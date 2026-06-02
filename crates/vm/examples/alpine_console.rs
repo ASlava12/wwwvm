@@ -127,7 +127,24 @@ fn main() {
     } else {
         ""
     };
-    let init = format!("#!/bin/sh\n{net_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}");
+    // When a framebuffer is requested (WWWVM_FB set), load the DRM + input
+    // modules so userspace gets real devices: `simpledrm` binds the EFI
+    // framebuffer → /dev/dri/card0 (the X `modesetting` device) and `evdev`
+    // exposes /dev/input/event* (once an input device binds). The netboot
+    // vmlinuz-lts ships these as modules, not built-ins, so without them
+    // there is no userspace graphics/input device at all. Stage the .ko's
+    // with `fetch-alpine-assets.sh --with-gui`; the insmods are silent
+    // no-ops when absent. Order = deps before dependents. These are large
+    // modules (drm.ko ~600 KiB) and slow to relocate on the emulator, so
+    // this adds noticeable boot time — hence gated on graphics being asked
+    // for rather than loaded unconditionally.
+    let gui_setup = if std::env::var_os("WWWVM_FB").is_some() {
+        "for m in i2c-core drm drm_kms_helper drm_shmem_helper simpledrm \
+             evdev mousedev psmouse; do insmod /$m.ko 2>/dev/null; done\n"
+    } else {
+        ""
+    };
+    let init = format!("#!/bin/sh\n{net_setup}{gui_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}");
     let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
