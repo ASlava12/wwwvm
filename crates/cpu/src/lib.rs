@@ -1976,6 +1976,25 @@ impl Cpu {
                     }
                 }
             }
+            // CMPSS (F3 0F C2) / CMPSD (F2 0F C2) — scalar float compare with
+            // an imm8 predicate; the low lane becomes an all-ones/all-zeros
+            // mask, the upper bits of the destination are preserved.
+            0xC2 => {
+                let (_, reg, rm) = self.fetch_modrm(mem);
+                if is_f3 {
+                    let a = f32::from_bits(self.xmm[reg as usize] as u32) as f64;
+                    let b = f32::from_bits(self.read_xmm_rm32(rm, mem)) as f64;
+                    let imm = self.fetch_u8(mem);
+                    let mask = if sse_cmp(a, b, imm) { LO32 } else { 0 };
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO32) | mask;
+                } else {
+                    let a = f64::from_bits(self.xmm[reg as usize] as u64);
+                    let b = f64::from_bits(self.read_xmm_rm64(rm, mem));
+                    let imm = self.fetch_u8(mem);
+                    let mask = if sse_cmp(a, b, imm) { LO64 } else { 0 };
+                    self.xmm[reg as usize] = (self.xmm[reg as usize] & !LO64) | mask;
+                }
+            }
             _ => {
                 return Err(CpuError::Unimplemented {
                     opcode: op2,
@@ -7609,6 +7628,22 @@ impl Cpu {
                         let hi = f64::from_bits((src >> 64) as u64).trunc() as i32 as u32 as u128;
                         self.xmm[reg as usize] = lo | (hi << 32);
                     }
+                    // CMPPS (0F C2) / CMPPD (66 0F C2): per-lane float compare
+                    // with an imm8 predicate (0 EQ,1 LT,2 LE,3 UNORD,4 NEQ,
+                    // 5 NLT,6 NLE,7 ORD), producing an all-ones/all-zeros mask
+                    // per lane. OpenBLAS / numpy emit these; the F2/F3-prefixed
+                    // scalar CMPSD/CMPSS route through sse_scalar.
+                    0xC2 => {
+                        let (_, reg, rm) = self.fetch_modrm(mem);
+                        let b = self.read_xmm_rm(rm, mem);
+                        let imm = self.fetch_u8(mem);
+                        let a = self.xmm[reg as usize];
+                        self.xmm[reg as usize] = if self.has_66() {
+                            packed_cmp_f64(a, b, imm)
+                        } else {
+                            packed_cmp_f32(a, b, imm)
+                        };
+                    }
                     // Packed float arithmetic. The 0x66 prefix
                     // (op_size_32) selects double-precision (PD, 2×f64)
                     // over single (PS, 4×f32); the opcode low bits pick
@@ -9280,6 +9315,56 @@ fn packed_f64(a: u128, b: u128, f: impl Fn(f64, f64) -> f64) -> u128 {
         let la = f64::from_bits((a >> shift) as u64);
         let lb = f64::from_bits((b >> shift) as u64);
         out |= (f(la, lb).to_bits() as u128) << shift;
+    }
+    out
+}
+
+/// SSE CMPPS/CMPPD/CMPSS/CMPSD predicate (imm8 low 3 bits) with x86 NaN
+/// semantics: the ordered forms (EQ/LT/LE/ORD) are false when either operand
+/// is NaN; the unordered forms (UNORD/NEQ/NLT/NLE) are true on NaN. Rust's
+/// `==`/`<`/`<=` already return false on NaN, so the negated forms come out
+/// right by construction.
+// The negated `!(x < y)` / `!(x <= y)` are deliberate: NLT/NLE must be TRUE
+// when a NaN is involved (x86 unordered semantics), which `>=`/`>` would get
+// wrong — so the lint that wants `>=`/`>` here does not apply.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn sse_cmp(x: f64, y: f64, pred: u8) -> bool {
+    match pred & 7 {
+        0 => x == y,                      // EQ
+        1 => x < y,                       // LT
+        2 => x <= y,                      // LE
+        3 => x.is_nan() || y.is_nan(),    // UNORD
+        4 => !(x == y),                   // NEQ
+        5 => !(x < y),                    // NLT
+        6 => !(x <= y),                   // NLE
+        _ => !(x.is_nan() || y.is_nan()), // ORD
+    }
+}
+
+/// CMPPD (66 0F C2): 2×f64 lanes → per-lane all-ones (true) / all-zeros mask.
+fn packed_cmp_f64(a: u128, b: u128, pred: u8) -> u128 {
+    let mut out: u128 = 0;
+    for lane in 0..2 {
+        let shift = lane * 64;
+        let x = f64::from_bits((a >> shift) as u64);
+        let y = f64::from_bits((b >> shift) as u64);
+        if sse_cmp(x, y, pred) {
+            out |= (u64::MAX as u128) << shift;
+        }
+    }
+    out
+}
+
+/// CMPPS (0F C2): 4×f32 lanes → per-lane all-ones / all-zeros mask.
+fn packed_cmp_f32(a: u128, b: u128, pred: u8) -> u128 {
+    let mut out: u128 = 0;
+    for lane in 0..4 {
+        let shift = lane * 32;
+        let x = f32::from_bits((a >> shift) as u32) as f64;
+        let y = f32::from_bits((b >> shift) as u32) as f64;
+        if sse_cmp(x, y, pred) {
+            out |= (u32::MAX as u128) << shift;
+        }
     }
     out
 }

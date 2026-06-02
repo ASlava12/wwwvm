@@ -6871,6 +6871,51 @@ fn sse2_pandn_xmm() {
     );
 }
 
+/// SSE2 CMPPD (66 0F C2 ib) — per-lane f64 compare → all-ones/all-zeros mask.
+/// OpenBLAS/numpy emit it (it surfaced as "unimplemented opcode 0xC2", the
+/// 0F-map second byte). XMM0=[1.0, 2.0] CMP-EQ [1.0, 9.0] → lane0 all-ones
+/// (1.0==1.0), lane1 zero (2.0≠9.0).
+#[test]
+fn sse2_cmppd_packed_compare_eq() {
+    let mut mem = Memory::new(0x10_0000);
+    // f64 little-endian: 1.0=0x3FF0…, 2.0=0x4000…, 9.0=0x4022…
+    mem.write_u32(0x600, 0);
+    mem.write_u32(0x604, 0x3FF0_0000); // XMM0 lane0 = 1.0
+    mem.write_u32(0x608, 0);
+    mem.write_u32(0x60C, 0x4000_0000); // XMM0 lane1 = 2.0
+    mem.write_u32(0x610, 0);
+    mem.write_u32(0x614, 0x3FF0_0000); // src  lane0 = 1.0
+    mem.write_u32(0x618, 0);
+    mem.write_u32(0x61C, 0x4022_0000); // src  lane1 = 9.0
+    mem.write_slice(
+        0x7C00,
+        &[
+            0x66, 0x0F, 0x6F, 0x06, 0x00, 0x06, // MOVDQA XMM0, [0x600]
+            0x66, 0x0F, 0xC2, 0x06, 0x10, 0x06, 0x00, // CMPPD XMM0, [0x610], EQ(0)
+            0x66, 0x0F, 0x7F, 0x06, 0x20, 0x06, // MOVDQA [0x620], XMM0
+            0xF4,
+        ],
+    );
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut io = IoBus::new();
+    for _ in 0..16 {
+        if cpu.halted {
+            break;
+        }
+        cpu.step(&mut mem, &mut io).expect("step");
+    }
+    assert!(cpu.halted, "program did not HLT");
+    assert_eq!(
+        mem.read_u32(0x620),
+        0xFFFF_FFFF,
+        "lane0 1.0==1.0 → all ones"
+    );
+    assert_eq!(mem.read_u32(0x624), 0xFFFF_FFFF, "lane0 high");
+    assert_eq!(mem.read_u32(0x628), 0, "lane1 2.0≠9.0 → zero");
+    assert_eq!(mem.read_u32(0x62C), 0, "lane1 high");
+}
+
 /// SSE data movement: MOVD GP→XMM, MOVDQA XMM→XMM, MOVD XMM→GP.
 /// Round-trips a dword through the XMM register file.
 #[test]
