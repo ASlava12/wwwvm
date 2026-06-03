@@ -159,6 +159,32 @@
         </fieldset>
 
         <fieldset>
+          <legend>Custom snapshots (recipe → store)</legend>
+          <label>store URL:
+            <input id="snap-url" type="text" size="22" placeholder="http://localhost:8090" />
+          </label>
+          <label>admin token:
+            <input id="snap-token" type="password" size="22" placeholder="(needed to upload)" />
+          </label>
+          <label>name:
+            <input id="snap-name" type="text" size="16" placeholder="task1" />
+          </label>
+          <label>recipe (one shell cmd per line, run on the booted base):
+            <textarea id="snap-recipe" rows="3" placeholder="apk add python3&#10;echo ready"></textarea>
+          </label>
+          <button id="snap-build">Build &amp; upload</button>
+          <hr />
+          <label>load snapshot:
+            <select id="snap-list"><option value="">— Refresh list —</option></select>
+          </label>
+          <div class="snapshot-row">
+            <button id="snap-refresh">Refresh list</button>
+            <button id="snap-load">Load selected</button>
+          </div>
+          <small id="snap-status" class="status">boot a base image, enter a recipe, then Build</small>
+        </fieldset>
+
+        <fieldset>
           <legend>VGA snapshot (0xB8000)</legend>
           <pre id="vga">(empty)</pre>
         </fieldset>
@@ -219,6 +245,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=16"></script>
+    <script type="module" src="./main.js?v=17"></script>
   </body>
 </html>

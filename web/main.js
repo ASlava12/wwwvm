@@ -7,6 +7,7 @@
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
 import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
 import { makeBytes, breakBytes, comboBytes } from "./ps2-keymap.js?v=2";
+import { SnapStore, uploadSnapshot, downloadSnapshot } from "./snapshot-store.js?v=1";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -61,11 +62,12 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=5", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=6", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
 let snapshotResolve = null;
+let exportResolve = null; // pending getSnapshotExport() in worker mode
 
 function renderDiag(m) {
   $("diag").textContent =
@@ -107,6 +109,12 @@ worker.onmessage = (e) => {
       if (snapshotResolve) {
         snapshotResolve(m.buf ? new Uint8Array(m.buf) : null);
         snapshotResolve = null;
+      }
+      break;
+    case "snapshot_export":
+      if (exportResolve) {
+        exportResolve(m.buf ? new Uint8Array(m.buf) : null);
+        exportResolve = null;
       }
       break;
   }
@@ -1075,6 +1083,29 @@ function restoreSnapshot(bytes) {
   }
 }
 
+// Paged-export variants (for the custom-snapshot store). snapshot_export()
+// returns the manifest + RAM pages framed for content-addressed upload;
+// restore_export() takes a rebuilt export buffer.
+async function getSnapshotExport() {
+  if (active === "worker") {
+    return await new Promise((resolve) => {
+      exportResolve = resolve;
+      worker.postMessage({ t: "snapshot_export" });
+    });
+  }
+  return vm.snapshot_export();
+}
+function restoreSnapshotExport(bytes) {
+  if (active === "worker") {
+    worker.postMessage({ t: "restore_export", buf: bytes.buffer }, [bytes.buffer]);
+    term.reset();
+  } else {
+    vm.restore_export(bytes);
+    term.reset();
+    resumePump();
+  }
+}
+
 $("save").addEventListener("click", async () => {
   if (!isBooted()) {
     setSnapshotStatus("can't snapshot before boot", "error");
@@ -1107,6 +1138,75 @@ $("load").addEventListener("click", async () => {
     setSnapshotStatus(`restored ${bytes.length.toLocaleString()} bytes`);
   } catch (e) {
     setSnapshotStatus(`load failed: ${e.message || e}`, "error");
+  }
+});
+
+// ---- Custom snapshots: recipe → content-addressed store (crates/snapstore) ----
+const snapStore = () =>
+  new SnapStore($("snap-url").value.trim(), $("snap-token").value.trim());
+const setSnapStatus = (t, cls) => {
+  const e = $("snap-status");
+  if (e) {
+    e.textContent = t;
+    e.className = "status" + (cls ? " " + cls : "");
+  }
+};
+
+$("snap-build")?.addEventListener("click", async () => {
+  if (!isBooted()) return setSnapStatus("boot a base image first", "error");
+  const name = $("snap-name").value.trim();
+  if (!name) return setSnapStatus("enter a snapshot name", "error");
+  const recipe = $("snap-recipe").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  const btn = $("snap-build");
+  btn.disabled = true;
+  try {
+    // Run the recipe on the booted base. runCommand waits for output to settle;
+    // a long step (e.g. apk add) may exceed the timeout — keep recipes modest or
+    // raise it. The user controls the recipe and can verify the console.
+    setSnapStatus(`running recipe (${recipe.length} cmd)…`);
+    for (const line of recipe) await runCommand(line, 8000);
+    setSnapStatus("snapshotting…");
+    const buf = await getSnapshotExport();
+    if (!buf) throw new Error("no snapshot returned");
+    const r = await uploadSnapshot(snapStore(), name, buf, (done, total) => {
+      if (done % 64 === 0 || done === total) setSnapStatus(`uploading pages ${done}/${total}…`);
+    });
+    setSnapStatus(
+      `uploaded "${name}": ${r.uploaded}/${r.pages} pages new (${(r.bytes / 1048576).toFixed(1)} MiB)`,
+    );
+  } catch (e) {
+    setSnapStatus(`build failed: ${e.message || e}`, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("snap-refresh")?.addEventListener("click", async () => {
+  try {
+    const ids = await snapStore().listManifests();
+    const sel = $("snap-list");
+    sel.innerHTML = ids.length ? "" : '<option value="">(none)</option>';
+    for (const id of ids) {
+      const o = document.createElement("option");
+      o.value = o.textContent = id;
+      sel.appendChild(o);
+    }
+    setSnapStatus(`${ids.length} snapshot(s) in store`);
+  } catch (e) {
+    setSnapStatus(`list failed: ${e.message || e}`, "error");
+  }
+});
+
+$("snap-load")?.addEventListener("click", async () => {
+  const id = $("snap-list").value;
+  if (!id) return setSnapStatus("pick a snapshot (Refresh first)", "error");
+  try {
+    setSnapStatus(`downloading "${id}"…`);
+    const buf = await downloadSnapshot(snapStore(), id);
+    restoreSnapshotExport(buf);
+    setSnapStatus(`restored "${id}" (${(buf.length / 1048576).toFixed(1)} MiB)`);
+  } catch (e) {
+    setSnapStatus(`load failed: ${e.message || e}`, "error");
   }
 });
 

@@ -302,6 +302,20 @@ self.onmessage = async (e) => {
           startLoop();
         }
         break;
+      case "snapshot_export":
+        if (vm && vm.is_booted()) {
+          const b = vm.snapshot_export();
+          post({ t: "snapshot_export", buf: b.buffer }, [b.buffer]);
+        } else {
+          post({ t: "snapshot_export", buf: null });
+        }
+        break;
+      case "restore_export":
+        if (vm) {
+          vm.restore_export(new Uint8Array(m.buf));
+          startLoop();
+        }
+        break;
     }
   } catch (err) {
     post({ t: "error", message: String((err && err.message) || err) });
