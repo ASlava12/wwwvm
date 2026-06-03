@@ -2095,9 +2095,27 @@ impl Cpu {
     }
 
     fn fetch_u16(&mut self, mem: &Memory) -> u16 {
-        let lo = self.fetch_u8(mem) as u16;
-        let hi = self.fetch_u8(mem) as u16;
-        lo | (hi << 8)
+        let ip = self.ip;
+        let linear = self.linear_seg(sreg::CS, ip);
+        // Page-crossing (low byte is the last in its page): the high byte has
+        // its own fetch translation — fall back to per-byte.
+        if linear & 0xFFF == 0xFFF {
+            let lo = self.fetch_u8(mem) as u16;
+            let hi = self.fetch_u8(mem) as u16;
+            return lo | (hi << 8);
+        }
+        // Same page: translate the fetch once, read both code bytes. 32-bit
+        // immediates/displacements (read as two fetch_u16) inherit this — 4
+        // translations become 2.
+        self.ip = ip.wrapping_add(2);
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        let phys = self.translate_fetch(mem, linear);
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        (mem.read_code_u8(phys) as u16) | ((mem.read_code_u8(phys.wrapping_add(1)) as u16) << 8)
     }
 
     /// Push a value onto the x87 stack: decrement TOP, write ST(0).
