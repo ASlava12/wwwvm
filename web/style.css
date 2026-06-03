@@ -60,12 +60,14 @@ body.has-fb #canvas-pane { display: flex; }
   padding: 0; border-radius: 4px; font-size: .85rem; background: rgba(22, 27, 34, .85);
   color: var(--fg); border: 1px solid var(--border); }
 
-/* Bottom: Autorun | Send command + result. min-width:0 lets a cell shrink so a
-   long line in <pre>/<input> can't force horizontal page overflow. */
-#bottom { flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
-#bottom > fieldset { min-width: 0; }
+/* Bottom: Autorun | Send command + result. Fixed height so the cells have a
+   definite size — the result/textarea then FILL their cell (flex:1) and their
+   scrollbars sit at the very bottom of the panel. min-width/height:0 lets cells
+   shrink so a long line can't force page overflow. */
+#bottom { flex: 0 0 auto; height: 24vh; display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+#bottom > fieldset { min-width: 0; min-height: 0; }
 #autorun-box, #command-box { display: flex; flex-direction: column; gap: .4rem; }
-#autorun-box textarea { resize: vertical; }
+#autorun { flex: 1 1 0; min-height: 0; resize: none; }
 .cmd-row { display: flex; gap: .5rem; }
 .cmd-row input { flex: 1; }
 
@@ -92,8 +94,7 @@ pre { margin: 0; max-height: 8rem; overflow: auto;
 /* Bound the result box so a big output (e.g. `ls -l`) scrolls inside it instead
    of growing the bottom panel and squishing the UART above. Click it to expand
    into a large scrollable overlay (close: click outside / Esc). */
-#last-result { max-height: 7rem; overflow: auto; cursor: zoom-in; }
-#bottom > fieldset { max-height: 30vh; }
+#last-result { flex: 1 1 0; min-height: 0; max-height: none; overflow: auto; cursor: zoom-in; }
 #last-result.expanded { position: fixed; inset: 6vh 8vw; max-height: none; z-index: 100;
   margin: 0; padding: 1rem; background: var(--panel); color: var(--fg);
   border: 1px solid var(--border); border-radius: 8px; overflow: auto; cursor: auto;

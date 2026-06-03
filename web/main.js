@@ -856,12 +856,23 @@ async function runCommand(text, timeoutMs = 1500) {
 }
 window.runCommand = runCommand;
 
+// Strip ANSI escapes (colors from `ls --color`, cursor moves, OSC titles) and
+// normalize CRLF — the terminal renders these, but the plain-text result box
+// would otherwise show them raw as "[1;34m…[m".
+function stripAnsi(s) {
+  return String(s)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC (e.g. window title)
+    .replace(/\x1b[[\x9b][0-9;?=]*[ -/]*[@-~]/g, "") // CSI (color, cursor, …)
+    .replace(/\x1b[@-Z\\-_]/g, "") // other single-char escapes
+    .replace(/\r\n?/g, "\n"); // CRLF / lone CR → LF
+}
+
 $("send").addEventListener("click", async () => {
   const text = $("cmd").value;
   if (!text) return;
   try {
     const result = await runCommand(text);
-    $("last-result").textContent = result || "(no output)";
+    $("last-result").textContent = stripAnsi(result) || "(no output)";
   } catch (e) {
     $("last-result").textContent = String(e);
   }
