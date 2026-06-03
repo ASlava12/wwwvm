@@ -1,0 +1,46 @@
+# One-command public deploy of wwwvm (static site + WebSocket↔TCP relay behind
+# single-origin TLS). See docs/DEPLOY.md.
+#
+#   # build web/pkg (wasm) and web/images (guest cpios) on the host FIRST, then:
+#   WWWVM_DOMAIN=example.com docker compose up -d --build
+#
+# Local test (Caddy serves an internal self-signed cert for localhost):
+#   docker compose up --build      # then open https://localhost
+services:
+  relay:
+    build: .
+    expose: ["8080"] # internal only; reached via Caddy /ws
+    environment:
+      # SCOPE THIS to only the hosts your demo needs (apk mirrors here). Never
+      # `*` on a public deploy — that's an open relay. comma/newline separated.
+      WWWVM_PROXY_ALLOWLIST: "${WWWVM_PROXY_ALLOWLIST:-dl-cdn.alpinelinux.org:80,dl-cdn.alpinelinux.org:443}"
+      # Lock WebSocket Origin to the page (Caddy forwards the browser's Origin).
+      WWWVM_PROXY_ORIGINS: "https://${WWWVM_DOMAIN:-localhost}"
+      # Abuse limits (0 = off). Conn caps are on; tune for your traffic.
+      WWWVM_PROXY_MAX_CONNS: "${WWWVM_PROXY_MAX_CONNS:-512}"
+      WWWVM_PROXY_MAX_CONNS_PER_IP: "${WWWVM_PROXY_MAX_CONNS_PER_IP:-16}"
+      WWWVM_PROXY_IDLE_TIMEOUT_SECS: "${WWWVM_PROXY_IDLE_TIMEOUT_SECS:-120}"
+      # Optional: rotate guest egress through public proxies (hides your IP).
+      # Point at a file you keep refreshed with scripts/fetch-proxies.py.
+      # WWWVM_PROXY_UPSTREAMS_FILE: "/data/proxies.json"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      WWWVM_DOMAIN: "${WWWVM_DOMAIN:-localhost}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web:/srv/web:ro # the static site (build web/pkg + web/images first!)
+      - caddy_data:/data # persists the issued TLS certs
+      - caddy_config:/config
+    depends_on:
+      - relay
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

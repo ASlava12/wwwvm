@@ -1,0 +1,10 @@
+# The relay image (Dockerfile) only needs the Rust sources. Keep the build
+# context small — the static site is served by Caddy from a host mount, not
+# baked into this image.
+target/
+.git/
+web/
+guest/
+docs/
+**/*.bin
+*.log

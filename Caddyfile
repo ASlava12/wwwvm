@@ -1,0 +1,22 @@
+# Single-origin deploy for wwwvm: Caddy terminates TLS (automatic HTTPS via
+# Let's Encrypt for a real domain; an internal self-signed cert for localhost),
+# serves the static site, and reverse-proxies the WebSocket relay at /ws — so
+# the page and its wss:// share one origin (no mixed-content, no CORS/CSWSH
+# surprises: the relay sees Origin https://<domain>).
+#
+# WWWVM_DOMAIN selects the site address (default localhost for local testing).
+{$WWWVM_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# WebSocket relay. The browser connects to wss://<domain>/ws; Caddy
+	# upgrades and forwards to the relay's plain ws inside the compose network.
+	handle /ws {
+		reverse_proxy relay:8080
+	}
+
+	# Everything else: the static site (web/ mounted at /srv/web).
+	handle {
+		root * /srv/web
+		file_server
+	}
+}
