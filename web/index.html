@@ -55,15 +55,16 @@
             Networking (TCP NAT → WebSocket proxy)
           </label>
           <br />
-          <label>proxy ws:
-            <input id="net-proxy" type="text" value="ws://localhost:8080" size="22" />
-          </label>
           <label>allow (one host[:port] per line; <code>*</code> = everything):
             <textarea id="net-allow" rows="3">*</textarea>
           </label>
           <small class="status">⚠ the proxy's own allowlist must also permit it (WWWVM_PROXY_ALLOWLIST)</small>
           <br />
-          <label>upstream proxy:
+          <label>proxy ws (свой релей):
+            <input id="net-proxy" type="text" value="ws://localhost:8080" size="22" />
+          </label>
+          <small class="status">⚠ нужно поднять свой WebSocket↔TCP-релей: <code>cargo run -p wwwvm-proxy</code> (см. README)</small>
+          <label>upstream proxy (через что выходить наружу):
             <select id="net-upstream">
               <option value="direct">Direct (no upstream)</option>
               <option value="auto">Auto-rotate (server picks)</option>
