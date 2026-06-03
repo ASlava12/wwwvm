@@ -83,6 +83,18 @@ pub mod sreg {
 /// Signature of an installed BIOS shim — see [`Cpu::bios_hook`].
 pub type BiosHook = fn(&mut Cpu, &mut Memory, &mut IoBus, u8) -> bool;
 
+/// Slots in the direct-mapped data read/write TLBs (must be a power of two —
+/// the index is `(linear_page >> 12) & (RW_TLB_WAYS - 1)`). 16 covers the
+/// handful of distinct pages a typical PM step/loop touches without bloating
+/// the per-CPU footprint or the flush cost.
+const RW_TLB_WAYS: usize = 16;
+
+/// Direct-mapped index for a page-aligned linear address into the read/write TLB.
+#[inline(always)]
+fn rw_tlb_index(page: u32) -> usize {
+    (page >> 12) as usize & (RW_TLB_WAYS - 1)
+}
+
 pub struct Cpu {
     /// General-purpose register file — AX..DI as the low 16 bits of
     /// E?X. Indexed by the standard r16 encoding.
@@ -270,27 +282,27 @@ pub struct Cpu {
     /// the unit tests do) is self-invalidating: the lookup just
     /// misses on the next translate when a20 changed under us.
     fetch_tlb: Cell<Option<(u32, u32, bool)>>,
-    /// Sibling 1-entry data-read translation cache. Covers
-    /// `translate` (read access). Sequential stack pushes, struct
-    /// field loads, REP MOVSD source/dest — these all hit the
-    /// same page for many bytes in a row, so caching the most
-    /// recent (page, frame, a20) tuple lets us skip the PDE+PTE
-    /// walk on each follow-up byte.
-    /// Invalidations match `fetch_tlb`.
-    read_tlb: Cell<Option<(u32, u32, bool)>>,
-    /// 1-entry data-write translation cache. Covers
-    /// `translate_write`. Stack pushes, struct field stores, REP
-    /// STOSD destination — these all keep writing to the same
-    /// page. Write *permission* (CR0.WP + effective R/W + CPL=3
-    /// U/S check) varies with state but all of those are
-    /// invalidated when they can change: CR3 reload (PDE/PTE
-    /// table swap), INVLPG (per-page R/W change), CR0 write
-    /// (CR0.WP toggle), and write_sreg(CS) (CPL transition).
-    /// As long as those four sites stay in `invalidate_fetch_tlb`,
-    /// caching a successful write translation is sound — the
-    /// permission check passed at cache time and nothing that
-    /// could change permissions has fired since.
-    write_tlb: Cell<Option<(u32, u32, bool)>>,
+    /// Data-read translation cache for `translate`. Unlike the 1-entry
+    /// `fetch_tlb`, this is a small **direct-mapped** array
+    /// (`RW_TLB_WAYS` slots, indexed by linear-page bits): real PM code
+    /// interleaves reads across several pages within a step/loop (a
+    /// global + a stack local + a struct field on distinct pages), which
+    /// thrashes a single slot into a full PDE+PTE walk every access. A
+    /// handful of slots keeps each of those pages resident. (A 2-entry
+    /// *fetch* TLB was a measured null — fetches stay on one page — but
+    /// the data path is the one that bounces; see perf notes.)
+    /// Invalidations match `fetch_tlb`: the WHOLE array is flushed at the
+    /// same sites (`invalidate_fetch_tlb`, reset), so the soundness
+    /// argument is unchanged — only the capacity grew from 1 to N.
+    /// Each slot is `(linear_page, phys_frame_after_a20, a20_state)`.
+    read_tlb: [Cell<Option<(u32, u32, bool)>>; RW_TLB_WAYS],
+    /// Data-write translation cache for `translate_write`. Same
+    /// direct-mapped N-slot shape and flush-all invalidation as
+    /// `read_tlb`; the write *permission* (CR0.WP + effective R/W + CPL=3
+    /// U/S) was valid at cache time and every state change that could
+    /// alter it (CR3 reload, INVLPG, CR0 write, write_sreg(CS)) flushes
+    /// the whole array via `invalidate_fetch_tlb`.
+    write_tlb: [Cell<Option<(u32, u32, bool)>>; RW_TLB_WAYS],
     /// IP of the instruction currently being decoded — captured at
     /// the top of every `step()` so that a #PF raised mid-decode
     /// can rewind `self.ip` to the faulting instruction before
@@ -664,8 +676,8 @@ impl Cpu {
             efer: 0,
             pending_fault: Cell::new(None),
             fetch_tlb: Cell::new(None),
-            read_tlb: Cell::new(None),
-            write_tlb: Cell::new(None),
+            read_tlb: std::array::from_fn(|_| Cell::new(None)),
+            write_tlb: std::array::from_fn(|_| Cell::new(None)),
             // (the TLB slots are also explicitly cleared by
             // reset_to_boot — see `Cpu::reset_to_boot`).
             last_op_ip: 0,
@@ -756,8 +768,12 @@ impl Cpu {
         self.efer = 0;
         self.pending_fault.set(None);
         self.fetch_tlb.set(None);
-        self.read_tlb.set(None);
-        self.write_tlb.set(None);
+        for s in &self.read_tlb {
+            s.set(None);
+        }
+        for s in &self.write_tlb {
+            s.set(None);
+        }
         self.last_op_ip = 0;
         self.a20 = true;
         self.code_size_32 = false;
@@ -1107,15 +1123,15 @@ impl Cpu {
             };
         }
         let page = linear & 0xFFFF_F000;
-        if let Some((cached_page, cached_frame, cached_a20)) = self.read_tlb.get() {
+        let slot = &self.read_tlb[rw_tlb_index(page)];
+        if let Some((cached_page, cached_frame, cached_a20)) = slot.get() {
             if cached_page == page && cached_a20 == self.a20 {
                 return cached_frame | (linear & 0xFFF);
             }
         }
         let phys = self.translate_inner(mem, linear, Access::Read);
         if self.pending_fault.get().is_none() {
-            self.read_tlb
-                .set(Some((page, phys & 0xFFFF_F000, self.a20)));
+            slot.set(Some((page, phys & 0xFFFF_F000, self.a20)));
         }
         phys
     }
@@ -1135,15 +1151,15 @@ impl Cpu {
             };
         }
         let page = linear & 0xFFFF_F000;
-        if let Some((cached_page, cached_frame, cached_a20)) = self.write_tlb.get() {
+        let slot = &self.write_tlb[rw_tlb_index(page)];
+        if let Some((cached_page, cached_frame, cached_a20)) = slot.get() {
             if cached_page == page && cached_a20 == self.a20 {
                 return cached_frame | (linear & 0xFFF);
             }
         }
         let phys = self.translate_inner(mem, linear, Access::Write);
         if self.pending_fault.get().is_none() {
-            self.write_tlb
-                .set(Some((page, phys & 0xFFFF_F000, self.a20)));
+            slot.set(Some((page, phys & 0xFFFF_F000, self.a20)));
         }
         phys
     }
@@ -1195,11 +1211,16 @@ impl Cpu {
     /// silicon and Linux never does that on the fetch path.
     fn invalidate_fetch_tlb(&self) {
         self.fetch_tlb.set(None);
-        // Read- and write-side caches share all the same
-        // invalidation triggers; clear them together so the call
-        // sites only have one helper to remember.
-        self.read_tlb.set(None);
-        self.write_tlb.set(None);
+        // Read- and write-side caches share all the same invalidation
+        // triggers; flush the WHOLE direct-mapped array of each together so
+        // the call sites only have one helper to remember (and the soundness
+        // argument stays "flush on every state change that could matter").
+        for s in &self.read_tlb {
+            s.set(None);
+        }
+        for s in &self.write_tlb {
+            s.set(None);
+        }
     }
 
     // PDE/PTE A/D bits are deliberately NOT updated by translate_inner.
