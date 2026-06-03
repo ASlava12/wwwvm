@@ -129,20 +129,30 @@ function sendMouse(dx, dy, buttons) {
   if (!cv) return;
   let buttons = 0; // bit0 left, bit1 right, bit2 middle
   const BTN = { 0: 1, 1: 4, 2: 2 }; // DOM button (0/1/2) → our bitmask
+  const wrap = document.getElementById("canvas-wrap");
   const locked = () => document.pointerLockElement === cv;
-  const setHint = () => {
+  let hovering = false;
+  // The hint never sits over the desktop: the "click to capture" prompt shows
+  // only while the pointer is over the canvas; the "captured" reminder flashes
+  // on lock then fades.
+  const refreshHint = () => {
     if (!hint) return;
-    hint.textContent = locked()
-      ? "Захвачено · правый Alt — отпустить"
-      : "Клик — захватить мышь и клавиатуру";
-    hint.classList.toggle("active", locked());
-    hint.style.opacity = "1";
-    // Fade the "captured" reminder after a moment so it doesn't cover the desktop.
-    if (locked()) setTimeout(() => { if (locked()) hint.style.opacity = "0"; }, 2500);
+    if (locked()) {
+      hint.textContent = "Захвачено · ESC или правый Alt — отпустить";
+      hint.classList.add("active");
+      hint.style.opacity = "1";
+      setTimeout(() => { if (locked()) hint.style.opacity = "0"; }, 2000);
+    } else {
+      hint.textContent = "Клик — захватить мышь и клавиатуру";
+      hint.classList.remove("active");
+      hint.style.opacity = hovering ? "1" : "0";
+    }
   };
 
   cv.addEventListener("click", () => { if (!locked()) cv.requestPointerLock?.(); });
-  document.addEventListener("pointerlockchange", setHint);
+  document.addEventListener("pointerlockchange", refreshHint);
+  wrap?.addEventListener("mouseenter", () => { hovering = true; refreshHint(); });
+  wrap?.addEventListener("mouseleave", () => { hovering = false; refreshHint(); });
 
   // Mouse + keyboard are captured globally, but only while the canvas is locked.
   document.addEventListener("mousemove", (e) => {

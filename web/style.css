@@ -47,10 +47,10 @@ body.has-fb #canvas-pane { display: flex; }
 #fb { max-width: 100%; max-height: 100%; image-rendering: pixelated; display: block; }
 #canvas-wrap:fullscreen { max-height: none; background: #000; }
 #canvas-wrap:fullscreen #fb { max-height: 100vh; }
-.hint { position: absolute; top: .4rem; left: 50%; transform: translateX(-50%);
+.hint { position: absolute; bottom: .5rem; left: 50%; transform: translateX(-50%);
   background: rgba(13, 17, 23, .82); color: var(--muted); border: 1px solid var(--border);
   border-radius: 999px; padding: .15rem .7rem; font: 12px ui-monospace, monospace;
-  pointer-events: none; transition: opacity .3s; }
+  pointer-events: none; opacity: 0; transition: opacity .3s; }
 .hint.active { color: #3fb950; border-color: #3fb950; }
 
 #terminal-pane { flex: 1 1 0; min-height: 120px; background: black;
