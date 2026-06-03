@@ -19,9 +19,10 @@ header h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
 .status.running { color: #3fb950; }
 .status.error { color: #f85149; }
 
-/* Layout: left sidebar (collapsible) + main stage column. */
+/* Layout: wide content stage on the LEFT + collapsible settings on the RIGHT
+   (the stage is first in the DOM; `order:1` floats the sidebar to the right). */
 main { flex: 1 1 auto; display: flex; gap: 1rem; padding: 1rem; min-height: 0; }
-#controls { flex: 0 0 320px; display: flex; flex-direction: column; gap: .75rem;
+#controls { order: 1; flex: 0 0 340px; display: flex; flex-direction: column; gap: .75rem;
   overflow-y: auto; padding-right: .25rem; }
 body.sidebar-hidden #controls { display: none; }
 
