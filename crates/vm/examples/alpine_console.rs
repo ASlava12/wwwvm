@@ -440,6 +440,15 @@ fn main() {
                 }
                 continue;
             }
+            // Ctrl-B (0x02): inject a small PS/2 mouse move + left click, to
+            // test/demo the pointer path to a graphical guest (psmouse →
+            // /dev/input/event1) without a real mouse.
+            if bytes.contains(&0x02) {
+                vm.push_mouse_packet(15, -15, true, false, false); // move + press
+                vm.push_mouse_packet(0, 0, false, false, false); // release
+                eprintln!("\r\n[wwwvm] PS/2 mouse: move + left-click (Ctrl-B)");
+                continue;
+            }
             if ready {
                 vm.send_input(&bytes);
             } else {
