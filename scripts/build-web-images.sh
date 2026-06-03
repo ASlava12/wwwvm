@@ -23,10 +23,12 @@ MINIROOT="${WWWVM_ALPINE_MINIROOT:-/tmp/alpine/root}"
 
 say() { echo "[build-web-images] $*"; }
 
-# 1. Ensure assets: kernel + minirootfs + the GUI .ko modules (simpledrm etc.).
-if [ ! -f "$KERNEL" ] || [ ! -x "$MINIROOT/bin/busybox" ] || [ ! -f "$MINIROOT/simpledrm.ko" ]; then
-  say "assets missing — fetching (kernel + minirootfs + GUI modules)…"
-  "$ROOT/scripts/fetch-alpine-assets.sh" --with-gui
+# 1. Ensure assets: kernel + minirootfs + the NIC .ko's (for in-guest apk over
+#    the browser relay) + the GUI .ko's (simpledrm/evdev/…).
+if [ ! -f "$KERNEL" ] || [ ! -x "$MINIROOT/bin/busybox" ] ||
+   [ ! -f "$MINIROOT/simpledrm.ko" ] || [ ! -f "$MINIROOT/8139too.ko" ]; then
+  say "assets missing — fetching (kernel + minirootfs + NIC + GUI modules)…"
+  "$ROOT/scripts/fetch-alpine-assets.sh" --with-net --with-gui
 fi
 
 # 2. Build the packer/dumper example.
@@ -36,12 +38,16 @@ BIN="$ROOT/target/release/examples/alpine_console"
 
 mkdir -p "$OUT"
 
-# 3. Dump the two initramfs variants. WWWVM_FB set → the GUI /init.
+# 3. Dump the two initramfs variants. WWWVM_NET_STUB=1 → /init insmods the NIC
+#    modules, brings eth0 up (10.0.2.15, gw/DNS 10.0.2.2 = the in-wasm NAT) and
+#    rewrites apk repos to http — so in-guest `apk` works over the browser relay
+#    (tick Networking + run crates/proxy). WWWVM_FB set → the GUI /init also
+#    insmods the DRM/input modules.
 say "packing console initramfs…"
-WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" \
+WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_NET_STUB=1 \
   WWWVM_DUMP_INITRAMFS="$OUT/alpine-console.cpio" "$BIN"
 say "packing GUI initramfs…"
-WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_FB=1024x768 \
+WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_NET_STUB=1 WWWVM_FB=1024x768 \
   WWWVM_DUMP_INITRAMFS="$OUT/alpine-gui.cpio" "$BIN"
 
 # 4. Copy the kernel beside them.
