@@ -1420,9 +1420,24 @@ impl Cpu {
     /// independently so the rare case of a read that straddles a
     /// page boundary picks up the second byte from the right frame.
     pub fn mem_read_u16(&self, m: &Memory, linear: u32) -> u16 {
-        let lo = self.mem_read_u8(m, linear) as u16;
-        let hi = self.mem_read_u8(m, linear.wrapping_add(1)) as u16;
-        lo | (hi << 8)
+        // Page-crossing (base is the last byte of its page): the high byte is
+        // on the next page with its own translation — fall back to per-byte.
+        if linear & 0xFFF == 0xFFF {
+            let lo = self.mem_read_u8(m, linear) as u16;
+            let hi = self.mem_read_u8(m, linear.wrapping_add(1)) as u16;
+            return lo | (hi << 8);
+        }
+        // Same-page fast path: translate once, read both bytes from the
+        // physical frame (mirrors `mem_write_aligned`). read_u8 still routes
+        // MMIO per byte, so a 16-bit MMIO read stays correct.
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        let phys = self.translate(m, linear);
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        (m.read_u8(phys) as u16) | ((m.read_u8(phys.wrapping_add(1)) as u16) << 8)
     }
 
     pub fn mem_write_u16(&self, m: &mut Memory, linear: u32, value: u16) {
@@ -1430,9 +1445,27 @@ impl Cpu {
     }
 
     pub fn mem_read_u32(&self, m: &Memory, linear: u32) -> u32 {
-        let lo = self.mem_read_u16(m, linear) as u32;
-        let hi = self.mem_read_u16(m, linear.wrapping_add(2)) as u32;
-        lo | (hi << 16)
+        // Page-crossing within the 4 bytes: split into two u16 reads, each of
+        // which handles its own page boundary.
+        if linear & 0xFFF > 0xFFC {
+            let lo = self.mem_read_u16(m, linear) as u32;
+            let hi = self.mem_read_u16(m, linear.wrapping_add(2)) as u32;
+            return lo | (hi << 16);
+        }
+        // Same-page fast path: translate once, read four bytes from the
+        // physical frame (was 4 separate translations). read_u8 still routes
+        // MMIO per byte.
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        let phys = self.translate(m, linear);
+        if self.pending_fault.get().is_some() {
+            return 0;
+        }
+        (m.read_u8(phys) as u32)
+            | ((m.read_u8(phys.wrapping_add(1)) as u32) << 8)
+            | ((m.read_u8(phys.wrapping_add(2)) as u32) << 16)
+            | ((m.read_u8(phys.wrapping_add(3)) as u32) << 24)
     }
 
     pub fn mem_write_u32(&self, m: &mut Memory, linear: u32, value: u32) {

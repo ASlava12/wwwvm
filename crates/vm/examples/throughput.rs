@@ -15,17 +15,23 @@ use wwwvm_vm::{Stop, Vm, BOOT_LOAD_ADDR};
 fn main() {
     // WWWVM_BENCH=alu (default): ALU-only loop — stresses fetch/decode/dispatch.
     //   MOV CX, 0xFFFF; XOR BX, BX; lp: ADD BX, CX; LOOP lp; HLT
-    // WWWVM_BENCH=mem: a load every iteration — stresses the data-read path.
+    // WWWVM_BENCH=mem: an 8-bit load every iteration — data-read path.
     //   MOV CX, 0xFFFF; XOR BX, BX; lp: MOV AL,[BX]; INC BX; LOOP lp; HLT
-    //   (LOOP rel8 = 0xFB = -5 back to lp; reads phys 0..65535, harmless.)
-    let mem_bench = std::env::var("WWWVM_BENCH").as_deref() == Ok("mem");
-    let program: &[u8] = if mem_bench {
-        &[
+    // WWWVM_BENCH=mem32: a 32-bit load every iteration — exercises the
+    //   translate-once multi-byte read path (mem_read_u32).
+    //   ...; lp: MOV EAX,[BX] (66 8B 07); INC BX; LOOP lp; HLT
+    // (reads phys 0..~65538, harmless; both mem loops INC BX to 0xFFFF.)
+    let bench = std::env::var("WWWVM_BENCH").unwrap_or_default();
+    let program: &[u8] = match bench.as_str() {
+        "mem" => &[
             0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x8A, 0x07, 0x43, 0xE2, 0xFB, 0xF4,
-        ]
-    } else {
-        &[0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x01, 0xCB, 0xE2, 0xFC, 0xF4]
+        ],
+        "mem32" => &[
+            0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x66, 0x8B, 0x07, 0x43, 0xE2, 0xFA, 0xF4,
+        ],
+        _ => &[0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x01, 0xCB, 0xE2, 0xFC, 0xF4],
     };
+    let mem_bench = bench == "mem" || bench == "mem32";
 
     let mut vm = Vm::new();
     vm.load_image(BOOT_LOAD_ADDR, program);
