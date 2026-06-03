@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <title>wwwvm — Rust VM in the browser</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="./style.css?v=6" />
+    <link rel="stylesheet" href="./style.css?v=7" />
   </head>
   <body>
     <header>
@@ -149,6 +149,8 @@
 
         <!-- UART (serial console). Fills the canvas area when there's no canvas. -->
         <div id="terminal-pane">
+          <button id="term-fullscreen-btn" class="term-fs"
+                  title="Fullscreen the console (captures Ctrl+W etc. in Chrome)">⛶</button>
           <div id="terminal"></div>
         </div>
 
@@ -176,6 +178,6 @@
     <button id="sidebar-toggle" title="Show/hide settings" aria-label="Settings">⚙</button>
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-    <script type="module" src="./main.js?v=5"></script>
+    <script type="module" src="./main.js?v=6"></script>
   </body>
 </html>

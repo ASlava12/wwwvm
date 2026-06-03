@@ -24,6 +24,18 @@ const term = new Terminal({
 });
 term.open($("terminal"));
 term.writeln("\x1b[90m(boot the VM to start)\x1b[0m");
+// While the terminal is focused, keep Ctrl/Alt combos out of the browser and
+// hand them to the guest instead, so e.g. Ctrl+U / Ctrl+W edit the shell line.
+// (Clipboard combos stay with the browser.) Browser-RESERVED combos like Ctrl+W
+// can't be cancelled in a normal tab — only the Keyboard Lock API in fullscreen
+// captures those, see the Fullscreen buttons.
+term.attachCustomKeyEventHandler((e) => {
+  if (e.type === "keydown" && (e.ctrlKey || e.altKey) && !e.metaKey) {
+    const k = (e.key || "").toLowerCase();
+    if (!(e.shiftKey && (k === "c" || k === "v"))) e.preventDefault();
+  }
+  return true; // let xterm translate the key and send it to the guest
+});
 
 await init();
 // `vm` is reassignable: the Linux/Alpine boot path swaps in a fresh
@@ -185,13 +197,23 @@ function sendMouse(dx, dy, buttons) {
   refreshHint();
 })();
 
-// Header controls: collapse/show the settings sidebar, fullscreen the canvas.
+// Collapse/show the settings sidebar.
 $("sidebar-toggle")?.addEventListener("click", () =>
   document.body.classList.toggle("sidebar-hidden"));
-$("fullscreen-btn")?.addEventListener("click", () => {
-  const wrap = document.getElementById("canvas-wrap");
+// Fullscreen (canvas or UART) + Keyboard Lock: in fullscreen Chromium grants
+// keyboard lock so even browser-reserved combos (Ctrl+W/T/N) reach the guest.
+// Firefox has no Keyboard Lock API, so there those combos can't be captured.
+function toggleFullscreen(el) {
   if (document.fullscreenElement) document.exitFullscreen?.();
-  else wrap?.requestFullscreen?.();
+  else el?.requestFullscreen?.();
+}
+$("fullscreen-btn")?.addEventListener("click", () =>
+  toggleFullscreen(document.getElementById("canvas-wrap")));
+$("term-fullscreen-btn")?.addEventListener("click", () =>
+  toggleFullscreen(document.getElementById("terminal-pane")));
+document.addEventListener("fullscreenchange", () => {
+  if (document.fullscreenElement) navigator.keyboard?.lock?.();
+  else navigator.keyboard?.unlock?.();
 });
 
 let rafHandle = 0;
