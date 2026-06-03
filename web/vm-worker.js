@@ -209,7 +209,8 @@ self.onmessage = async (e) => {
         netEnabled = false;
         tick = 0;
         if (m.linux) {
-          vm = WwwVm.new_with_ram_size(256 * 1024 * 1024);
+          const ramMiB = m.ramMiB && m.ramMiB >= 64 ? m.ramMiB : 256;
+          vm = WwwVm.new_with_ram_size(ramMiB * 1024 * 1024);
           const entry = vm.load_bzimage(new Uint8Array(m.kernel));
           vm.set_kernel_cmdline(m.cmdline);
           if (m.initrd) vm.set_ramdisk(new Uint8Array(m.initrd));

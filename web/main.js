@@ -465,22 +465,23 @@ const setLinuxStatus = (text, cls = "") => {
   el.className = "status" + (cls ? ` ${cls}` : "");
 };
 
-$("boot-linux").addEventListener("click", async () => {
-  const kfile = $("kernel-file").files?.[0];
-  if (!kfile) {
-    setLinuxStatus("pick a kernel (vmlinuz bzImage) first", "error");
-    return;
-  }
+// Boot a real Linux/Alpine kernel from in-memory buffers (kernel bzImage +
+// optional initramfs cpio as ArrayBuffers). Shared by the server-image picker
+// and the "load your own files" fallback. cmdline / framebuffer / networking
+// are read from the control panel (the image picker fills those in first).
+// `ramMiB` sizes the guest RAM — the GUI image asks for more (framebuffer +
+// the DRM/input modules unpacked into the initramfs tmpfs).
+async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   if (rafHandle) cancelAnimationFrame(rafHandle);
   useWorker = $("worker-enable")?.checked ?? true;
+  const cmdline = $("cmdline").value;
+  const fbEnabled = $("fb-enable").checked;
+  const [fbw, fbh] = ($("fb-res").value || "800x600").split("x").map(Number);
+  const kib = (n) => `${(n >> 10).toLocaleString()} KiB`;
 
   // ---- Web Worker path (default): hand the VM off the UI thread ----
   if (useWorker) {
     try {
-      setLinuxStatus("reading kernel…");
-      const kbuf = await kfile.arrayBuffer();
-      const ifile = $("initrd-file").files?.[0];
-      const ibuf = ifile ? await ifile.arrayBuffer() : null;
       const kLen = kbuf.byteLength;
       const iLen = ibuf ? ibuf.byteLength : 0;
       term.reset();
@@ -488,14 +489,13 @@ $("boot-linux").addEventListener("click", async () => {
       workerBooted = false;
 
       let fb = null;
-      if ($("fb-enable").checked) {
-        const [w, h] = ($("fb-res").value || "800x600").split("x").map(Number);
+      if (fbEnabled) {
         const cv = $("fb");
-        cv.width = w;
-        cv.height = h;
+        cv.width = fbw;
+        cv.height = fbh;
         fbImage = null;
-        $("fb-status").textContent = `${w}×${h}×32 efifb — waiting for kernel…`;
-        fb = { w, h };
+        $("fb-status").textContent = `${fbw}×${fbh}×32 efifb — waiting for kernel…`;
+        fb = { w: fbw, h: fbh };
       }
       let net = null;
       if ($("net-enable").checked) {
@@ -511,14 +511,13 @@ $("boot-linux").addEventListener("click", async () => {
       const transfer = [kbuf];
       if (ibuf) transfer.push(ibuf);
       worker.postMessage(
-        { t: "boot", linux: true, kernel: kbuf, initrd: ibuf, cmdline: $("cmdline").value, fb, net },
+        { t: "boot", linux: true, kernel: kbuf, initrd: ibuf, cmdline, fb, net, ramMiB },
         transfer
       );
-      const kib = (n) => `${(n >> 10).toLocaleString()} KiB`;
       setLinuxStatus(
         `booting in worker — kernel ${kib(kLen)}` +
           (iLen ? `, initramfs ${kib(iLen)}` : "") +
-          " (off the UI thread)",
+          ` (${ramMiB} MiB RAM, off the UI thread)`,
         "running"
       );
       setStatus("running", "running");
@@ -533,18 +532,16 @@ $("boot-linux").addEventListener("click", async () => {
   // ---- inline (main-thread) fallback ----
   active = "inline";
   try {
-    setLinuxStatus("reading kernel…");
-    const kbytes = new Uint8Array(await kfile.arrayBuffer());
-    const ifile = $("initrd-file").files?.[0];
-    const ibytes = ifile ? new Uint8Array(await ifile.arrayBuffer()) : null;
+    const kbytes = new Uint8Array(kbuf);
+    const ibytes = ibuf ? new Uint8Array(ibuf) : null;
 
-    // Fresh VM with the headroom Alpine needs (the default demo VM is tiny).
-    vm = WwwVm.new_with_ram_size(256 * 1024 * 1024);
+    // Fresh VM with the requested headroom (the default demo VM is tiny).
+    vm = WwwVm.new_with_ram_size(ramMiB * 1024 * 1024);
     window.__wwwvm = vm;
     term.reset();
 
     const entry = vm.load_bzimage(kbytes);
-    vm.set_kernel_cmdline($("cmdline").value);
+    vm.set_kernel_cmdline(cmdline);
     if (ibytes) vm.set_ramdisk(ibytes);
     // Host networking: spin up the in-wasm TCP NAT, pre-resolve the allowed
     // hosts over DoH, and relay each flow over a WebSocket to crates/proxy.
@@ -569,10 +566,9 @@ $("boot-linux").addEventListener("click", async () => {
     }
     // Advertise a linear framebuffer so the kernel's efifb binds and
     // fbcon renders the console as pixels (needs `console=tty0` on the
-    // cmdline, which the default value includes). Enable BEFORE the PM
+    // cmdline — the GUI image's cmdline includes it). Enable BEFORE the PM
     // hand-off, which writes screen_info + reserves the e820 region.
-    if ($("fb-enable").checked) {
-      const [fbw, fbh] = ($("fb-res").value || "800x600").split("x").map(Number);
+    if (fbEnabled) {
       vm.enable_framebuffer(fbw, fbh);
       const cv = $("fb");
       cv.width = fbw;
@@ -584,11 +580,10 @@ $("boot-linux").addEventListener("click", async () => {
 
     idleAware = true;
     stepBudget = 1_500_000;
-    const kib = (b) => `${(b >> 10).toLocaleString()} KiB`;
     setLinuxStatus(
       `booting — kernel ${kib(kbytes.length)}` +
         (ibytes ? `, initramfs ${kib(ibytes.length)}` : "") +
-        " (slow in wasm; watch the terminal)",
+        ` (${ramMiB} MiB RAM; slow in wasm, watch the terminal)`,
       "running"
     );
     setStatus("running", "running");
@@ -598,7 +593,110 @@ $("boot-linux").addEventListener("click", async () => {
     setLinuxStatus(`boot failed: ${e.message || e}`, "error");
     setStatus("idle", "");
   }
+}
+
+// "Boot from files" fallback — read the file inputs, then boot (256 MiB).
+$("boot-linux").addEventListener("click", async () => {
+  const kfile = $("kernel-file").files?.[0];
+  if (!kfile) {
+    setLinuxStatus("pick a kernel (vmlinuz bzImage) first", "error");
+    return;
+  }
+  setLinuxStatus("reading kernel…");
+  const kbuf = await kfile.arrayBuffer();
+  const ifile = $("initrd-file").files?.[0];
+  const ibuf = ifile ? await ifile.arrayBuffer() : null;
+  bootLinux(kbuf, ibuf, { ramMiB: 256 });
 });
+
+// ---- Server image picker -------------------------------------------------
+// List the images the server advertises in images/manifest.json, fetch the
+// chosen kernel + initramfs, and boot via bootLinux(). Picking an image fills
+// the cmdline / framebuffer controls so the user sees (and can tweak) what it
+// will boot with. Falls back gracefully when no images are built.
+const IMAGES_BASE = "images/";
+let imageManifest = [];
+
+function applyImageToControls(img) {
+  if (!img) return;
+  if (img.cmdline) $("cmdline").value = img.cmdline;
+  $("fb-enable").checked = !!img.gui;
+  if (img.fbRes) {
+    const sel = $("fb-res");
+    if (![...sel.options].some((o) => o.value === img.fbRes)) {
+      const o = document.createElement("option");
+      o.value = img.fbRes;
+      o.textContent = img.fbRes.replace("x", "×");
+      sel.appendChild(o);
+    }
+    sel.value = img.fbRes;
+  }
+}
+
+async function loadImageManifest() {
+  const sel = $("image-select");
+  try {
+    const r = await fetch(IMAGES_BASE + "manifest.json", { cache: "no-cache" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    imageManifest = Array.isArray(j.images) ? j.images : [];
+    if (!imageManifest.length) throw new Error("manifest lists no images");
+    sel.innerHTML = "";
+    for (const img of imageManifest) {
+      const o = document.createElement("option");
+      o.value = img.id;
+      const mb = img.bytes ? ` (~${Math.round(img.bytes / (1 << 20))} MiB)` : "";
+      o.textContent = (img.name || img.id) + mb;
+      sel.appendChild(o);
+    }
+    $("boot-image").disabled = false;
+    applyImageToControls(imageManifest[0]);
+    $("image-status").textContent = `${imageManifest.length} image(s) — pick one and Load`;
+  } catch (e) {
+    sel.innerHTML = '<option value="">(no images)</option>';
+    $("boot-image").disabled = true;
+    $("image-status").textContent =
+      `no server images — run scripts/build-web-images.sh (${e.message || e})`;
+  }
+}
+
+$("image-select").addEventListener("change", () => {
+  applyImageToControls(imageManifest.find((x) => x.id === $("image-select").value));
+});
+
+$("boot-image").addEventListener("click", async () => {
+  const img = imageManifest.find((x) => x.id === $("image-select").value);
+  if (!img) {
+    $("image-status").textContent = "pick an image first";
+    return;
+  }
+  applyImageToControls(img); // ensure cmdline / fb match the selection
+  const btn = $("boot-image");
+  btn.disabled = true;
+  try {
+    $("image-status").textContent = `fetching ${img.name}…`;
+    setLinuxStatus(`downloading ${img.kernel} + ${img.initramfs}…`, "running");
+    // Default cache: the server's Last-Modified lets a re-boot revalidate with
+    // If-Modified-Since (304, no re-download) yet pick up a rebuilt image.
+    const [kr, ir] = await Promise.all([
+      fetch(IMAGES_BASE + img.kernel),
+      fetch(IMAGES_BASE + img.initramfs),
+    ]);
+    if (!kr.ok) throw new Error(`kernel HTTP ${kr.status}`);
+    if (!ir.ok) throw new Error(`initramfs HTTP ${ir.status}`);
+    const kbuf = await kr.arrayBuffer();
+    const ibuf = await ir.arrayBuffer();
+    $("image-status").textContent = `booting ${img.name}`;
+    await bootLinux(kbuf, ibuf, { ramMiB: img.ramMiB || 256 });
+  } catch (e) {
+    $("image-status").textContent = `image boot failed: ${e.message || e}`;
+    setLinuxStatus(`image boot failed: ${e.message || e}`, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadImageManifest();
 
 // `runCommand()` — send a line, collect output until it stops growing
 // for ~250ms, return as a Promise. JS callers can await the result

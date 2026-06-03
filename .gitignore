@@ -9,3 +9,6 @@ dist/
 # Scratch notes and Claude runtime state (accidentally committed earlier)
 /temp
 .claude/
+
+# Prebuilt browser images (large; built by scripts/build-web-images.sh)
+/web/images/

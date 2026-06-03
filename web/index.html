@@ -55,14 +55,16 @@
 
         <fieldset>
           <legend>Boot Linux / Alpine (real kernel)</legend>
-          <label>kernel (vmlinuz bzImage):
-            <input type="file" id="kernel-file" />
+          <!-- Pick a prebuilt image hosted on the server (manifest.json). -->
+          <label>Server image:
+            <select id="image-select">
+              <option value="">— loading images… —</option>
+            </select>
           </label>
+          <small id="image-status" class="status">checking for prebuilt images…</small>
           <br />
-          <label>initramfs (cpio, optional):
-            <input type="file" id="initrd-file" />
-          </label>
-          <br />
+          <!-- Boot options — apply to the selected image OR your own files.
+               Picking an image fills these in; tweak before booting if you like. -->
           <label>cmdline:
             <input id="cmdline" type="text"
               value="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
@@ -92,8 +94,21 @@
             <input id="net-allow" type="text" value="dl-cdn.alpinelinux.org:80" size="26" />
           </label>
           <br />
-          <button id="boot-linux">Boot Linux</button>
-          <small id="linux-status" class="status">pick a kernel (+ initramfs) to boot</small>
+          <button id="boot-image" disabled>Load selected image</button>
+          <hr />
+          <details>
+            <summary>…or load your own kernel files</summary>
+            <label>kernel (vmlinuz bzImage):
+              <input type="file" id="kernel-file" />
+            </label>
+            <br />
+            <label>initramfs (cpio, optional):
+              <input type="file" id="initrd-file" />
+            </label>
+            <br />
+            <button id="boot-linux">Boot from files</button>
+            <small id="linux-status" class="status">pick a kernel (+ initramfs) to boot</small>
+          </details>
         </fieldset>
 
         <fieldset>
