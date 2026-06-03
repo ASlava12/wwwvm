@@ -61,7 +61,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=2", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
@@ -591,6 +591,19 @@ const setLinuxStatus = (text, cls = "") => {
   el.className = "status" + (cls ? ` ${cls}` : "");
 };
 
+// Seed the guest CMOS clock with the host wall-clock (local) so the guest's
+// `date` is real instead of the 2026-01-01 default — wasm has no host clock, so
+// pass JS Date components (year is two-digit, month 1-12). Native examples call
+// set_cmos_time_from_host; the browser path must do it explicitly.
+function seedGuestClock(vm) {
+  if (typeof vm.set_cmos_time !== "function") return;
+  const d = new Date();
+  vm.set_cmos_time(
+    d.getFullYear() % 100, d.getMonth() + 1, d.getDate(),
+    d.getHours(), d.getMinutes(), d.getSeconds()
+  );
+}
+
 // Boot a real Linux/Alpine kernel from in-memory buffers (kernel bzImage +
 // optional initramfs cpio as ArrayBuffers). Shared by the server-image picker
 // and the "load your own files" fallback. cmdline / framebuffer / networking
@@ -668,6 +681,7 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
 
     // Fresh VM with the requested headroom (the default demo VM is tiny).
     vm = WwwVm.new_with_ram_size(ramMiB * 1024 * 1024);
+    seedGuestClock(vm);
     window.__wwwvm = vm;
     term.reset();
 

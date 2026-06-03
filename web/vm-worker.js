@@ -211,6 +211,15 @@ self.onmessage = async (e) => {
         if (m.linux) {
           const ramMiB = m.ramMiB && m.ramMiB >= 64 ? m.ramMiB : 256;
           vm = WwwVm.new_with_ram_size(ramMiB * 1024 * 1024);
+          // Seed the RTC with the host wall-clock (local) so the guest's `date`
+          // is real, not the 2026-01-01 default (wasm has no host clock).
+          if (typeof vm.set_cmos_time === "function") {
+            const d = new Date();
+            vm.set_cmos_time(
+              d.getFullYear() % 100, d.getMonth() + 1, d.getDate(),
+              d.getHours(), d.getMinutes(), d.getSeconds()
+            );
+          }
           const entry = vm.load_bzimage(new Uint8Array(m.kernel));
           vm.set_kernel_cmdline(m.cmdline);
           if (m.initrd) vm.set_ramdisk(new Uint8Array(m.initrd));
