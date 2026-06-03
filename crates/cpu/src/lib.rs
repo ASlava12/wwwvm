@@ -2509,17 +2509,14 @@ impl Cpu {
         }
     }
 
-    /// Read 32-bit value through an `Rm`. Memory dword = two 16-bit
-    /// reads at `off` and `off+2`.
+    /// Read 32-bit value through an `Rm`. A memory dword goes through
+    /// `mem_read_u32`, which translates once for the whole (same-page) span
+    /// — `mov r32,[mem]` is ubiquitous in 32-bit code, so this avoids the
+    /// redundant second translation the old two-u16-reads form did.
     fn read_rm32(&self, rm: Rm, mem: &Memory) -> u32 {
         match rm {
             Rm::Reg(i) => self.read_r32(i),
-            Rm::Mem(ea) => {
-                let base = self.linear_seg(ea.seg, ea.off);
-                let lo = self.mem_read_u16(mem, base) as u32;
-                let hi = self.mem_read_u16(mem, base.wrapping_add(2)) as u32;
-                lo | (hi << 16)
-            }
+            Rm::Mem(ea) => self.mem_read_u32(mem, self.linear_seg(ea.seg, ea.off)),
         }
     }
 
