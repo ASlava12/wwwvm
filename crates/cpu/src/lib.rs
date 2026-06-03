@@ -332,6 +332,11 @@ pub struct Cpu {
     /// checked once per step on the hot path instead of a RefCell borrow (the
     /// trace is off in every non-debug run). Set by `enable_pf_trace`.
     pf_trace_on: core::cell::Cell<bool>,
+    /// Cached `WWWVM_TRACE_CALL` target (env read once at construction). Checked
+    /// once per step on the hot path as a plain field load instead of a
+    /// per-step `OnceLock::get_or_init` atomic acquire. `None` in every
+    /// non-debug run.
+    trace_call_target: Option<u32>,
 }
 
 /// Debug instruction-trace ring buffer (see `Cpu::pf_trace`).
@@ -665,6 +670,18 @@ impl Cpu {
             seg_cache: [SegmentCache::default(); 6],
             pf_trace: core::cell::RefCell::new(None),
             pf_trace_on: core::cell::Cell::new(false),
+            trace_call_target: {
+                // OnceLock so the env lookup runs exactly once per process even
+                // if many Cpus are constructed (tests), then cache the result
+                // in the field for a per-step plain load.
+                use std::sync::OnceLock;
+                static TARGET: OnceLock<Option<u32>> = OnceLock::new();
+                *TARGET.get_or_init(|| {
+                    std::env::var("WWWVM_TRACE_CALL")
+                        .ok()
+                        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                })
+            },
         }
     }
 
@@ -3861,29 +3878,20 @@ impl Cpu {
         // Diagnostic: WWWVM_TRACE_CALL=0xADDR prints whenever EIP
         // enters that address (typically a function start), with
         // the args (EAX/EDX/ECX), saved return addr at [ESP], and
-        // the TSC. Cached in a OnceLock so the env-var lookup runs
-        // exactly once per process — checking env::var per step
-        // adds 50+ syscalls/instr and the kernel boot crawls.
-        {
-            use std::sync::OnceLock;
-            static TARGET: OnceLock<Option<u32>> = OnceLock::new();
-            let t = *TARGET.get_or_init(|| {
-                std::env::var("WWWVM_TRACE_CALL")
-                    .ok()
-                    .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            });
-            if let Some(target) = t {
-                if self.ip == target {
-                    let esp = self.read_r32(r16::SP as u8);
-                    let ret = mem.read_u32(self.translate(mem, esp));
-                    eprintln!(
-                        "[CALL {target:08X}] EAX={:08X} EDX={:08X} ECX={:08X} ret={ret:08X} TSC={}",
-                        self.read_r32(0),
-                        self.read_r32(2),
-                        self.read_r32(1),
-                        self.tsc
-                    );
-                }
+        // the TSC. The target is cached in a field at construction
+        // (see `trace_call_target`) so the hot path is a plain load,
+        // not a per-step OnceLock atomic acquire.
+        if let Some(target) = self.trace_call_target {
+            if self.ip == target {
+                let esp = self.read_r32(r16::SP as u8);
+                let ret = mem.read_u32(self.translate(mem, esp));
+                eprintln!(
+                    "[CALL {target:08X}] EAX={:08X} EDX={:08X} ECX={:08X} ret={ret:08X} TSC={}",
+                    self.read_r32(0),
+                    self.read_r32(2),
+                    self.read_r32(1),
+                    self.tsc
+                );
             }
         }
         // A page fault flagged by the previous instruction's memory
