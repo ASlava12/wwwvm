@@ -150,6 +150,20 @@ impl Memory {
         }
     }
 
+    /// Read a byte for *instruction fetch* — straight from RAM, skipping the
+    /// LAPIC/HPET MMIO checks `read_u8` does on every byte. Code never executes
+    /// from those MMIO windows, so the checks are pure per-byte overhead on the
+    /// hot fetch path. Out-of-range reads 0.
+    #[inline]
+    pub fn read_code_u8(&self, addr: u32) -> u8 {
+        let a = addr as usize;
+        if a < self.bytes.len() {
+            self.bytes[a]
+        } else {
+            0
+        }
+    }
+
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         if Self::is_lapic(addr) {
             let off = (addr - LAPIC_BASE) as usize;

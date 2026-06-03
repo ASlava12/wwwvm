@@ -1389,7 +1389,9 @@ impl Cpu {
         if self.pending_fault.get().is_some() {
             return 0;
         }
-        m.read_u8(self.translate_fetch(m, linear))
+        // Instruction fetch never targets the LAPIC/HPET MMIO windows, so use
+        // the code-read path that skips those per-byte checks.
+        m.read_code_u8(self.translate_fetch(m, linear))
     }
 
     pub fn mem_write_u8(&self, m: &mut Memory, linear: u32, value: u8) {
