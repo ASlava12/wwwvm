@@ -23,12 +23,12 @@
 //! does for the native relay — the `HostConn` it sees is identical — so the NAT
 //! logic is unchanged across native, browser, and tests.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 
 use crate::nat::Connect;
@@ -55,6 +55,14 @@ struct QueueConn {
     /// Tripped on [`host_closed`](QueueConnector::host_closed); also the flag
     /// the native relay's reaper sets. Kept so the `HostConn` contract matches.
     stop: Arc<AtomicBool>,
+    /// Set once the guest **write** half-closes (its FIN makes the NAT drop
+    /// `to_host`, so `out_rx` disconnects) while the flow is still live
+    /// (`!stop`). The embedder must then shut down the upstream write side
+    /// (without closing the WebSocket, so host→guest keeps flowing).
+    write_closed: Cell<bool>,
+    /// Whether [`take_write_closed`](QueueConnector::take_write_closed) has
+    /// already reported this connection's half-close (report-once).
+    wc_reported: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -103,6 +111,8 @@ impl QueueConnector {
                     out_rx,
                     in_tx,
                     stop: stop.clone(),
+                    write_closed: Cell::new(false),
+                    wc_reported: Cell::new(false),
                 },
             );
             HostConn {
@@ -140,10 +150,42 @@ impl QueueConnector {
             return (Vec::new(), true);
         };
         let mut out = Vec::new();
-        while let Ok(mut b) = conn.out_rx.try_recv() {
-            out.append(&mut b);
+        loop {
+            match conn.out_rx.try_recv() {
+                Ok(mut b) => out.append(&mut b),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The NAT dropped `to_host`: either a guest write half-close
+                    // (FIN) or a full reap. `take_write_closed` distinguishes
+                    // them via `stop` and reports only the half-close.
+                    conn.write_closed.set(true);
+                    break;
+                }
+            }
         }
         (out, conn.stop.load(Ordering::Relaxed))
+    }
+
+    /// Connection ids whose guest **write** side has half-closed (FIN) since the
+    /// last call, while the flow is still live. The embedder should shut down
+    /// the upstream write side for each (e.g. a control frame to the proxy →
+    /// `TcpStream::shutdown(Write)`) WITHOUT closing the WebSocket, so the
+    /// host→guest direction keeps delivering the response. Reported once per id;
+    /// a flow that goes on to fully close is handled by `drain_outbound`'s
+    /// `closed` instead.
+    pub fn take_write_closed(&self) -> Vec<u32> {
+        let s = self.state.borrow();
+        let mut ids = Vec::new();
+        for (id, conn) in s.conns.iter() {
+            if conn.write_closed.get()
+                && !conn.wc_reported.get()
+                && !conn.stop.load(Ordering::Relaxed)
+            {
+                conn.wc_reported.set(true);
+                ids.push(*id);
+            }
+        }
+        ids
     }
 
     /// Feed host→guest bytes received on the WebSocket for `id`. Returns
@@ -237,6 +279,19 @@ mod tests {
         assert!(!closed, "guest write half-close must NOT read as closed");
         assert!(qc.push_inbound(0, b"body"), "host→guest still open");
         assert_eq!(from_host.try_recv().unwrap(), b"body");
+
+        // The write half-close is reported to the embedder exactly once, so it
+        // can shut down the upstream write side (the proxy half-closes its TCP)
+        // without tearing the WebSocket down.
+        assert_eq!(
+            qc.take_write_closed(),
+            vec![0],
+            "guest write half-close reported"
+        );
+        assert!(
+            qc.take_write_closed().is_empty(),
+            "half-close reported once"
+        );
 
         // The NAT reaping the flow trips `stop` → now it reads as closed.
         stop.store(true, Ordering::Relaxed);

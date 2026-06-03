@@ -332,6 +332,15 @@ function pumpNet() {
     }
     if (out.length) c.ws.send(out);
   }
+  // Propagate guest write half-closes: a "FIN" control frame tells the proxy to
+  // shut down the upstream write side without closing the WebSocket, so the
+  // host→guest response keeps flowing. Reported once per connection.
+  for (const id of vm.net_take_write_closed()) {
+    const c = netConns.get(id);
+    if (c && c.open && c.ws.readyState === WebSocket.OPEN) {
+      try { c.ws.send("FIN"); } catch {}
+    }
+  }
   setNetStatus(`live — ${vm.net_conn_count()} flow(s), ${netConns.size} socket(s)`);
 }
 function pump() {

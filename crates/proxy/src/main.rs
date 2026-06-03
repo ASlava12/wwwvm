@@ -41,6 +41,12 @@ struct ConnectFrame {
     port: u16,
 }
 
+/// Control text frame meaning "the guest half-closed its write side": shut down
+/// the upstream TCP write side but keep the socket open for the response. Our
+/// client only ever sends binary data frames otherwise, so a text frame is
+/// unambiguously control.
+const HALF_CLOSE: &str = "FIN";
+
 // The connection allowlist now lives in `wwwvm-net` so the proxy and the
 // in-process guest bridge share one deny-by-default implementation.
 use wwwvm_net::Allowlist;
@@ -216,6 +222,12 @@ async fn handle(
                     total += b.len() as u64;
                     tcp_wr.write_all(&b).await?
                 }
+                // A text frame is a control signal from our client (which only
+                // ever sends binary data frames otherwise). "FIN" = the guest
+                // half-closed its write side: shut down the upstream write side
+                // and stop reading this direction, but DON'T close the socket —
+                // the tcp→ws task keeps delivering the response.
+                Message::Text(t) if t == HALF_CLOSE => break,
                 Message::Text(t) => {
                     total += t.len() as u64;
                     tcp_wr.write_all(t.as_bytes()).await?

@@ -659,6 +659,16 @@ impl WwwVm {
         }
     }
 
+    /// Connection ids whose guest write side just half-closed (sent FIN), as a
+    /// flat list. For each, the embedder should signal the proxy to shut down
+    /// the upstream write side (a control frame) WITHOUT closing the WebSocket,
+    /// so the host→guest response keeps flowing. Reported once per id.
+    pub fn net_take_write_closed(&self) -> Vec<u32> {
+        self.net
+            .as_ref()
+            .map_or_else(Vec::new, |n| n.conns.take_write_closed())
+    }
+
     /// Feed host→guest bytes received on connection `id`'s WebSocket. Returns
     /// false under backpressure (re-queue and retry) or for an unknown id.
     pub fn net_conn_send(&self, id: u32, bytes: &[u8]) -> bool {
