@@ -337,6 +337,10 @@ pub struct Cpu {
     /// per-step `OnceLock::get_or_init` atomic acquire. `None` in every
     /// non-debug run.
     trace_call_target: Option<u32>,
+    /// Cached "any diagnostic write-watchpoint is set" flag. Checked on every
+    /// memory write to skip `watch_write` (which otherwise does a per-write
+    /// `OnceLock` atomic load) — off in every non-debug run.
+    watch_on: bool,
 }
 
 /// Debug instruction-trace ring buffer (see `Cpu::pf_trace`).
@@ -682,6 +686,7 @@ impl Cpu {
                         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 })
             },
+            watch_on: Self::watch_write_range().is_some() || Self::watch_write_value().is_some(),
         }
     }
 
@@ -1432,10 +1437,11 @@ impl Cpu {
         if had_fault || self.pending_fault.get().is_some() {
             return;
         }
-        // Diagnostic watchpoint — see `watch_write` for the cached
-        // env-var path. Sharing the helper means a single OnceLock
-        // bound, used by both the byte and aligned paths.
-        self.watch_write(m, linear, phys, value);
+        // Diagnostic watchpoint (off in normal runs — gated on the cached
+        // `watch_on` so the hot write path skips the per-write OnceLock).
+        if self.watch_on {
+            self.watch_write(m, linear, phys, value);
+        }
         m.write_u8(phys, value);
     }
 
@@ -1513,8 +1519,9 @@ impl Cpu {
     /// (WWWVM_WATCH_WRITE) fires for every byte regardless of which
     /// path we take.
     fn mem_write_aligned(&self, m: &mut Memory, linear: u32, bytes: &[u8]) {
-        // Diagnostic VALUE watchpoint (one-shot pf_trace dump).
-        if bytes.len() == 4 {
+        // Diagnostic VALUE watchpoint (one-shot pf_trace dump). Gated on the
+        // cached `watch_on` so the common path skips the OnceLock entirely.
+        if self.watch_on && bytes.len() == 4 {
             if let Some(wv) = *Self::watch_write_value() {
                 if u32::from_le_bytes(bytes.try_into().unwrap()) == wv
                     && linear >= Self::watch_write_value_min()
@@ -1542,7 +1549,9 @@ impl Cpu {
             }
             for (i, b) in bytes.iter().enumerate() {
                 let phys = phys_base.wrapping_add(i as u32);
-                self.watch_write(m, linear.wrapping_add(i as u32), phys, *b);
+                if self.watch_on {
+                    self.watch_write(m, linear.wrapping_add(i as u32), phys, *b);
+                }
                 m.write_u8(phys, *b);
             }
         } else {
