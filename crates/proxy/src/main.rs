@@ -24,6 +24,15 @@
 //! writes). See `upstream.rs`. Public proxies are untrusted — non-sensitive
 //! traffic only.
 //!
+//! For a publicly-reachable bind, resource limits guard against abuse:
+//! `WWWVM_PROXY_MAX_CONNS` (global concurrent, default 512),
+//! `WWWVM_PROXY_MAX_CONNS_PER_IP` (per peer IP, default 32),
+//! `WWWVM_PROXY_IDLE_TIMEOUT_SECS` (close idle tunnels, default off), and
+//! `WWWVM_PROXY_MAX_BYTES` (cap bytes/connection, default off). A `0` disables
+//! the corresponding limit. Combined with a SPECIFIC allowlist (so the relay
+//! can only reach the hosts your demo needs — e.g. apk mirrors) this is safe to
+//! expose; `*` (open relay) is not.
+//!
 //! Run (specific host, bound to loopback — the safe default):
 //!     WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80' \
 //!     WWWVM_PROXY_ORIGINS='http://localhost:8080' \
@@ -33,10 +42,12 @@
 
 mod upstream;
 
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -44,6 +55,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Deserialize)]
@@ -69,6 +81,100 @@ const HALF_CLOSE: &str = "FIN";
 // The connection allowlist now lives in `wwwvm-net` so the proxy and the
 // in-process guest bridge share one deny-by-default implementation.
 use wwwvm_net::Allowlist;
+
+/// Resource limits for public hosting (abuse mitigation). Concurrency caps are
+/// ON by default; the byte and idle caps are opt-in (`0` = off) because they
+/// can curtail legitimate long transfers, so the operator turns them on for an
+/// exposed deployment.
+struct Limits {
+    /// Max concurrent connections across all clients (0 = unlimited).
+    max_conns: usize,
+    /// Max concurrent connections per peer IP (0 = unlimited).
+    max_per_ip: usize,
+    /// Close a connection idle (no bytes either way) this long (0 = off).
+    idle: Duration,
+    /// Cap total bytes relayed per connection, both directions summed (0 = off).
+    max_bytes: u64,
+}
+
+impl Limits {
+    fn from_env() -> Self {
+        let g = |k: &str, d: u64| -> u64 {
+            env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d)
+        };
+        Limits {
+            max_conns: g("WWWVM_PROXY_MAX_CONNS", 512) as usize,
+            max_per_ip: g("WWWVM_PROXY_MAX_CONNS_PER_IP", 32) as usize,
+            idle: Duration::from_secs(g("WWWVM_PROXY_IDLE_TIMEOUT_SECS", 0)),
+            max_bytes: g("WWWVM_PROXY_MAX_BYTES", 0),
+        }
+    }
+}
+
+/// Concurrency gate: a global semaphore + per-IP counters. `try_acquire` hands
+/// back a guard held for the connection's lifetime, or `None` when a cap is
+/// hit — so an over-limit client is rejected immediately rather than queued
+/// (queuing under a flood is itself a resource sink).
+struct Gate {
+    sem: Option<Arc<Semaphore>>, // None = unlimited global
+    per_ip: StdMutex<HashMap<IpAddr, usize>>,
+    max_per_ip: usize,
+}
+
+impl Gate {
+    fn new(l: &Limits) -> Arc<Self> {
+        Arc::new(Gate {
+            sem: (l.max_conns > 0).then(|| Arc::new(Semaphore::new(l.max_conns))),
+            per_ip: StdMutex::new(HashMap::new()),
+            max_per_ip: l.max_per_ip,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnGuard> {
+        // Take the global slot first; if the per-IP cap then rejects, the permit
+        // is dropped on the early return and the global slot is freed again.
+        let permit = match &self.sem {
+            Some(s) => Some(s.clone().try_acquire_owned().ok()?),
+            None => None,
+        };
+        {
+            let mut map = self.per_ip.lock().unwrap();
+            let n = map.entry(ip).or_insert(0);
+            if self.max_per_ip > 0 && *n >= self.max_per_ip {
+                return None;
+            }
+            *n += 1;
+        }
+        Some(ConnGuard {
+            _permit: permit,
+            gate: self.clone(),
+            ip,
+        })
+    }
+}
+
+/// Held for a connection's lifetime; releasing it (Drop) frees the global
+/// semaphore permit and decrements the per-IP counter.
+struct ConnGuard {
+    _permit: Option<OwnedSemaphorePermit>,
+    gate: Arc<Gate>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut map = self.gate.per_ip.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -137,16 +243,49 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Resource limits (abuse mitigation for a publicly-reachable bind). The
+    // connection caps are on by default; `0` means a given limit is off.
+    let limits = Arc::new(Limits::from_env());
+    let gate = Gate::new(&limits);
+    let off = |n: u64| {
+        if n == 0 {
+            "off".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    log::info!(
+        "limits: max_conns={}, per_ip={}, idle_timeout={}, max_bytes/conn={}",
+        off(limits.max_conns as u64),
+        off(limits.max_per_ip as u64),
+        if limits.idle.is_zero() {
+            "off".into()
+        } else {
+            format!("{}s", limits.idle.as_secs())
+        },
+        off(limits.max_bytes),
+    );
+
     let listener = TcpListener::bind(bind).await.context("bind")?;
     log::info!("wwwvm-proxy listening on {bind}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Reject immediately (and drop the socket) when a concurrency cap is hit.
+        let guard = match gate.try_acquire(peer.ip()) {
+            Some(g) => g,
+            None => {
+                log::warn!("{peer}: rejected — connection limit reached");
+                continue;
+            }
+        };
         let allow = allow.clone();
         let origins = origins.clone();
         let upstreams_file = upstreams_file.clone();
+        let limits = limits.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, peer, allow, origins, upstreams_file).await {
+            let _guard = guard; // released (caps freed) when the connection ends
+            if let Err(e) = handle(stream, peer, allow, origins, upstreams_file, limits).await {
                 log::warn!("{peer}: {e:#}");
             }
         });
@@ -163,6 +302,7 @@ async fn handle(
     allow: Arc<Allowlist>,
     origins: Arc<Option<Vec<String>>>,
     upstreams_file: Arc<Option<PathBuf>>,
+    limits: Arc<Limits>,
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     // Reject disallowed Origins during the handshake (before any TCP connect).
@@ -279,60 +419,177 @@ async fn handle(
     };
     let (mut tcp_rd, mut tcp_wr) = tcp.into_split();
 
+    // Shared across both directions for the resource caps: `counted` = total
+    // bytes relayed (byte cap), `last_ms` = ms-since-`start` of the most recent
+    // transfer (idle timeout). `Instant` is Copy; the atomics let both tasks
+    // update without a lock.
+    let counted = Arc::new(AtomicU64::new(0));
+    let last_ms = Arc::new(AtomicU64::new(0));
+    let start = std::time::Instant::now();
+    let max_bytes = limits.max_bytes;
+
     // ws -> tcp (guest → upstream). Log the first chunk + total so a stalled
     // relay is diagnosable (did the guest's request reach the server at all?).
-    let ws_to_tcp = async move {
-        let mut total = 0u64;
-        while let Some(msg) = ws_stream.next().await {
-            match msg? {
-                Message::Binary(b) => {
-                    if total == 0 {
-                        log::info!("{peer} ws→tcp: first {} bytes", b.len());
+    let ws_to_tcp = {
+        let counted = counted.clone();
+        let last_ms = last_ms.clone();
+        async move {
+            let mut total = 0u64;
+            while let Some(msg) = ws_stream.next().await {
+                match msg? {
+                    Message::Binary(b) => {
+                        if total == 0 {
+                            log::info!("{peer} ws→tcp: first {} bytes", b.len());
+                        }
+                        total += b.len() as u64;
+                        tcp_wr.write_all(&b).await?;
+                        last_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let c =
+                            counted.fetch_add(b.len() as u64, Ordering::Relaxed) + b.len() as u64;
+                        if max_bytes > 0 && c > max_bytes {
+                            return Err(anyhow!("byte cap ({max_bytes}) exceeded"));
+                        }
                     }
-                    total += b.len() as u64;
-                    tcp_wr.write_all(&b).await?
+                    // A text frame is a control signal from our client (which only
+                    // ever sends binary data frames otherwise). "FIN" = the guest
+                    // half-closed its write side: shut down the upstream write side
+                    // and stop reading this direction, but DON'T close the socket —
+                    // the tcp→ws task keeps delivering the response.
+                    Message::Text(t) if t == HALF_CLOSE => break,
+                    Message::Text(t) => {
+                        total += t.len() as u64;
+                        tcp_wr.write_all(t.as_bytes()).await?;
+                        last_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                // A text frame is a control signal from our client (which only
-                // ever sends binary data frames otherwise). "FIN" = the guest
-                // half-closed its write side: shut down the upstream write side
-                // and stop reading this direction, but DON'T close the socket —
-                // the tcp→ws task keeps delivering the response.
-                Message::Text(t) if t == HALF_CLOSE => break,
-                Message::Text(t) => {
-                    total += t.len() as u64;
-                    tcp_wr.write_all(t.as_bytes()).await?
-                }
-                Message::Close(_) => break,
-                _ => {}
             }
+            log::info!("{peer} ws→tcp: done, {total} bytes total");
+            let _ = tcp_wr.shutdown().await;
+            Ok::<_, anyhow::Error>(())
         }
-        log::info!("{peer} ws→tcp: done, {total} bytes total");
-        let _ = tcp_wr.shutdown().await;
-        Ok::<_, anyhow::Error>(())
     };
 
     // tcp -> ws (upstream → guest).
-    let tcp_to_ws = async move {
-        let mut buf = vec![0u8; 4096];
-        let mut total = 0u64;
-        loop {
-            let n = tcp_rd.read(&mut buf).await?;
-            if n == 0 {
-                break;
+    let tcp_to_ws = {
+        let counted = counted.clone();
+        let last_ms = last_ms.clone();
+        async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0u64;
+            loop {
+                let n = tcp_rd.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if total == 0 {
+                    log::info!("{peer} tcp→ws: first {n} bytes");
+                }
+                total += n as u64;
+                ws_sink.send(Message::Binary(buf[..n].to_vec())).await?;
+                last_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                let c = counted.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                if max_bytes > 0 && c > max_bytes {
+                    return Err(anyhow!("byte cap ({max_bytes}) exceeded"));
+                }
             }
-            if total == 0 {
-                log::info!("{peer} tcp→ws: first {n} bytes");
-            }
-            total += n as u64;
-            ws_sink.send(Message::Binary(buf[..n].to_vec())).await?;
+            log::info!("{peer} tcp→ws: done, {total} bytes total");
+            let _ = ws_sink.send(Message::Close(None)).await;
+            Ok::<_, anyhow::Error>(())
         }
-        log::info!("{peer} tcp→ws: done, {total} bytes total");
-        let _ = ws_sink.send(Message::Close(None)).await;
-        Ok::<_, anyhow::Error>(())
     };
 
-    let (a, b) = tokio::join!(ws_to_tcp, tcp_to_ws);
-    a?;
-    b?;
+    let relay = async {
+        let (a, b) = tokio::join!(ws_to_tcp, tcp_to_ws);
+        a?;
+        b?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    // Idle-timeout watchdog (opt-in). Closes the connection if no bytes flow in
+    // EITHER direction for `idle` — bounds stuck/abandoned tunnels without
+    // killing an active long transfer, since any transfer refreshes `last_ms`.
+    // On fire, dropping `relay` tears down both halves (and the sockets).
+    if !limits.idle.is_zero() {
+        let idle = limits.idle;
+        let watchdog = async move {
+            let tick = (idle / 2).max(Duration::from_secs(1));
+            loop {
+                tokio::time::sleep(tick).await;
+                let idle_ms = start.elapsed().as_millis() as u64 - last_ms.load(Ordering::Relaxed);
+                if idle_ms >= idle.as_millis() as u64 {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            r = relay => r?,
+            _ = watchdog => log::info!("{peer}: idle {}s — closing", idle.as_secs()),
+        }
+    } else {
+        relay.await?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// The gate must enforce BOTH the per-IP and the global cap, free a global
+    /// slot when a per-IP rejection happens (no leak), and release everything on
+    /// guard drop so a client that disconnects gets its budget back.
+    #[test]
+    fn gate_enforces_caps_and_releases_on_drop() {
+        let limits = Limits {
+            max_conns: 3,
+            max_per_ip: 2,
+            idle: Duration::ZERO,
+            max_bytes: 0,
+        };
+        let gate = Gate::new(&limits);
+        let (a, b) = (ip("1.1.1.1"), ip("2.2.2.2"));
+
+        let g1 = gate.try_acquire(a).expect("a #1");
+        let g2 = gate.try_acquire(a).expect("a #2");
+        // a is at its per-IP cap (2); a third from a is refused — and this must
+        // NOT consume a global slot (else b below couldn't get two).
+        assert!(gate.try_acquire(a).is_none(), "per-IP cap reached for a");
+
+        let g3 = gate.try_acquire(b).expect("b #1 (global slot 3/3)");
+        // Global cap (3) now reached: even a fresh IP is refused.
+        assert!(gate.try_acquire(b).is_none(), "global cap reached");
+
+        // Dropping one of a's frees a global slot *and* a's per-IP count.
+        drop(g2);
+        let g4 = gate.try_acquire(a).expect("a reacquires after release");
+
+        drop((g1, g3, g4));
+        // Everything released → acquirable again, and the per-IP map is cleaned.
+        assert!(gate.try_acquire(a).is_some());
+        assert!(
+            gate.per_ip.lock().unwrap().get(&b).is_none(),
+            "b entry removed"
+        );
+    }
+
+    /// `max_conns = 0` means an unbounded global pool (only per-IP applies).
+    #[test]
+    fn zero_max_conns_is_unlimited_global() {
+        let limits = Limits {
+            max_conns: 0,
+            max_per_ip: 0,
+            idle: Duration::ZERO,
+            max_bytes: 0,
+        };
+        let gate = Gate::new(&limits);
+        let a = ip("9.9.9.9");
+        let guards: Vec<_> = (0..1000).filter_map(|_| gate.try_acquire(a)).collect();
+        assert_eq!(guards.len(), 1000, "no global or per-IP cap");
+    }
 }

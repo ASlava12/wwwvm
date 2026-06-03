@@ -307,6 +307,20 @@ HTTP/SOCKS-списки из Proxifly, TheSpeedX, ProxyScrape, GeoNode → `web/
 этот файл в выпадающий список upstream-прокси (плюс «Direct», «Auto-rotate» и
 ручной ввод `kind://host:port`).
 
+**Публичный хостинг — релей нельзя убрать (браузер не умеет в raw TCP), но его
+можно сделать безопасным.** Цепочка всегда `браузер → твой WS-релей → [опц. публичный
+прокси] → сайт`. Абузят не «релей вообще», а ОТКРЫТЫЙ релей (`*`). Рецепт для выкладки
+наружу: (1) **узкий allowlist** — только хосты, нужные демке (напр. `dl-cdn.alpinelinux.org:80,:443`),
+тогда произвольный туннелинг/SSRF невозможен; (2) `WWWVM_PROXY_ORIGINS` на свой домен;
+(3) **ресурс-лимиты** (anti-abuse): `WWWVM_PROXY_MAX_CONNS` (глоб. одновременных, деф. 512),
+`WWWVM_PROXY_MAX_CONNS_PER_IP` (на IP, деф. 32) — включены по умолчанию, мгновенный reject
+сверх лимита; `WWWVM_PROXY_IDLE_TIMEOUT_SECS` (закрыть простаивающие туннели) и
+`WWWVM_PROXY_MAX_BYTES` (потолок байт/соединение) — opt-in (`0` = выкл; не режут легитимные
+длинные передачи). Гейт = глобальный `Semaphore` + per-IP счётчики (RAII-`ConnGuard`
+освобождает оба на Drop); idle-watchdog через `select!` + общий `last_ms`. Спрятать свой
+egress-IP можно, направив релей через auto-rotate публичных прокси (выход не с твоего IP),
+но это флаки и не отменяет allowlist.
+
 **Сеть в браузере — TCP NAT в wasm → WebSocket-relay.** Тот же smoltcp-NAT,
 что в нативе, крутится в wasm; меняется только транспорт per-flow:
 вместо `std::thread`+`TcpStream` (невозможно в wasm) — `QueueConnector`
