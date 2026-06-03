@@ -283,10 +283,29 @@ reserved. Teeth: `linux_efifb_framebuffer_renders_pixels_milestone`
 Standalone Rust-бинарь на tokio + tokio-tungstenite. Принимает
 WebSocket, первое сообщение JSON `{"host","port"}`, дальше байты в
 обе стороны. Allow-list — env var `WWWVM_PROXY_ALLOWLIST`
-(`*` / `host:port` / `host:*`, comma-separated; `*` = OPEN RELAY,
-только loopback). `WWWVM_PROXY_ORIGINS` запирает WebSocket-handshake на
-конкретные браузерные Origin'ы (защита от Cross-Site WebSocket Hijacking).
-Хост резолвится на стороне прокси и пинится globally-routable IP (SSRF-guard).
+(`*` / `host:port` / `host:*`, comma- **или** newline-separated — веб-UI
+шлёт многострочный textarea; `*` = OPEN RELAY, только loopback).
+`WWWVM_PROXY_ORIGINS` запирает WebSocket-handshake на конкретные браузерные
+Origin'ы (защита от Cross-Site WebSocket Hijacking). Хост резолвится на
+стороне прокси и пинится globally-routable IP (SSRF-guard).
+
+**Цепочка через публичный прокси (upstream chaining, `crates/proxy/src/upstream.rs`).**
+Connect-кадр может попросить туннель не напрямую, а через сторонний публичный
+прокси: `{"host","port","upstream":{"kind":"socks5|socks4|http","host","port"}}`
+— через конкретный, либо `{"host","port","auto":true}` — сервер сам берёт и
+round-robin-ротирует из пула `WWWVM_PROXY_UPSTREAMS_FILE` (тот JSON, что пишет
+`scripts/fetch-proxies.py`), пробуя до 6 штук с коротким per-proxy таймаутом
+(дохлые отваливаются быстро). Реализованы no-auth SOCKS5 (ATYP=domain),
+SOCKS4a (по имени — таргет локально не резолвится) и HTTP CONNECT. Адрес
+*самого* upstream'а резолвится и обязан быть globally-routable (manual/auto
+нельзя навести на loopback/LAN); таргет по-прежнему гейтится общим `Allowlist`.
+Публичные прокси НЕдоверенные — только не-чувствительный трафик.
+
+`scripts/fetch-proxies.py` — stdlib-only (Python 3.6+, для cron) парсер: тянет
+HTTP/SOCKS-списки из Proxifly, TheSpeedX, ProxyScrape, GeoNode → `web/proxies.json`
+(gitignored, дедуп, atomic write, fault-tolerant по источникам). Веб-UI грузит
+этот файл в выпадающий список upstream-прокси (плюс «Direct», «Auto-rotate» и
+ручной ввод `kind://host:port`).
 
 **Сеть в браузере — TCP NAT в wasm → WebSocket-relay.** Тот же smoltcp-NAT,
 что в нативе, крутится в wasm; меняется только транспорт per-flow:

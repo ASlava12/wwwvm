@@ -21,6 +21,9 @@ let tick = 0;
 // ---- network relay (mirrors the main-thread fallback in main.js) ----
 let netEnabled = false;
 let netProxyUrl = "ws://localhost:8080";
+// Upstream-proxy selection from main.js, merged into every connect frame:
+// {} = direct, {auto:true} = server rotates, {upstream:{kind,host,port}} = chain.
+let netUpstream = {};
 const netConns = new Map();
 
 // Resolve one host (DoH via Cloudflare) and feed the answer into the NAT's DNS
@@ -76,7 +79,7 @@ function netOpenConn({ id, host, port }) {
   c.ws = ws;
   ws.onopen = () => {
     c.open = true;
-    ws.send(JSON.stringify({ host, port }));
+    ws.send(JSON.stringify({ host, port, ...netUpstream }));
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === "string") {
@@ -246,6 +249,7 @@ self.onmessage = async (e) => {
           if (m.net) {
             netEnabled = true;
             netProxyUrl = m.net.proxyUrl;
+            netUpstream = m.net.upstream || {};
             vm.net_enable(m.net.allow);
             netPreResolve(m.net.allow); // async; cache fills before the guest queries
           }

@@ -61,7 +61,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=4", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=5", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
@@ -348,6 +348,10 @@ function blitFramebuffer() {
 // allowlist on a reachable host — it's an open relay.
 let netEnabled = false;
 let netProxyUrl = "ws://localhost:8080";
+// Upstream-proxy selection merged into every connect frame: {} = direct,
+// {auto:true} = server rotates its pool, {upstream:{kind,host,port}} = chain
+// through that one specific public proxy.
+let netUpstream = {};
 const netConns = new Map(); // id -> { ws, open, pendingOut: [Uint8Array], pendingIn: [Uint8Array] }
 const setNetStatus = (t) => { const el = $("net-status"); if (el) el.textContent = t; };
 
@@ -389,6 +393,55 @@ async function netPreResolve(allowlist) {
   }
 }
 
+// Read the upstream-proxy choice from the UI into a connect-frame fragment.
+// A non-empty manual field wins; otherwise the dropdown (direct / auto / a
+// fetched proxy encoded as "kind|host|port"). Returns {} for direct/invalid.
+function readUpstream() {
+  const status = $("net-upstream-status");
+  const manual = $("net-upstream-manual").value.trim();
+  if (manual) {
+    const m = manual.match(/^(?:(socks5|socks4|http):\/\/)?([^\s:/]+):(\d+)$/i);
+    if (!m) {
+      if (status) status.textContent = `⚠ bad upstream "${manual}" — use kind://host:port`;
+      return {};
+    }
+    return { upstream: { kind: (m[1] || "socks5").toLowerCase(), host: m[2], port: +m[3] } };
+  }
+  const v = $("net-upstream").value;
+  if (v === "auto") return { auto: true };
+  if (v === "direct" || !v) return {};
+  const [kind, host, port] = v.split("|");
+  return { upstream: { kind, host, port: +port } };
+}
+
+// Populate the upstream dropdown from proxies.json (the cron parser's output).
+// Absent/empty file → just the built-in Direct + Auto options.
+async function loadProxyList() {
+  const sel = $("net-upstream");
+  const status = $("net-upstream-status");
+  try {
+    const r = await fetch("proxies.json", { cache: "no-cache" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const list = Array.isArray(j.proxies) ? j.proxies : [];
+    if (!list.length) throw new Error("list is empty");
+    const grp = document.createElement("optgroup");
+    grp.label = `public proxies (${list.length})`;
+    for (const p of list) {
+      const o = document.createElement("option");
+      o.value = `${p.type}|${p.host}|${p.port}`;
+      o.textContent = `${p.type} ${p.host}:${p.port}`;
+      grp.appendChild(o);
+    }
+    sel.appendChild(grp);
+    if (status) status.textContent =
+      `${list.length} public proxies loaded — untrusted, non-sensitive traffic only`;
+  } catch (e) {
+    if (status) status.textContent =
+      `no proxies.json (run scripts/fetch-proxies.py) — Direct/Auto/manual still work`;
+  }
+}
+
 function netOpenConn({ id, host, port }) {
   // hostClosed: the WebSocket ended — stop reading, but keep the slot until
   // every buffered inbound chunk has been handed to the guest (else the tail
@@ -407,7 +460,8 @@ function netOpenConn({ id, host, port }) {
   c.ws = ws;
   ws.onopen = () => {
     c.open = true;
-    ws.send(JSON.stringify({ host, port })); // proxy handshake header
+    // proxy handshake header; netUpstream adds {auto} or {upstream:{…}} if set
+    ws.send(JSON.stringify({ host, port, ...netUpstream }));
   };
   ws.onmessage = (ev) => {
     // The proxy sends TCP payload as BINARY frames; a TEXT frame is a control
@@ -664,6 +718,7 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
         net = {
           proxyUrl: $("net-proxy").value.trim() || "ws://localhost:8080",
           allow: $("net-allow").value.trim(),
+          upstream: readUpstream(), // {} | {auto} | {upstream:{…}}
         };
         setNetStatus("enabled — resolving hosts…");
       } else {
@@ -720,6 +775,7 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
     netEnabled = $("net-enable").checked;
     if (netEnabled) {
       netProxyUrl = $("net-proxy").value.trim() || "ws://localhost:8080";
+      netUpstream = readUpstream(); // {} | {auto} | {upstream:{…}}
       const allow = $("net-allow").value.trim();
       vm.net_enable(allow);
       setNetStatus("enabled — resolving hosts…");
@@ -860,6 +916,7 @@ $("boot-image").addEventListener("click", async () => {
 });
 
 loadImageManifest();
+loadProxyList();
 
 // `runCommand()` — send a line, collect output until it stops growing
 // for ~250ms, return as a Promise. JS callers can await the result

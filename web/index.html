@@ -63,6 +63,18 @@
           </label>
           <small class="status">⚠ the proxy's own allowlist must also permit it (WWWVM_PROXY_ALLOWLIST)</small>
           <br />
+          <label>upstream proxy:
+            <select id="net-upstream">
+              <option value="direct">Direct (no upstream)</option>
+              <option value="auto">Auto-rotate (server picks)</option>
+            </select>
+          </label>
+          <label>or enter your own:
+            <input id="net-upstream-manual" type="text" size="22"
+              placeholder="socks5://host:port" />
+          </label>
+          <small id="net-upstream-status" class="status">public proxies are untrusted — non-sensitive traffic only</small>
+          <br />
           <button id="boot-image" disabled>Load selected image</button>
           <hr />
           <details>
@@ -183,6 +195,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=14"></script>
+    <script type="module" src="./main.js?v=15"></script>
   </body>
 </html>
