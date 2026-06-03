@@ -328,6 +328,10 @@ pub struct Cpu {
     /// of a low address — the investigation hook for the ld.so
     /// null-deref. `RefCell` so the `&self` `raise_fault` can dump it.
     pf_trace: core::cell::RefCell<Option<PfTrace>>,
+    /// Cheap mirror of `pf_trace.borrow().is_some()` — a plain `Cell<bool>`
+    /// checked once per step on the hot path instead of a RefCell borrow (the
+    /// trace is off in every non-debug run). Set by `enable_pf_trace`.
+    pf_trace_on: core::cell::Cell<bool>,
 }
 
 /// Debug instruction-trace ring buffer (see `Cpu::pf_trace`).
@@ -660,6 +664,7 @@ impl Cpu {
             bios_hook: None,
             seg_cache: [SegmentCache::default(); 6],
             pf_trace: core::cell::RefCell::new(None),
+            pf_trace_on: core::cell::Cell::new(false),
         }
     }
 
@@ -669,6 +674,7 @@ impl Cpu {
     /// For investigating the ld.so null-deref; off by default.
     pub fn enable_pf_trace(&self, cap: usize) {
         *self.pf_trace.borrow_mut() = Some(PfTrace::new(cap));
+        self.pf_trace_on.set(true);
     }
 
     /// Dump the instruction-trace ring on demand (no-op if not enabled).
@@ -3936,7 +3942,7 @@ impl Cpu {
         // about to execute at a "wild" low address (op_ip < 0x10000) —
         // e.g. the kernel's bad jump to 0x2061 — so the ring shows the
         // instruction (ret/jmp/call) that set the bad target.
-        if self.pf_trace.borrow().is_some() {
+        if self.pf_trace_on.get() {
             let entry = (op_ip, self.read_r32(0), self.read_r32(3), self.read_r32(5));
             let wild = op_ip < 0x1_0000;
             if let Some(t) = self.pf_trace.borrow_mut().as_mut() {
