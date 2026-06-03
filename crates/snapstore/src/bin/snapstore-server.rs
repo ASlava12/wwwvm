@@ -92,6 +92,12 @@ async fn serve(
     let Some((method, path, content_len, auth)) = parse_head(head) else {
         return respond(&mut sock, &resp(400, "bad request"), false).await;
     };
+    // CORS preflight: the browser sends OPTIONS before a cross-origin PUT (which
+    // carries Authorization + a body). Answer it with the allow headers; the
+    // real auth still happens on the PUT itself.
+    if method == "OPTIONS" {
+        return respond(&mut sock, &resp(204, ""), true).await;
+    }
     let is_head = method == "HEAD";
 
     // Read the body (already-buffered remainder + the rest up to Content-Length).
@@ -165,8 +171,19 @@ fn resp(status: u16, msg: &str) -> http::Response {
 /// accurate-enough Content-Length of 0 (clients use the status for existence).
 async fn respond(sock: &mut TcpStream, r: &http::Response, is_head: bool) -> std::io::Result<()> {
     let body: &[u8] = if is_head { &[] } else { &r.body };
+    // Permissive CORS so the browser uploader can reach the store cross-origin
+    // (e.g. page on :8081, store on :8090). Writes are still gated by the admin
+    // token on the request itself — CORS only governs which origins the browser
+    // lets read the response / send the header.
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, HEAD, PUT, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+         Access-Control-Max-Age: 86400\r\n\
+         Connection: close\r\n\r\n",
         r.status,
         http::reason(r.status),
         r.content_type,
