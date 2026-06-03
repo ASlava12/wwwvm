@@ -106,20 +106,27 @@ if [ "$WITH_X" = 1 ]; then
     WWWVM_DUMP_INITRAMFS="$OUT/alpine-x.cpio" "$BIN"
 fi
 
+# 4c. Gzip the initramfs images. The kernel decompresses gzip initramfs natively
+#     (it's how Alpine itself boots), so this shrinks the download a lot — the X
+#     image especially (~132 → ~50 MiB) — for little extra boot cost. The web UI
+#     hands set_ramdisk the gzipped bytes as-is; the guest kernel inflates them.
+say "gzipping initramfs images…"
+for f in "$OUT"/alpine-*.cpio; do [ -f "$f" ] && gzip -f -9 "$f"; done
+
 # 5. Generate the manifest the web UI fetches. Sizes are advisory (shown in the
 #    picker so the user knows the download cost). cmdline mirrors what the native
 #    example sets per variant (the GUI ones add console=tty0 so fbcon renders).
 CONSOLE_CMD="earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4"
 GUI_CMD="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4"
 ksz=$(stat -c%s "$OUT/vmlinuz-lts")
-csz=$(stat -c%s "$OUT/alpine-console.cpio")
-gsz=$(stat -c%s "$OUT/alpine-gui.cpio")
+csz=$(stat -c%s "$OUT/alpine-console.cpio.gz")
+gsz=$(stat -c%s "$OUT/alpine-gui.cpio.gz")
 IMAGES=$(cat <<JSON
     {
       "id": "alpine-console",
       "name": "Alpine — console (musl shell, serial)",
       "kernel": "vmlinuz-lts",
-      "initramfs": "alpine-console.cpio",
+      "initramfs": "alpine-console.cpio.gz",
       "cmdline": "$CONSOLE_CMD",
       "gui": false,
       "ramMiB": 256,
@@ -129,7 +136,7 @@ IMAGES=$(cat <<JSON
       "id": "alpine-gui",
       "name": "Alpine — GUI (framebuffer + DRM/input)",
       "kernel": "vmlinuz-lts",
-      "initramfs": "alpine-gui.cpio",
+      "initramfs": "alpine-gui.cpio.gz",
       "cmdline": "$GUI_CMD",
       "gui": true,
       "fbRes": "1024x768",
@@ -138,14 +145,14 @@ IMAGES=$(cat <<JSON
     }
 JSON
 )
-if [ "$WITH_X" = 1 ] && [ -f "$OUT/alpine-x.cpio" ]; then
-  xsz=$(stat -c%s "$OUT/alpine-x.cpio")
+if [ "$WITH_X" = 1 ] && [ -f "$OUT/alpine-x.cpio.gz" ]; then
+  xsz=$(stat -c%s "$OUT/alpine-x.cpio.gz")
   IMAGES="$IMAGES,
     {
       \"id\": \"alpine-x\",
       \"name\": \"Alpine — X desktop (Xorg + twm, preinstalled)\",
       \"kernel\": \"vmlinuz-lts\",
-      \"initramfs\": \"alpine-x.cpio\",
+      \"initramfs\": \"alpine-x.cpio.gz\",
       \"cmdline\": \"$GUI_CMD\",
       \"gui\": true,
       \"fbRes\": \"1024x768\",

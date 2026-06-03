@@ -199,11 +199,22 @@ Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.c
     let init = format!(
         "#!/bin/sh\n{bb_install}{BASE_MOUNTS}{net_setup}{gui_setup}{gui_session}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
     );
-    let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: cannot pack Alpine rootfs {root}: {e}");
+    // WWWVM_INITRAMFS_FILE=<path> boots a PREBUILT initramfs (e.g. a dumped or
+    // gzipped cpio) as-is instead of packing the directory — handy for
+    // validating the exact image the browser serves (gzip included; the kernel
+    // decompresses gzip/xz initramfs natively).
+    let cpio = if let Some(path) = std::env::var_os("WWWVM_INITRAMFS_FILE") {
+        std::fs::read(&path).unwrap_or_else(|e| {
+            eprintln!("error: cannot read initramfs {:?}: {e}", path);
             std::process::exit(1);
+        })
+    } else {
+        match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: cannot pack Alpine rootfs {root}: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
