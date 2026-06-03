@@ -140,16 +140,14 @@ fn main() {
         ""
     };
     // When a framebuffer is requested (WWWVM_FB set), load the DRM + input
-    // modules so userspace gets real devices: `simpledrm` binds the EFI
-    // framebuffer → /dev/dri/card0 (the X `modesetting` device) and `evdev`
-    // exposes /dev/input/event* (once an input device binds). The netboot
-    // vmlinuz-lts ships these as modules, not built-ins, so without them
-    // there is no userspace graphics/input device at all. Stage the .ko's
-    // with `fetch-alpine-assets.sh --with-gui`; the insmods are silent
-    // no-ops when absent. Order = deps before dependents. These are large
-    // modules (drm.ko ~600 KiB) and slow to relocate on the emulator, so
-    // this adds noticeable boot time — hence gated on graphics being asked
-    // for rather than loaded unconditionally.
+    // modules so userspace gets real devices: `simpledrm` is what creates
+    // /dev/fb0 here (this kernel's sysfb hands the firmware framebuffer to a
+    // simple-framebuffer/DRM device, NOT efifb — without simpledrm there is no
+    // /dev/fb0 at all), plus /dev/dri/card0; `evdev` exposes /dev/input/event*
+    // (keyboard via atkbd/8042, mouse via psmouse). The netboot vmlinuz-lts
+    // ships these as modules; stage them with `fetch-alpine-assets.sh
+    // --with-gui`. Order = deps before dependents; insmods are silent no-ops
+    // when absent.
     let gui_setup = if std::env::var_os("WWWVM_FB").is_some() {
         "for m in i2c-core drm drm_kms_helper drm_shmem_helper simpledrm \
              evdev mousedev psmouse; do insmod /$m.ko 2>/dev/null; done\n"
@@ -177,8 +175,11 @@ Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.c
          printf 'RandomPlacement\\nNoTitleFocus\\n' > /root/.twmrc\n\
          ( X :0 vt1 -noreset -nolisten tcp > /var/log/x.log 2>&1 &\n\
            i=0; while [ ! -e /tmp/.X11-unix/X0 ] && [ \"$i\" -lt 180 ]; do i=$((i+1)); sleep 1; done; sleep 2\n\
+           DISPLAY=:0 xsetroot -solid '#30343f' 2>/dev/null\n\
            DISPLAY=:0 twm > /var/log/twm.log 2>&1 &\n\
-           DISPLAY=:0 xterm -geometry 100x30+20+20 > /var/log/xterm.log 2>&1 & ) &\n"
+           DISPLAY=:0 xterm -fn fixed -geometry 100x30+20+20 > /var/log/xterm.log 2>&1 &\n\
+           while :; do dd if=/dev/fb0 of=/tmp/.fbr bs=512k 2>/dev/null && \
+             dd if=/tmp/.fbr of=/dev/fb0 bs=512k 2>/dev/null; sleep 1; done & ) &\n"
     } else {
         ""
     };

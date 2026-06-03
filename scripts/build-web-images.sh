@@ -77,6 +77,9 @@ cp -f "$KERNEL" "$OUT/vmlinuz-lts"
 #     cache (skipped scriptlets) are rebuilt at first boot by /init.
 if [ "$WITH_X" = 1 ]; then
   command -v docker >/dev/null || { echo "--with-x needs docker (host can't run x86 apk)"; exit 1; }
+  if [ -x "$XROOT/usr/bin/Xorg" ] && [ -z "${WWWVM_REBUILD_XROOT:-}" ]; then
+    say "reusing existing X rootfs at $XROOT (set WWWVM_REBUILD_XROOT=1 to rebuild)"
+  else
   say "cross-building X rootfs in docker (downloads the X stack — slow)…"
   docker run --rm -v "$ALP:/out" alpine:3.21 sh -c "
     set -e
@@ -96,6 +99,7 @@ if [ "$WITH_X" = 1 ]; then
     cp /out/root/*.ko /out/xroot/ 2>/dev/null || true
     chmod -R a+rX /out/xroot
   "
+  fi
   say "packing X initramfs (this is large)…"
   WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$XROOT" \
     WWWVM_FB=1024x768 WWWVM_NET_STUB=1 WWWVM_INIT_GUI_SESSION=1 \
