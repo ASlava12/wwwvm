@@ -182,7 +182,7 @@ function sendMouse(dx, dy, buttons) {
     const b = breakBytes(e.code);
     if (b) { e.preventDefault(); sendScancodes(b); }
   });
-  setHint();
+  refreshHint();
 })();
 
 // Header controls: collapse/show the settings sidebar, fullscreen the canvas.
