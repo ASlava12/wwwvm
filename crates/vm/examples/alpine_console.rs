@@ -449,6 +449,21 @@ fn main() {
                 eprintln!("\r\n[wwwvm] PS/2 mouse: move + left-click (Ctrl-B)");
                 continue;
             }
+            // Ctrl-U (0x15): inject the four arrow keys as PS/2 scan codes, to
+            // test/demo the EXTENDED-key path (0xE0-prefixed Set-1 codes, what
+            // the browser keymap sends for arrows/Home/End/Del) to a graphical
+            // guest. Each is 0xE0 + code (make) then 0xE0 + code|0x80 (break).
+            if bytes.contains(&0x15) {
+                for &code in &[0x48u8, 0x50, 0x4B, 0x4D] {
+                    // up, down, left, right
+                    vm.push_scancode(0xE0);
+                    vm.push_scancode(code);
+                    vm.push_scancode(0xE0);
+                    vm.push_scancode(code | 0x80);
+                }
+                eprintln!("\r\n[wwwvm] PS/2: arrow keys ↑↓←→ (Ctrl-U)");
+                continue;
+            }
             if ready {
                 vm.send_input(&bytes);
             } else {
