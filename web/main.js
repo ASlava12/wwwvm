@@ -6,7 +6,7 @@
 
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
 import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
-import { makeBytes, breakBytes } from "./ps2-keymap.js";
+import { makeBytes, breakBytes, comboBytes } from "./ps2-keymap.js?v=2";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -207,6 +207,69 @@ function sendMouse(dx, dy, buttons) {
     if (b) { e.preventDefault(); sendScancodes(b); }
   });
   refreshHint();
+})();
+
+// "Send keys to VM": inject key combinations as PS/2 scan codes WITHOUT needing
+// to capture the canvas — the whole point, since the browser/OS swallow combos
+// like Ctrl+Alt+Del / Ctrl+Alt+F1 / Alt+Tab before they ever reach the guest.
+// Quick buttons carry a "+"-joined list of DOM codes in data-combo; the
+// composer builds one from the modifier checkboxes + key dropdown. Routed via
+// sendScancodes (worker or inline), so it reaches the graphical guest's evdev.
+(function wireKeyCombos() {
+  // Populate the key dropdown (DOM code → label) so the HTML stays small.
+  const keySel = $("kc-key");
+  if (keySel && !keySel.options.length) {
+    const L = (s) => String.fromCharCode(s);
+    const KEYS = [["", "— key —"]];
+    for (let c = 65; c <= 90; c++) KEYS.push(["Key" + L(c), L(c)]); // A–Z
+    for (let d = 0; d <= 9; d++) KEYS.push(["Digit" + d, String(d)]); // 0–9
+    for (let f = 1; f <= 12; f++) KEYS.push(["F" + f, "F" + f]); // F1–F12
+    KEYS.push(
+      ["Enter", "Enter"], ["Escape", "Esc"], ["Tab", "Tab"], ["Space", "Space"],
+      ["Backspace", "Backspace"], ["Delete", "Delete"], ["Insert", "Insert"],
+      ["Home", "Home"], ["End", "End"], ["PageUp", "PgUp"], ["PageDown", "PgDn"],
+      ["ArrowUp", "↑"], ["ArrowDown", "↓"], ["ArrowLeft", "←"], ["ArrowRight", "→"],
+    );
+    for (const [code, label] of KEYS) {
+      const o = document.createElement("option");
+      o.value = code;
+      o.textContent = label;
+      keySel.appendChild(o);
+    }
+  }
+  const status = $("kc-status");
+  const flash = (label) => {
+    if (!status) return;
+    const booted = active === "worker" ? workerBooted : vm && vm.is_booted();
+    status.textContent = booted ? `sent: ${label}` : "boot a guest first";
+  };
+  const fire = (codes, label) => {
+    const bytes = comboBytes(codes);
+    if (!bytes.length) return;
+    sendScancodes(bytes);
+    flash(label);
+  };
+
+  document.querySelectorAll("[data-combo]").forEach((btn) => {
+    btn.addEventListener("click", () =>
+      fire(btn.dataset.combo.split("+"), btn.textContent.trim()));
+  });
+
+  const send = $("kc-send");
+  if (send) {
+    send.addEventListener("click", () => {
+      const codes = [];
+      const labels = [];
+      if ($("kc-ctrl").checked) { codes.push("ControlLeft"); labels.push("Ctrl"); }
+      if ($("kc-alt").checked) { codes.push("AltLeft"); labels.push("Alt"); }
+      if ($("kc-shift").checked) { codes.push("ShiftLeft"); labels.push("Shift"); }
+      if ($("kc-super").checked) { codes.push("MetaLeft"); labels.push("Super"); }
+      const key = $("kc-key").value;
+      if (key) { codes.push(key); labels.push($("kc-key").selectedOptions[0].textContent); }
+      if (!codes.length) return;
+      fire(codes, labels.join("+"));
+    });
+  }
 })();
 
 // "Last result": click to expand into a large scrollable overlay; click the

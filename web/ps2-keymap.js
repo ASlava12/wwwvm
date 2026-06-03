@@ -51,3 +51,23 @@ export function breakBytes(code) {
   // Set the 0x80 release bit on the final code byte; keep any 0xE0 prefix.
   return m.length === 1 ? [m[0] | 0x80] : [m[0], m[1] | 0x80];
 }
+
+/**
+ * Full scan-code sequence for a key combination given as an array of DOM
+ * `event.code`s (modifiers first, e.g. ["ControlLeft","AltLeft","Delete"]).
+ * Presses every key in order, then releases them in REVERSE order — exactly how
+ * a real chord arrives — so the guest sees e.g. Ctrl↓ Alt↓ Del↓ Del↑ Alt↑ Ctrl↑.
+ * Unknown codes are skipped. Returns a flat byte array for push_scancode.
+ */
+export function comboBytes(codes) {
+  const out = [];
+  for (const c of codes) {
+    const m = makeBytes(c);
+    if (m) out.push(...m);
+  }
+  for (let i = codes.length - 1; i >= 0; i--) {
+    const b = breakBytes(codes[i]);
+    if (b) out.push(...b);
+  }
+  return out;
+}

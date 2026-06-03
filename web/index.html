@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <title>wwwvm — Rust VM in the browser</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="./style.css?v=10" />
+    <link rel="stylesheet" href="./style.css?v=11" />
   </head>
   <body>
     <header>
@@ -122,6 +122,29 @@
         </fieldset>
 
         <fieldset>
+          <legend>Send keys to VM</legend>
+          <div class="key-combos">
+            <button data-combo="ControlLeft+AltLeft+Delete">Ctrl+Alt+Del</button>
+            <button data-combo="ControlLeft+AltLeft+F1">Ctrl+Alt+F1</button>
+            <button data-combo="ControlLeft+AltLeft+F2">Ctrl+Alt+F2</button>
+            <button data-combo="AltLeft+Tab">Alt+Tab</button>
+            <button data-combo="ControlLeft+KeyC">Ctrl+C</button>
+            <button data-combo="Escape">Esc</button>
+            <button data-combo="Tab">Tab</button>
+            <button data-combo="Enter">Enter</button>
+          </div>
+          <div class="key-composer">
+            <label><input type="checkbox" id="kc-ctrl" />Ctrl</label>
+            <label><input type="checkbox" id="kc-alt" />Alt</label>
+            <label><input type="checkbox" id="kc-shift" />Shift</label>
+            <label><input type="checkbox" id="kc-super" />Super</label>
+            <select id="kc-key"></select>
+            <button id="kc-send">Send</button>
+          </div>
+          <small id="kc-status" class="status">PS/2 scancodes → graphical guest (evdev); no canvas focus needed</small>
+        </fieldset>
+
+        <fieldset>
           <legend>Snapshot / restore</legend>
           <div class="snapshot-row">
             <button id="save">Save</button>
@@ -196,6 +219,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=15"></script>
+    <script type="module" src="./main.js?v=16"></script>
   </body>
 </html>

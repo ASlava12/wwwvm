@@ -105,3 +105,11 @@ pre { margin: 0; max-height: 8rem; overflow: auto;
 .snapshot-row { display: flex; gap: .5rem; margin: .25rem 0; }
 .snapshot-row button { flex: 1; }
 #snapshot-status { display: block; margin-top: .25rem; }
+
+/* "Send keys to VM": quick-combo buttons wrap; composer is a tidy row. */
+.key-combos { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .4rem; }
+.key-combos button { flex: 0 0 auto; font-size: .8rem; padding: .2rem .45rem; }
+.key-composer { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; }
+.key-composer label { display: inline-flex; align-items: center; gap: .15rem; font-size: .8rem; }
+.key-composer select { min-width: 4.5rem; }
+#kc-status { display: block; margin-top: .3rem; }
