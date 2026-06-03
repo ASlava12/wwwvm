@@ -16,6 +16,14 @@
 //! specific browser Origins (guards against Cross-Site WebSocket Hijacking);
 //! unset accepts any Origin (fine for a loopback dev demo only).
 //!
+//! The connect frame may also chain through a third-party public proxy instead
+//! of connecting to the target directly: `{"host","port","upstream":{"kind":
+//! "socks5"|"socks4"|"http","host","port"}}` tunnels through that one, and
+//! `{"host","port","auto":true}` lets the server pick & rotate one from the
+//! pool in `WWWVM_PROXY_UPSTREAMS_FILE` (the JSON `scripts/fetch-proxies.py`
+//! writes). See `upstream.rs`. Public proxies are untrusted — non-sensitive
+//! traffic only.
+//!
 //! Run (specific host, bound to loopback — the safe default):
 //!     WWWVM_PROXY_ALLOWLIST='dl-cdn.alpinelinux.org:80' \
 //!     WWWVM_PROXY_ORIGINS='http://localhost:8080' \
@@ -23,8 +31,11 @@
 
 #![forbid(unsafe_code)]
 
+mod upstream;
+
 use std::env;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +50,14 @@ use tokio_tungstenite::tungstenite::Message;
 struct ConnectFrame {
     host: String,
     port: u16,
+    /// Optional: tunnel through this specific upstream proxy instead of
+    /// connecting to the target directly (browser-selected / manual entry).
+    #[serde(default)]
+    upstream: Option<upstream::Upstream>,
+    /// Optional: let the server pick & rotate an upstream from its pool
+    /// (`WWWVM_PROXY_UPSTREAMS_FILE`). Ignored if `upstream` is set.
+    #[serde(default)]
+    auto: bool,
 }
 
 /// Control text frame meaning "the guest half-closed its write side": shut down
@@ -105,6 +124,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Optional pool of upstream proxies for "auto" mode — the JSON file written
+    // by scripts/fetch-proxies.py. Read fresh per request so a cron refresh is
+    // picked up without restarting. Unset → "auto" requests are rejected.
+    let upstreams_file: Arc<Option<PathBuf>> =
+        Arc::new(env::var_os("WWWVM_PROXY_UPSTREAMS_FILE").map(PathBuf::from));
+    match upstreams_file.as_ref() {
+        Some(p) => log::info!("auto-upstream pool: {}", p.display()),
+        None => log::info!(
+            "WWWVM_PROXY_UPSTREAMS_FILE unset — 'auto' upstream mode disabled \
+             (direct + explicit-upstream still work)"
+        ),
+    }
+
     let listener = TcpListener::bind(bind).await.context("bind")?;
     log::info!("wwwvm-proxy listening on {bind}");
 
@@ -112,8 +144,9 @@ async fn main() -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         let allow = allow.clone();
         let origins = origins.clone();
+        let upstreams_file = upstreams_file.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, peer, allow, origins).await {
+            if let Err(e) = handle(stream, peer, allow, origins, upstreams_file).await {
                 log::warn!("{peer}: {e:#}");
             }
         });
@@ -129,6 +162,7 @@ async fn handle(
     peer: SocketAddr,
     allow: Arc<Allowlist>,
     origins: Arc<Option<Vec<String>>>,
+    upstreams_file: Arc<Option<PathBuf>>,
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     // Reject disallowed Origins during the handshake (before any TCP connect).
@@ -175,38 +209,74 @@ async fn handle(
         ));
     }
 
-    // Resolve the host OURSELVES and pin a vetted, globally-routable address.
-    // Passing the hostname to connect() would re-resolve at connect time
-    // (reopening a DNS-rebinding window) and could reach a loopback/private/
-    // internal IP (SSRF). The allowlist authorizes a *name*; the IP it points
-    // at must still be a real external address. (v4-only — the bridge is v4.)
-    let addr = tokio::net::lookup_host((connect.host.as_str(), connect.port))
-        .await
-        .context("resolve")?
-        .find(|sa| match sa.ip() {
-            IpAddr::V4(ip) => wwwvm_net::allow::is_globally_routable(ip),
-            IpAddr::V6(_) => false,
-        });
-    let Some(addr) = addr else {
-        let _ = ws_sink
-            .send(Message::Text(format!(
-                "ERR {}:{} no globally-routable address",
-                connect.host, connect.port
-            )))
-            .await;
-        return Err(anyhow!(
-            "{peer}: refused {} — no globally-routable address (SSRF guard)",
-            connect.host
-        ));
+    // Establish the byte stream to the target. Three ways, in priority order:
+    //   1. explicit upstream  — chain through the browser-selected proxy
+    //   2. auto               — server picks & rotates from its pool
+    //   3. direct (default)   — connect to the target ourselves
+    // On any failure we tell the client (ERR text frame) before bailing so the
+    // browser can surface why a flow didn't open.
+    let tcp_result: Result<TcpStream> = if let Some(up) = &connect.upstream {
+        log::info!("{peer} -> {}:{} via {up}", connect.host, connect.port);
+        upstream::open_via(up, &connect.host, connect.port).await
+    } else if connect.auto {
+        match upstreams_file.as_ref() {
+            Some(path) => match upstream::load_auto_list(path).await {
+                Ok(list) => {
+                    log::info!(
+                        "{peer} -> {}:{} via auto ({} upstreams)",
+                        connect.host,
+                        connect.port,
+                        list.len()
+                    );
+                    upstream::open_auto(&list, &connect.host, connect.port).await
+                }
+                Err(e) => Err(e),
+            },
+            None => Err(anyhow!(
+                "auto upstream requested but WWWVM_PROXY_UPSTREAMS_FILE is unset"
+            )),
+        }
+    } else {
+        // Direct: resolve the host OURSELVES and pin a vetted, globally-routable
+        // address. Passing the hostname to connect() would re-resolve at connect
+        // time (reopening a DNS-rebinding window) and could reach a loopback/
+        // private/internal IP (SSRF). The allowlist authorizes a *name*; the IP
+        // it points at must still be external. (v4-only — the bridge is v4.)
+        let addr = tokio::net::lookup_host((connect.host.as_str(), connect.port))
+            .await
+            .context("resolve")?
+            .find(|sa| match sa.ip() {
+                IpAddr::V4(ip) => wwwvm_net::allow::is_globally_routable(ip),
+                IpAddr::V6(_) => false,
+            });
+        match addr {
+            Some(addr) => {
+                log::info!(
+                    "{peer} -> {} [{}]:{}",
+                    connect.host,
+                    addr.ip(),
+                    connect.port
+                );
+                TcpStream::connect(addr).await.context("upstream connect")
+            }
+            None => Err(anyhow!(
+                "no globally-routable address for {} (SSRF guard)",
+                connect.host
+            )),
+        }
     };
-
-    log::info!(
-        "{peer} -> {} [{}]:{}",
-        connect.host,
-        addr.ip(),
-        connect.port
-    );
-    let tcp = TcpStream::connect(addr).await.context("upstream connect")?;
+    let tcp = match tcp_result {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            let _ = ws_sink
+                .send(Message::Text(format!(
+                    "ERR {}:{} {e:#}",
+                    connect.host, connect.port
+                )))
+                .await;
+            return Err(anyhow!("{peer}: {} failed: {e:#}", connect.host));
+        }
+    };
     let (mut tcp_rd, mut tcp_wr) = tcp.into_split();
 
     // ws -> tcp (guest → upstream). Log the first chunk + total so a stalled
