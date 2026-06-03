@@ -19,6 +19,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod http;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
