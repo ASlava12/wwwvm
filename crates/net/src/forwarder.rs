@@ -14,6 +14,7 @@
 //! framing is replaced by a smoltcp UDP socket; the cache + codec stay.)
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use crate::dns::{self, DnsAnswer, QTYPE_A, QTYPE_AAAA};
@@ -40,6 +41,11 @@ pub struct DnsForwarder {
     by_name: HashMap<String, Vec<Ipv4Addr>>,
     /// resolved IP → name, for the TCP NAT's hostname allowlist check.
     by_ip: HashMap<Ipv4Addr, String>,
+    /// Names the guest asked for that aren't cached yet but ARE allowlisted
+    /// (incl. a `*` wildcard) — queued for the host to resolve on the fly
+    /// (DoH in JS). The guest's query is dropped so its resolver retries and
+    /// hits the now-filled cache. Deduped; drained by `take_pending`.
+    pending: HashSet<String>,
 }
 
 impl DnsForwarder {
@@ -50,7 +56,13 @@ impl DnsForwarder {
             allow,
             by_name: HashMap::new(),
             by_ip: HashMap::new(),
+            pending: HashSet::new(),
         }
+    }
+
+    /// Drain the names queued for on-demand host resolution (see `pending`).
+    pub fn take_pending(&mut self) -> Vec<String> {
+        self.pending.drain().collect()
     }
 
     /// Record a pre-resolved name→addrs mapping. Non-allowlisted names and
@@ -110,14 +122,27 @@ impl DnsForwarder {
     /// empty NOERROR (v4-only LAN), and ANY/TXT/etc. are refused (NXDOMAIN) so
     /// the forwarder can't be an exfil channel. Used both by the hand-rolled
     /// framing below and by the smoltcp UDP socket.
-    pub fn respond_to_query(&self, payload: &[u8]) -> Option<Vec<u8>> {
+    pub fn respond_to_query(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         let query = dns::parse_query(payload)?;
         let answer = if query.qtype == QTYPE_AAAA {
             DnsAnswer::Addrs(Vec::new())
         } else if query.qtype == QTYPE_A {
             match self.by_name.get(&query.name) {
                 Some(addrs) if !addrs.is_empty() => DnsAnswer::Addrs(addrs.clone()),
-                _ => DnsAnswer::NxDomain,
+                // Uncached. If the name is allowlisted (incl. a `*` wildcard),
+                // queue it for on-demand resolution by the host and DROP this
+                // query (return None) so the guest's resolver retries and the
+                // retry hits the freshly-cached answer. Not allowlisted →
+                // NXDOMAIN (the forwarder can't be used to probe arbitrary
+                // names). The SSRF guards still apply when the resolution is
+                // cached (routable-only, resolved-name-only at connect).
+                _ => {
+                    if self.allow.permits_host(&query.name) {
+                        self.pending.insert(query.name.clone());
+                        return None;
+                    }
+                    DnsAnswer::NxDomain
+                }
             }
         } else {
             DnsAnswer::NxDomain
@@ -128,10 +153,13 @@ impl DnsForwarder {
     /// If `frame` is a DNS query to the gateway, return the response frame to
     /// inject; otherwise None. (Hand-rolled UDP/IP/Ethernet framing — used
     /// before the bridge moves onto smoltcp, which does the framing itself.)
-    pub fn handle_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
-        let q = self.parse_dns_query_frame(frame)?;
-        let dns_resp = self.respond_to_query(q.payload)?;
-        Some(self.build_udp_frame(q.guest_mac, q.guest_ip, q.src_port, &dns_resp))
+    pub fn handle_frame(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (guest_mac, guest_ip, src_port, dns_resp) = {
+            let q = self.parse_dns_query_frame(frame)?;
+            let resp = self.respond_to_query(q.payload)?;
+            (q.guest_mac, q.guest_ip, q.src_port, resp)
+        };
+        Some(self.build_udp_frame(guest_mac, guest_ip, src_port, &dns_resp))
     }
 
     /// Parse an Ethernet/IPv4/UDP frame addressed to the gateway's DNS port.
@@ -310,11 +338,25 @@ mod tests {
 
     #[test]
     fn uncached_name_gets_nxdomain() {
-        let f = fwd();
+        let mut f = fwd();
         let frame = query_frame(GW_IP, &dns_query_payload(2, "not-cached.example", QTYPE_A));
         let resp = f.handle_frame(&frame).expect("reply");
         let dns = &resp[42..];
         assert_eq!(u16::from_be_bytes([dns[2], dns[3]]) & 0x000F, 3, "NXDOMAIN");
+    }
+
+    #[test]
+    fn wildcard_queues_uncached_name_and_drops_query() {
+        let mut f = DnsForwarder::new(GW_IP, GW_MAC, Allowlist::parse("*"));
+        let frame = query_frame(GW_IP, &dns_query_payload(5, "newhost.example.com", QTYPE_A));
+        // Uncached + allowlisted (*) → drop the query (None) and queue the name
+        // for on-demand host resolution.
+        assert!(
+            f.handle_frame(&frame).is_none(),
+            "query dropped so the resolver retries"
+        );
+        assert_eq!(f.take_pending(), vec!["newhost.example.com".to_string()]);
+        assert!(f.take_pending().is_empty(), "drained");
     }
 
     #[test]
@@ -333,7 +375,7 @@ mod tests {
 
     #[test]
     fn non_dns_and_wrong_dst_are_ignored() {
-        let f = fwd();
+        let mut f = fwd();
         // UDP to a different IP → not ours.
         let frame = query_frame([8, 8, 8, 8], &dns_query_payload(1, "x.com", QTYPE_A));
         assert!(f.handle_frame(&frame).is_none());

@@ -23,28 +23,41 @@ let netEnabled = false;
 let netProxyUrl = "ws://localhost:8080";
 const netConns = new Map();
 
+// Resolve one host (DoH via Cloudflare) and feed the answer into the NAT's DNS
+// cache. Deduped while in flight so the guest's DNS retries don't spam DoH.
+const dnsInFlight = new Set();
+async function resolveHost(host) {
+  if (!host || dnsInFlight.has(host)) return;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    vm.net_cache_dns(host, Uint8Array.from(host.split(".").map(Number)));
+    return;
+  }
+  dnsInFlight.add(host);
+  try {
+    const r = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
+      { headers: { accept: "application/dns-json" } });
+    const j = await r.json();
+    const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+    const packed = new Uint8Array(ips.length * 4);
+    ips.forEach((ip, i) => ip.split(".").forEach((o, k) => (packed[i * 4 + k] = +o)));
+    const kept = vm.net_cache_dns(host, packed);
+    post({ t: "net", text: `resolved ${host} → ${ips.join(", ") || "(none)"} (${kept} cached)` });
+  } catch (e) {
+    post({ t: "net", text: `DoH resolve failed for ${host}: ${e.message || e}` });
+  } finally {
+    dnsInFlight.delete(host);
+  }
+}
+
+// Pre-resolve the allowlist's named hosts (skip "*" / empty). With an allow-all
+// list this does nothing — names get resolved on demand from net_pump instead.
 async function netPreResolve(allowlist) {
   const hosts = [
-    ...new Set(allowlist.split(",").map((s) => s.trim().split(":")[0]).filter(Boolean)),
+    ...new Set(allowlist.split(/[,\n]/).map((s) => s.trim().split(":")[0]).filter(Boolean)),
   ];
   for (const host of hosts) {
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-      vm.net_cache_dns(host, Uint8Array.from(host.split(".").map(Number)));
-      continue;
-    }
-    try {
-      const r = await fetch(
-        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
-        { headers: { accept: "application/dns-json" } });
-      const j = await r.json();
-      const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
-      const packed = new Uint8Array(ips.length * 4);
-      ips.forEach((ip, i) => ip.split(".").forEach((o, k) => (packed[i * 4 + k] = +o)));
-      const kept = vm.net_cache_dns(host, packed);
-      post({ t: "net", text: `resolved ${host} → ${ips.join(", ") || "(none)"} (${kept} cached)` });
-    } catch (e) {
-      post({ t: "net", text: `DoH resolve failed for ${host}: ${e.message || e}` });
-    }
+    if (host !== "*") resolveHost(host);
   }
 }
 
@@ -79,6 +92,11 @@ function netOpenConn({ id, host, port }) {
 function pumpNet() {
   if (!netEnabled) return;
   vm.net_pump(performance.now());
+  // On-demand DNS: resolve names the guest queried that weren't pre-cached
+  // (the path that makes an allow-all "*" list work).
+  let dnsReqs;
+  try { dnsReqs = JSON.parse(vm.net_take_dns_requests()); } catch { dnsReqs = []; }
+  for (const name of dnsReqs) resolveHost(name);
   let news;
   try { news = JSON.parse(vm.net_take_new_connections()); } catch { news = []; }
   for (const conn of news) netOpenConn(conn);

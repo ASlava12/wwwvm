@@ -55,12 +55,13 @@ impl Allowlist {
         Self::parse(&std::env::var("WWWVM_PROXY_ALLOWLIST").unwrap_or_default())
     }
 
-    /// Parse a comma-separated allowlist string. Whitespace around entries
-    /// is trimmed; empty entries are dropped (so a trailing comma or an
-    /// empty string yields an empty, deny-all list).
+    /// Parse a comma- or newline-separated allowlist string (the web UI uses a
+    /// multi-line textarea). Whitespace around entries is trimmed; empty entries
+    /// are dropped (so a trailing separator or an empty string yields an empty,
+    /// deny-all list).
     pub fn parse(raw: &str) -> Self {
         let entries = raw
-            .split(',')
+            .split([',', '\n'])
             .filter(|s| !s.trim().is_empty())
             .map(|s| {
                 let s = s.trim();

@@ -311,6 +311,14 @@ impl NatStack {
         self.dns.cache_resolution(name, ips)
     }
 
+    /// Drain the names the guest asked for that aren't cached yet but are
+    /// allowlisted — the browser resolves these on the fly (DoH) and feeds the
+    /// answers back via `cache_dns`. Enables a `*` (allow-all) allowlist, where
+    /// nothing is pre-resolved.
+    pub fn take_dns_requests(&mut self) -> Vec<String> {
+        self.dns.take_pending()
+    }
+
     /// The hostname the guest's destination `ip` resolved from, if any. The
     /// browser relay sends this (not the bare IP) to `crates/proxy`, which
     /// re-resolves + allowlists by name and pins the address — so the proxy's

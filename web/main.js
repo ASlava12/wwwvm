@@ -61,7 +61,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=3", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=4", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
@@ -352,29 +352,40 @@ const netConns = new Map(); // id -> { ws, open, pendingOut: [Uint8Array], pendi
 const setNetStatus = (t) => { const el = $("net-status"); if (el) el.textContent = t; };
 
 // Resolve each allowlisted host via Cloudflare DoH and seed the NAT's cache.
+// Resolve one host (DoH) into the NAT's DNS cache; deduped while in flight so
+// the guest's DNS retries don't spam DoH.
+const dnsInFlight = new Set();
+async function resolveHost(host) {
+  if (!host || dnsInFlight.has(host)) return;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    vm.net_cache_dns(host, Uint8Array.from(host.split(".").map(Number)));
+    return;
+  }
+  dnsInFlight.add(host);
+  try {
+    const r = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
+      { headers: { accept: "application/dns-json" } });
+    const j = await r.json();
+    const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
+    const packed = new Uint8Array(ips.length * 4);
+    ips.forEach((ip, i) => ip.split(".").forEach((o, k) => (packed[i * 4 + k] = +o)));
+    const kept = vm.net_cache_dns(host, packed);
+    setNetStatus(`resolved ${host} → ${ips.join(", ") || "(none)"} (${kept} cached)`);
+  } catch (e) {
+    setNetStatus(`DoH resolve failed for ${host}: ${e.message || e}`);
+  } finally {
+    dnsInFlight.delete(host);
+  }
+}
+
+// Pre-resolve the allowlist's named hosts (skip "*"/empty). With allow-all,
+// names are resolved on demand from pumpNet instead.
 async function netPreResolve(allowlist) {
-  const hosts = [...new Set(allowlist.split(",")
+  const hosts = [...new Set(allowlist.split(/[,\n]/)
     .map((s) => s.trim().split(":")[0]).filter(Boolean))];
   for (const host of hosts) {
-    // A bare IPv4 literal needs no lookup.
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-      const ip = Uint8Array.from(host.split(".").map(Number));
-      vm.net_cache_dns(host, ip);
-      continue;
-    }
-    try {
-      const r = await fetch(
-        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`,
-        { headers: { accept: "application/dns-json" } });
-      const j = await r.json();
-      const ips = (j.Answer || []).filter((a) => a.type === 1).map((a) => a.data);
-      const packed = new Uint8Array(ips.length * 4);
-      ips.forEach((ip, i) => ip.split(".").forEach((o, k) => (packed[i * 4 + k] = +o)));
-      const kept = vm.net_cache_dns(host, packed);
-      setNetStatus(`resolved ${host} → ${ips.join(", ") || "(none)"} (${kept} cached)`);
-    } catch (e) {
-      setNetStatus(`DoH resolve failed for ${host}: ${e.message || e}`);
-    }
+    if (host !== "*") resolveHost(host);
   }
 }
 
@@ -418,6 +429,12 @@ function netOpenConn({ id, host, port }) {
 function pumpNet() {
   if (!netEnabled) return;
   vm.net_pump(performance.now());
+
+  // On-demand DNS: resolve names the guest queried that weren't pre-cached
+  // (makes an allow-all "*" list work).
+  let dnsReqs;
+  try { dnsReqs = JSON.parse(vm.net_take_dns_requests()); } catch { dnsReqs = []; }
+  for (const name of dnsReqs) resolveHost(name);
 
   // New flows → open a WebSocket each.
   let news;

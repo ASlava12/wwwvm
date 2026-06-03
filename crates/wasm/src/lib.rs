@@ -594,6 +594,28 @@ impl WwwVm {
         net.nat.cache_dns(name, &addrs)
     }
 
+    /// Drain the hostnames the guest tried to resolve that aren't cached yet but
+    /// are allowlisted (incl. a `*` wildcard). JS resolves these on the fly via
+    /// DoH and feeds the answers back through `net_cache_dns`; the guest's
+    /// resolver retries and hits the cache. Returns a JSON array of names. This
+    /// is what makes an allow-all allowlist work (nothing is pre-resolved).
+    pub fn net_take_dns_requests(&mut self) -> String {
+        let Some(net) = self.net.as_mut() else {
+            return "[]".into();
+        };
+        let mut s = String::from("[");
+        for (i, name) in net.nat.take_dns_requests().into_iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('"');
+            s.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
+            s.push('"');
+        }
+        s.push(']');
+        s
+    }
+
     /// Pump the NAT one tick at monotonic host time `now_ms`: move the guest's
     /// transmitted frames into the stack, advance smoltcp, and inject its
     /// replies into the guest NIC. Call each tick after stepping the CPU.

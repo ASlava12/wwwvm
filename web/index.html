@@ -58,9 +58,10 @@
           <label>proxy ws:
             <input id="net-proxy" type="text" value="ws://localhost:8080" size="22" />
           </label>
-          <label>allow:
-            <input id="net-allow" type="text" value="dl-cdn.alpinelinux.org:80" size="26" />
+          <label>allow (one host[:port] per line; <code>*</code> = everything):
+            <textarea id="net-allow" rows="3">*</textarea>
           </label>
+          <small class="status">⚠ the proxy's own allowlist must also permit it (WWWVM_PROXY_ALLOWLIST)</small>
           <br />
           <button id="boot-image" disabled>Load selected image</button>
           <hr />
@@ -182,6 +183,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=13"></script>
+    <script type="module" src="./main.js?v=14"></script>
   </body>
 </html>
