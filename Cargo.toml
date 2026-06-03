@@ -20,3 +20,14 @@ rust-version = "1.75"
 [workspace.dependencies]
 log = "0.4"
 thiserror = "1"
+
+# Release builds are perf-critical (the emulator's hot CPU loop). Fat LTO +
+# a single codegen unit let the optimizer inline across crate boundaries
+# (cpu ↔ mem ↔ devices are split into separate crates, which otherwise blocks
+# cross-crate inlining of the hot fetch/translate/dispatch path). Portable —
+# applies to both native and the wasm build; no target-specific flags here
+# (use RUSTFLAGS="-C target-cpu=native" locally if you want native codegen).
+# Trade-off: noticeably slower release builds.
+[profile.release]
+lto = "fat"
+codegen-units = 1
