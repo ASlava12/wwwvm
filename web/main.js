@@ -606,13 +606,17 @@ function seedGuestClock(vm) {
 }
 
 // The host timezone as a POSIX TZ string (works without tzdata, which the
-// minimal guest lacks). POSIX sign is inverted (east of UTC = '-'); name is
-// cosmetic, "LOC" reads clearly as local time. MSK (UTC+3) → "LOC-3".
+// minimal guest lacks). Uses the POSIX angle-bracket numeric name so `date`
+// prints the standard numeric zone (e.g. "+03") like a normal Linux box without
+// a named zone — not a made-up "LOC". The offset sign is inverted (east of UTC
+// = '-'). MSK (UTC+3) → "<+03>-3" → `date` shows "+03".
 function hostPosixTz() {
   const offMin = -new Date().getTimezoneOffset(); // minutes EAST of UTC (MSK = +180)
-  const sign = offMin >= 0 ? "-" : "+";
-  const a = Math.abs(offMin), hh = Math.floor(a / 60), mm = a % 60;
-  return `LOC${sign}${hh}${mm ? ":" + String(mm).padStart(2, "0") : ""}`;
+  const p2 = (n) => String(n).padStart(2, "0");
+  const hh = Math.floor(Math.abs(offMin) / 60), mm = Math.abs(offMin) % 60;
+  const abbr = (offMin >= 0 ? "+" : "-") + p2(hh) + (mm ? p2(mm) : "");
+  const off = (offMin >= 0 ? "-" : "+") + hh + (mm ? ":" + p2(mm) : "");
+  return `<${abbr}>${off}`;
 }
 
 // Boot a real Linux/Alpine kernel from in-memory buffers (kernel bzImage +
