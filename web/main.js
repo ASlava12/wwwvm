@@ -591,11 +591,10 @@ const setLinuxStatus = (text, cls = "") => {
   el.className = "status" + (cls ? ` ${cls}` : "");
 };
 
-// Seed the guest CMOS clock with the host's real time so the guest's `date` is
-// correct instead of the 2026-01-01 default (wasm has no host clock, so pass JS
-// Date components; year is two-digit, month 1-12). Use UTC — the guest treats
-// the RTC as UTC, so the system clock is then truly correct; the local timezone
-// is applied separately via TZ on shell-ready (see hostPosixTz / bootLinux).
+// Seed the guest CMOS clock with the host's real time (UTC) so the guest's
+// `date` is correct instead of the 2026-01-01 default — wasm has no host clock,
+// so pass JS Date components (year two-digit, month 1-12). The guest treats the
+// RTC as UTC and runs on UTC; that's fine — the point is a correct clock.
 function seedGuestClock(vm) {
   if (typeof vm.set_cmos_time !== "function") return;
   const d = new Date();
@@ -603,20 +602,6 @@ function seedGuestClock(vm) {
     d.getUTCFullYear() % 100, d.getUTCMonth() + 1, d.getUTCDate(),
     d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()
   );
-}
-
-// The host timezone as a POSIX TZ string (works without tzdata, which the
-// minimal guest lacks). Uses the POSIX angle-bracket numeric name so `date`
-// prints the standard numeric zone (e.g. "+03") like a normal Linux box without
-// a named zone — not a made-up "LOC". The offset sign is inverted (east of UTC
-// = '-'). MSK (UTC+3) → "<+03>-3" → `date` shows "+03".
-function hostPosixTz() {
-  const offMin = -new Date().getTimezoneOffset(); // minutes EAST of UTC (MSK = +180)
-  const p2 = (n) => String(n).padStart(2, "0");
-  const hh = Math.floor(Math.abs(offMin) / 60), mm = Math.abs(offMin) % 60;
-  const abbr = (offMin >= 0 ? "+" : "-") + p2(hh) + (mm ? p2(mm) : "");
-  const off = (offMin >= 0 ? "-" : "+") + hh + (mm ? ":" + p2(mm) : "");
-  return `<${abbr}>${off}`;
 }
 
 // Boot a real Linux/Alpine kernel from in-memory buffers (kernel bzImage +
@@ -630,10 +615,9 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   // Hide the canvas until this boot actually produces a frame (paintFb re-shows
   // it). A console-only image never does, so the UART fills the column.
   document.body.classList.remove("has-fb");
-  // On shell-ready: set the timezone so `date` shows local time (the RTC is
-  // UTC), then run the user's Autorun lines.
-  const userAutorun = $("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  armAutorunOnReady([`export TZ='${hostPosixTz()}'`, ...userAutorun]);
+  // Autorun: type these into the guest once its shell is ready (any boot path).
+  // (The guest runs on UTC — its RTC is seeded with real UTC time.)
+  armAutorunOnReady($("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean));
   useWorker = $("worker-enable")?.checked ?? true;
   const cmdline = $("cmdline").value;
   const fbEnabled = $("fb-enable").checked;
