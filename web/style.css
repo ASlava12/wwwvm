@@ -90,9 +90,17 @@ pre { margin: 0; max-height: 8rem; overflow: auto;
   font-family: ui-monospace, monospace; color: var(--muted); }
 #vga { max-height: 14rem; font-size: 11px; line-height: 1.15; color: #c9d1d9; white-space: pre; }
 /* Bound the result box so a big output (e.g. `ls -l`) scrolls inside it instead
-   of growing the bottom panel and squishing the UART above. */
-#last-result { max-height: 7rem; overflow: auto; }
+   of growing the bottom panel and squishing the UART above. Click it to expand
+   into a large scrollable overlay (close: click outside / Esc). */
+#last-result { max-height: 7rem; overflow: auto; cursor: zoom-in; }
 #bottom > fieldset { max-height: 30vh; }
+#last-result.expanded { position: fixed; inset: 6vh 8vw; max-height: none; z-index: 100;
+  margin: 0; padding: 1rem; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px; overflow: auto; cursor: auto;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, .6); white-space: pre-wrap; word-break: break-word; }
+#result-backdrop { position: fixed; inset: 0; z-index: 99; background: rgba(0, 0, 0, .55);
+  display: none; }
+#result-backdrop.show { display: block; }
 .snapshot-row { display: flex; gap: .5rem; margin: .25rem 0; }
 .snapshot-row button { flex: 1; }
 #snapshot-status { display: block; margin-top: .25rem; }

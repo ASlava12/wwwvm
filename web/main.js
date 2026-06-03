@@ -209,6 +209,24 @@ function sendMouse(dx, dy, buttons) {
   refreshHint();
 })();
 
+// "Last result": click to expand into a large scrollable overlay; click the
+// dimmer or press Esc to collapse. Keeps the bottom panel compact while still
+// letting you read a big result comfortably.
+(function wireResultExpand() {
+  const res = $("last-result");
+  const backdrop = $("result-backdrop");
+  if (!res || !backdrop) return;
+  const expand = (on) => {
+    res.classList.toggle("expanded", on);
+    backdrop.classList.toggle("show", on);
+  };
+  res.addEventListener("click", () => { if (!res.classList.contains("expanded")) expand(true); });
+  backdrop.addEventListener("click", () => expand(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && res.classList.contains("expanded")) expand(false);
+  });
+})();
+
 // Collapse/show the settings sidebar.
 $("sidebar-toggle")?.addEventListener("click", () =>
   document.body.classList.toggle("sidebar-hidden"));
