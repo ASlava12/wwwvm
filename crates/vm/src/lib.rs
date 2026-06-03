@@ -816,6 +816,191 @@ fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 /// Snapshot format constants and the error type used by `restore`.
+/// Content-addressed **paged** snapshots, for storing many derived snapshots
+/// (e.g. one per training task) cheaply against a shared base image.
+///
+/// A snapshot blob is `header + cpu + RAM + devices`; the RAM region dominates
+/// the size (it's the full guest RAM, verbatim). This module splits a blob into
+/// a small `meta` (everything but RAM) plus the RAM as PAGE-sized pages keyed by
+/// blake3 hash. A snapshot derived from a base by running a recipe only dirties
+/// a fraction of RAM, so it shares all unchanged pages with the base — storing
+/// it costs just the pages whose hash the content store lacks. Restore is a
+/// single pass (no diff-chain replay): take `meta`, splice each page back by
+/// hash. Dedup is automatic across all snapshots sharing a base.
+pub mod paged {
+    use std::collections::HashSet;
+
+    /// Page granularity for the RAM split (matches the guest page size).
+    pub const PAGE: usize = 4096;
+
+    /// A content-addressed page: its blake3 hash and the (≤ `PAGE`) bytes.
+    pub type Page = ([u8; 32], Vec<u8>);
+
+    /// A snapshot decomposed for content-addressed storage.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Paged {
+        /// The snapshot blob with the RAM region removed (prefix ++ suffix).
+        pub meta: Vec<u8>,
+        /// Offset where the RAM region sat in the original blob (= where the
+        /// suffix begins in `meta`); RAM is spliced back here on reassembly.
+        pub ram_off: usize,
+        /// Length of the RAM region in the original blob.
+        pub ram_len: usize,
+        /// blake3 hash of each RAM page, in order. The last page may be shorter
+        /// than `PAGE` if `ram_len` isn't a multiple of it.
+        pub page_hashes: Vec<[u8; 32]>,
+    }
+
+    /// Split a full snapshot `blob` (whose RAM occupies `[ram_off, ram_off +
+    /// ram_len)`) into a [`Paged`] manifest plus the `(hash, bytes)` of every
+    /// page so the caller can persist any the store lacks. Panics if the RAM
+    /// region is out of bounds (a malformed blob/region pairing — a bug).
+    pub fn split(blob: &[u8], ram_off: usize, ram_len: usize) -> (Paged, Vec<Page>) {
+        assert!(ram_off + ram_len <= blob.len(), "RAM region out of bounds");
+        let ram = &blob[ram_off..ram_off + ram_len];
+        let n_pages = ram_len.div_ceil(PAGE);
+        let mut page_hashes = Vec::with_capacity(n_pages);
+        let mut pages = Vec::with_capacity(n_pages);
+        for chunk in ram.chunks(PAGE) {
+            let h = *blake3::hash(chunk).as_bytes();
+            page_hashes.push(h);
+            pages.push((h, chunk.to_vec()));
+        }
+        let mut meta = Vec::with_capacity(blob.len() - ram_len);
+        meta.extend_from_slice(&blob[..ram_off]);
+        meta.extend_from_slice(&blob[ram_off + ram_len..]);
+        (
+            Paged {
+                meta,
+                ram_off,
+                ram_len,
+                page_hashes,
+            },
+            pages,
+        )
+    }
+
+    /// The distinct page hashes this snapshot needs that `have` (the hashes the
+    /// store already holds — e.g. from the base image) lacks: exactly the pages
+    /// to upload. Deduped, preserving first-seen order.
+    pub fn missing(paged: &Paged, have: &HashSet<[u8; 32]>) -> Vec<[u8; 32]> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for h in &paged.page_hashes {
+            if !have.contains(h) && seen.insert(*h) {
+                out.push(*h);
+            }
+        }
+        out
+    }
+
+    /// Reassemble the full snapshot blob from a [`Paged`] manifest and a page
+    /// fetcher (hash → page bytes). Returns `None` if any page is missing from
+    /// the store, or if a fetched page is the wrong size.
+    pub fn reassemble(
+        paged: &Paged,
+        fetch: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let mut blob = Vec::with_capacity(paged.meta.len() + paged.ram_len);
+        blob.extend_from_slice(&paged.meta[..paged.ram_off]);
+        let mut remaining = paged.ram_len;
+        for h in &paged.page_hashes {
+            let page = fetch(h)?;
+            let take = remaining.min(PAGE);
+            if page.len() < take {
+                return None;
+            }
+            blob.extend_from_slice(&page[..take]);
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return None; // manifest's pages didn't cover the whole RAM region
+        }
+        blob.extend_from_slice(&paged.meta[paged.ram_off..]);
+        Some(blob)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn blob(prefix: &[u8], ram: &[u8], suffix: &[u8]) -> (Vec<u8>, usize, usize) {
+            let mut b = Vec::new();
+            b.extend_from_slice(prefix);
+            let off = b.len();
+            b.extend_from_slice(ram);
+            b.extend_from_slice(suffix);
+            (b, off, ram.len())
+        }
+
+        /// split → reassemble (via a hash→bytes store) reproduces the blob
+        /// byte-for-byte, including a final partial page and the suffix.
+        #[test]
+        fn split_reassemble_round_trips() {
+            let ram: Vec<u8> = (0..(PAGE as u32 * 3 + 100)).map(|i| i as u8).collect();
+            let (b, off, len) = blob(b"PREFIX", &ram, b"SUFFIXBYTES");
+            let (paged, pages) = split(&b, off, len);
+            assert_eq!(paged.page_hashes.len(), 4, "3 full + 1 partial page");
+            let store: HashMap<_, _> = pages.into_iter().collect();
+            let out = reassemble(&paged, |h| store.get(h).cloned()).unwrap();
+            assert_eq!(out, b);
+        }
+
+        /// A reassemble that can't find a page fails cleanly (None), rather than
+        /// producing a corrupt blob.
+        #[test]
+        fn reassemble_missing_page_is_none() {
+            let ram = vec![1u8; PAGE * 2];
+            let (b, off, len) = blob(b"", &ram, b"");
+            let (paged, _) = split(&b, off, len);
+            assert!(reassemble(&paged, |_| None).is_none());
+        }
+
+        /// `missing` returns only the pages a base store lacks — the upload diff.
+        #[test]
+        fn missing_is_only_changed_pages() {
+            let ram1 = vec![0xAA; PAGE * 4];
+            let (b1, off, len) = blob(b"M", &ram1, b"");
+            let (_p1, pages1) = split(&b1, off, len);
+            let have: HashSet<_> = pages1.iter().map(|(h, _)| *h).collect();
+
+            let mut ram2 = ram1.clone();
+            ram2[PAGE + 5] = 0xBB; // dirty exactly one page
+            let (b2, off2, len2) = blob(b"M", &ram2, b"");
+            let (p2, _) = split(&b2, off2, len2);
+            assert_eq!(missing(&p2, &have).len(), 1, "only the dirtied page is new");
+            assert!(missing(&p2, &have)[0] == p2.page_hashes[1]);
+        }
+
+        /// Identical pages collapse to one hash (cross-page dedup), so an
+        /// all-zero RAM region stores a single page.
+        #[test]
+        fn identical_pages_dedup() {
+            let ram = vec![0u8; PAGE * 5];
+            let (b, off, len) = blob(b"", &ram, b"");
+            let (p, pages) = split(&b, off, len);
+            assert_eq!(p.page_hashes.len(), 5);
+            let uniq: HashSet<_> = pages.iter().map(|(h, _)| *h).collect();
+            assert_eq!(uniq.len(), 1, "identical pages share one hash");
+            assert_eq!(missing(&p, &HashSet::new()).len(), 1, "deduped upload");
+        }
+
+        /// End-to-end against a real VM snapshot: paging then reassembling the
+        /// actual `Vm::snapshot()` blob reproduces it exactly.
+        #[test]
+        fn vm_snapshot_paged_round_trips() {
+            let vm = crate::Vm::new();
+            let blob = vm.snapshot();
+            let (off, len) = vm.snapshot_ram_region();
+            let (paged, pages) = split(&blob, off, len);
+            let store: HashMap<_, _> = pages.into_iter().collect();
+            let out = reassemble(&paged, |h| store.get(h).cloned()).unwrap();
+            assert_eq!(out, blob, "paged round-trip equals the raw snapshot");
+        }
+    }
+}
+
 pub mod snapshot {
     /// 6-byte format magic. Suitable for identifying the file from a
     /// hex dump.
@@ -1091,6 +1276,27 @@ impl Vm {
     /// devices. A snapshot taken mid-handler can therefore land in a
     /// surprising place after restore. Use snapshots when the guest
     /// is at a clean rest point (boot, JMP -2 idle, HLT).
+    /// The `[offset, length)` of the RAM region inside a [`Vm::snapshot`] blob.
+    /// RAM is written immediately after the fixed-size header + v12 CPU image,
+    /// so it starts at `HEADER_LEN + CPU_V12_LEN` and runs for the guest RAM
+    /// size. Used to split a blob into content-addressed pages without parsing
+    /// the whole format. (The browser slices the blob at this offset to page it.)
+    pub fn snapshot_ram_region(&self) -> (usize, usize) {
+        (
+            snapshot::HEADER_LEN + snapshot::CPU_V12_LEN,
+            self.mem.size(),
+        )
+    }
+
+    /// Take a snapshot and decompose it into a content-addressed [`paged::Paged`]
+    /// manifest + the `(hash, bytes)` of each RAM page — the form used to store a
+    /// derived snapshot as just the pages a base lacks. See [`mod@paged`].
+    pub fn snapshot_paged(&self) -> (paged::Paged, Vec<paged::Page>) {
+        let blob = self.snapshot();
+        let (off, len) = self.snapshot_ram_region();
+        paged::split(&blob, off, len)
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
         let total = snapshot::HEADER_LEN + snapshot::CPU_V12_LEN + self.mem.size();
         let mut buf = Vec::with_capacity(total);

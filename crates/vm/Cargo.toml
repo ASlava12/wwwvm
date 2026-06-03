@@ -12,6 +12,9 @@ path = "src/lib.rs"
 wwwvm-cpu = { path = "../cpu" }
 wwwvm-mem = { path = "../mem" }
 wwwvm-devices = { path = "../devices" }
+# Content-addressed page hashing for paged snapshot diffs. default-features off
+# → the portable no_std impl, so the wasm build stays clean.
+blake3 = { version = "1", default-features = false }
 
 [dev-dependencies]
 # Used only by the interactive console examples (alpine_console / busybox_console)
