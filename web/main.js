@@ -22,7 +22,19 @@ const term = new Terminal({
   cursorBlink: true,
   convertEol: true,
 });
+// FitAddon makes the terminal fill its pane and resize with the layout (canvas
+// show/hide, fullscreen, window resize) instead of a fixed 80×24 box in the
+// corner. Guarded so a missing CDN addon can't break the page. NB: the guest's
+// serial tty size isn't renegotiated (no SIGWINCH over UART), so the guest
+// keeps emitting at its own width — this just sizes the on-screen grid.
+const fitAddon = typeof FitAddon !== "undefined" ? new FitAddon.FitAddon() : null;
+if (fitAddon) term.loadAddon(fitAddon);
 term.open($("terminal"));
+if (fitAddon) {
+  const refit = () => { try { fitAddon.fit(); } catch {} };
+  refit();
+  new ResizeObserver(refit).observe($("terminal-pane"));
+}
 term.writeln("\x1b[90m(boot the VM to start)\x1b[0m");
 // While the terminal is focused, keep Ctrl/Alt combos out of the browser and
 // hand them to the guest instead, so e.g. Ctrl+U / Ctrl+W edit the shell line.

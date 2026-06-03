@@ -89,7 +89,10 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 pre { margin: 0; max-height: 8rem; overflow: auto;
   font-family: ui-monospace, monospace; color: var(--muted); }
 #vga { max-height: 14rem; font-size: 11px; line-height: 1.15; color: #c9d1d9; white-space: pre; }
-#last-result { flex: 1 1 auto; max-height: none; }
+/* Bound the result box so a big output (e.g. `ls -l`) scrolls inside it instead
+   of growing the bottom panel and squishing the UART above. */
+#last-result { max-height: 7rem; overflow: auto; }
+#bottom > fieldset { max-height: 30vh; }
 .snapshot-row { display: flex; gap: .5rem; margin: .25rem 0; }
 .snapshot-row button { flex: 1; }
 #snapshot-status { display: block; margin-top: .25rem; }
