@@ -61,7 +61,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=2", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=3", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
@@ -591,17 +591,28 @@ const setLinuxStatus = (text, cls = "") => {
   el.className = "status" + (cls ? ` ${cls}` : "");
 };
 
-// Seed the guest CMOS clock with the host wall-clock (local) so the guest's
-// `date` is real instead of the 2026-01-01 default — wasm has no host clock, so
-// pass JS Date components (year is two-digit, month 1-12). Native examples call
-// set_cmos_time_from_host; the browser path must do it explicitly.
+// Seed the guest CMOS clock with the host's real time so the guest's `date` is
+// correct instead of the 2026-01-01 default (wasm has no host clock, so pass JS
+// Date components; year is two-digit, month 1-12). Use UTC — the guest treats
+// the RTC as UTC, so the system clock is then truly correct; the local timezone
+// is applied separately via TZ on shell-ready (see hostPosixTz / bootLinux).
 function seedGuestClock(vm) {
   if (typeof vm.set_cmos_time !== "function") return;
   const d = new Date();
   vm.set_cmos_time(
-    d.getFullYear() % 100, d.getMonth() + 1, d.getDate(),
-    d.getHours(), d.getMinutes(), d.getSeconds()
+    d.getUTCFullYear() % 100, d.getUTCMonth() + 1, d.getUTCDate(),
+    d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds()
   );
+}
+
+// The host timezone as a POSIX TZ string (works without tzdata, which the
+// minimal guest lacks). POSIX sign is inverted (east of UTC = '-'); name is
+// cosmetic, "LOC" reads clearly as local time. MSK (UTC+3) → "LOC-3".
+function hostPosixTz() {
+  const offMin = -new Date().getTimezoneOffset(); // minutes EAST of UTC (MSK = +180)
+  const sign = offMin >= 0 ? "-" : "+";
+  const a = Math.abs(offMin), hh = Math.floor(a / 60), mm = a % 60;
+  return `LOC${sign}${hh}${mm ? ":" + String(mm).padStart(2, "0") : ""}`;
 }
 
 // Boot a real Linux/Alpine kernel from in-memory buffers (kernel bzImage +
@@ -615,8 +626,10 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   // Hide the canvas until this boot actually produces a frame (paintFb re-shows
   // it). A console-only image never does, so the UART fills the column.
   document.body.classList.remove("has-fb");
-  // Autorun: type these into the guest once its shell is ready (any boot path).
-  armAutorunOnReady($("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean));
+  // On shell-ready: set the timezone so `date` shows local time (the RTC is
+  // UTC), then run the user's Autorun lines.
+  const userAutorun = $("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  armAutorunOnReady([`export TZ='${hostPosixTz()}'`, ...userAutorun]);
   useWorker = $("worker-enable")?.checked ?? true;
   const cmdline = $("cmdline").value;
   const fbEnabled = $("fb-enable").checked;
