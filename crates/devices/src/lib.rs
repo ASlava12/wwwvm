@@ -30,6 +30,7 @@ mod pci;
 mod pic;
 mod pit;
 mod rtl8139;
+mod scancode;
 mod uart;
 
 pub use ata::{Ata, PRIMARY_PORT_BASE, SECONDARY_PORT_BASE};
@@ -40,6 +41,7 @@ pub use pci::Pci;
 pub use pic::Pic;
 pub use pit::Pit;
 pub use rtl8139::Rtl8139;
+pub use scancode::{push_char_scancodes, string_to_scancodes};
 pub use uart::Uart;
 
 /// Concrete IO dispatcher. Owns one instance of each PC device,

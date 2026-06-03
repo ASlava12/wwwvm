@@ -341,6 +341,16 @@ fn main() {
     let mut ready = false;
     let mut boot_log: Vec<u8> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
+    // WWWVM_PS2_TYPE=<text>: press Ctrl-T (0x14) to "type" <text> into the
+    // guest as real PS/2 scan codes (the 8042 → atkbd → evdev path), e.g. into
+    // an X client. Triggered on demand so you bring up X first; nothing is
+    // injected without the hotkey.
+    let ps2_type = std::env::var("WWWVM_PS2_TYPE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if ps2_type.is_some() {
+        eprintln!("[wwwvm] WWWVM_PS2_TYPE set — press Ctrl-T to PS/2-type it into the guest");
+    }
     'main: loop {
         // While a TCP flow is live, step only until the guest goes idle
         // (blocked waiting for a NIC frame) so we hand it the next RX batch
@@ -417,6 +427,18 @@ fn main() {
             if bytes.contains(&0x03) {
                 eprintln!("\r\n[wwwvm] Ctrl-C — bye.");
                 break 'main;
+            }
+            // Ctrl-T (0x14): inject WWWVM_PS2_TYPE as PS/2 scan codes instead
+            // of forwarding it to the UART console.
+            if bytes.contains(&0x14) {
+                if let Some(text) = &ps2_type {
+                    vm.type_ascii(text);
+                    eprintln!(
+                        "\r\n[wwwvm] PS/2-typed {} char(s) (Ctrl-T)",
+                        text.chars().count()
+                    );
+                }
+                continue;
             }
             if ready {
                 vm.send_input(&bytes);

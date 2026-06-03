@@ -2096,6 +2096,16 @@ impl Vm {
         self.io.kbd.push_mouse_packet(dx, dy, left, right, middle);
     }
 
+    /// Type an ASCII string into the PS/2 keyboard as Set-1 scan codes
+    /// (make+break, Shift-wrapped for uppercase/symbols; unmapped chars
+    /// skipped). For scripting keyboard input to a graphical guest from the
+    /// host — the native counterpart of the browser's per-key path.
+    pub fn type_ascii(&mut self, text: &str) {
+        for code in wwwvm_devices::string_to_scancodes(text) {
+            self.io.kbd.push_scancode(code);
+        }
+    }
+
     /// Seed the CMOS clock with a date/time. Arguments are natural decimal
     /// values, year two-digit (00..99); the device stores them BCD-encoded
     /// (Status B is BCD + 24-hour), which is what a guest probing 0x70/0x71
