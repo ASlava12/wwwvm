@@ -25,6 +25,7 @@ pub mod forwarder;
 pub mod nat;
 pub mod queue;
 pub mod relay;
+pub mod switch;
 pub mod util;
 
 pub use allow::Allowlist;
