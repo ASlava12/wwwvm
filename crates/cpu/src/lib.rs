@@ -3751,6 +3751,8 @@ impl Cpu {
             }
             io.record_nic_tx_frame(frame);
         }
+        // Completing a TX can raise the NIC's TX-OK interrupt; re-latch it.
+        io.mark_irq_dirty();
     }
 
     /// Execute a single instruction. Returns Ok(()) on success, or an

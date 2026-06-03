@@ -85,6 +85,15 @@ pub struct IoBus {
     /// (drop-oldest, like a real NIC's TX-overrun) so an embedder that
     /// forgets to drain can't grow host memory without bound.
     nic_tx_frames: std::collections::VecDeque<Vec<u8>>,
+    /// Perf: device IRQ lines (UART/keyboard/NIC) only change on port I/O or
+    /// host input injection, yet `refresh_irqs` runs every CPU step. Set on
+    /// those events so the expensive device-line latch runs only when it can
+    /// matter; the PIT tick (cheap, divided) always runs. See `refresh_irqs`.
+    irq_dirty: bool,
+    /// Backstop counter for the dirty gate: even when "clean", re-latch every
+    /// 256 steps so a missed `irq_dirty` set delays an IRQ by ≤256 instructions
+    /// (~negligible) rather than indefinitely. Wraps at 256.
+    irq_poll: u8,
 }
 
 /// Max buffered guest TX frames before we drop the oldest (TX overrun).
@@ -120,6 +129,8 @@ impl IoBus {
             rtl8139: Rtl8139::new(),
             nic_tx_frames: std::collections::VecDeque::new(),
             pit_div_counter: 0,
+            irq_dirty: true,
+            irq_poll: 0,
         }
     }
 
@@ -139,6 +150,8 @@ impl IoBus {
             rtl8139: Rtl8139::new(),
             nic_tx_frames: std::collections::VecDeque::new(),
             pit_div_counter: 0,
+            irq_dirty: true,
+            irq_poll: 0,
         }
     }
 
@@ -150,6 +163,14 @@ impl IoBus {
         &mut self.pic
     }
 
+    /// Host-input seams (a pushed scan code, an injected RX frame, fed UART
+    /// bytes) change a device IRQ line from outside the port-I/O path — call
+    /// this so the next `refresh_irqs` re-latches promptly instead of waiting
+    /// for the 256-step backstop.
+    pub fn mark_irq_dirty(&mut self) {
+        self.irq_dirty = true;
+    }
+
     /// Latch every device-asserted IRQ line into the PIC's IRR and
     /// drive time-based devices forward by one tick. CPUs call this
     /// once per step() before checking pending IRQs.
@@ -158,30 +179,9 @@ impl IoBus {
     /// the line); PIT channel 0 → IRQ 0 (edge-triggered, one IRR pulse
     /// per terminal count).
     pub fn refresh_irqs(&mut self) {
-        // UART — level-triggered. IRR bit 4 mirrors the line.
-        let irq4_bit = 1u8 << 4;
-        if self.uart.irq_pending() {
-            self.pic.irr |= irq4_bit;
-        } else {
-            self.pic.irr &= !irq4_bit;
-        }
-        // Keyboard — level-triggered on IRQ 1.
-        let irq1_bit = 1u8 << 1;
-        if self.kbd.irq_pending() {
-            self.pic.irr |= irq1_bit;
-        } else {
-            self.pic.irr &= !irq1_bit;
-        }
-        // PS/2 mouse (AUX) — level-triggered on IRQ 12, which lives on the
-        // slave PIC (IRQ 8..15 → slave IRR bits 0..7, so IRQ 12 = bit 4).
-        // The cascade block below propagates it to master IRQ 2.
-        let mouse_slave_bit = 1u8 << 4;
-        if self.kbd.aux_irq_pending() {
-            self.slave_pic.irr |= mouse_slave_bit;
-        } else {
-            self.slave_pic.irr &= !mouse_slave_bit;
-        }
-        // PIT — prescaler-divided tick. One CPU step ≠ one PIT
+        // PIT — prescaler-divided tick. Runs every step (ungated below): the
+        // divider already throttles it, and it's the one source that advances
+        // on its own without any device or host event. One CPU step ≠ one PIT
         // cycle: at our ~17 MIPS effective throughput, ticking PIT
         // once per step gives Linux a HZ=250 latch (~4773 PIT
         // cycles) every ~4 800 CPU steps. The scheduler-tick
@@ -205,6 +205,40 @@ impl IoBus {
             if self.pit.take_ch0_pending() {
                 self.pic.irr |= 1u8 << 0;
             }
+        }
+        // Perf gate: the device IRQ lines below (UART/keyboard/mouse/NIC)
+        // change only on port I/O or host input injection — both of which set
+        // `irq_dirty` (port read/write here, host paths via `mark_irq_dirty`).
+        // When clean, skip the per-device poll: re-latching it every step
+        // otherwise costs ~14% of CPU time (callgrind). A 256-step backstop
+        // bounds a missed dirty-mark to ≤256 instructions of IRQ latency
+        // (imperceptible) rather than never.
+        self.irq_poll = self.irq_poll.wrapping_add(1);
+        if !self.irq_dirty && self.irq_poll != 0 {
+            return;
+        }
+        self.irq_dirty = false;
+        // UART — level-triggered. IRR bit 4 mirrors the line.
+        let irq4_bit = 1u8 << 4;
+        if self.uart.irq_pending() {
+            self.pic.irr |= irq4_bit;
+        } else {
+            self.pic.irr &= !irq4_bit;
+        }
+        // Keyboard — level-triggered on IRQ 1.
+        let irq1_bit = 1u8 << 1;
+        if self.kbd.irq_pending() {
+            self.pic.irr |= irq1_bit;
+        } else {
+            self.pic.irr &= !irq1_bit;
+        }
+        // PS/2 mouse (AUX) — level-triggered on IRQ 12, on the slave PIC
+        // (IRQ 8..15 → slave bits 0..7, so IRQ 12 = bit 4); cascade below.
+        let mouse_slave_bit = 1u8 << 4;
+        if self.kbd.aux_irq_pending() {
+            self.slave_pic.irr |= mouse_slave_bit;
+        } else {
+            self.slave_pic.irr &= !mouse_slave_bit;
         }
         // RTL8139 NIC — level-triggered on IRQ 11, which lives on the
         // slave PIC (IRQ 8..15 → slave IRR bits 0..7, so IRQ 11 = bit 3).
@@ -256,6 +290,9 @@ impl IoBus {
             self.slave_pic.ack();
         }
         self.pic.ack();
+        // Acking moves bits IRR→ISR (and may clear the cascade) — the next
+        // refresh must re-latch the device lines / cascade. See `refresh_irqs`.
+        self.irq_dirty = true;
     }
 
     /// True when the NIC has a transmit the CPU step should DMA out of
@@ -298,6 +335,10 @@ impl IoBus {
     }
 
     pub fn read(&mut self, port: u16) -> u8 {
+        // A device access can change an IRQ line (e.g. reading the UART data
+        // register drains its RX queue and deasserts IRQ 4) — mark dirty so
+        // the next refresh re-latches. See `refresh_irqs`.
+        self.irq_dirty = true;
         // RTL8139 register window — a DYNAMIC range at the I/O base the
         // kernel assigned to BAR0 (in the high I/O range, away from legacy
         // ports). Checked first; if the NIC isn't I/O-enabled this is inert.
@@ -364,6 +405,9 @@ impl IoBus {
     }
 
     pub fn write(&mut self, port: u16, value: u8) {
+        // A device write can assert/clear an IRQ line (UART IER, 8042 CCB,
+        // NIC registers, PIC EOI…) — mark dirty so the next refresh re-latches.
+        self.irq_dirty = true;
         // RTL8139 register window (see `read`).
         if self.pci.nic_io_enabled() {
             let base = self.pci.nic_io_base();

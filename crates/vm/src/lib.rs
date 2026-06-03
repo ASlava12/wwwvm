@@ -2076,6 +2076,7 @@ impl Vm {
     /// forward keystrokes or `runCommand` payloads.
     pub fn send_input(&mut self, bytes: &[u8]) {
         self.io.uart_mut().push_rx(bytes);
+        self.io.mark_irq_dirty();
     }
 
     /// Push a raw scan code byte into the PS/2 keyboard buffer.
@@ -2084,6 +2085,7 @@ impl Vm {
     /// host's job — this just queues bytes.
     pub fn push_scancode(&mut self, code: u8) {
         self.io.kbd.push_scancode(code);
+        self.io.mark_irq_dirty();
     }
 
     /// Inject a PS/2 mouse movement/button packet (raises IRQ 12 to a
@@ -2094,6 +2096,7 @@ impl Vm {
     /// mouse reporting.
     pub fn push_mouse_packet(&mut self, dx: i16, dy: i16, left: bool, right: bool, middle: bool) {
         self.io.kbd.push_mouse_packet(dx, dy, left, right, middle);
+        self.io.mark_irq_dirty();
     }
 
     /// Type an ASCII string into the PS/2 keyboard as Set-1 scan codes
@@ -2180,6 +2183,8 @@ impl Vm {
                 for (i, b) in bytes.iter().enumerate() {
                     self.mem.write_u8(dest.wrapping_add(i as u32), *b);
                 }
+                // An accepted RX frame raises the NIC's RX-OK interrupt.
+                self.io.mark_irq_dirty();
                 true
             }
             None => false,
