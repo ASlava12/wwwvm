@@ -119,6 +119,12 @@ impl Keyboard {
     const CCB_KBD_CLK_DIS: u8 = 1 << 4;
     /// Aux clock disable (CCB bit 5) — set ⇒ aux/mouse port off.
     const CCB_AUX_CLK_DIS: u8 = 1 << 5;
+    /// Scan-code translation (CCB bit 6) — when set, the controller presents
+    /// Set-1 codes to the OS (atkbd binds as "Translated Set 2" and decodes
+    /// Set 1). We push Set-1 scan codes (see `scancode.rs` / ps2-keymap.js),
+    /// so default this ON; without it atkbd runs "Raw Set 2" and misreads our
+    /// Set-1 codes (no/garbage key events reach X).
+    const CCB_TRANSLATE: u8 = 1 << 6;
 
     /// Device ACK byte, sent in reply to (almost) every device command.
     const ACK: u8 = 0xFA;
@@ -129,7 +135,10 @@ impl Keyboard {
             status_port: Self::STATUS_PORT,
             queue: VecDeque::new(),
             out: VecDeque::new(),
-            ccb: Self::CCB_KBD_INT | Self::CCB_SYS_FLAG | Self::CCB_AUX_CLK_DIS,
+            ccb: Self::CCB_KBD_INT
+                | Self::CCB_SYS_FLAG
+                | Self::CCB_AUX_CLK_DIS
+                | Self::CCB_TRANSLATE,
             kbd_enabled: true,
             aux_enabled: false,
             pending: CtrlPending::None,
@@ -566,6 +575,17 @@ mod tests {
         kbd.write(Keyboard::DATA_PORT, 0x47);
         kbd.write(Keyboard::STATUS_PORT, 0x20);
         assert_eq!(kbd.read(Keyboard::DATA_PORT), 0x47);
+    }
+
+    /// The default config byte enables scan-code translation (bit 6) so the
+    /// kernel's atkbd binds as "Translated Set 2" and decodes the Set-1 codes
+    /// we push (rather than "Raw Set 2", which would misread them).
+    #[test]
+    fn default_config_enables_scancode_translation() {
+        let mut kbd = Keyboard::new();
+        kbd.write(Keyboard::STATUS_PORT, 0x20);
+        let ccb = kbd.read(Keyboard::DATA_PORT);
+        assert_eq!(ccb & 0x40, 0x40, "translate bit set");
     }
 
     /// Disabling the keyboard interrupt in the CCB (bit 0) suppresses
