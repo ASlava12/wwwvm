@@ -12,3 +12,7 @@ dist/
 
 # Prebuilt browser images (large; built by scripts/build-web-images.sh)
 /web/images/
+
+# Fetched public proxy list (scripts/fetch-proxies.py)
+/web/proxies.json
+__pycache__/
