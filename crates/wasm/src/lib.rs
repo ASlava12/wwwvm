@@ -392,6 +392,24 @@ impl WwwVm {
             .map_err(|e| JsError::new(&e.to_string()))
     }
 
+    /// Snapshot into a single self-describing **export** buffer for the custom-
+    /// snapshot platform: a manifest header (meta + blake3 page hashes) followed
+    /// by the RAM pages. The browser slices each 4 KiB page out, uploads the
+    /// ones the content store lacks (named by their blake3 hash — the SAME hash
+    /// the store verifies, which is why this is computed here, not in JS), then
+    /// stores the manifest header. Format: see `wwwvm_vm::paged::encode_export`.
+    pub fn snapshot_export(&self) -> Vec<u8> {
+        self.inner.snapshot_export()
+    }
+
+    /// Restore from an `snapshot_export()` buffer (the browser rebuilds it from a
+    /// fetched manifest + its pages). JS Error on a malformed buffer.
+    pub fn restore_export(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        self.inner
+            .restore_export(bytes)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Pre-queue commands to be delivered to the guest at boot. Pass an
     /// array of strings from JS — each is appended with `\n`.
     pub fn set_autorun(&mut self, commands: Vec<String>) {

@@ -920,6 +920,66 @@ pub mod paged {
         Some(blob)
     }
 
+    /// Frame a snapshot blob into one self-describing **export** buffer for the
+    /// browser: the manifest header (so it can be stored verbatim) followed by
+    /// the RAM pages (so each can be sliced out and uploaded). Keeping the blake3
+    /// hashing here means the browser uses the *same* hashes the content store
+    /// verifies (Web Crypto has no blake3). Little-endian `u32` lengths:
+    ///
+    /// ```text
+    ///   meta_len | meta[meta_len] | ram_off | ram_len | n_pages
+    ///   | hashes[n_pages*32] | ram[ram_len]
+    /// ```
+    ///
+    /// The leading `meta_len + meta + ram_off + ram_len + n_pages + hashes` (i.e.
+    /// everything before `ram`) is the **manifest** to store; page `i` is
+    /// `ram[i*PAGE ..]` (last may be short) named by `hashes[i]`.
+    pub fn encode_export(blob: &[u8], ram_off: usize, ram_len: usize) -> Vec<u8> {
+        let (paged, _pages) = split(blob, ram_off, ram_len);
+        let n = paged.page_hashes.len();
+        let mut out = Vec::with_capacity(4 + paged.meta.len() + 12 + n * 32 + ram_len);
+        out.extend_from_slice(&(paged.meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(&paged.meta);
+        out.extend_from_slice(&(ram_off as u32).to_le_bytes());
+        out.extend_from_slice(&(ram_len as u32).to_le_bytes());
+        out.extend_from_slice(&(n as u32).to_le_bytes());
+        for h in &paged.page_hashes {
+            out.extend_from_slice(h);
+        }
+        out.extend_from_slice(&blob[ram_off..ram_off + ram_len]);
+        out
+    }
+
+    /// Decode an [`encode_export`] buffer back into the original snapshot blob,
+    /// or `None` if it's malformed/truncated. (The page hashes are skipped — the
+    /// store verified them on upload; local reassembly just needs the bytes.)
+    pub fn decode_export(buf: &[u8]) -> Option<Vec<u8>> {
+        let rd = |p: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(buf.get(p..p + 4)?.try_into().ok()?) as usize)
+        };
+        let mut p = 0;
+        let meta_len = rd(p)?;
+        p += 4;
+        let meta = buf.get(p..p + meta_len)?;
+        p += meta_len;
+        let ram_off = rd(p)?;
+        p += 4;
+        let ram_len = rd(p)?;
+        p += 4;
+        let n = rd(p)?;
+        p += 4;
+        p = p.checked_add(n.checked_mul(32)?)?; // skip hashes
+        let pages = buf.get(p..p + ram_len)?;
+        if ram_off > meta.len() {
+            return None;
+        }
+        let mut blob = Vec::with_capacity(meta.len() + ram_len);
+        blob.extend_from_slice(&meta[..ram_off]);
+        blob.extend_from_slice(pages);
+        blob.extend_from_slice(&meta[ram_off..]);
+        Some(blob)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -984,6 +1044,19 @@ pub mod paged {
             let uniq: HashSet<_> = pages.iter().map(|(h, _)| *h).collect();
             assert_eq!(uniq.len(), 1, "identical pages share one hash");
             assert_eq!(missing(&p, &HashSet::new()).len(), 1, "deduped upload");
+        }
+
+        /// encode_export → decode_export reproduces the original blob (incl. a
+        /// partial last page + suffix), and a truncated buffer decodes to None.
+        #[test]
+        fn export_round_trips_and_rejects_truncated() {
+            let ram: Vec<u8> = (0..(PAGE as u32 * 2 + 7)).map(|i| (i * 3) as u8).collect();
+            let (b, off, len) = blob(b"PRE", &ram, b"SUF");
+            let enc = encode_export(&b, off, len);
+            assert_eq!(decode_export(&enc).unwrap(), b);
+            // Truncating anywhere in the framed buffer must fail cleanly.
+            assert!(decode_export(&enc[..enc.len() - 1]).is_none());
+            assert!(decode_export(&[]).is_none());
         }
 
         /// End-to-end against a real VM snapshot: paging then reassembling the
@@ -1295,6 +1368,26 @@ impl Vm {
         let blob = self.snapshot();
         let (off, len) = self.snapshot_ram_region();
         paged::split(&blob, off, len)
+    }
+
+    /// Snapshot into a single self-describing **export** buffer: a manifest
+    /// header (meta plus the blake3 page hashes) followed by the RAM pages. This
+    /// is the form the browser slices to upload changed pages and the manifest
+    /// to the content store. See [`paged::encode_export`] for the wire format.
+    pub fn snapshot_export(&self) -> Vec<u8> {
+        let blob = self.snapshot();
+        let (off, len) = self.snapshot_ram_region();
+        paged::encode_export(&blob, off, len)
+    }
+
+    /// Restore from an [`Vm::snapshot_export`] buffer (the browser rebuilds it
+    /// from a fetched manifest + its pages). Errors if the buffer is malformed.
+    pub fn restore_export(&mut self, buf: &[u8]) -> Result<(), snapshot::SnapshotError> {
+        let blob = paged::decode_export(buf).ok_or(snapshot::SnapshotError::TooSmall {
+            got: buf.len(),
+            need: 0,
+        })?;
+        self.restore(&blob)
     }
 
     pub fn snapshot(&self) -> Vec<u8> {
