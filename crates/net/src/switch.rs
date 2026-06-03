@@ -106,6 +106,58 @@ impl Switch {
     }
 }
 
+/// One attachment point on the [`Hub`] — a VM's NIC. `Vm` implements this via
+/// its `drain_tx_frames`/`inject_rx_frame` seam; the in-browser hub mirrors the
+/// same two calls per worker over postMessage.
+pub trait L2Port {
+    /// Take every Ethernet frame the guest has transmitted since the last call.
+    fn drain_tx(&mut self) -> Vec<Vec<u8>>;
+    /// Deliver one inbound frame to the guest's NIC. Returns false if dropped
+    /// (RX disabled / ring full).
+    fn inject_rx(&mut self, frame: &[u8]) -> bool;
+}
+
+/// Drives a [`Switch`] over a set of [`L2Port`]s: one `pump` drains every port's
+/// transmitted frames, routes each through the switch, and injects it into the
+/// destination port(s). The port's index in the slice is its switch port number.
+#[derive(Debug, Default)]
+pub struct Hub {
+    switch: Switch,
+}
+
+impl Hub {
+    pub fn new() -> Self {
+        Self {
+            switch: Switch::new(),
+        }
+    }
+
+    /// Move one round of frames between ports. Drains all TX first, then injects
+    /// — so a frame transmitted this round is delivered this round, and the
+    /// two-pass split keeps the borrow of `ports` non-aliasing.
+    pub fn pump<P: L2Port>(&mut self, ports: &mut [P]) {
+        let n = ports.len();
+        // Pass 1: collect (egress_port, frame) deliveries.
+        let mut deliveries: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (i, port) in ports.iter_mut().enumerate() {
+            for f in port.drain_tx() {
+                for eg in self.switch.egress(i, &f, n) {
+                    deliveries.push((eg, f.clone())); // flood → one clone per egress
+                }
+            }
+        }
+        // Pass 2: deliver.
+        for (port, frame) in deliveries {
+            ports[port].inject_rx(&frame);
+        }
+    }
+
+    /// The underlying switch (for diagnostics, or to `forget_port` on detach).
+    pub fn switch_mut(&mut self) -> &mut Switch {
+        &mut self.switch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +238,49 @@ mod tests {
         // A frame with a broadcast SOURCE (illegal) must not pollute the table.
         sw.route(0, &frame(B, BCAST));
         assert_eq!(sw.learned(), 0);
+    }
+
+    /// A test port: a queue of frames to "transmit" and a log of injected ones.
+    #[derive(Default)]
+    struct MockPort {
+        tx: Vec<Vec<u8>>,
+        rx: Vec<Vec<u8>>,
+    }
+    impl L2Port for MockPort {
+        fn drain_tx(&mut self) -> Vec<Vec<u8>> {
+            std::mem::take(&mut self.tx)
+        }
+        fn inject_rx(&mut self, f: &[u8]) -> bool {
+            self.rx.push(f.to_vec());
+            true
+        }
+    }
+
+    /// Broadcast from one port reaches all others (not the sender); a follow-up
+    /// unicast to the now-learned source goes only to that port.
+    #[test]
+    fn hub_floods_broadcast_then_unicasts_learned() {
+        let mut hub = Hub::new();
+        let mut ports = [
+            MockPort::default(),
+            MockPort::default(),
+            MockPort::default(),
+        ];
+        // Port 0 broadcasts (announcing A).
+        ports[0].tx.push(frame(BCAST, A));
+        hub.pump(&mut ports);
+        assert!(ports[0].rx.is_empty(), "sender doesn't get its own frame");
+        assert_eq!(ports[1].rx.len(), 1, "flooded to 1");
+        assert_eq!(ports[2].rx.len(), 1, "flooded to 2");
+
+        // Port 1 replies to A — A was learned on port 0, so only port 0 hears it.
+        ports[1].tx.push(frame(A, B));
+        hub.pump(&mut ports);
+        assert_eq!(ports[0].rx.len(), 1, "unicast reached port 0");
+        assert_eq!(
+            ports[2].rx.len(),
+            1,
+            "port 2 unchanged (still just the bcast)"
+        );
     }
 }
