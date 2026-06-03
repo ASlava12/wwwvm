@@ -1,0 +1,13 @@
+[package]
+name = "wwwvm-snapstore"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Content-addressing: a page's name IS its blake3 hash, verified on write.
+blake3 = { version = "1", default-features = false }

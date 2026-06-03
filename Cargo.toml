@@ -8,6 +8,7 @@ members = [
     "crates/wasm",
     "crates/net",
     "crates/proxy",
+    "crates/snapstore",
 ]
 exclude = ["guest"]
 

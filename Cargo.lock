@@ -1345,6 +1345,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wwwvm-snapstore"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
 name = "wwwvm-vm"
 version = "0.0.1"
 dependencies = [
