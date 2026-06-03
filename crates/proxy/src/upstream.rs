@@ -356,4 +356,173 @@ mod tests {
         assert!(err.to_string().contains("too long"), "got: {err}");
         let _ = server.await;
     }
+
+    /// Happy-path SOCKS5: the request byte layout (CONNECT, ATYP=domain,
+    /// length-prefixed name, big-endian port) is what most easily goes wrong.
+    /// The mock asserts the exact bytes, replies success with a 4-byte BND.ADDR,
+    /// and we confirm the handshake returns Ok with the stream drained to the
+    /// relay position.
+    #[tokio::test]
+    async fn socks5_connect_request_bytes_are_correct() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            s.read_exact(&mut greet).await.unwrap();
+            assert_eq!(
+                greet,
+                [0x05, 0x01, 0x00],
+                "greeting: ver, 1 method, no-auth"
+            );
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            // Request head: VER, CMD=CONNECT, RSV, ATYP=domain, len.
+            let mut head = [0u8; 5];
+            s.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..4], &[0x05, 0x01, 0x00, 0x03]);
+            let name_len = head[4] as usize;
+            let mut rest = vec![0u8; name_len + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest[..name_len], b"example.com");
+            assert_eq!(&rest[name_len..], &443u16.to_be_bytes(), "port big-endian");
+            // Success reply with an IPv4 BND.ADDR (4) + BND.PORT (2).
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            // Prove the stream is positioned at relayed bytes: send a sentinel.
+            s.write_all(b"OK").await.unwrap();
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        socks5_handshake(&mut c, "example.com", 443).await.unwrap();
+        let mut tail = [0u8; 2];
+        c.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"OK", "bound addr fully drained");
+        server.await.unwrap();
+    }
+
+    /// SOCKS4a: 8-byte request prologue (VER, CMD, port BE, 0.0.0.1 marker),
+    /// empty NUL userid, NUL-terminated hostname; CD=0x5A grants.
+    #[tokio::test]
+    async fn socks4a_request_uses_hostname_marker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 8];
+            s.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[0], 0x04);
+            assert_eq!(head[1], 0x01, "CONNECT");
+            assert_eq!(&head[2..4], &80u16.to_be_bytes(), "port BE");
+            assert_eq!(
+                &head[4..8],
+                &[0, 0, 0, 1],
+                "0.0.0.1 = SOCKS4a hostname marker"
+            );
+            // userid NUL, then hostname, then NUL.
+            let mut rest = Vec::new();
+            let mut b = [0u8; 1];
+            loop {
+                s.read_exact(&mut b).await.unwrap();
+                rest.push(b[0]);
+                if rest.len() >= 2 && rest[rest.len() - 1] == 0 {
+                    break;
+                }
+            }
+            assert_eq!(rest, b"\0example.com\0", "empty userid + host + NUL");
+            s.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            s.write_all(b"OK").await.unwrap();
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        socks4_handshake(&mut c, "example.com", 80).await.unwrap();
+        let mut tail = [0u8; 2];
+        c.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"OK");
+        server.await.unwrap();
+    }
+
+    /// HTTP CONNECT: a well-formed CONNECT line + a 200 response opens the tunnel;
+    /// headers after the status line are consumed up to the blank line.
+    #[tokio::test]
+    async fn http_connect_tunnels_on_200() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut b).await.unwrap();
+                req.push(b[0]);
+            }
+            let req = String::from_utf8(req).unwrap();
+            assert!(
+                req.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+                "got: {req:?}"
+            );
+            assert!(req.contains("Host: example.com:443\r\n"));
+            s.write_all(b"HTTP/1.1 200 Connection established\r\nX-Via: mock\r\n\r\n")
+                .await
+                .unwrap();
+            s.write_all(b"OK").await.unwrap();
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        http_connect(&mut c, "example.com", 443).await.unwrap();
+        let mut tail = [0u8; 2];
+        c.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"OK", "headers drained to blank line");
+        server.await.unwrap();
+    }
+
+    /// A non-2xx HTTP CONNECT (e.g. 403) must fail rather than silently relay
+    /// the error page as if it were tunnel data.
+    #[tokio::test]
+    async fn http_connect_rejects_non_2xx() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut b = [0u8; 1];
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut b).await.unwrap();
+                req.push(b[0]);
+            }
+            s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let err = http_connect(&mut c, "blocked.example", 443)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refused"), "got: {err}");
+        server.await.unwrap();
+    }
+
+    /// SOCKS5 with a non-zero REP (e.g. 0x05 connection refused) must error.
+    #[tokio::test]
+    async fn socks5_propagates_connect_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            s.read_exact(&mut greet).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 5];
+            s.read_exact(&mut head).await.unwrap();
+            let mut rest = vec![0u8; head[4] as usize + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            // REP=0x05 (connection refused), ATYP=v4.
+            s.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let err = socks5_handshake(&mut c, "down.example", 80)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("REP="), "got: {err}");
+        server.await.unwrap();
+    }
 }
