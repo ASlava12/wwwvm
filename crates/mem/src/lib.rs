@@ -136,18 +136,21 @@ impl Memory {
     }
 
     pub fn read_u8(&self, addr: u32) -> u8 {
+        // RAM first — the overwhelmingly common case (one comparison). The
+        // LAPIC/HPET MMIO windows sit near 4 GiB, far above our RAM (<=1 GiB),
+        // so a RAM address never collides with them; checking MMIO first only
+        // cost two wasted comparisons on every data read.
+        let a = addr as usize;
+        if a < self.bytes.len() {
+            return self.bytes[a];
+        }
         if Self::is_lapic(addr) {
             return self.lapic[(addr - LAPIC_BASE) as usize];
         }
         if Self::is_hpet(addr) {
             return self.hpet[(addr - HPET_BASE) as usize];
         }
-        let a = addr as usize;
-        if a < self.bytes.len() {
-            self.bytes[a]
-        } else {
-            0
-        }
+        0
     }
 
     /// Read a byte for *instruction fetch* — straight from RAM, skipping the

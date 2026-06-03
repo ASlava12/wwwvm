@@ -13,13 +13,19 @@ use std::time::Instant;
 use wwwvm_vm::{Stop, Vm, BOOT_LOAD_ADDR};
 
 fn main() {
-    // Guest:
-    //   MOV CX, 0xFFFF      ; B9 FF FF
-    //   XOR BX, BX          ; 31 DB
-    // lp: ADD BX, CX        ; 01 CB
-    //   LOOP lp             ; E2 FC
-    //   HLT                 ; F4
-    let program: &[u8] = &[0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x01, 0xCB, 0xE2, 0xFC, 0xF4];
+    // WWWVM_BENCH=alu (default): ALU-only loop — stresses fetch/decode/dispatch.
+    //   MOV CX, 0xFFFF; XOR BX, BX; lp: ADD BX, CX; LOOP lp; HLT
+    // WWWVM_BENCH=mem: a load every iteration — stresses the data-read path.
+    //   MOV CX, 0xFFFF; XOR BX, BX; lp: MOV AL,[BX]; INC BX; LOOP lp; HLT
+    //   (LOOP rel8 = 0xFB = -5 back to lp; reads phys 0..65535, harmless.)
+    let mem_bench = std::env::var("WWWVM_BENCH").as_deref() == Ok("mem");
+    let program: &[u8] = if mem_bench {
+        &[
+            0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x8A, 0x07, 0x43, 0xE2, 0xFB, 0xF4,
+        ]
+    } else {
+        &[0xB9, 0xFF, 0xFF, 0x31, 0xDB, 0x01, 0xCB, 0xE2, 0xFC, 0xF4]
+    };
 
     let mut vm = Vm::new();
     vm.load_image(BOOT_LOAD_ADDR, program);
@@ -58,8 +64,11 @@ fn main() {
     match stop {
         Stop::Halted => {
             let bx = vm.cpu().regs[wwwvm_cpu::r16::BX];
-            assert_eq!(bx, 0x8000, "ALU loop sanity check failed");
-            println!("sanity:          BX = 0x{bx:04X} (expected 0x8000) ✓");
+            // ALU loop: BX = sum 1..=65535 mod 2^16 = 0x8000. Mem loop: BX is
+            // INC'd 65535 times from 0 = 0xFFFF.
+            let expected = if mem_bench { 0xFFFF } else { 0x8000 };
+            assert_eq!(bx, expected, "loop sanity check failed");
+            println!("sanity:          BX = 0x{bx:04X} (expected 0x{expected:04X}) ✓");
         }
         other => panic!("expected Halted, got {other:?}"),
     }
