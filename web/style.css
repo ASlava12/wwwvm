@@ -68,6 +68,13 @@ fieldset { border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); padding: .5rem .75rem; margin: 0; }
 legend { color: var(--muted); padding: 0 .25rem; }
 label { display: inline-block; }
+/* In the narrow sidebar, stack each label on its own line and never let a
+   control spill past the panel (was: the fb checkbox + "res:" sat side by side
+   and overflowed the browser edge). */
+#controls { overflow-x: hidden; }
+#controls label { display: block; margin: .2rem 0; }
+#controls select, #controls input[type=text] { max-width: 100%; }
+#controls select { width: 100%; }
 textarea, input[type=text] { width: 100%; background: #0d1117; color: var(--fg);
   border: 1px solid var(--border); border-radius: 4px; padding: .35rem;
   font-family: ui-monospace, monospace; }
