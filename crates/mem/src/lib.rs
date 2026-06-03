@@ -168,70 +168,78 @@ impl Memory {
     }
 
     pub fn write_u8(&mut self, addr: u32, value: u8) {
-        if Self::is_lapic(addr) {
-            let off = (addr - LAPIC_BASE) as usize;
-            self.lapic[off] = value;
-            // A write to LAPIC Initial Count (0x380..0x384) also
-            // resets the matching byte of Current Count (0x390+).
-            // Real silicon snaps current = initial atomically; we
-            // mirror byte-wise, which converges to the same value
-            // after the kernel finishes its u32 write (Linux writes
-            // initial count as a single MOV).
-            if (0x380..0x384).contains(&off) {
-                self.lapic[0x390 + (off - 0x380)] = value;
-            }
-            // ICR low (0x300..0x304): on completion of the dword write
-            // (high byte at 0x303 — Linux issues a single MOV in
-            // little-endian byte order), decode the command. A
-            // self-IPI (destination shorthand bits 19:18 = 01) or
-            // an all-including-self IPI (= 10) with fixed delivery
-            // (bits 10:8 = 000) queues the vector locally. Linux's
-            // apic_test_irq does a self-IPI to validate that the
-            // LAPIC actually delivers — without this, the test
-            // sees no IRQ and the kernel disables the APIC.
-            if off == 0x303 {
-                let icr_lo = u32::from_le_bytes([
-                    self.lapic[0x300],
-                    self.lapic[0x301],
-                    self.lapic[0x302],
-                    self.lapic[0x303],
-                ]);
-                let delivery_mode = (icr_lo >> 8) & 0b111;
-                let shorthand = (icr_lo >> 18) & 0b11;
-                let self_targeted = shorthand == 0b01 || shorthand == 0b10;
-                let svr_enabled = self.lapic[0xF1] & 0x01 != 0;
-                if delivery_mode == 0 && self_targeted && svr_enabled {
-                    let vector = (icr_lo & 0xFF) as u8;
-                    if self.pending_lapic_irq.is_none() {
-                        self.pending_lapic_irq = Some(vector);
+        let a = addr as usize;
+        // MMIO (LAPIC/HPET) sits near 4 GiB, above RAM. Take the MMIO and
+        // out-of-range paths only when the address isn't RAM, so the common
+        // RAM store skips the two MMIO range checks.
+        if a >= self.bytes.len() {
+            if Self::is_lapic(addr) {
+                let off = (addr - LAPIC_BASE) as usize;
+                self.lapic[off] = value;
+                // A write to LAPIC Initial Count (0x380..0x384) also
+                // resets the matching byte of Current Count (0x390+).
+                // Real silicon snaps current = initial atomically; we
+                // mirror byte-wise, which converges to the same value
+                // after the kernel finishes its u32 write (Linux writes
+                // initial count as a single MOV).
+                if (0x380..0x384).contains(&off) {
+                    self.lapic[0x390 + (off - 0x380)] = value;
+                }
+                // ICR low (0x300..0x304): on completion of the dword write
+                // (high byte at 0x303 — Linux issues a single MOV in
+                // little-endian byte order), decode the command. A
+                // self-IPI (destination shorthand bits 19:18 = 01) or
+                // an all-including-self IPI (= 10) with fixed delivery
+                // (bits 10:8 = 000) queues the vector locally. Linux's
+                // apic_test_irq does a self-IPI to validate that the
+                // LAPIC actually delivers — without this, the test
+                // sees no IRQ and the kernel disables the APIC.
+                if off == 0x303 {
+                    let icr_lo = u32::from_le_bytes([
+                        self.lapic[0x300],
+                        self.lapic[0x301],
+                        self.lapic[0x302],
+                        self.lapic[0x303],
+                    ]);
+                    let delivery_mode = (icr_lo >> 8) & 0b111;
+                    let shorthand = (icr_lo >> 18) & 0b11;
+                    let self_targeted = shorthand == 0b01 || shorthand == 0b10;
+                    let svr_enabled = self.lapic[0xF1] & 0x01 != 0;
+                    if delivery_mode == 0 && self_targeted && svr_enabled {
+                        let vector = (icr_lo & 0xFF) as u8;
+                        if self.pending_lapic_irq.is_none() {
+                            self.pending_lapic_irq = Some(vector);
+                        }
                     }
                 }
+                return;
             }
-            return;
-        }
-        if Self::is_hpet(addr) {
-            let off = (addr - HPET_BASE) as usize;
-            self.hpet[off] = value;
-            // Latch per-timer period from the low dword of each
-            // timer's comparator (0x108, 0x128, 0x148, each +0..4).
-            // We snapshot after each byte so a four-byte dword
-            // write converges to the final value, regardless of the
-            // store order the kernel uses.
-            for tn in 0..3 {
-                let cmp_lo_start = 0x108 + tn * 0x20;
-                if (cmp_lo_start..cmp_lo_start + 4).contains(&off) {
-                    self.hpet_period[tn] = u32::from_le_bytes([
-                        self.hpet[cmp_lo_start],
-                        self.hpet[cmp_lo_start + 1],
-                        self.hpet[cmp_lo_start + 2],
-                        self.hpet[cmp_lo_start + 3],
-                    ]);
-                    break;
+            if Self::is_hpet(addr) {
+                let off = (addr - HPET_BASE) as usize;
+                self.hpet[off] = value;
+                // Latch per-timer period from the low dword of each
+                // timer's comparator (0x108, 0x128, 0x148, each +0..4).
+                // We snapshot after each byte so a four-byte dword
+                // write converges to the final value, regardless of the
+                // store order the kernel uses.
+                for tn in 0..3 {
+                    let cmp_lo_start = 0x108 + tn * 0x20;
+                    if (cmp_lo_start..cmp_lo_start + 4).contains(&off) {
+                        self.hpet_period[tn] = u32::from_le_bytes([
+                            self.hpet[cmp_lo_start],
+                            self.hpet[cmp_lo_start + 1],
+                            self.hpet[cmp_lo_start + 2],
+                            self.hpet[cmp_lo_start + 3],
+                        ]);
+                        break;
+                    }
                 }
+                return;
             }
+            // Outside RAM and not an MMIO window — open-bus drop.
             return;
         }
-        let a = addr as usize;
+        // RAM store (the common path): diagnostic watchpoint, then the write.
         // Diagnostic watchpoint: print every write within a
         // configurable physical range. Used to find what kernel
         // code path stores to a struct field of interest (e.g.
@@ -255,9 +263,7 @@ impl Memory {
                 eprintln!("[WATCH] phys[{:08X}] <- {:02X}", addr, value);
             }
         }
-        if a < self.bytes.len() {
-            self.bytes[a] = value;
-        }
+        self.bytes[a] = value;
     }
 
     /// Tick the LAPIC timer once. Decrements the Current Count
