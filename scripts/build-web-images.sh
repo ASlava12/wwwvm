@@ -20,6 +20,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/web/images"
 KERNEL="${WWWVM_ALPINE_KERNEL:-/tmp/wwwvm-alpine/vmlinuz-lts}"
 MINIROOT="${WWWVM_ALPINE_MINIROOT:-/tmp/alpine/root}"
+BRANCH="${ALPINE_BRANCH:-v3.21}"
+ALP="$(dirname "$MINIROOT")"   # /tmp/alpine — docker mounts this
+XROOT="$ALP/xroot"             # the X-preinstalled rootfs (cross-built)
+
+# --with-x also builds a heavyweight "Alpine + X desktop" image (Xorg + twm +
+# xterm preinstalled → boots straight to a desktop, no in-guest apk). It needs
+# docker (the host can't run the x86 apk) and the network. The image is large
+# (~130 MiB) and wants ~1 GiB guest RAM.
+WITH_X=0
+for a in "$@"; do
+  case "$a" in
+    --with-x) WITH_X=1 ;;
+    *) echo "unknown arg: $a (usage: build-web-images.sh [--with-x])" >&2; exit 2 ;;
+  esac
+done
 
 say() { echo "[build-web-images] $*"; }
 
@@ -53,17 +68,49 @@ WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_NET_STUB=1
 # 4. Copy the kernel beside them.
 cp -f "$KERNEL" "$OUT/vmlinuz-lts"
 
+# 4b. (--with-x) Cross-build an X-preinstalled rootfs and pack it. Done in an
+#     amd64 Alpine container (the host can't exec the x86 apk): `apk --arch x86
+#     --no-scripts` extracts the x86 packages without running x86 scriptlets;
+#     we drop the mesa/llvm GL stack (unused by the fbdev driver) + docs to
+#     shrink, copy in the NIC/DRM .ko's, and pack with the GUI-session /init
+#     (WWWVM_INIT_GUI_SESSION launches X+twm+xterm). Font indices/fontconfig
+#     cache (skipped scriptlets) are rebuilt at first boot by /init.
+if [ "$WITH_X" = 1 ]; then
+  command -v docker >/dev/null || { echo "--with-x needs docker (host can't run x86 apk)"; exit 1; }
+  say "cross-building X rootfs in docker (downloads the X stack — slow)…"
+  docker run --rm -v "$ALP:/out" alpine:3.21 sh -c "
+    set -e
+    rm -rf /out/xroot
+    apk --root /out/xroot --arch x86 --initdb -U --allow-untrusted --no-scripts \
+      -X http://dl-cdn.alpinelinux.org/alpine/$BRANCH/main \
+      -X http://dl-cdn.alpinelinux.org/alpine/$BRANCH/community \
+      add alpine-base xorg-server xf86-video-fbdev xf86-input-libinput \
+          xrandr xsetroot twm xterm font-misc-misc font-cursor-misc \
+          mkfontscale fontconfig eudev >/dev/null
+    R=/out/xroot
+    rm -rf \$R/usr/lib/libLLVM* \$R/usr/lib/libgallium* \$R/usr/lib/dri \
+           \$R/usr/lib/libGLX_mesa* \$R/usr/lib/libEGL* \$R/usr/lib/libgbm* \
+           \$R/usr/lib/xorg/modules/extensions/libglx.so \
+           \$R/usr/share/man \$R/usr/share/doc \$R/usr/share/locale \
+           \$R/usr/share/licenses \$R/usr/share/gtk-doc \$R/usr/lib/*.a \$R/usr/include
+    cp /out/root/*.ko /out/xroot/ 2>/dev/null || true
+    chmod -R a+rX /out/xroot
+  "
+  say "packing X initramfs (this is large)…"
+  WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$XROOT" \
+    WWWVM_FB=1024x768 WWWVM_NET_STUB=1 WWWVM_INIT_GUI_SESSION=1 \
+    WWWVM_DUMP_INITRAMFS="$OUT/alpine-x.cpio" "$BIN"
+fi
+
 # 5. Generate the manifest the web UI fetches. Sizes are advisory (shown in the
 #    picker so the user knows the download cost). cmdline mirrors what the native
-#    example sets per variant (the GUI one adds console=tty0 so fbcon renders).
+#    example sets per variant (the GUI ones add console=tty0 so fbcon renders).
 CONSOLE_CMD="earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4"
 GUI_CMD="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4"
 ksz=$(stat -c%s "$OUT/vmlinuz-lts")
 csz=$(stat -c%s "$OUT/alpine-console.cpio")
 gsz=$(stat -c%s "$OUT/alpine-gui.cpio")
-cat > "$OUT/manifest.json" <<JSON
-{
-  "images": [
+IMAGES=$(cat <<JSON
     {
       "id": "alpine-console",
       "name": "Alpine — console (musl shell, serial)",
@@ -85,9 +132,24 @@ cat > "$OUT/manifest.json" <<JSON
       "ramMiB": 512,
       "bytes": $((ksz + gsz))
     }
-  ]
-}
 JSON
+)
+if [ "$WITH_X" = 1 ] && [ -f "$OUT/alpine-x.cpio" ]; then
+  xsz=$(stat -c%s "$OUT/alpine-x.cpio")
+  IMAGES="$IMAGES,
+    {
+      \"id\": \"alpine-x\",
+      \"name\": \"Alpine — X desktop (Xorg + twm, preinstalled)\",
+      \"kernel\": \"vmlinuz-lts\",
+      \"initramfs\": \"alpine-x.cpio\",
+      \"cmdline\": \"$GUI_CMD\",
+      \"gui\": true,
+      \"fbRes\": \"1024x768\",
+      \"ramMiB\": 1024,
+      \"bytes\": $((ksz + xsz))
+    }"
+fi
+printf '{\n  "images": [\n%s\n  ]\n}\n' "$IMAGES" > "$OUT/manifest.json"
 
 say "done → $OUT"
 ls -la "$OUT"

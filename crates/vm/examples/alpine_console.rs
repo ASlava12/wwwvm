@@ -156,8 +156,47 @@ fn main() {
     } else {
         ""
     };
+    // WWWVM_INIT_GUI_SESSION=1 (used by the prebuilt browser GUI image, which
+    // ships Xorg+twm+xterm preinstalled): after the DRM/input modules load,
+    // bring udev up and launch X (fbdev on /dev/fb0) + twm + xterm in the
+    // background, so the guest comes up in a desktop on the framebuffer canvas
+    // while the serial shell stays as a console. Needs WWWVM_FB (gui_setup
+    // above must have insmod'd simpledrm → /dev/fb0). Font indices + fontconfig
+    // cache are (re)built here because the cross-arch rootfs build skips apk
+    // scriptlets. No-ops on a rootfs without X (insmod-style silent failure).
+    let gui_session = if std::env::var_os("WWWVM_INIT_GUI_SESSION").is_some() {
+        "export HOME=/root\n\
+         for d in /usr/share/fonts/* /usr/share/fonts/misc; do [ -d \"$d\" ] && \
+           { mkfontscale \"$d\" 2>/dev/null; mkfontdir \"$d\" 2>/dev/null; }; done\n\
+         fc-cache -f 2>/dev/null\n\
+         [ -S /run/udev/control ] || { /sbin/udevd --daemon 2>/dev/null; \
+           udevadm trigger 2>/dev/null; udevadm settle 2>/dev/null; }\n\
+         mkdir -p /etc/X11/xorg.conf.d /tmp/.X11-unix; chmod 1777 /tmp/.X11-unix 2>/dev/null\n\
+         printf 'Section \"Device\"\\n Identifier \"fb\"\\n Driver \"fbdev\"\\n \
+Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.conf\n\
+         printf 'RandomPlacement\\nNoTitleFocus\\n' > /root/.twmrc\n\
+         ( X :0 vt1 -noreset -nolisten tcp > /var/log/x.log 2>&1 &\n\
+           i=0; while [ ! -e /tmp/.X11-unix/X0 ] && [ \"$i\" -lt 180 ]; do i=$((i+1)); sleep 1; done; sleep 2\n\
+           DISPLAY=:0 twm > /var/log/twm.log 2>&1 &\n\
+           DISPLAY=:0 xterm -geometry 100x30+20+20 > /var/log/xterm.log 2>&1 & ) &\n"
+    } else {
+        ""
+    };
+    // The cross-built X rootfs is installed with `apk --no-scripts`, so
+    // busybox's applet symlinks (/bin/setsid, /bin/mount, /usr/bin/awk, …) were
+    // never created — bare applet names don't resolve and /init can't run
+    // mount/setsid/etc. Recreate them with `busybox --install -s` as the very
+    // first thing (it runs the x86 busybox by absolute path, no symlink needed),
+    // then export a PATH. Gated to the X-session image; the minirootfs images
+    // already ship the symlinks.
+    let bb_install = if std::env::var_os("WWWVM_INIT_GUI_SESSION").is_some() {
+        "/bin/busybox --install -s 2>/dev/null\n\
+         export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"
+    } else {
+        ""
+    };
     let init = format!(
-        "#!/bin/sh\n{BASE_MOUNTS}{net_setup}{gui_setup}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
+        "#!/bin/sh\n{bb_install}{BASE_MOUNTS}{net_setup}{gui_setup}{gui_session}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
     );
     let cpio = match build_cpio_from_dir(Path::new(&root), init.as_bytes()) {
         Ok(c) => c,
@@ -615,7 +654,7 @@ fn build_cpio_from_dir(root: &Path, init_script: &[u8]) -> std::io::Result<Vec<u
             } else if md.is_dir() {
                 out.extend_from_slice(&cpio_entry_mtime(&rel, &[], 0o040_000 | mode, 0, 0, mtime));
                 walk(&path, base, out)?;
-            } else {
+            } else if md.is_file() {
                 let data = std::fs::read(&path)?;
                 out.extend_from_slice(&cpio_entry_mtime(
                     &rel,
@@ -626,6 +665,10 @@ fn build_cpio_from_dir(root: &Path, init_script: &[u8]) -> std::io::Result<Vec<u
                     mtime,
                 ));
             }
+            // else: device node / FIFO / socket — skip. `fs::read` on one (e.g.
+            // a real rootfs's /dev/urandom from alpine-base) would block forever
+            // or stream endlessly; the guest's devtmpfs mount plus the essential
+            // /dev nodes injected below cover what's needed at boot.
         }
         Ok(())
     }

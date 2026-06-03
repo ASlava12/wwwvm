@@ -1715,11 +1715,18 @@ wasm-pack build crates/wasm --target web --out-dir ../../web/pkg
 ```
 
 (Опционально, но рекомендуется) собрать **готовые образы Alpine** для пикера
-в UI — kernel + два initramfs (console и GUI) + `manifest.json` в `web/images/`:
+в UI — kernel + initramfs'ы + `manifest.json` в `web/images/`:
 
 ```bash
-scripts/build-web-images.sh   # тянет ассеты (--with-gui) если их нет, пакует cpio
+scripts/build-web-images.sh            # console + GUI образы (быстро)
+scripts/build-web-images.sh --with-x   # + тяжёлый образ с предустановленным X
 ```
+
+`--with-x` кросс-собирает x86-rootfs с `xorg-server`+`twm`+`xterm` в docker-
+контейнере amd64 Alpine (хост не запускает x86 `apk`), выкидывает GL-стек
+mesa/llvm (fbdev-драйвер его не использует) и пакует ~130-МиБ образ, который
+грузится сразу в десктоп (X на `/dev/fb0` + twm + xterm) — `apk` в госте не
+нужен. Нужны docker + сеть; образу нужно ~1 ГиБ гостевой RAM.
 
 `web/images/` в `.gitignore` (большие бинарники). Без этого шага пикер покажет
 «no server images», но ручной fallback (свои файлы) и встроенные демки работают.
@@ -1731,8 +1738,15 @@ python3 -m http.server -d web 8080
 ```
 
 Открыть `http://localhost:8080/`. В панели «Boot Linux / Alpine» выбрать образ
-(**console** — musl-шелл по serial; **GUI** — framebuffer + DRM/input-модули,
-поверх ставится Xorg при включённом Networking) и нажать «Load selected image».
+и нажать «Load selected image»:
+* **console** — musl-шелл по serial;
+* **GUI** — framebuffer + DRM/input-модули (поверх ставится Xorg при сети);
+* **X desktop** — Xorg+twm+xterm предустановлены, грузится сразу в десктоп
+  (тяжёлый: ~130 МиБ, ~1 ГиБ RAM, медленный старт в wasm).
+
+Сеть в госте (`apk`): поставить галку Networking до буста и запустить
+`crates/proxy` (allowlist `dl-cdn.alpinelinux.org:80`) — образы поднимают
+`eth0` (10.0.2.15) через in-wasm NAT → WebSocket-relay.
 
 В UI:
 * выбрать гостя (default polling, interactive IRQ-driven, или
