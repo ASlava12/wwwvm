@@ -1547,12 +1547,25 @@ impl Cpu {
             if had_fault || self.pending_fault.get().is_some() {
                 return;
             }
-            for (i, b) in bytes.iter().enumerate() {
-                let phys = phys_base.wrapping_add(i as u32);
-                if self.watch_on {
-                    self.watch_write(m, linear.wrapping_add(i as u32), phys, *b);
+            // Diagnostic watchpoint (rare — gated): per-byte CPU watch_write.
+            if self.watch_on {
+                for (i, b) in bytes.iter().enumerate() {
+                    self.watch_write(
+                        m,
+                        linear.wrapping_add(i as u32),
+                        phys_base.wrapping_add(i as u32),
+                        *b,
+                    );
                 }
-                m.write_u8(phys, *b);
+            }
+            // Write the same-page span straight to RAM in one slice copy,
+            // skipping the per-byte write_u8 overhead (MMIO range check etc.).
+            // Falls back to per-byte write_u8 only if the span isn't all RAM
+            // (i.e. a write into an MMIO window), which write_u8 handles.
+            if !m.write_ram_bulk(phys_base, bytes) {
+                for (i, b) in bytes.iter().enumerate() {
+                    m.write_u8(phys_base.wrapping_add(i as u32), *b);
+                }
             }
         } else {
             // Page-crossing slow path: per-byte translate (each may

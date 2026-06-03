@@ -56,6 +56,10 @@ pub struct Memory {
     /// Zero (the default) means no auto-advance — equivalent to
     /// one-shot. Snapshotted along with hpet[] for resume.
     hpet_period: [u32; 3],
+    /// Diagnostic write-watchpoint range (`WWWVM_WATCH_PHYS=lo:hi`), read once
+    /// at construction. Checked on the hot write path as a plain field instead
+    /// of a per-write `OnceLock` atomic. `None` in every non-debug run.
+    watch_phys: Option<(u32, u32)>,
 }
 
 impl Memory {
@@ -104,6 +108,20 @@ impl Memory {
             hpet,
             pending_lapic_irq: None,
             hpet_period: [0; 3],
+            watch_phys: {
+                // OnceLock so the env lookup runs once per process even across
+                // many Memory constructions (tests); cached in the field after.
+                use std::sync::OnceLock;
+                static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+                *SPEC.get_or_init(|| {
+                    let spec = std::env::var("WWWVM_WATCH_PHYS").ok()?;
+                    let (lo, hi) = spec.split_once(':')?;
+                    Some((
+                        u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
+                        u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
+                    ))
+                })
+            },
         }
     }
 
@@ -239,31 +257,37 @@ impl Memory {
             // Outside RAM and not an MMIO window — open-bus drop.
             return;
         }
-        // RAM store (the common path): diagnostic watchpoint, then the write.
-        // Diagnostic watchpoint: print every write within a
-        // configurable physical range. Used to find what kernel
-        // code path stores to a struct field of interest (e.g.
-        // boot_cpu_data.x86_capability[0] at phys 0xB70128). The
-        // env-var is read exactly once per process via OnceLock —
-        // a per-write getenv is a syscall in the hottest path the
-        // CPU has, and the Linux boot probe slows by 5×+ without
-        // this cache.
-        use std::sync::OnceLock;
-        static SPEC: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-        let cached = SPEC.get_or_init(|| {
-            let spec = std::env::var("WWWVM_WATCH_PHYS").ok()?;
-            let (lo, hi) = spec.split_once(':')?;
-            Some((
-                u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
-                u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
-            ))
-        });
-        if let Some((lo, hi)) = cached {
-            if addr >= *lo && addr < *hi {
+        // RAM store (the common path). Diagnostic watchpoint (WWWVM_WATCH_PHYS):
+        // print every write within a configurable physical range. Gated on the
+        // cached `watch_phys` field (env read once at construction) so the hot
+        // path is a plain check, not a per-write OnceLock atomic.
+        if let Some((lo, hi)) = self.watch_phys {
+            if addr >= lo && addr < hi {
                 eprintln!("[WATCH] phys[{:08X}] <- {:02X}", addr, value);
             }
         }
         self.bytes[a] = value;
+    }
+
+    /// Bulk-write `bytes` to a contiguous RAM range at physical `phys`; returns
+    /// true on success. The CPU's aligned-write fast path uses this to skip the
+    /// per-byte `write_u8` overhead. Returns false if the range isn't fully in
+    /// RAM (so the caller falls back to per-byte `write_u8`, which is MMIO-aware)
+    /// — and honors the diagnostic watchpoint when one is armed.
+    pub fn write_ram_bulk(&mut self, phys: u32, bytes: &[u8]) -> bool {
+        let start = phys as usize;
+        let end = match start.checked_add(bytes.len()) {
+            Some(e) if e <= self.bytes.len() => e,
+            _ => return false,
+        };
+        if self.watch_phys.is_some() {
+            for (i, b) in bytes.iter().enumerate() {
+                self.write_u8(phys + i as u32, *b); // rare: honor the watchpoint
+            }
+        } else {
+            self.bytes[start..end].copy_from_slice(bytes);
+        }
+        true
     }
 
     /// Tick the LAPIC timer once. Decrements the Current Count
