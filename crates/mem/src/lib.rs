@@ -185,6 +185,33 @@ impl Memory {
         }
     }
 
+    /// Read a little-endian u16/u32 straight from RAM in one shot when the whole
+    /// span is in RAM (the common case). `None` means it touches MMIO or runs
+    /// off the end — the caller falls back to per-byte `read_u8`, which is
+    /// MMIO-aware. Saves the per-byte range checks the CPU's aligned reads did.
+    #[inline]
+    pub fn read_ram_u16(&self, phys: u32) -> Option<u16> {
+        let a = phys as usize;
+        match a.checked_add(2) {
+            Some(e) if e <= self.bytes.len() => {
+                Some(u16::from_le_bytes([self.bytes[a], self.bytes[a + 1]]))
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn read_ram_u32(&self, phys: u32) -> Option<u32> {
+        let a = phys as usize;
+        match a.checked_add(4) {
+            Some(e) if e <= self.bytes.len() => {
+                let b = &self.bytes[a..e];
+                Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            }
+            _ => None,
+        }
+    }
+
     pub fn write_u8(&mut self, addr: u32, value: u8) {
         let a = addr as usize;
         // MMIO (LAPIC/HPET) sits near 4 GiB, above RAM. Take the MMIO and

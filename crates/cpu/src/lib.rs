@@ -1466,7 +1466,11 @@ impl Cpu {
         if self.pending_fault.get().is_some() {
             return 0;
         }
-        (m.read_u8(phys) as u16) | ((m.read_u8(phys.wrapping_add(1)) as u16) << 8)
+        // One RAM read when in RAM; per-byte read_u8 (MMIO-aware) otherwise.
+        match m.read_ram_u16(phys) {
+            Some(v) => v,
+            None => (m.read_u8(phys) as u16) | ((m.read_u8(phys.wrapping_add(1)) as u16) << 8),
+        }
     }
 
     pub fn mem_write_u16(&self, m: &mut Memory, linear: u32, value: u16) {
@@ -1491,10 +1495,16 @@ impl Cpu {
         if self.pending_fault.get().is_some() {
             return 0;
         }
-        (m.read_u8(phys) as u32)
-            | ((m.read_u8(phys.wrapping_add(1)) as u32) << 8)
-            | ((m.read_u8(phys.wrapping_add(2)) as u32) << 16)
-            | ((m.read_u8(phys.wrapping_add(3)) as u32) << 24)
+        // One RAM read when in RAM; per-byte read_u8 (MMIO-aware) otherwise.
+        match m.read_ram_u32(phys) {
+            Some(v) => v,
+            None => {
+                (m.read_u8(phys) as u32)
+                    | ((m.read_u8(phys.wrapping_add(1)) as u32) << 8)
+                    | ((m.read_u8(phys.wrapping_add(2)) as u32) << 16)
+                    | ((m.read_u8(phys.wrapping_add(3)) as u32) << 24)
+            }
+        }
     }
 
     pub fn mem_write_u32(&self, m: &mut Memory, linear: u32, value: u32) {
