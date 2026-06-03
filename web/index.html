@@ -4,13 +4,12 @@
     <meta charset="utf-8" />
     <title>wwwvm — Rust VM in the browser</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="./style.css?v=3" />
+    <link rel="stylesheet" href="./style.css?v=4" />
   </head>
   <body>
     <header>
       <h1>wwwvm</h1>
       <span id="status" class="status">idle</span>
-      <button id="sidebar-toggle" title="Show/hide settings">☰ Settings</button>
     </header>
 
     <main>
@@ -171,6 +170,10 @@
         </div>
       </section>
     </main>
+
+    <!-- Floating settings toggle (FAB), like a phone. Lives outside the panel
+         so it can re-show a hidden sidebar. -->
+    <button id="sidebar-toggle" title="Show/hide settings" aria-label="Settings">⚙</button>
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script type="module" src="./main.js?v=2"></script>
