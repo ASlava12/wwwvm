@@ -13,9 +13,18 @@ path = "src/main.rs"
 wwwvm-net = { path = "../net" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
 tokio-tungstenite = "0.21"
+# TLS termination for wss:// (optional, enabled at runtime via cert/key env).
+# default-features off + ring → no aws-lc-rs (avoids a C/cmake build dep).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = { workspace = true }
 env_logger = "0.11"
 anyhow = "1"
+
+[dev-dependencies]
+# Generate a throwaway self-signed cert in the TLS-config test.
+# ring (not aws-lc-rs) to match the runtime provider and avoid a C/cmake build.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

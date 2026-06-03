@@ -50,12 +50,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Deserialize)]
@@ -176,6 +177,39 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Build a rustls server config from PEM cert + key files (for serving `wss://`
+/// directly, so an https-hosted page doesn't need a separate TLS reverse proxy).
+/// Uses the `ring` crypto provider explicitly so we don't depend on a process
+/// default being installed.
+fn load_tls(cert_path: &str, key_path: &str) -> Result<Arc<tokio_rustls::rustls::ServerConfig>> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::{crypto::ring, ServerConfig};
+
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(
+        File::open(cert_path).with_context(|| format!("open TLS cert {cert_path}"))?,
+    ))
+    .collect::<std::result::Result<_, _>>()
+    .with_context(|| format!("parse TLS cert {cert_path}"))?;
+    if certs.is_empty() {
+        bail!("no certificates found in {cert_path}");
+    }
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(
+        File::open(key_path).with_context(|| format!("open TLS key {key_path}"))?,
+    ))
+    .with_context(|| format!("parse TLS key {key_path}"))?
+    .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+
+    let cfg = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions")?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("TLS cert/key")?;
+    Ok(Arc::new(cfg))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -266,6 +300,31 @@ async fn main() -> Result<()> {
         off(limits.max_bytes),
     );
 
+    // Optional TLS so we can serve wss:// directly (an https-hosted page can't
+    // open ws://). Both cert+key must be set together; neither → plain ws.
+    let tls: Option<TlsAcceptor> = match (
+        env::var("WWWVM_PROXY_TLS_CERT")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        env::var("WWWVM_PROXY_TLS_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    ) {
+        (Some(cert), Some(key)) => {
+            let cfg = load_tls(&cert, &key)?;
+            log::info!("TLS enabled — serving wss:// (cert {cert})");
+            Some(TlsAcceptor::from(cfg))
+        }
+        (None, None) => {
+            log::info!(
+                "TLS disabled — plain ws:// (set WWWVM_PROXY_TLS_CERT + WWWVM_PROXY_TLS_KEY \
+                 to serve wss:// for an https page)"
+            );
+            None
+        }
+        _ => bail!("WWWVM_PROXY_TLS_CERT and WWWVM_PROXY_TLS_KEY must be set together"),
+    };
+
     let listener = TcpListener::bind(bind).await.context("bind")?;
     log::info!("wwwvm-proxy listening on {bind}");
 
@@ -283,9 +342,22 @@ async fn main() -> Result<()> {
         let origins = origins.clone();
         let upstreams_file = upstreams_file.clone();
         let limits = limits.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             let _guard = guard; // released (caps freed) when the connection ends
-            if let Err(e) = handle(stream, peer, allow, origins, upstreams_file, limits).await {
+                                // TLS handshake (if enabled) runs in the task so a slow/failing one
+                                // can't stall the accept loop. Then the same handler runs over
+                                // either the plain TCP stream or the TLS stream.
+            let res = match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        handle(tls_stream, peer, allow, origins, upstreams_file, limits).await
+                    }
+                    Err(e) => Err(anyhow!("TLS handshake failed: {e}")),
+                },
+                None => handle(stream, peer, allow, origins, upstreams_file, limits).await,
+            };
+            if let Err(e) = res {
                 log::warn!("{peer}: {e:#}");
             }
         });
@@ -296,14 +368,17 @@ async fn main() -> Result<()> {
 // and ErrorResponse (an http::Response) is large — that's the library's
 // signature, not ours, so silence the size lint here.
 #[allow(clippy::result_large_err)]
-async fn handle(
-    stream: TcpStream,
+async fn handle<S>(
+    stream: S,
     peer: SocketAddr,
     allow: Arc<Allowlist>,
     origins: Arc<Option<Vec<String>>>,
     upstreams_file: Arc<Option<PathBuf>>,
     limits: Arc<Limits>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     // Reject disallowed Origins during the handshake (before any TCP connect).
     let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, resp: Response| {
@@ -576,6 +651,34 @@ mod tests {
             gate.per_ip.lock().unwrap().get(&b).is_none(),
             "b entry removed"
         );
+    }
+
+    /// `load_tls` parses a valid PEM cert+key into a usable ServerConfig and
+    /// reports clear errors for a missing file and a file with no certificate.
+    #[test]
+    fn load_tls_accepts_valid_pem_and_rejects_bad() {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let cp = dir.join(format!("wwwvm-test-cert-{pid}.pem"));
+        let kp = dir.join(format!("wwwvm-test-key-{pid}.pem"));
+        let empty = dir.join(format!("wwwvm-test-empty-{pid}.pem"));
+        std::fs::write(&cp, ck.cert.pem()).unwrap();
+        std::fs::write(&kp, ck.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&empty, b"not a pem").unwrap();
+
+        let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        // Happy path: valid cert + key build a ServerConfig.
+        assert!(load_tls(&s(&cp), &s(&kp)).is_ok(), "valid PEM should load");
+        // Missing cert file → error.
+        assert!(load_tls("/no/such/cert.pem", &s(&kp)).is_err());
+        // A cert file with no certificate in it → clear error.
+        let err = load_tls(&s(&empty), &s(&kp)).unwrap_err();
+        assert!(err.to_string().contains("no certificates"), "got: {err}");
+
+        let _ = std::fs::remove_file(&cp);
+        let _ = std::fs::remove_file(&kp);
+        let _ = std::fs::remove_file(&empty);
     }
 
     /// `max_conns = 0` means an unbounded global pool (only per-IP applies).

@@ -321,6 +321,12 @@ HTTP/SOCKS-списки из Proxifly, TheSpeedX, ProxyScrape, GeoNode → `web/
 egress-IP можно, направив релей через auto-rotate публичных прокси (выход не с твоего IP),
 но это флаки и не отменяет allowlist.
 
+**TLS / `wss://` встроен** (для https-страницы `ws://` браузер не пустит — mixed content).
+Задай `WWWVM_PROXY_TLS_CERT` + `WWWVM_PROXY_TLS_KEY` (PEM-файлы, оба вместе) — релей сам
+терминирует TLS (rustls/ring, TLS 1.2+1.3), отдельный reverse-proxy не нужен; без них —
+обычный `ws://`. Тогда в поле `proxy ws` пишешь `wss://твой-домен:порт`. Стрим после
+TLS-handshake тот же, что и для plain ws (handler дженерик по типу сокета).
+
 **Сеть в браузере — TCP NAT в wasm → WebSocket-relay.** Тот же smoltcp-NAT,
 что в нативе, крутится в wasm; меняется только транспорт per-flow:
 вместо `std::thread`+`TcpStream` (невозможно в wasm) — `QueueConnector`
