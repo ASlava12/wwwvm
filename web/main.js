@@ -196,6 +196,37 @@ $("fullscreen-btn")?.addEventListener("click", () => {
 
 let rafHandle = 0;
 const outputListeners = new Set();
+
+// Autorun for real-OS boots: once the guest's shell announces readiness, type
+// the Autorun lines into it as commands. The built-in demos instead get autorun
+// pre-fed at boot (no shell-ready signal), so this is the path for any kernel
+// image that prints the marker. Lines are sent with a gap so the shell runs
+// them in order and we don't overrun the tty's ~255-char line buffer.
+let autorunListener = null;
+const AUTORUN_READY_MARKER = "alpine shell ready";
+function sendCommandLine(text) {
+  if (active === "worker") worker.postMessage({ t: "command", text });
+  else if (vm.is_booted()) vm.send_command(text);
+}
+function armAutorunOnReady(lines) {
+  if (autorunListener) { outputListeners.delete(autorunListener); autorunListener = null; }
+  if (!lines.length) return;
+  let buf = "";
+  autorunListener = (chunk) => {
+    buf += chunk;
+    if (!buf.includes(AUTORUN_READY_MARKER)) return;
+    outputListeners.delete(autorunListener);
+    autorunListener = null;
+    let i = 0;
+    const tick = () => {
+      if (i >= lines.length) return;
+      sendCommandLine(lines[i++]);
+      setTimeout(tick, 400);
+    };
+    setTimeout(tick, 600); // small grace after the ready line
+  };
+  outputListeners.add(autorunListener);
+}
 // Per-frame step budget + stepping mode. The tiny built-in guests use a
 // small polling budget with the HLT-terminal `run`; booting a real kernel
 // (Linux/Alpine) needs the idle-aware stepper (Linux idles on HLT all
@@ -519,6 +550,8 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   // Hide the canvas until this boot actually produces a frame (paintFb re-shows
   // it). A console-only image never does, so the UART fills the column.
   document.body.classList.remove("has-fb");
+  // Autorun: type these into the guest once its shell is ready (any boot path).
+  armAutorunOnReady($("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean));
   useWorker = $("worker-enable")?.checked ?? true;
   const cmdline = $("cmdline").value;
   const fbEnabled = $("fb-enable").checked;
