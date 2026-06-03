@@ -33,6 +33,19 @@ inside its guest.
    PS/2 mouse (`psmouse` → `event1`); the host injects events via
    `Vm::push_scancode` / `Keyboard::push_mouse_packet`.
 
+## In-guest: one command
+
+If you fetched assets with `--with-gui`, the helper script is already at
+`/guest-startx.sh` in the guest — it does everything below (udev, packages,
+fbdev config, an auto-placing `twm`, and an `xterm`) in one shot:
+
+```sh
+sh /guest-startx.sh
+```
+
+(In the browser, click the framebuffer canvas first so it has input focus.) The
+manual steps follow, for reference.
+
 ## In-guest: install X and start it
 
 ```sh

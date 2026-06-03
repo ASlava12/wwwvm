@@ -187,7 +187,16 @@ fn main() {
         return;
     }
 
-    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    // Guest RAM, in MiB, via WWWVM_RAM_MB (default 256). The rootfs is the
+    // initramfs (a RAM-backed tmpfs), so installing heavy packages eats into
+    // this: running X needs the full xorg-server closure (mesa + llvm pulled
+    // via libGL), which overflows 256 MiB — use WWWVM_RAM_MB=1024 for the GUI.
+    let ram_mb = std::env::var("WWWVM_RAM_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&m| m >= 64)
+        .unwrap_or(256);
+    let mut vm = Vm::with_ram_size(ram_mb * 1024 * 1024);
     vm.set_cmos_time_from_host(); // so the guest's `date` is the real time
     let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
     // WWWVM_FB=WxH (e.g. 800x600) advertises a linear framebuffer so the

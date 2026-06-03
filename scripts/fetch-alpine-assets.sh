@@ -137,6 +137,13 @@ if [ "$WITH_GUI" = 1 ]; then
   else
     say "GUI modules present — skip"
   fi
+  # Stage the one-command X bring-up helper into the guest root (→ lands at
+  # /guest-startx.sh in the guest; run `sh /guest-startx.sh`).
+  if [ -f "$(dirname "$0")/guest-startx.sh" ]; then
+    cp "$(dirname "$0")/guest-startx.sh" "$ROOT/guest-startx.sh"
+    chmod +x "$ROOT/guest-startx.sh"
+    say "X helper staged: $ROOT/guest-startx.sh (run 'sh /guest-startx.sh' in-guest)"
+  fi
 fi
 
 rm -rf "$MODLOOP" "$ALP/modloop_x"
