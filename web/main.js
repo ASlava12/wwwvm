@@ -120,40 +120,69 @@ function sendMouse(dx, dy, buttons) {
   if (vm.is_booted()) vm.push_mouse_packet(dx, dy, buttons);
 }
 
+// Click the canvas to CAPTURE mouse + keyboard via Pointer Lock: relative mouse
+// motion → PS/2 packets, keys → Set-1 scancodes. Right Alt releases the capture.
+// A hint overlay reminds how to release. Routes to whichever engine owns the VM.
 (function wireCanvasInput() {
   const cv = $("fb");
+  const hint = $("capture-hint");
   if (!cv) return;
-  cv.tabIndex = 0; // focusable, so it can receive key events
   let buttons = 0; // bit0 left, bit1 right, bit2 middle
   const BTN = { 0: 1, 1: 4, 2: 2 }; // DOM button (0/1/2) → our bitmask
+  const locked = () => document.pointerLockElement === cv;
+  const setHint = () => {
+    if (!hint) return;
+    hint.textContent = locked()
+      ? "Захвачено · правый Alt — отпустить"
+      : "Клик — захватить мышь и клавиатуру";
+    hint.classList.toggle("active", locked());
+    hint.style.opacity = "1";
+    // Fade the "captured" reminder after a moment so it doesn't cover the desktop.
+    if (locked()) setTimeout(() => { if (locked()) hint.style.opacity = "0"; }, 2500);
+  };
 
-  cv.addEventListener("keydown", (e) => {
+  cv.addEventListener("click", () => { if (!locked()) cv.requestPointerLock?.(); });
+  document.addEventListener("pointerlockchange", setHint);
+
+  // Mouse + keyboard are captured globally, but only while the canvas is locked.
+  document.addEventListener("mousemove", (e) => {
+    if (!locked()) return;
+    const dx = e.movementX | 0, dy = -(e.movementY | 0); // screen y down; PS/2 +y up
+    if (dx || dy) sendMouse(dx, dy, buttons);
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (!locked()) return;
+    buttons |= BTN[e.button] || 0; sendMouse(0, 0, buttons); e.preventDefault();
+  });
+  document.addEventListener("mouseup", (e) => {
+    if (!locked()) return;
+    buttons &= ~(BTN[e.button] || 0); sendMouse(0, 0, buttons); e.preventDefault();
+  });
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  document.addEventListener("keydown", (e) => {
+    if (!locked()) return;
+    if (e.code === "AltRight") { e.preventDefault(); document.exitPointerLock?.(); return; }
     const b = makeBytes(e.code);
     if (b) { e.preventDefault(); sendScancodes(b); }
   });
-  cv.addEventListener("keyup", (e) => {
+  document.addEventListener("keyup", (e) => {
+    if (!locked()) return;
+    if (e.code === "AltRight") { e.preventDefault(); return; }
     const b = breakBytes(e.code);
     if (b) { e.preventDefault(); sendScancodes(b); }
   });
-  cv.addEventListener("mousemove", (e) => {
-    const dx = e.movementX | 0;
-    const dy = -(e.movementY | 0); // screen y grows down; PS/2 +y is up
-    if (dx || dy) sendMouse(dx, dy, buttons);
-  });
-  cv.addEventListener("mousedown", (e) => {
-    cv.focus();
-    buttons |= BTN[e.button] || 0;
-    sendMouse(0, 0, buttons);
-    e.preventDefault();
-  });
-  cv.addEventListener("mouseup", (e) => {
-    buttons &= ~(BTN[e.button] || 0);
-    sendMouse(0, 0, buttons);
-    e.preventDefault();
-  });
-  // Let right-click reach the guest instead of opening the page context menu.
-  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+  setHint();
 })();
+
+// Header controls: collapse/show the settings sidebar, fullscreen the canvas.
+$("sidebar-toggle")?.addEventListener("click", () =>
+  document.body.classList.toggle("sidebar-hidden"));
+$("fullscreen-btn")?.addEventListener("click", () => {
+  const wrap = document.getElementById("canvas-wrap");
+  if (document.fullscreenElement) document.exitFullscreen?.();
+  else wrap?.requestFullscreen?.();
+});
 
 let rafHandle = 0;
 const outputListeners = new Set();
@@ -201,6 +230,9 @@ function paintFb(w, h, stride, bytes) {
     }
   }
   ctx.putImageData(fbImage, 0, 0);
+  // First frame → reveal the canvas pane (CSS shows it under body.has-fb; the
+  // UART pane shrinks to share the column). Hidden again at the next boot.
+  document.body.classList.add("has-fb");
   const fbStatus = $("fb-status");
   if (fbStatus) fbStatus.textContent = `${w}×${h}×32 efifb — live`;
 }
@@ -408,6 +440,7 @@ function pump() {
 
 $("boot").addEventListener("click", () => {
   if (rafHandle) cancelAnimationFrame(rafHandle);
+  document.body.classList.remove("has-fb"); // built-in guests have no framebuffer
   term.reset();
   const autorun = $("autorun").value
     .split("\n")
@@ -473,6 +506,9 @@ const setLinuxStatus = (text, cls = "") => {
 // the DRM/input modules unpacked into the initramfs tmpfs).
 async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   if (rafHandle) cancelAnimationFrame(rafHandle);
+  // Hide the canvas until this boot actually produces a frame (paintFb re-shows
+  // it). A console-only image never does, so the UART fills the column.
+  document.body.classList.remove("has-fb");
   useWorker = $("worker-enable")?.checked ?? true;
   const cmdline = $("cmdline").value;
   const fbEnabled = $("fb-enable").checked;

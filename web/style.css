@@ -9,21 +9,57 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
   font: 14px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif; }
-header { display: flex; align-items: baseline; gap: 1rem; padding: .75rem 1rem;
-  border-bottom: 1px solid var(--border); }
+body { display: flex; flex-direction: column; }
+header { display: flex; align-items: baseline; gap: 1rem; padding: .6rem 1rem;
+  border-bottom: 1px solid var(--border); flex: 0 0 auto; }
 header h1 { margin: 0; font-size: 1.1rem; color: var(--accent); }
+#sidebar-toggle { align-self: center; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); font-weight: 700; padding: .25rem .6rem; }
 .status { color: var(--muted); font-family: ui-monospace, monospace; }
 .status.running { color: #3fb950; }
 .status.error { color: #f85149; }
-main { display: grid; grid-template-columns: 1fr 320px; gap: 1rem;
-  padding: 1rem; height: calc(100% - 50px); }
-#terminal-pane { background: black; border: 1px solid var(--border);
-  border-radius: 6px; padding: .5rem; overflow: hidden; }
+
+/* Layout: left sidebar (collapsible) + main stage column. */
+main { flex: 1 1 auto; display: flex; gap: 1rem; padding: 1rem; min-height: 0; }
+#controls { flex: 0 0 320px; display: flex; flex-direction: column; gap: .75rem;
+  overflow-y: auto; padding-right: .25rem; }
+body.sidebar-hidden #controls { display: none; }
+
+#stage { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .75rem; }
+
+/* Canvas: hidden until the guest produces a framebuffer (body.has-fb). Bounded
+   so it shares the column with the terminal; the UART grows to fill when absent. */
+#canvas-pane { display: none; flex: 0 1 auto; min-height: 0; flex-direction: column;
+  gap: .35rem; }
+body.has-fb #canvas-pane { display: flex; }
+#canvas-bar { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+#canvas-wrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex;
+  align-items: center; justify-content: center; background: #000;
+  border: 1px solid var(--border); border-radius: 6px; overflow: hidden; max-height: 58vh; }
+#fb { max-width: 100%; max-height: 100%; image-rendering: pixelated; display: block; }
+#canvas-wrap:fullscreen { max-height: none; background: #000; }
+#canvas-wrap:fullscreen #fb { max-height: 100vh; }
+.hint { position: absolute; top: .4rem; left: 50%; transform: translateX(-50%);
+  background: rgba(13, 17, 23, .82); color: var(--muted); border: 1px solid var(--border);
+  border-radius: 999px; padding: .15rem .7rem; font: 12px ui-monospace, monospace;
+  pointer-events: none; transition: opacity .3s; }
+.hint.active { color: #3fb950; border-color: #3fb950; }
+
+#terminal-pane { flex: 1 1 0; min-height: 120px; background: black;
+  border: 1px solid var(--border); border-radius: 6px; padding: .5rem; overflow: hidden; }
 #terminal { width: 100%; height: 100%; }
-#controls { display: flex; flex-direction: column; gap: .75rem; }
+
+/* Bottom: Autorun | Send command + result. */
+#bottom { flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+#autorun-box, #command-box { display: flex; flex-direction: column; gap: .4rem; }
+#autorun-box textarea { resize: vertical; }
+.cmd-row { display: flex; gap: .5rem; }
+.cmd-row input { flex: 1; }
+
 fieldset { border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); padding: .5rem .75rem; margin: 0; }
 legend { color: var(--muted); padding: 0 .25rem; }
+label { display: inline-block; }
 textarea, input[type=text] { width: 100%; background: #0d1117; color: var(--fg);
   border: 1px solid var(--border); border-radius: 4px; padding: .35rem;
   font-family: ui-monospace, monospace; }
@@ -32,8 +68,8 @@ button { background: var(--accent); color: #0d1117; border: 0;
 button:disabled { opacity: .5; cursor: not-allowed; }
 pre { margin: 0; max-height: 8rem; overflow: auto;
   font-family: ui-monospace, monospace; color: var(--muted); }
-#vga { max-height: 14rem; font-size: 11px; line-height: 1.15; color: #c9d1d9;
-  white-space: pre; }
+#vga { max-height: 14rem; font-size: 11px; line-height: 1.15; color: #c9d1d9; white-space: pre; }
+#last-result { flex: 1 1 auto; max-height: none; }
 .snapshot-row { display: flex; gap: .5rem; margin: .25rem 0; }
 .snapshot-row button { flex: 1; }
 #snapshot-status { display: block; margin-top: .25rem; }

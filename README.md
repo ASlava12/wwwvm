@@ -1748,6 +1748,14 @@ python3 -m http.server -d web 8080
 `crates/proxy` (allowlist `dl-cdn.alpinelinux.org:80`) — образы поднимают
 `eth0` (10.0.2.15) через in-wasm NAT → WebSocket-relay.
 
+**Раскладка:** слева — скрываемые (кнопка ☰) настройки + отладка; в центре
+сверху — **Canvas** (появляется, когда у гостя есть фреймбуфер), под ним —
+**UART**-консоль (занимает всё поле, если Canvas нет), снизу — Autorun + отправка
+команд. **Клик по Canvas** захватывает мышь и клавиатуру (pointer lock →
+PS/2/scancodes), **правый Alt** отпускает; кнопка **Fullscreen** разворачивает
+Canvas. У X-десктопа `/init` раз в 2 с перерисовывает весь фреймбуфер (simpledrm
+шлёт в видимый scanout только damaged-области — иначе статичные окна застывают).
+
 В UI:
 * выбрать гостя (default polling, interactive IRQ-driven, или
   calculator с MUL и decimal-форматированием);

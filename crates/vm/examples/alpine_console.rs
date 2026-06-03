@@ -178,8 +178,8 @@ Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.c
            DISPLAY=:0 xsetroot -solid '#30343f' 2>/dev/null\n\
            DISPLAY=:0 twm > /var/log/twm.log 2>&1 &\n\
            DISPLAY=:0 xterm -fn fixed -geometry 100x30+20+20 > /var/log/xterm.log 2>&1 &\n\
-           while :; do dd if=/dev/fb0 of=/tmp/.fbr bs=512k 2>/dev/null && \
-             dd if=/tmp/.fbr of=/dev/fb0 bs=512k 2>/dev/null; sleep 1; done & ) &\n"
+           while :; do dd if=/dev/fb0 of=/dev/fb0 conv=notrunc bs=512k 2>/dev/null; \
+             sleep 2; done & ) &\n"
     } else {
         ""
     };

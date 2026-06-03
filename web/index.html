@@ -8,15 +8,13 @@
   </head>
   <body>
     <header>
+      <button id="sidebar-toggle" title="Show/hide settings">☰</button>
       <h1>wwwvm</h1>
       <span id="status" class="status">idle</span>
     </header>
 
     <main>
-      <section id="terminal-pane">
-        <div id="terminal"></div>
-      </section>
-
+      <!-- Left: collapsible settings + debug info (visible by default). -->
       <aside id="controls">
         <fieldset>
           <legend>Engine</legend>
@@ -25,33 +23,6 @@
             Web Worker (recommended — doesn't freeze the tab)
           </label>
         </fieldset>
-        <fieldset>
-          <legend>Guest</legend>
-          <label>
-            <input type="radio" name="guest" value="default" checked />
-            Default (poll LSR + echo)
-          </label>
-          <br />
-          <label>
-            <input type="radio" name="guest" value="interactive" />
-            Interactive (IRQ-driven echo + banner)
-          </label>
-          <br />
-          <label>
-            <input type="radio" name="guest" value="calculator" />
-            Calculator (squares each input byte)
-          </label>
-          <br />
-          <label>
-            <input type="radio" name="guest" value="pm" />
-            PM kernel (bzImage handoff → UART → HLT)
-          </label>
-        </fieldset>
-        <fieldset>
-          <legend>Autorun (one command per line)</legend>
-          <textarea id="autorun" rows="4" placeholder="echo hello&#10;uname -a"></textarea>
-        </fieldset>
-        <button id="boot">Boot VM</button>
 
         <fieldset>
           <legend>Boot Linux / Alpine (real kernel)</legend>
@@ -63,8 +34,6 @@
           </label>
           <small id="image-status" class="status">checking for prebuilt images…</small>
           <br />
-          <!-- Boot options — apply to the selected image OR your own files.
-               Picking an image fills these in; tweak before booting if you like. -->
           <label>cmdline:
             <input id="cmdline" type="text"
               value="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
@@ -112,14 +81,31 @@
         </fieldset>
 
         <fieldset>
-          <legend>Send command</legend>
-          <input id="cmd" type="text" placeholder="type and press Enter" />
-          <button id="send">runCommand()</button>
+          <legend>Built-in guest (for “Boot VM” below)</legend>
+          <label>
+            <input type="radio" name="guest" value="default" checked />
+            Default (poll LSR + echo)
+          </label>
+          <br />
+          <label>
+            <input type="radio" name="guest" value="interactive" />
+            Interactive (IRQ-driven echo + banner)
+          </label>
+          <br />
+          <label>
+            <input type="radio" name="guest" value="calculator" />
+            Calculator (squares each input byte)
+          </label>
+          <br />
+          <label>
+            <input type="radio" name="guest" value="pm" />
+            PM kernel (bzImage handoff → UART → HLT)
+          </label>
         </fieldset>
 
         <fieldset>
-          <legend>Last result</legend>
-          <pre id="last-result">(none yet)</pre>
+          <legend>Networking</legend>
+          <small id="net-status" class="status">(off — tick "Networking" before Boot Linux)</small>
         </fieldset>
 
         <fieldset>
@@ -137,18 +123,6 @@
         </fieldset>
 
         <fieldset>
-          <legend>Networking</legend>
-          <small id="net-status" class="status">(off — tick "Networking" before Boot Linux)</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Framebuffer (efifb pixels)</legend>
-          <canvas id="fb" width="800" height="600"
-                  style="width:100%;height:auto;background:#000;image-rendering:pixelated;border:1px solid #30363d"></canvas>
-          <small id="fb-status" class="status">(enable the framebuffer + boot a kernel)</small>
-        </fieldset>
-
-        <fieldset>
           <legend>VGA snapshot (0xB8000)</legend>
           <pre id="vga">(empty)</pre>
         </fieldset>
@@ -158,6 +132,44 @@
           <pre id="diag">CPU not booted</pre>
         </fieldset>
       </aside>
+
+      <!-- Main column: Canvas (top, when present) · UART · bottom controls. -->
+      <section id="stage">
+        <!-- Canvas: shown once the guest produces a framebuffer. Click to grab
+             mouse+keyboard (pointer lock); right Alt releases. -->
+        <div id="canvas-pane">
+          <div id="canvas-bar">
+            <small id="fb-status" class="status">(enable the framebuffer + boot a kernel)</small>
+            <button id="fullscreen-btn" title="Fullscreen the canvas">⛶ Fullscreen</button>
+          </div>
+          <div id="canvas-wrap">
+            <canvas id="fb" width="800" height="600"></canvas>
+            <div id="capture-hint" class="hint">Клик — захватить мышь и клавиатуру</div>
+          </div>
+        </div>
+
+        <!-- UART (serial console). Fills the canvas area when there's no canvas. -->
+        <div id="terminal-pane">
+          <div id="terminal"></div>
+        </div>
+
+        <!-- Bottom: Autorun (+ Boot VM) | Send command + result. -->
+        <div id="bottom">
+          <fieldset id="autorun-box">
+            <legend>Autorun (one command per line) + Boot VM</legend>
+            <textarea id="autorun" rows="3" placeholder="echo hello&#10;uname -a"></textarea>
+            <button id="boot">Boot VM</button>
+          </fieldset>
+          <fieldset id="command-box">
+            <legend>Send command / result</legend>
+            <div class="cmd-row">
+              <input id="cmd" type="text" placeholder="type and press Enter" />
+              <button id="send">runCommand()</button>
+            </div>
+            <pre id="last-result">(none yet)</pre>
+          </fieldset>
+        </div>
+      </section>
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
