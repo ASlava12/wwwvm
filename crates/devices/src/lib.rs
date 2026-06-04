@@ -509,7 +509,11 @@ impl IoBus {
 
     pub fn snapshot(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512);
-        out.push(9u8); // device count
+        // device count — MUST match the number of emit() calls below. restore()
+        // loops exactly `count` times, so an undercount silently drops trailing
+        // devices (this was 9 while 10 are emitted → the RTL8139 NIC was never
+        // restored, losing a networked guest's MAC + ring config on resume).
+        out.push(10u8);
         let emit = |out: &mut Vec<u8>, id: u8, payload: &[u8]| {
             let len = 1 + payload.len() as u32;
             out.extend_from_slice(&len.to_le_bytes());
@@ -620,6 +624,27 @@ mod tests {
         assert_eq!(bus2.read(0x173), 0x42);
         assert_eq!(bus2.read(0x174), 0x84);
         assert_eq!(bus2.read(0x176), 0x4F);
+    }
+
+    /// Regression: the device count must cover EVERY emitted device. It was 9
+    /// while 10 are emitted, so restore's `0..count` loop dropped the trailing
+    /// RTL8139 — a networked guest lost its MAC + ring config on resume.
+    #[test]
+    fn rtl8139_nic_round_trips_through_snapshot() {
+        let mut bus = IoBus::new();
+        let mac = [0x52u8, 0x54, 0x00, 0xAB, 0xCD, 0xEF];
+        bus.rtl8139.set_mac(mac);
+        let blob = bus.snapshot();
+        assert_eq!(blob[0], 10, "device count must include the NIC");
+        let mut bus2 = IoBus::new();
+        bus2.restore(&blob).expect("restore");
+        for (i, &b) in mac.iter().enumerate() {
+            assert_eq!(
+                bus2.rtl8139.read_reg(i as u16),
+                b,
+                "NIC MAC byte {i} survives"
+            );
+        }
     }
 
     #[test]
