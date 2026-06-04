@@ -585,4 +585,79 @@ mod tests {
         assert_eq!(nat.flow_count(), 0);
         assert!(log.borrow().is_empty());
     }
+
+    // --- Hybrid LAN + NAT: the NAT shares an L2 segment with peer VMs (the web
+    // "lan+nat" mode). The worker routes peer-bound frames to the switch and
+    // gateway/broadcast frames to the NAT. The safety property the routing
+    // relies on: the NAT answers ARP for ITS gateway IP only — it must ignore
+    // ARP for a peer IP, or it would hijack that peer's traffic on the segment.
+
+    const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    fn arp_request(target_ip: [u8; 4]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0xff; 6]); // dst = broadcast
+        f.extend_from_slice(&GUEST_MAC); // src = guest
+        f.extend_from_slice(&[0x08, 0x06]); // ethertype = ARP
+        f.extend_from_slice(&[0x00, 0x01]); // htype = Ethernet
+        f.extend_from_slice(&ETH_IPV4.to_be_bytes()); // ptype = IPv4
+        f.extend_from_slice(&[6, 4]); // hlen, plen
+        f.extend_from_slice(&[0x00, 0x01]); // opcode = request
+        f.extend_from_slice(&GUEST_MAC); // sender HW
+        f.extend_from_slice(&[10, 0, 2, 15]); // sender proto (guest)
+        f.extend_from_slice(&[0; 6]); // target HW (unknown)
+        f.extend_from_slice(&target_ip); // target proto
+        f
+    }
+
+    fn drain_egress(nat: &mut NatStack) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        while let Some(f) = nat.pop_egress() {
+            v.push(f);
+        }
+        v
+    }
+
+    // ARP reply (op 2) whose sender protocol address is `sender_ip`.
+    fn is_arp_reply_for(f: &[u8], sender_ip: [u8; 4]) -> bool {
+        f.len() >= 42
+            && f[12] == 0x08
+            && f[13] == 0x06
+            && f[20] == 0
+            && f[21] == 2
+            && f[28..32] == sender_ip
+    }
+
+    #[test]
+    fn answers_gateway_arp_but_ignores_peer_arp() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let dns = DnsForwarder::new([10, 0, 2, 2], GW_MAC, Allowlist::parse(""));
+        let mut nat = nat_with(dns, log);
+
+        // ARP "who has 10.0.2.2" (the gateway) → the NAT owns it → reply with
+        // the gateway MAC, so the guest can route off-subnet through it.
+        nat.push_guest_frame(arp_request([10, 0, 2, 2]));
+        nat.poll(0);
+        let egress = drain_egress(&mut nat);
+        let reply = egress
+            .iter()
+            .find(|f| is_arp_reply_for(f, [10, 0, 2, 2]))
+            .expect("NAT must answer ARP for its gateway IP");
+        assert_eq!(
+            &reply[22..28],
+            &GW_MAC,
+            "ARP reply sender MAC = gateway MAC"
+        );
+
+        // ARP "who has 10.0.2.16" (a peer VM on the same switch) → NOT the
+        // gateway → the NAT must stay silent; the switch delivers it to the real
+        // peer. Answering would blackhole that peer's traffic.
+        nat.push_guest_frame(arp_request([10, 0, 2, 16]));
+        nat.poll(10);
+        let egress = drain_egress(&mut nat);
+        assert!(
+            !egress.iter().any(|f| is_arp_reply_for(f, [10, 0, 2, 16])),
+            "NAT must ignore ARP for peer IPs (no hijack on the shared LAN)"
+        );
+    }
 }
