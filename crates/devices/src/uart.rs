@@ -82,6 +82,16 @@ impl Uart {
         rx || tx
     }
 
+    /// Interrupt-enable register (debug/diagnostics).
+    pub fn ier(&self) -> u8 {
+        self.ier
+    }
+
+    /// Bytes currently queued in the RX FIFO (debug/diagnostics).
+    pub fn rx_len(&self) -> usize {
+        self.rx_buffer.len()
+    }
+
     /// Serialize UART state into `out`. Format: IER (u8), tx_len
     /// (u32LE) + tx_bytes, rx_len (u32LE) + rx_bytes. Base port is
     /// not stored — it's an architectural constant set at

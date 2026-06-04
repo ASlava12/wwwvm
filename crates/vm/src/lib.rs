@@ -1120,7 +1120,7 @@ pub mod snapshot {
     ///   calibration setup at port 0x42 + the port-0x61 gate/
     ///   speaker bits round-trip. Pre-v14 snapshots leave ch2
     ///   idle on restore; the kernel re-arms it next calibration.
-    pub const VERSION: u8 = 14;
+    pub const VERSION: u8 = 15;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
@@ -1500,6 +1500,18 @@ impl Vm {
         let dev_len = dev.len() as u32;
         buf.extend_from_slice(&dev_len.to_le_bytes());
         buf.extend_from_slice(&dev);
+
+        // v15: the protected-mode segment descriptor caches (base/limit/access).
+        // The CPU addresses memory through `seg_cache[].base`, NOT the selector;
+        // pre-v15 restore re-derived these as `sel << 4` (real-mode semantics),
+        // which corrupts a PM guest the instant it resumes execution (every
+        // memory access goes through a wrong base). 6 segments × (u32 base, u32
+        // limit, u8 access) = 54 bytes.
+        for sc in &self.cpu.seg_cache {
+            buf.extend_from_slice(&sc.base.to_le_bytes());
+            buf.extend_from_slice(&sc.limit.to_le_bytes());
+            buf.push(sc.access);
+        }
         buf
     }
 
@@ -1520,14 +1532,14 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=14) {
+        if !matches!(version, 1..=15) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            // v13 / v14 don't extend the CPU image — they extend
-            // device-side blobs (HPET periods in v13, PIT ch2 in
-            // v14).
-            12..=14 => snapshot::CPU_V12_LEN,
+            // v13 / v14 / v15 don't extend the CPU image — they extend
+            // device-side blobs (HPET periods in v13, PIT ch2 in v14) or
+            // append a trailing section (seg_cache in v15).
+            12..=15 => snapshot::CPU_V12_LEN,
             // v10/v11 don't extend the CPU image — they append MMIO
             // sections (LAPIC, then HPET) between RAM and the device
             // blob.
@@ -1805,6 +1817,9 @@ impl Vm {
             lapic_end
         };
         // Device section (v2 and v3). v1 snapshots have nothing here.
+        // `seg_end` tracks where the device blob ends, so the v15 seg_cache
+        // section (if present) can be located right after it.
+        let mut seg_end = mmio_end;
         if version >= 2 {
             let dev_off = mmio_end;
             if bytes.len() < dev_off + 4 {
@@ -1828,7 +1843,42 @@ impl Vm {
             self.io
                 .restore(&bytes[dev_off + 4..dev_off + 4 + dev_len])
                 .map_err(SnapshotError::DeviceRestore)?;
+            seg_end = dev_off + 4 + dev_len;
         }
+
+        // v15 segment-cache section: 6 × (u32 base, u32 limit, u8 access) = 54 B,
+        // right after the device blob. Pre-v15 snapshots lack it and fall back to
+        // the (real-mode-only) `sel << 4` derivation below.
+        let seg_cache_restored: Option<[wwwvm_cpu::SegmentCache; 6]> = if version >= 15 {
+            let need = seg_end + 6 * 9;
+            if bytes.len() < need {
+                return Err(SnapshotError::TooSmall {
+                    got: bytes.len(),
+                    need,
+                });
+            }
+            let mut cache = [wwwvm_cpu::SegmentCache::default(); 6];
+            let mut o = seg_end;
+            for slot in cache.iter_mut() {
+                let rd = |i: usize| {
+                    u32::from_le_bytes([
+                        bytes[o + i],
+                        bytes[o + i + 1],
+                        bytes[o + i + 2],
+                        bytes[o + i + 3],
+                    ])
+                };
+                *slot = wwwvm_cpu::SegmentCache {
+                    base: rd(0),
+                    limit: rd(4),
+                    access: bytes[o + 8],
+                };
+                o += 9;
+            }
+            Some(cache)
+        } else {
+            None
+        };
 
         // Commit CPU state.
         self.cpu.regs = regs;
@@ -1866,16 +1916,20 @@ impl Vm {
         self.cpu.misc_enable = misc_enable;
         self.cpu.tsc_aux = tsc_aux;
         self.cpu.dr = dr;
-        // Re-derive seg_cache from the visible selectors. For real-
-        // mode snapshots this is exact (cache = sel << 4). For a
-        // future PM snapshot the cache values would diverge from
-        // sel<<4 and need their own section in a v4 layout.
-        for (slot, sel) in self.cpu.seg_cache.iter_mut().zip(sregs.iter()) {
-            *slot = wwwvm_cpu::SegmentCache {
-                base: (*sel as u32) << 4,
-                limit: 0xFFFF,
-                access: 0x93,
-            };
+        // Segment descriptor caches. v15+ carries the exact base/limit/access
+        // (required for a protected-mode guest — the CPU addresses memory
+        // through `seg_cache[].base`). Older snapshots are real-mode, where the
+        // cache is exactly `sel << 4`, so derive it.
+        if let Some(cache) = seg_cache_restored {
+            self.cpu.seg_cache = cache;
+        } else {
+            for (slot, sel) in self.cpu.seg_cache.iter_mut().zip(sregs.iter()) {
+                *slot = wwwvm_cpu::SegmentCache {
+                    base: (*sel as u32) << 4,
+                    limit: 0xFFFF,
+                    access: 0x93,
+                };
+            }
         }
         self.booted = true;
         Ok(())
@@ -2453,6 +2507,36 @@ impl Vm {
     /// Drain everything the guest has transmitted since the last call.
     pub fn drain_output(&mut self) -> Vec<u8> {
         self.io.uart_mut().drain_tx()
+    }
+
+    /// Debug: a one-line dump of interrupt + LAPIC-timer state, for diagnosing
+    /// snapshot/restore fidelity (compare the string pre-snapshot vs after
+    /// `restore`/`restore_export`). Not part of the stable API.
+    pub fn debug_irq(&self) -> String {
+        let l = self.mem.lapic_bytes();
+        let rd = |o: usize| u32::from_le_bytes([l[o], l[o + 1], l[o + 2], l[o + 3]]);
+        format!(
+            "IF={} halted={} PICm[imr={:02x} irr={:02x} isr={:02x}] \
+             PICs[imr={:02x} irr={:02x} isr={:02x}] \
+             uart[irq={} ier={:02x} rx_len={}] \
+             LAPIC[lvt_timer={:08x} init={:08x} cur={:08x} div={:08x} svr={:08x}]",
+            self.cpu.flags & wwwvm_cpu::flag::IF != 0,
+            self.cpu.halted,
+            self.io.pic.imr,
+            self.io.pic.irr,
+            self.io.pic.isr,
+            self.io.slave_pic.imr,
+            self.io.slave_pic.irr,
+            self.io.slave_pic.isr,
+            self.io.uart.irq_pending(),
+            self.io.uart.ier(),
+            self.io.uart.rx_len(),
+            rd(0x320),
+            rd(0x380),
+            rd(0x390),
+            rd(0x3E0),
+            rd(0xF0),
+        )
     }
 
     /// Drain the Ethernet frames the guest's NIC driver has transmitted

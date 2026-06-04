@@ -3,17 +3,14 @@
 //! Boots Alpine, writes a marker into the (tmpfs) fs, takes a paged
 //! `snapshot_export`, restores it into a fresh VM, and `cat`s the marker back.
 //!
-//! KNOWN LIMITATION (this currently FAILS, exit 1): the export/decode round-trip
-//! is byte-exact (proven by `vm::paged` unit tests), and `restore_export`
-//! reconstructs the identical snapshot blob — but a restored full Linux guest
-//! does NOT faithfully resume: it busy-loops (first run_steps returns
-//! StepBudget, not Halted) and never services console I/O (no output, no
-//! response to input). Signature of device-timer/interrupt state not resuming
-//! after restore (this kernel uses the LAPIC timer + IRQ routing; no tick → the
-//! idle loop spins, no UART IRQ → input ignored). A pre-existing emulator-core
-//! snapshot-FIDELITY gap, independent of the storage/transport layer — it also
-//! affects the web Save/Load. Use this example to drive a fix; it PASSES when a
-//! restored guest resumes and `cat /tmp/m` prints the marker.
+//! PASSES (since the v15 seg_cache fix). It also guards against a regression of
+//! that fix: before v15, the snapshot saved segment SELECTORS but restore
+//! re-derived the hidden descriptor caches as `sel << 4` (real-mode), so a
+//! protected-mode guest's segment bases came back wrong — every memory access
+//! corrupted the instant it resumed execution (the guest woke from the restored
+//! HLT, crashed into an IF=0 busy-spin, and serviced no I/O). v15 saves and
+//! restores the true `seg_cache` (base/limit/access). The export/storage layer
+//! was never at fault: `vm::paged` round-trips byte-exact.
 //!
 //! Prereqs:
 //!   WWWVM_DUMP_INITRAMFS=/tmp/wwwvm-console.cpio WWWVM_ALPINE_MINIROOT=/tmp/alpine/root \
@@ -79,6 +76,7 @@ fn main() {
     }
 
     // --- snapshot (paged export) → restore into a FRESH VM ---
+    eprintln!("[snapshot_resume] PRE-SNAPSHOT  {}", vm.debug_irq());
     let export = vm.snapshot_export();
     eprintln!(
         "[snapshot_resume] exported {} bytes; restoring into a fresh VM",
@@ -92,6 +90,7 @@ fn main() {
         vm2.is_booted(),
         vm2.is_halted()
     );
+    eprintln!("[snapshot_resume] POST-RESTORE  {}", vm2.debug_irq());
 
     // --- confirm the marker survived: cat it back ---
     let mut out2 = Vec::new();
@@ -108,6 +107,9 @@ fn main() {
     eprintln!("[snapshot_resume] warmup output: {} bytes", out2.len());
     // Kick with a newline — a live shell reprints its prompt.
     vm2.send_input(b"\n");
+    eprintln!("[snapshot_resume] POST-INPUT(0) {}", vm2.debug_irq());
+    vm2.run_steps_idle_aware(2_000_000);
+    eprintln!("[snapshot_resume] POST-INPUT(1) {}", vm2.debug_irq());
     for _ in 0..60 {
         vm2.run_steps_idle_aware(2_000_000);
         out2.extend(vm2.drain_output());
