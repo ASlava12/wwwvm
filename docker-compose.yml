@@ -9,6 +9,8 @@
 services:
   relay:
     build: .
+    image: wwwvm-servers:latest # shared by the snapstore service (built once)
+    command: ["wwwvm-proxy", "0.0.0.0:8080"]
     expose: ["8080"] # internal only; reached via Caddy /ws
     environment:
       # SCOPE THIS to only the hosts your demo needs (apk mirrors here). Never
@@ -25,6 +27,22 @@ services:
       # WWWVM_PROXY_UPSTREAMS_FILE: "/data/proxies.json"
     restart: unless-stopped
 
+  # Content-addressed snapshot store (custom-snapshot platform). Reached via
+  # Caddy at /snap/* (same origin as the page). Uploads need the admin token;
+  # reads are open. Without WWWVM_SNAPSTORE_TOKEN it's read-only.
+  snapstore:
+    image: wwwvm-servers:latest # same image relay builds (run after relay)
+    command: ["snapstore-server", "0.0.0.0:8090"]
+    expose: ["8090"]
+    environment:
+      WWWVM_SNAPSTORE_TOKEN: "${WWWVM_SNAPSTORE_TOKEN:-}"
+      WWWVM_SNAPSTORE_ROOT: "/data"
+    volumes:
+      - snapstore_data:/data
+    depends_on:
+      - relay
+    restart: unless-stopped
+
   caddy:
     image: caddy:2
     ports:
@@ -39,8 +57,10 @@ services:
       - caddy_config:/config
     depends_on:
       - relay
+      - snapstore
     restart: unless-stopped
 
 volumes:
   caddy_data:
   caddy_config:
+  snapstore_data:

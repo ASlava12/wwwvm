@@ -51,6 +51,29 @@ docker compose up --build      # WWWVM_DOMAIN defaults to localhost
   the relay sees `Origin: https://<domain>`.
 - **relay** — `wwwvm-proxy`, internal only (not published). Configured by env in
   `docker-compose.yml`.
+- **snapstore** — `snapstore-server`, the content-addressed snapshot store,
+  reached at `/snap/*` (same origin as the page). Built into the same image as
+  the relay.
+
+## Custom snapshots (the "recipe → store" workflow)
+
+The compose stack includes the snapshot store at `https://<domain>/snap`. To use
+it from the UI's **Custom snapshots** panel, set **store URL** to `/snap` (same
+origin — no CORS), an **admin token** (must match `WWWVM_SNAPSTORE_TOKEN` below)
+to upload, a **name**, and a **recipe** (shell commands run on the booted base).
+Build&upload snapshots the VM and stores only the RAM pages the store lacks
+(content-addressed by blake3 — a derived snapshot costs just what its recipe
+changed). Refresh/Load restores a stored snapshot.
+
+Set the upload token (without it the store is read-only):
+
+```sh
+WWWVM_DOMAIN=example.com WWWVM_SNAPSTORE_TOKEN=some-long-secret \
+  docker compose up -d --build
+```
+
+Snapshots persist in the `snapstore_data` volume. Page/manifest GETs are
+immutable, so they're cache/CDN-friendly.
 
 ## Security knobs (set in docker-compose.yml / env)
 

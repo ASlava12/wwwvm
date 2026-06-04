@@ -14,6 +14,13 @@
 		reverse_proxy relay:8080
 	}
 
+	# Snapshot store at /snap/* → snapstore-server (path prefix stripped, so
+	# /snap/pages/<h> → /pages/<h>). Same origin as the page, so the UI's
+	# "store URL" is just "/snap". Uploads are admin-token-gated by the service.
+	handle_path /snap/* {
+		reverse_proxy snapstore:8090
+	}
+
 	# Everything else: the static site (web/ mounted at /srv/web).
 	handle {
 		root * /srv/web
