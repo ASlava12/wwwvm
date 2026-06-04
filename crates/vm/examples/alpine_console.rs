@@ -128,7 +128,21 @@ fn main() {
     // setup. The insmods are silent no-ops on a rootfs that lacks the .ko
     // files (the standard minirootfs vs the modroot). PATH is exported so
     // applets — and your interactive commands — resolve by bare name.
-    let net_setup = if net_stub {
+    // LAN mode (WWWVM_NET_LAN): for parallel VMs wired together by the in-page
+    // L2 switch — NO NAT gateway. Each VM reads its own static IP (and optional
+    // gateway) from the kernel cmdline so one image serves a whole LAN, e.g.
+    // `wwwvm.ip=10.0.0.5/24`. The browser hub gives each worker a distinct
+    // `wwwvm.ip=` (and a distinct MAC via set_nic_mac) before booting.
+    let net_lan = std::env::var_os("WWWVM_NET_LAN").is_some();
+    let net_setup = if net_lan {
+        "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
+         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
+         ip link set eth0 up 2>/dev/null\n\
+         IP=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.ip=//p')\n\
+         [ -n \"$IP\" ] && ip addr add \"$IP\" dev eth0 2>/dev/null\n\
+         GW=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.gw=//p')\n\
+         [ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\n"
+    } else if net_stub {
         "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
          insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
          ip link set eth0 up 2>/dev/null\n\
