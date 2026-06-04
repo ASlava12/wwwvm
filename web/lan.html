@@ -9,15 +9,34 @@
       a { color: #58a6ff; }
       .bar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-bottom: .6rem; }
       .bar input, .bar select, .bar button { font-family: inherit; }
+      .bar input[type="number"] { width: 4rem; }
       .status { color: #8b949e; margin: .4rem 0; }
-      #lan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: .6rem; }
-      .vm-cell { border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
-      .vm-head { background: #161b22; padding: .3rem .5rem; font-size: .8rem; }
-      .vm-con { margin: 0; padding: .4rem .5rem; height: 220px; overflow: auto; white-space: pre-wrap;
+
+      /* Main area: focused VM stage on the left, openable VM list on the right. */
+      #lan-main { display: flex; gap: .6rem; align-items: stretch; }
+      #vm-stage { flex: 1; min-width: 0; }
+      .vm-pane { display: none; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+      .vm-pane.active { display: block; }
+      .vm-head { background: #161b22; padding: .3rem .5rem; font-size: .85rem; }
+      .vm-con { margin: 0; padding: .4rem .5rem; height: 60vh; overflow: auto; white-space: pre-wrap;
                 word-break: break-all; font-size: 12px; background: #000; }
       .vm-row { padding: .3rem .5rem; background: #161b22; }
       .vm-row input { width: 100%; box-sizing: border-box; background: #0d1117; color: #c9d1d9;
                       border: 1px solid #30363d; border-radius: 4px; padding: .2rem .4rem; }
+
+      /* Right-hand openable list of running VMs. */
+      #vm-list { width: 220px; flex: 0 0 220px; border: 1px solid #30363d; border-radius: 6px;
+                 overflow: auto; background: #0d1117; }
+      #vm-list.collapsed { display: none; }
+      .vm-list-head { background: #161b22; padding: .35rem .5rem; font-size: .8rem; color: #8b949e;
+                      position: sticky; top: 0; }
+      .vm-item { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #21262d;
+                 background: transparent; color: #c9d1d9; font: inherit; padding: .4rem .55rem; cursor: pointer; }
+      .vm-item:hover { background: #161b22; }
+      .vm-item.sel { background: #1f6feb33; border-left: 3px solid #58a6ff; padding-left: calc(.55rem - 3px); }
+      .vm-item .ip { color: #8b949e; font-size: .78rem; }
+      .vm-item .st { float: right; font-size: .72rem; color: #6e7681; }
+      .vm-item.sel .st, .vm-item .st.up { color: #3fb950; }
     </style>
   </head>
   <body>
@@ -25,17 +44,28 @@
     <p class="status">
       Each VM runs in its own Web Worker; their NICs are bridged by an in-page
       learning switch (no NAT). Needs a LAN image (built with
-      <code>WWWVM_NET_LAN</code> + NIC modules). Boot, wait for the shells, then
-      e.g. <code>ping -c2 10.0.0.2</code> in VM 1. · <a href="./index.html">single-VM demo</a>
+      <code>WWWVM_NET_LAN</code> + NIC modules). Start, wait for the shells, pick a
+      VM on the right, then e.g. <code>ping -c2 10.0.0.2</code> in VM 1. ·
+      <a href="./index.html">single-VM demo</a>
     </p>
     <div class="bar">
-      <label>VMs: <input id="lan-count" type="number" min="2" max="8" value="2" size="2" /></label>
+      <label>VMs: <input id="lan-count" type="number" min="1" max="8" value="2" /></label>
       <label>image: <select id="lan-image"></select></label>
+      <label title="Guest RAM per VM (MiB)">RAM: <input id="lan-ram" type="number" min="64" step="64" value="256" /> MiB</label>
+      <label title="Mount a tmpfs RAM disk at /mnt/ramdisk inside each guest (0 = none). Needs a rebuilt image.">
+        RAM disk: <input id="lan-ramdisk" type="number" min="0" step="16" value="0" /> MiB
+      </label>
       <button id="lan-start">Start LAN</button>
       <button id="lan-stop">Stop</button>
+      <button id="vm-list-toggle" title="Show/hide the VM list">VMs ☰</button>
     </div>
     <div id="lan-status" class="status">pick an image and Start</div>
-    <div id="lan-grid"></div>
-    <script type="module" src="./lan.js?v=1"></script>
+    <div id="lan-main">
+      <section id="vm-stage"></section>
+      <aside id="vm-list">
+        <div class="vm-list-head">Running VMs</div>
+      </aside>
+    </div>
+    <script type="module" src="./lan.js?v=2"></script>
   </body>
 </html>
