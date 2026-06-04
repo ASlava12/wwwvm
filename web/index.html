@@ -38,6 +38,13 @@
               value="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4" />
           </label>
           <br />
+          <label title="Guest RAM (MiB) — overrides the image default">RAM:
+            <input id="vm-ram" type="number" min="64" step="64" value="256" size="5" /> MiB
+          </label>
+          <label title="Mount a tmpfs RAM disk at /mnt/ramdisk (0 = none; needs a rebuilt image)">RAM disk:
+            <input id="vm-ramdisk" type="number" min="0" step="16" value="0" size="5" /> MiB
+          </label>
+          <br />
           <label>
             <input type="checkbox" id="fb-enable" checked />
             Graphics framebuffer (efifb → canvas)
@@ -245,6 +252,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=17"></script>
+    <script type="module" src="./main.js?v=18"></script>
   </body>
 </html>

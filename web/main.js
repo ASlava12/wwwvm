@@ -761,7 +761,14 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
   // (The guest runs on UTC — its RTC is seeded with real UTC time.)
   armAutorunOnReady($("autorun").value.split("\n").map((s) => s.trim()).filter(Boolean));
   useWorker = $("worker-enable")?.checked ?? true;
-  const cmdline = $("cmdline").value;
+  // RAM (MiB) + optional tmpfs RAM disk are set in the UI; the RAM input
+  // overrides the image default, the RAM disk appends `wwwvm.ramdisk=N` to the
+  // cmdline (the guest /init mounts it at /mnt/ramdisk).
+  const ramEl = $("vm-ram");
+  const v = ramEl ? parseInt(ramEl.value, 10) : NaN;
+  if (v >= 64) ramMiB = v;
+  const rd = parseInt($("vm-ramdisk")?.value, 10) || 0;
+  const cmdline = $("cmdline").value + (rd > 0 ? ` wwwvm.ramdisk=${rd}` : "");
   const fbEnabled = $("fb-enable").checked;
   const [fbw, fbh] = ($("fb-res").value || "800x600").split("x").map(Number);
   const kib = (n) => `${(n >> 10).toLocaleString()} KiB`;
@@ -910,6 +917,7 @@ let imageManifest = [];
 function applyImageToControls(img) {
   if (!img) return;
   if (img.cmdline) $("cmdline").value = img.cmdline;
+  if ($("vm-ram") && img.ramMiB) $("vm-ram").value = img.ramMiB; // image's RAM default (overridable)
   $("fb-enable").checked = !!img.gui;
   if (img.fbRes) {
     const sel = $("fb-res");
