@@ -187,7 +187,7 @@ function addOneVm() {
   meta[i] = { ip: ipOf(i), ram, ramdisk };
 
   addPane(i);
-  const worker = new Worker(new URL("./vm-worker.js?v=9", import.meta.url), { type: "module" });
+  const worker = new Worker(new URL("./vm-worker.js?v=10", import.meta.url), { type: "module" });
   wireWorker(i, worker);
   workers.push(worker);
 

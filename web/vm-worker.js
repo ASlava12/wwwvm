@@ -35,6 +35,9 @@ let rxBytes = 0;
 // {} = direct, {auto:true} = server rotates, {upstream:{kind,host,port}} = chain.
 let netUpstream = {};
 const netConns = new Map();
+// Warn once per boot if the relay can't be reached — otherwise networking just
+// hangs silently (apk/wget never connect) with no clue the proxy isn't up.
+let relayWarned = false;
 
 // Resolve one host (DoH via Cloudflare) and feed the answer into the NAT's DNS
 // cache. Deduped while in flight so the guest's DNS retries don't spam DoH.
@@ -81,6 +84,10 @@ function netOpenConn({ id, host, port }) {
   try {
     ws = new WebSocket(netProxyUrl);
   } catch (e) {
+    if (!relayWarned) {
+      relayWarned = true;
+      post({ t: "output", text: `\r\n[net] bad relay URL "${netProxyUrl}": ${e.message || e}\r\n` });
+    }
     vm.net_conn_closed(id);
     netConns.delete(id);
     return;
@@ -99,7 +106,19 @@ function netOpenConn({ id, host, port }) {
     }
     c.pendingIn.push(new Uint8Array(ev.data));
   };
-  ws.onclose = ws.onerror = () => { c.hostClosed = true; };
+  ws.onclose = ws.onerror = () => {
+    // Never opened → the relay is unreachable (not started / wrong URL / blocked).
+    // Surface it once so a hung `apk`/`wget` has a visible cause.
+    if (!c.open && !relayWarned) {
+      relayWarned = true;
+      post({
+        t: "output",
+        text: `\r\n[net] relay unreachable at ${netProxyUrl} — start it (cargo run -p wwwvm-proxy) ` +
+          `and ensure its allowlist + WWWVM_PROXY_ORIGINS permit this page.\r\n`,
+      });
+    }
+    c.hostClosed = true;
+  };
 }
 
 function pumpNet() {
@@ -307,6 +326,7 @@ self.onmessage = async (e) => {
         netEnabled = false;
         switchNet = false;
         hybridNet = false;
+        relayWarned = false;
         tick = 0;
         bootMs = performance.now();
         txFrames = rxFrames = txBytes = rxBytes = 0;
