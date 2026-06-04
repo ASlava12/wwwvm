@@ -241,6 +241,10 @@ API из JS:
 - **Память/IDT:** `set_ivt(vec, seg, off)`, `read_mem_u8/u16(addr)`,
   `vga_text_snapshot() -> String`
 - **Persistence:** `snapshot() -> Vec<u8>` / `restore(&[u8]) -> Result<…>`
+  (формат **v15**: CPU+RAM+устройства+LAPIC/HPET **+ protected-mode
+  seg_cache** — base/limit каждого сегмента; до v15 restore восстанавливал
+  кэши как `sel<<4`, из-за чего PM-гость (Linux) падал при resume — см.
+  «Снапшот-платформа» ниже)
 
 Три встроенных гостя:
 - `HELLO_GUEST` (43 байта) — polling LSR + echo;
@@ -347,6 +351,29 @@ Teeth: `queue::tests::guest_tcp_through_queue_nat_echoes` — настоящий
 гостевой smoltcp-клиент через NAT (handshake + данные в обе стороны) +
 half-close/reap различение. Браузерный e2e (WebSocket+DoH) — только в
 реальном браузере (см. `docs/BROWSER_NET.md`).
+
+### Снапшот-платформа + виртуальный LAN (`crates/snapstore`, `crates/net::switch`, `web/lan.html`)
+
+Две фичи для обучающих сценариев (всё в браузере; сервер — только хранилище):
+
+- **Кастомные снапшоты (base + recipe → content-addressed page-diff).** Снапшот
+  бьётся на страницы 4 КиБ, каждая адресуется blake3-хешем (`crates/vm::paged`
+  `encode_export`/`decode_export`; `Vm::snapshot_export`/`restore_export`,
+  проброшены в wasm). Производный снапшот делит с базой неизменённые страницы →
+  хранится только diff (изменённые рецептом), дедуп между снапшотами. Сервер
+  `crates/snapstore` (`snapstore-server`) — filesystem content-addressed store:
+  `put_page` сверяет `blake3(body)==hash` (нельзя подделать/испортить страницу),
+  идемпотентный дедуп; PUT под admin-токеном (`WWWVM_SNAPSTORE_TOKEN`), GET
+  открыт (immutable → кешируемо), CORS. Веб-UI «Custom snapshots»: загрузить
+  базу → рецепт (команды в гостя) → `snapshot_export` → залить только
+  недостающие страницы + манифест; обратная загрузка восстанавливает. Teeth:
+  `examples/snapshot_resume` — маркер в гостевой ФС переживает export→restore.
+- **Параллельные VM в одном L2-LAN.** `crates/net::switch` — learning Ethernet
+  switch + `Hub` (drain TX → route → inject RX); каждая VM в своём Web Worker
+  (`web/lan.html`), у каждой свой MAC (`set_nic_mac`) и IP (cmdline
+  `wwwvm.ip=10.0.0.N/24`, режим `WWWVM_NET_LAN` в `/init`). Teeth:
+  `examples/two_vm_lan` — два настоящих Alpine-гостя пингуют друг друга через
+  свитч (2/2 received). Деплой снапстора — в `docs/DEPLOY.md` (Caddy `/snap`).
 
 ### Веб-демо (`web/`)
 
