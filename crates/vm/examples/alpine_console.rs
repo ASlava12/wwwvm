@@ -272,16 +272,25 @@ Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.c
         let (w, h) = s.split_once('x')?;
         Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
     });
+    // WWWVM_CMDLINE_EXTRA is appended to the kernel cmdline — e.g.
+    // `wwwvm.ip=10.0.0.1/24` for the LAN init (WWWVM_NET_LAN), or any other
+    // boot param to test. Empty/unset adds nothing.
+    let extra = std::env::var("WWWVM_CMDLINE_EXTRA").unwrap_or_default();
+    let extra = if extra.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {}", extra.trim())
+    };
     if let Some((w, h)) = fb {
         vm.enable_linear_framebuffer(w, h, wwwvm_vm::VIDEO_TYPE_EFI);
-        vm.set_kernel_cmdline(
-            "earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4",
-        );
+        vm.set_kernel_cmdline(&format!(
+            "earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=1000000 loglevel=4{extra}"
+        ));
         eprintln!("[wwwvm] framebuffer {w}x{h}x32 enabled (efifb)");
     } else {
-        vm.set_kernel_cmdline(
-            "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4",
-        );
+        vm.set_kernel_cmdline(&format!(
+            "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 loglevel=4{extra}"
+        ));
     }
     vm.set_ramdisk(&cpio).expect("set_ramdisk");
     vm.start_protected_mode_at(bz.code32_start);
