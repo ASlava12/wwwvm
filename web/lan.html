@@ -37,11 +37,21 @@
       .vm-item .ip { color: #8b949e; font-size: .78rem; }
       .vm-item .st { float: right; font-size: .72rem; color: #6e7681; }
       .vm-item.sel .st, .vm-item .st.up { color: #3fb950; }
+
+      /* Embedded mode (?embed=1, e.g. the Fleet panel inside index.html): drop
+         the standalone page chrome so only the lab controls + VMs show. */
+      body.embed { margin: .5rem; }
+      body.embed h1, body.embed .intro { display: none; }
     </style>
   </head>
   <body>
+    <script>
+      // Set before render so the chrome never flashes in the embedded panel.
+      if (new URLSearchParams(location.search).has("embed"))
+        document.body.classList.add("embed");
+    </script>
     <h1>wwwvm — Virtual LAN <small style="color:#8b949e">· parallel VMs on one L2 switch</small></h1>
-    <p class="status">
+    <p class="status intro">
       Each VM runs in its own Web Worker; their NICs are bridged by an in-page
       learning switch. Tick <b>Internet</b> to also give every VM a NAT gateway
       (10.0.2.2 → your WebSocket relay) so they reach each other <em>and</em> the

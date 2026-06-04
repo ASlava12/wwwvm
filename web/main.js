@@ -301,6 +301,10 @@ function sendMouse(dx, dy, buttons) {
 // Collapse/show the settings sidebar.
 $("sidebar-toggle")?.addEventListener("click", () =>
   document.body.classList.toggle("sidebar-hidden"));
+// Collapse/show the Fleet panel (the embedded virtual-LAN lab). The lab keeps
+// running while hidden — the iframe isn't destroyed, just display:none'd.
+$("fleet-toggle")?.addEventListener("click", () =>
+  document.body.classList.toggle("fleet-hidden"));
 // Fullscreen (canvas or UART) + Keyboard Lock: in fullscreen Chromium grants
 // keyboard lock so even browser-reserved combos (Ctrl+W/T/N) reach the guest.
 // Firefox has no Keyboard Lock API, so there those combos can't be captured.

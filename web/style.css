@@ -35,6 +35,27 @@ body.sidebar-hidden #controls { display: none; }
 
 #stage { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: .75rem; }
 
+/* Fleet — the virtual-LAN lab (lan.html) embedded as a right-hand panel, shown
+   by default. Rightmost column; toggled by the header "🖥 Fleet" button. */
+#fleet { order: 2; flex: 0 0 30rem; display: flex; flex-direction: column; min-height: 0;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
+body.fleet-hidden #fleet { display: none; }
+.fleet-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+  padding: .4rem .6rem; border-bottom: 1px solid var(--border); font-size: .85rem; }
+.fleet-head small { color: var(--muted); }
+.fleet-head a { color: var(--accent); text-decoration: none; font-size: .8rem; }
+#fleet-frame { flex: 1 1 auto; width: 100%; border: 0; min-height: 0; background: var(--bg); }
+#fleet-toggle { margin-left: auto; align-self: center; font: inherit; font-size: .82rem;
+  cursor: pointer; background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: .25rem .6rem; }
+#fleet-toggle:hover { border-color: var(--accent); }
+body.fleet-hidden #fleet-toggle { opacity: .55; }
+/* Narrow screens: drop the Fleet below the content instead of squeezing it. */
+@media (max-width: 1200px) {
+  main { flex-wrap: wrap; }
+  #fleet { order: 3; flex-basis: 100%; min-height: 26rem; }
+}
+
 /* Canvas: hidden until the guest produces a framebuffer (body.has-fb). Bounded
    so it shares the column with the terminal; the UART grows to fill when absent. */
 #canvas-pane { display: none; flex: 0 1 auto; min-height: 0; flex-direction: column;
