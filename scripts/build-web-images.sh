@@ -65,6 +65,13 @@ say "packing GUI initramfs…"
 WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_NET_STUB=1 WWWVM_FB=1024x768 \
   WWWVM_DUMP_INITRAMFS="$OUT/alpine-gui.cpio" "$BIN"
 
+# LAN variant: WWWVM_NET_LAN → /init brings eth0 up and reads its IP from the
+# kernel cmdline (wwwvm.ip=10.0.0.N/24), no NAT. For the web/lan.html lab, which
+# boots several of these on the in-page L2 switch (each a distinct MAC + IP).
+say "packing LAN initramfs…"
+WWWVM_ALPINE_KERNEL="$KERNEL" WWWVM_ALPINE_MINIROOT="$MINIROOT" WWWVM_NET_LAN=1 \
+  WWWVM_DUMP_INITRAMFS="$OUT/alpine-lan.cpio" "$BIN"
+
 # 4. Copy the kernel beside them.
 cp -f "$KERNEL" "$OUT/vmlinuz-lts"
 
@@ -121,6 +128,7 @@ GUI_CMD="earlyprintk=ttyS0,115200 console=tty0 console=ttyS0 panic=10 lpj=100000
 ksz=$(stat -c%s "$OUT/vmlinuz-lts")
 csz=$(stat -c%s "$OUT/alpine-console.cpio.gz")
 gsz=$(stat -c%s "$OUT/alpine-gui.cpio.gz")
+lsz=$(stat -c%s "$OUT/alpine-lan.cpio.gz")
 IMAGES=$(cat <<JSON
     {
       "id": "alpine-console",
@@ -142,6 +150,17 @@ IMAGES=$(cat <<JSON
       "fbRes": "1024x768",
       "ramMiB": 512,
       "bytes": $((ksz + gsz))
+    },
+    {
+      "id": "alpine-lan",
+      "name": "Alpine — LAN node (cmdline IP, for web/lan.html)",
+      "kernel": "vmlinuz-lts",
+      "initramfs": "alpine-lan.cpio.gz",
+      "cmdline": "$CONSOLE_CMD",
+      "gui": false,
+      "lan": true,
+      "ramMiB": 256,
+      "bytes": $((ksz + lsz))
     }
 JSON
 )
