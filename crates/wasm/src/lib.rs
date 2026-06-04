@@ -592,12 +592,27 @@ impl WwwVm {
     /// hosts in any real deployment — an open relay is dangerous). Gateway is
     /// 10.0.2.2, guest 10.0.2.15 (matching the native console).
     pub fn net_enable(&mut self, allowlist: &str) {
+        self.net_enable_ip(allowlist, &[10, 0, 2, 15]);
+    }
+
+    /// Like [`net_enable`] but with a custom guest IP, so several worker VMs can
+    /// share one NAT-gatewayed subnet (10.0.2.0/24, gateway 10.0.2.2): each VM
+    /// is on the in-page L2 switch for peer traffic AND uses this NAT for the
+    /// outside world. The worker routes each transmitted frame by destination
+    /// (gateway MAC → the NAT via [`net_push_frame`], peer MAC → the switch,
+    /// broadcast → both). The NAT must address its unicast replies (DNS, TCP) to
+    /// the *right* guest, so each VM passes its own IP here.
+    pub fn net_enable_ip(&mut self, allowlist: &str, guest_ip: &[u8]) {
         const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
         const GW_IP: [u8; 4] = [10, 0, 2, 2];
-        const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+        let gip = if guest_ip.len() == 4 {
+            [guest_ip[0], guest_ip[1], guest_ip[2], guest_ip[3]]
+        } else {
+            [10, 0, 2, 15]
+        };
         let conns = QueueConnector::new();
         let dns = DnsForwarder::new(GW_IP, GW_MAC, Allowlist::parse(allowlist));
-        let nat = NatStack::with_connect(GW_IP, GW_MAC, GUEST_IP, dns, conns.connector());
+        let nat = NatStack::with_connect(GW_IP, GW_MAC, gip, dns, conns.connector());
         self.net = Some(NetBridge {
             nat,
             conns,
@@ -672,6 +687,49 @@ impl WwwVm {
                 break;
             }
             guard -= 1;
+        }
+    }
+
+    // --- Hybrid (switch + NAT) seams ---
+    //
+    // For VMs that are BOTH on the in-page L2 switch (peer traffic) and behind
+    // this NAT (the outside world), net_pump's "drain ALL NIC frames into the
+    // NAT" is wrong — peer frames must go to the switch, not the NAT. So the
+    // worker drains the NIC itself, routes each frame by destination, and uses
+    // these to drive only the NAT half: push the gateway/broadcast frames in,
+    // poll, then pop the NAT's replies back out to the NIC.
+
+    /// Feed one guest-transmitted Ethernet frame into the NAT. The worker calls
+    /// this for frames bound for the gateway MAC (and broadcasts); peer-bound
+    /// frames go to the L2 switch instead. No-op when networking is off.
+    pub fn net_push_frame(&mut self, frame: &[u8]) {
+        if let Some(net) = self.net.as_mut() {
+            net.nat.push_guest_frame(frame.to_vec());
+        }
+    }
+
+    /// Advance the NAT one tick without draining the NIC (the worker pushes
+    /// frames selectively via [`Self::net_push_frame`]). Pair with
+    /// [`Self::net_pop_egress`]. No-op when networking is off.
+    pub fn net_poll(&mut self, now_ms: f64) {
+        if let Some(net) = self.net.as_mut() {
+            net.now_ms = now_ms as i64;
+            net.nat.poll(net.now_ms);
+        }
+    }
+
+    /// Take one frame the NAT wants delivered to the guest (its replies from the
+    /// outside world), or `undefined` when none. The worker injects it into the
+    /// NIC; on a full RX ring it re-pushes via [`Self::net_push_egress_front`].
+    pub fn net_pop_egress(&mut self) -> Option<Vec<u8>> {
+        self.net.as_mut().and_then(|net| net.nat.pop_egress())
+    }
+
+    /// Re-queue a popped egress frame at the front (the RX ring was full), so
+    /// it's retried next tick and ordering is preserved.
+    pub fn net_push_egress_front(&mut self, frame: &[u8]) {
+        if let Some(net) = self.net.as_mut() {
+            net.nat.requeue_egress_front(frame.to_vec());
         }
     }
 

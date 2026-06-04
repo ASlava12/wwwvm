@@ -21,7 +21,15 @@ let tick = 0;
 // ---- network relay (mirrors the main-thread fallback in main.js) ----
 let netEnabled = false;
 let switchNet = false; // virtual-LAN mode: raw L2 frames ↔ the in-page hub
+let hybridNet = false; // LAN + NAT: peer frames → hub, gateway frames → NAT
 let netProxyUrl = "ws://localhost:8080";
+// LAN live-stats counters (reported to the lab UI): frames/bytes in & out of
+// this VM's NIC, plus a boot timestamp for uptime.
+let bootMs = 0;
+let txFrames = 0;
+let rxFrames = 0;
+let txBytes = 0;
+let rxBytes = 0;
 // Upstream-proxy selection from main.js, merged into every connect frame:
 // {} = direct, {auto:true} = server rotates, {upstream:{kind,host,port}} = chain.
 let netUpstream = {};
@@ -96,6 +104,14 @@ function netOpenConn({ id, host, port }) {
 function pumpNet() {
   if (!netEnabled) return;
   vm.net_pump(performance.now());
+  pumpRelay();
+}
+
+// DNS + per-connection WebSocket plumbing shared by NAT and hybrid modes. Reads
+// the NAT's pending work (new flows, DNS queries, write-closes) and shuttles
+// payload over the proxy WebSockets. Assumes the NAT was already advanced
+// (net_pump for pure-NAT, net_poll for hybrid).
+function pumpRelay() {
   // On-demand DNS: resolve names the guest queried that weren't pre-cached
   // (the path that makes an allow-all "*" list work).
   let dnsReqs;
@@ -187,9 +203,63 @@ function pumpSwitch() {
   for (;;) {
     const f = vm.drain_tx_frame();
     if (f === undefined || f === null) break;
+    txFrames++; txBytes += f.length;
     frames.push(f);
   }
   if (frames.length) post({ t: "tx", frames }, frames.map((f) => f.buffer));
+}
+
+// Gateway MAC the in-wasm NAT answers to (matches net_enable_ip's GW_MAC).
+const GW_MAC = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+const isGwMac = (f) =>
+  f[0] === GW_MAC[0] && f[1] === GW_MAC[1] && f[2] === GW_MAC[2] &&
+  f[3] === GW_MAC[3] && f[4] === GW_MAC[4] && f[5] === GW_MAC[5];
+
+// Hybrid LAN + NAT: one NIC serves both peer traffic and the outside world.
+// Route each transmitted frame by destination — frames for the gateway MAC go
+// into the NAT; broadcasts go to BOTH (the NAT answers gateway ARP/DNS, peers
+// see the broadcast); everything else is peer unicast → the hub. The NAT's
+// replies (net_pop_egress) are injected straight back into this VM's NIC.
+function pumpHybrid() {
+  if (!vm) return;
+  const txToHub = [];
+  for (;;) {
+    const f = vm.drain_tx_frame();
+    if (f === undefined || f === null) break;
+    txFrames++; txBytes += f.length;
+    const group = (f[0] & 1) === 1; // broadcast / multicast
+    if (isGwMac(f)) {
+      vm.net_push_frame(f); // outside world only
+    } else if (group) {
+      vm.net_push_frame(f); // gateway may answer (ARP/DHCP)…
+      txToHub.push(f);      // …and peers see it too
+    } else {
+      txToHub.push(f);      // peer unicast
+    }
+  }
+  if (txToHub.length) post({ t: "tx", frames: txToHub }, txToHub.map((f) => f.buffer));
+  // Advance the NAT and drain its replies into the NIC (bounded; requeue on a
+  // full RX ring so ordering holds and we retry next tick).
+  vm.net_poll(performance.now());
+  let guard = 1024;
+  while (guard-- > 0) {
+    const f = vm.net_pop_egress();
+    if (f === undefined || f === null) break;
+    if (!vm.inject_rx_frame(f)) { vm.net_push_egress_front(f); break; }
+    rxFrames++; rxBytes += f.length;
+  }
+  pumpRelay();
+}
+
+// Per-VM live stats for the LAN lab's right-hand list (uptime + RX/TX).
+function postLanStat() {
+  if (!vm || !bootMs) return;
+  post({
+    t: "stat",
+    upMs: performance.now() - bootMs,
+    txFrames, rxFrames, txBytes, rxBytes,
+    flows: netEnabled ? vm.net_conn_count() : 0,
+  });
 }
 
 function loop() {
@@ -213,11 +283,13 @@ function loop() {
     running = false;
     return;
   }
-  if (switchNet) pumpSwitch();
+  if (hybridNet) pumpHybrid();
+  else if (switchNet) pumpSwitch();
   else pumpNet();
   tick++;
   if (tick % 6 === 0) postFb();
   if (tick % 12 === 0) postStatus();
+  if ((switchNet || hybridNet) && tick % 20 === 0) postLanStat();
   // A built-in demo's HLT is terminal; a booted Linux guest idles in HLT
   // (waiting for input/timer IRQs) so keep looping in idle-aware mode.
   if (vm.is_halted() && !idleAware) {
@@ -244,7 +316,11 @@ self.onmessage = async (e) => {
         running = false;
         clearNet();
         netEnabled = false;
+        switchNet = false;
+        hybridNet = false;
         tick = 0;
+        bootMs = performance.now();
+        txFrames = rxFrames = txBytes = rxBytes = 0;
         if (m.linux) {
           const ramMiB = m.ramMiB && m.ramMiB >= 64 ? m.ramMiB : 256;
           vm = WwwVm.new_with_ram_size(ramMiB * 1024 * 1024);
@@ -267,6 +343,17 @@ self.onmessage = async (e) => {
             // are distinct), then raw L2 frames flow to/from the in-page hub.
             switchNet = true;
             if (m.net.mac) vm.set_nic_mac(Uint8Array.from(m.net.mac));
+          } else if (m.net && m.net.mode === "lan+nat") {
+            // Hybrid: on the L2 switch for peers AND behind the in-wasm NAT for
+            // the outside world. Distinct MAC + IP per VM; the NAT addresses its
+            // replies to this VM's IP. pumpHybrid routes frames per-destination.
+            hybridNet = true;
+            netEnabled = true;
+            netProxyUrl = m.net.proxyUrl;
+            netUpstream = m.net.upstream || {};
+            if (m.net.mac) vm.set_nic_mac(Uint8Array.from(m.net.mac));
+            vm.net_enable_ip(m.net.allow, Uint8Array.from(m.net.ip || [10, 0, 2, 15]));
+            netPreResolve(m.net.allow); // async; cache fills before the guest queries
           } else if (m.net) {
             netEnabled = true;
             netProxyUrl = m.net.proxyUrl;
@@ -339,7 +426,10 @@ self.onmessage = async (e) => {
         break;
       case "rx":
         // A frame from a LAN peer (via the hub) → deliver to this VM's NIC.
-        if (vm && vm.is_booted()) vm.inject_rx_frame(new Uint8Array(m.frame));
+        if (vm && vm.is_booted()) {
+          const frame = new Uint8Array(m.frame);
+          if (vm.inject_rx_frame(frame)) { rxFrames++; rxBytes += frame.length; }
+        }
         break;
     }
   } catch (err) {

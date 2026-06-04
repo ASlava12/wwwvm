@@ -43,21 +43,31 @@
     <h1>wwwvm — Virtual LAN <small style="color:#8b949e">· parallel VMs on one L2 switch</small></h1>
     <p class="status">
       Each VM runs in its own Web Worker; their NICs are bridged by an in-page
-      learning switch (no NAT). Needs a LAN image (built with
-      <code>WWWVM_NET_LAN</code> + NIC modules). Start, wait for the shells, pick a
-      VM on the right, then e.g. <code>ping -c2 10.0.0.2</code> in VM 1. ·
-      <a href="./index.html">single-VM demo</a>
+      learning switch. Tick <b>Internet</b> to also give every VM a NAT gateway
+      (10.0.2.2 → your WebSocket relay) so they reach each other <em>and</em> the
+      outside world over one NIC. Needs a LAN image (built with
+      <code>WWWVM_NET_LAN</code> + NIC modules). Start, wait for the shells, pick
+      a VM on the right, then e.g. <code>ping -c2 10.0.2.16</code> (or
+      <code>apk update</code> with Internet on). · <a href="./index.html">single-VM demo</a>
     </p>
     <div class="bar">
       <label>VMs: <input id="lan-count" type="number" min="1" max="8" value="2" /></label>
       <label>image: <select id="lan-image"></select></label>
-      <label title="Guest RAM per VM (MiB)">RAM: <input id="lan-ram" type="number" min="64" step="64" value="256" /> MiB</label>
-      <label title="Mount a tmpfs RAM disk at /mnt/ramdisk inside each guest (0 = none). Needs a rebuilt image.">
+      <label title="Guest RAM (MiB) for the next launched VM — vary it between + Add VM presses for per-VM RAM">RAM: <input id="lan-ram" type="number" min="64" step="64" value="256" /> MiB</label>
+      <label title="tmpfs RAM disk at /mnt/ramdisk for the next launched VM (0 = none). Needs a rebuilt image.">
         RAM disk: <input id="lan-ramdisk" type="number" min="0" step="16" value="0" /> MiB
       </label>
       <button id="lan-start">Start LAN</button>
+      <button id="lan-add" title="Add one more VM to the running LAN (uses the current RAM / RAM disk)">+ Add VM</button>
       <button id="lan-stop">Stop</button>
       <button id="vm-list-toggle" title="Show/hide the VM list">VMs ☰</button>
+    </div>
+    <div class="bar">
+      <label title="Give every VM internet via an in-wasm NAT gateway (10.0.2.2) → your WebSocket relay, while staying on the L2 switch for peer traffic. Puts the LAN on 10.0.2.0/24.">
+        <input type="checkbox" id="lan-net" /> Internet (NAT → relay)
+      </label>
+      <label title="allowed hosts for the relay; * = everything (the relay's own WWWVM_PROXY_ALLOWLIST must also permit it)">allow: <input id="lan-allow" type="text" value="*" size="10" /></label>
+      <label title="your WebSocket↔TCP relay — cargo run -p wwwvm-proxy (see README)">relay: <input id="lan-proxy" type="text" value="ws://localhost:8080" size="18" /></label>
     </div>
     <div id="lan-status" class="status">pick an image and Start</div>
     <div id="lan-main">
@@ -66,6 +76,6 @@
         <div class="vm-list-head">Running VMs</div>
       </aside>
     </div>
-    <script type="module" src="./lan.js?v=2"></script>
+    <script type="module" src="./lan.js?v=3"></script>
   </body>
 </html>

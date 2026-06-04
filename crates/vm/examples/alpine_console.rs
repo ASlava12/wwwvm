@@ -129,10 +129,13 @@ fn main() {
     // files (the standard minirootfs vs the modroot). PATH is exported so
     // applets — and your interactive commands — resolve by bare name.
     // LAN mode (WWWVM_NET_LAN): for parallel VMs wired together by the in-page
-    // L2 switch — NO NAT gateway. Each VM reads its own static IP (and optional
-    // gateway) from the kernel cmdline so one image serves a whole LAN, e.g.
-    // `wwwvm.ip=10.0.0.5/24`. The browser hub gives each worker a distinct
-    // `wwwvm.ip=` (and a distinct MAC via set_nic_mac) before booting.
+    // L2 switch. Each VM reads its own static IP (and optional gateway) from the
+    // kernel cmdline so one image serves a whole LAN, e.g. `wwwvm.ip=10.0.0.5/24`.
+    // The browser hub gives each worker a distinct `wwwvm.ip=` (and a distinct
+    // MAC via set_nic_mac) before booting. When a `wwwvm.gw=` is also passed
+    // (hybrid mode: all VMs on 10.0.2.0/24 with the in-wasm NAT as gateway
+    // 10.0.2.2), /init also points the resolver at the gateway and rewrites apk
+    // to http — so the VMs reach each other AND the outside world over one NIC.
     let net_lan = std::env::var_os("WWWVM_NET_LAN").is_some();
     let net_setup = if net_lan {
         "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
@@ -141,7 +144,9 @@ fn main() {
          IP=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.ip=//p')\n\
          [ -n \"$IP\" ] && ip addr add \"$IP\" dev eth0 2>/dev/null\n\
          GW=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.gw=//p')\n\
-         [ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\n"
+         [ -n \"$GW\" ] && { ip route add default via \"$GW\" 2>/dev/null; \
+           echo \"nameserver $GW\" > /etc/resolv.conf; \
+           sed -i 's,https://,http://,g' /etc/apk/repositories 2>/dev/null; }\n"
     } else if net_stub {
         "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
          insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
