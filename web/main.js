@@ -62,7 +62,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=6", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=7", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;

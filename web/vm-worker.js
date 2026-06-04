@@ -20,6 +20,7 @@ let tick = 0;
 
 // ---- network relay (mirrors the main-thread fallback in main.js) ----
 let netEnabled = false;
+let switchNet = false; // virtual-LAN mode: raw L2 frames ↔ the in-page hub
 let netProxyUrl = "ws://localhost:8080";
 // Upstream-proxy selection from main.js, merged into every connect frame:
 // {} = direct, {auto:true} = server rotates, {upstream:{kind,host,port}} = chain.
@@ -177,6 +178,20 @@ function postStatus() {
   });
 }
 
+// Virtual-LAN mode: drain the frames the guest transmitted and hand them to the
+// main-thread hub (which routes them through the L2 switch to peer VMs). Inbound
+// frames arrive as "rx" messages → inject_rx_frame.
+function pumpSwitch() {
+  if (!vm) return;
+  const frames = [];
+  for (;;) {
+    const f = vm.drain_tx_frame();
+    if (f === undefined || f === null) break;
+    frames.push(f);
+  }
+  if (frames.length) post({ t: "tx", frames }, frames.map((f) => f.buffer));
+}
+
 function loop() {
   if (!running || !vm) return;
   // Idle (HLT) → small budget so we don't spin-burn a core; active → full budget.
@@ -198,7 +213,8 @@ function loop() {
     running = false;
     return;
   }
-  pumpNet();
+  if (switchNet) pumpSwitch();
+  else pumpNet();
   tick++;
   if (tick % 6 === 0) postFb();
   if (tick % 12 === 0) postStatus();
@@ -246,7 +262,12 @@ self.onmessage = async (e) => {
           vm.set_kernel_cmdline(m.cmdline);
           if (m.initrd) vm.set_ramdisk(new Uint8Array(m.initrd));
           if (m.fb) vm.enable_framebuffer(m.fb.w, m.fb.h);
-          if (m.net) {
+          if (m.net && m.net.mode === "switch") {
+            // Virtual-LAN mode: no NAT. Give this VM its own MAC (so LAN peers
+            // are distinct), then raw L2 frames flow to/from the in-page hub.
+            switchNet = true;
+            if (m.net.mac) vm.set_nic_mac(Uint8Array.from(m.net.mac));
+          } else if (m.net) {
             netEnabled = true;
             netProxyUrl = m.net.proxyUrl;
             netUpstream = m.net.upstream || {};
@@ -315,6 +336,10 @@ self.onmessage = async (e) => {
           vm.restore_export(new Uint8Array(m.buf));
           startLoop();
         }
+        break;
+      case "rx":
+        // A frame from a LAN peer (via the hub) → deliver to this VM's NIC.
+        if (vm && vm.is_booted()) vm.inject_rx_frame(new Uint8Array(m.frame));
         break;
     }
   } catch (err) {
