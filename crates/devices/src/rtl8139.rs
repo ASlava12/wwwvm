@@ -84,6 +84,18 @@ impl Rtl8139 {
         Self::with_mac(DEFAULT_MAC)
     }
 
+    /// Reassign the MAC in place — both IDR0-5 and the EEPROM words 7-9 the
+    /// driver actually reads. Must be done BEFORE the guest's driver binds (it
+    /// latches the MAC from EEPROM at probe), i.e. before boot. Used to give
+    /// each VM on a virtual LAN a distinct address (parallel VMs from the same
+    /// image would otherwise all share `DEFAULT_MAC` and collide).
+    pub fn set_mac(&mut self, mac: [u8; 6]) {
+        self.regs[0..6].copy_from_slice(&mac);
+        self.eeprom[7] = mac[0] as u16 | ((mac[1] as u16) << 8);
+        self.eeprom[8] = mac[2] as u16 | ((mac[3] as u16) << 8);
+        self.eeprom[9] = mac[4] as u16 | ((mac[5] as u16) << 8);
+    }
+
     pub fn with_mac(mac: [u8; 6]) -> Self {
         let mut regs = [0u8; 256];
         regs[0..6].copy_from_slice(&mac);
@@ -439,6 +451,19 @@ mod tests {
         assert_eq!(eeprom_read(&mut nic, 7), 0xADDE);
         assert_eq!(eeprom_read(&mut nic, 8), 0xEFBE);
         assert_eq!(eeprom_read(&mut nic, 9), 0x0100);
+    }
+
+    #[test]
+    fn set_mac_updates_eeprom_and_idr() {
+        // A default NIC reassigned in place exposes the new MAC via both the
+        // EEPROM words the driver reads and the IDR registers.
+        let mut nic = Rtl8139::new();
+        nic.set_mac([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x02]);
+        assert_eq!(eeprom_read(&mut nic, 7), 0xADDE);
+        assert_eq!(eeprom_read(&mut nic, 8), 0xEFBE);
+        assert_eq!(eeprom_read(&mut nic, 9), 0x0200);
+        assert_eq!(nic.read_reg(0), 0xDE);
+        assert_eq!(nic.read_reg(5), 0x02);
     }
 
     #[test]

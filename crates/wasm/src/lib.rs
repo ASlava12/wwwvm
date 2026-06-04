@@ -553,6 +553,19 @@ impl WwwVm {
     // native build uses with smoltcp. (Native code does the NAT in-process;
     // in the browser it lives in JS/WebAssembly above these calls.)
 
+    /// Assign the guest NIC's MAC (6 bytes) — call BEFORE boot. Used to give
+    /// each VM on an in-page virtual LAN a distinct address so they don't
+    /// collide. Returns false (no-op) if `mac` isn't exactly 6 bytes.
+    pub fn set_nic_mac(&mut self, mac: &[u8]) -> bool {
+        if mac.len() != 6 {
+            return false;
+        }
+        let mut m = [0u8; 6];
+        m.copy_from_slice(mac);
+        self.inner.set_nic_mac(m);
+        true
+    }
+
     /// Take the next Ethernet frame the guest transmitted, or `undefined`
     /// when the TX queue is empty. Call in a loop each tick to drain it.
     pub fn drain_tx_frame(&mut self) -> Option<Vec<u8>> {

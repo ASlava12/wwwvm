@@ -2464,6 +2464,14 @@ impl Vm {
         self.io.drain_nic_tx()
     }
 
+    /// Assign the guest NIC's MAC address — **before boot** (the driver latches
+    /// it from the EEPROM at probe). Give each VM on a virtual LAN a distinct
+    /// MAC so they don't collide (parallel VMs from one image otherwise all use
+    /// the default). See [`wwwvm_devices::Rtl8139::set_mac`].
+    pub fn set_nic_mac(&mut self, mac: [u8; 6]) {
+        self.io.rtl8139.set_mac(mac);
+    }
+
     /// Pop a single transmitted frame (oldest first), or None when none are
     /// queued. For one-frame-at-a-time hosts (the wasm/browser bridge).
     pub fn drain_tx_frames_one(&mut self) -> Option<Vec<u8>> {
