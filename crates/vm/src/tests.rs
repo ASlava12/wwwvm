@@ -3979,3 +3979,45 @@ fn div_by_zero_vectors_through_ivt_de_under_vm() {
     assert!(vm.is_halted(), "VM halts via the handler, not on Err");
     assert_eq!(vm.cpu().read_r8(0), 0xDE, "handler ran");
 }
+
+/// v15 regression: a PROTECTED-MODE segment cache (descriptor base ≠
+/// selector<<4) must survive snapshot → restore verbatim. Before v15 the
+/// restore re-derived the cache as `sel << 4` (real-mode), so a PM/Linux guest
+/// came back with wrong segment bases and corrupted every memory access on
+/// resume (see crates/vm/examples/snapshot_resume.rs). The CPU addresses memory
+/// through `seg_cache[].base`, so this is load-bearing.
+#[test]
+fn snapshot_preserves_protected_mode_segment_cache() {
+    let mut vm = Vm::new();
+    // GS: selector 0x0060 (so the old sel<<4 derivation would give base 0x600),
+    // but a real PM descriptor base far from that.
+    vm.cpu.sregs[wwwvm_cpu::sreg::GS] = 0x0060;
+    vm.cpu.seg_cache[wwwvm_cpu::sreg::GS] = wwwvm_cpu::SegmentCache {
+        base: 0xC012_3000,
+        limit: 0x000F_FFFF,
+        access: 0x9A,
+    };
+    // DS: a flat 4 GiB data segment with base 0 (also ≠ sel<<4 for a nonzero sel).
+    vm.cpu.sregs[wwwvm_cpu::sreg::DS] = 0x0010;
+    vm.cpu.seg_cache[wwwvm_cpu::sreg::DS] = wwwvm_cpu::SegmentCache {
+        base: 0,
+        limit: 0xFFFF_FFFF,
+        access: 0x93,
+    };
+
+    let blob = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&blob).expect("restore");
+
+    let gs = vm2.cpu.seg_cache[wwwvm_cpu::sreg::GS];
+    assert_eq!(
+        gs.base, 0xC012_3000,
+        "GS base preserved (NOT re-derived as sel<<4 = 0x600)"
+    );
+    assert_eq!(gs.limit, 0x000F_FFFF);
+    assert_eq!(gs.access, 0x9A);
+    let ds = vm2.cpu.seg_cache[wwwvm_cpu::sreg::DS];
+    assert_eq!(ds.base, 0, "flat DS base 0 preserved");
+    assert_eq!(ds.limit, 0xFFFF_FFFF);
+    assert_eq!(ds.access, 0x93);
+}
