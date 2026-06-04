@@ -210,8 +210,12 @@ Option \"fbdev\" \"/dev/fb0\"\\nEndSection\\n' > /etc/X11/xorg.conf.d/10-fbdev.c
     } else {
         ""
     };
+    // Optional tmpfs RAM disk at /mnt/ramdisk, sized via the kernel cmdline
+    // (`wwwvm.ramdisk=<MiB>`, set by the web UI). No-op when the param is absent.
+    let ramdisk_setup = "RD=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.ramdisk=//p')\n\
+         [ -n \"$RD\" ] && mkdir -p /mnt/ramdisk && mount -t tmpfs -o size=${RD}m tmpfs /mnt/ramdisk 2>/dev/null\n";
     let init = format!(
-        "#!/bin/sh\n{bb_install}{BASE_MOUNTS}{net_setup}{gui_setup}{gui_session}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
+        "#!/bin/sh\n{bb_install}{BASE_MOUNTS}{ramdisk_setup}{net_setup}{gui_setup}{gui_session}echo '{READY_LINE}'\n{SHELL_LAUNCH}"
     );
     // WWWVM_INITRAMFS_FILE=<path> boots a PREBUILT initramfs (e.g. a dumped or
     // gzipped cpio) as-is instead of packing the directory — handy for
