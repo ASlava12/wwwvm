@@ -1120,7 +1120,7 @@ pub mod snapshot {
     ///   calibration setup at port 0x42 + the port-0x61 gate/
     ///   speaker bits round-trip. Pre-v14 snapshots leave ch2
     ///   idle on restore; the kernel re-arms it next calibration.
-    pub const VERSION: u8 = 15;
+    pub const VERSION: u8 = 16;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here
     /// so the snapshot module is self-contained.
@@ -1512,6 +1512,24 @@ impl Vm {
             buf.extend_from_slice(&sc.limit.to_le_bytes());
             buf.push(sc.access);
         }
+
+        // v16: linear-framebuffer config (host-side metadata — where/how big the
+        // fb is in guest RAM, so framebuffer_bytes() can extract pixels after a
+        // restore; the pixels themselves live in the RAM image). 1 present-byte,
+        // then 5×u32 + 2×u8 when present.
+        match &self.fb {
+            Some(fb) => {
+                buf.push(1);
+                buf.extend_from_slice(&fb.base.to_le_bytes());
+                buf.extend_from_slice(&fb.size.to_le_bytes());
+                buf.extend_from_slice(&fb.width.to_le_bytes());
+                buf.extend_from_slice(&fb.height.to_le_bytes());
+                buf.extend_from_slice(&fb.stride.to_le_bytes());
+                buf.push(fb.bpp);
+                buf.push(fb.video_type);
+            }
+            None => buf.push(0),
+        }
         buf
     }
 
@@ -1532,14 +1550,14 @@ impl Vm {
             return Err(SnapshotError::BadMagic);
         }
         let version = bytes[snapshot::MAGIC.len()];
-        if !matches!(version, 1..=15) {
+        if !matches!(version, 1..=16) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let cpu_len = match version {
-            // v13 / v14 / v15 don't extend the CPU image — they extend
-            // device-side blobs (HPET periods in v13, PIT ch2 in v14) or
-            // append a trailing section (seg_cache in v15).
-            12..=15 => snapshot::CPU_V12_LEN,
+            // v13..v16 don't extend the CPU image — they extend device-side
+            // blobs (HPET periods in v13, PIT ch2 in v14) or append trailing
+            // sections (seg_cache in v15, framebuffer config in v16).
+            12..=16 => snapshot::CPU_V12_LEN,
             // v10/v11 don't extend the CPU image — they append MMIO
             // sections (LAPIC, then HPET) between RAM and the device
             // blob.
@@ -1880,6 +1898,50 @@ impl Vm {
             None
         };
 
+        // v16 framebuffer config — sits right after the v15 seg_cache (which is
+        // always 54 B in v15+). Outer Option = "v16 provided it"; inner = the
+        // fb Option itself. Pre-v16 leaves `self.fb` untouched.
+        let fb_restored: Option<Option<FramebufferConfig>> = if version >= 16 {
+            let mut o = seg_end + 6 * 9;
+            if bytes.len() < o + 1 {
+                return Err(SnapshotError::TooSmall {
+                    got: bytes.len(),
+                    need: o + 1,
+                });
+            }
+            let present = bytes[o] != 0;
+            o += 1;
+            if present {
+                if bytes.len() < o + 22 {
+                    return Err(SnapshotError::TooSmall {
+                        got: bytes.len(),
+                        need: o + 22,
+                    });
+                }
+                let rd = |i: usize| {
+                    u32::from_le_bytes([
+                        bytes[o + i],
+                        bytes[o + i + 1],
+                        bytes[o + i + 2],
+                        bytes[o + i + 3],
+                    ])
+                };
+                Some(Some(FramebufferConfig {
+                    base: rd(0),
+                    size: rd(4),
+                    width: rd(8),
+                    height: rd(12),
+                    stride: rd(16),
+                    bpp: bytes[o + 20],
+                    video_type: bytes[o + 21],
+                }))
+            } else {
+                Some(None)
+            }
+        } else {
+            None
+        };
+
         // Commit CPU state.
         self.cpu.regs = regs;
         self.cpu.regs_high = regs_high;
@@ -1930,6 +1992,11 @@ impl Vm {
                     access: 0x93,
                 };
             }
+        }
+        // v16: restore the host-side framebuffer config so framebuffer_bytes()
+        // can render a restored GUI guest's canvas.
+        if let Some(fb) = fb_restored {
+            self.fb = fb;
         }
         self.booted = true;
         Ok(())

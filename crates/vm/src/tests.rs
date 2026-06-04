@@ -4021,3 +4021,37 @@ fn snapshot_preserves_protected_mode_segment_cache() {
     assert_eq!(ds.limit, 0xFFFF_FFFF);
     assert_eq!(ds.access, 0x93);
 }
+
+/// v16 regression: the linear-framebuffer config must survive snapshot/restore
+/// so the host can render a restored GUI guest's canvas (the pixels are in the
+/// RAM image; this is the metadata locating them). Before v16 it was dropped →
+/// framebuffer_config()/bytes() returned None after restore.
+#[test]
+fn snapshot_preserves_framebuffer_config() {
+    let mut vm = Vm::new();
+    vm.enable_linear_framebuffer(64, 48, crate::VIDEO_TYPE_EFI);
+    let want = vm.framebuffer_config().expect("fb enabled");
+    let blob = vm.snapshot();
+    let mut vm2 = Vm::new();
+    vm2.restore(&blob).expect("restore");
+    let got = vm2
+        .framebuffer_config()
+        .expect("fb config restored, not None");
+    assert_eq!(got.base, want.base);
+    assert_eq!(got.width, 64);
+    assert_eq!(got.height, 48);
+    assert_eq!(got.stride, want.stride);
+    assert_eq!(got.bpp, 32);
+    assert_eq!(got.video_type, crate::VIDEO_TYPE_EFI);
+
+    // A no-framebuffer snapshot restored into a VM that HAD one must clear it
+    // (the present-byte=0 path), not leave a phantom fb.
+    let plain = Vm::new().snapshot();
+    let mut vm3 = Vm::new();
+    vm3.enable_linear_framebuffer(64, 48, crate::VIDEO_TYPE_EFI);
+    vm3.restore(&plain).expect("restore");
+    assert!(
+        vm3.framebuffer_config().is_none(),
+        "no-fb snapshot clears fb"
+    );
+}
