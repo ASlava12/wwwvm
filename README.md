@@ -420,6 +420,15 @@ CI gates: `cargo fmt --check`,
 `docs/HAND_ASSEMBLY.md` — любое смещение между документацией и
 поведением VM ловит CI.
 
+**Тесты браузерной логики:** `scripts/test-web-js.sh` (нужен Node 18+)
+синтакс-проверяет все `web/*.js` и гоняет `node --test` на чистых
+модулях без DOM/wasm/worker — гибридный роутер кадров
+(`web/net-route.js`: шлюз→NAT, broadcast→оба, peer→свитч) и L2-свитч
+(`web/l2-switch.js`). Они зеркалят свои Rust-двойники в `crates/net`
+(`switch.rs` + `nat.rs` ARP-ownership), чтобы браузер и натив не
+разъехались. `web/package.json` (`"type":"module"`) — только чтобы Node
+видел `web/*.js` как ESM.
+
 **Аудит корректности CPU (30 мая 2026):** многоагентный adversarial-
 аудит ISA-семантики против Intel SDM нашёл и исправил 5 багов (каждый
 с teeth-confirmed unit-тестом): (1) SHLD/SHRD затирали CF через

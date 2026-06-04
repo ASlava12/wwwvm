@@ -10,6 +10,7 @@
 // over postMessage; see web/main.js for the client. The main thread keeps an
 // identical inline implementation as a fallback (the "Web Worker" checkbox).
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
+import { classifyFrame } from "./net-route.js?v=1";
 
 const ready = init(); // wasm init promise; every handler awaits it
 let vm = null;
@@ -209,17 +210,11 @@ function pumpSwitch() {
   if (frames.length) post({ t: "tx", frames }, frames.map((f) => f.buffer));
 }
 
-// Gateway MAC the in-wasm NAT answers to (matches net_enable_ip's GW_MAC).
-const GW_MAC = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
-const isGwMac = (f) =>
-  f[0] === GW_MAC[0] && f[1] === GW_MAC[1] && f[2] === GW_MAC[2] &&
-  f[3] === GW_MAC[3] && f[4] === GW_MAC[4] && f[5] === GW_MAC[5];
-
 // Hybrid LAN + NAT: one NIC serves both peer traffic and the outside world.
-// Route each transmitted frame by destination — frames for the gateway MAC go
-// into the NAT; broadcasts go to BOTH (the NAT answers gateway ARP/DNS, peers
-// see the broadcast); everything else is peer unicast → the hub. The NAT's
-// replies (net_pop_egress) are injected straight back into this VM's NIC.
+// Route each transmitted frame by destination (classifyFrame, the shared pure
+// decision): "nat" → the NAT only; "both" → NAT (it answers gateway ARP/DHCP)
+// AND the hub (peers see the broadcast); "switch" → peer unicast → the hub. The
+// NAT's replies (net_pop_egress) are injected straight back into this VM's NIC.
 function pumpHybrid() {
   if (!vm) return;
   const txToHub = [];
@@ -227,15 +222,9 @@ function pumpHybrid() {
     const f = vm.drain_tx_frame();
     if (f === undefined || f === null) break;
     txFrames++; txBytes += f.length;
-    const group = (f[0] & 1) === 1; // broadcast / multicast
-    if (isGwMac(f)) {
-      vm.net_push_frame(f); // outside world only
-    } else if (group) {
-      vm.net_push_frame(f); // gateway may answer (ARP/DHCP)…
-      txToHub.push(f);      // …and peers see it too
-    } else {
-      txToHub.push(f);      // peer unicast
-    }
+    const route = classifyFrame(f);
+    if (route !== "switch") vm.net_push_frame(f); // "nat" or "both"
+    if (route !== "nat") txToHub.push(f);         // "switch" or "both"
   }
   if (txToHub.length) post({ t: "tx", frames: txToHub }, txToHub.map((f) => f.buffer));
   // Advance the NAT and drain its replies into the NIC (bounded; requeue on a

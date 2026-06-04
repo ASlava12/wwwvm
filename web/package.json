@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks web/*.js as ES modules (they're loaded as type=\"module\" in the browser) so Node can run the pure-logic tests — see scripts/test-web-js.sh. No dependencies; nothing is installed or built from here."
+}
