@@ -84,6 +84,8 @@
         transition: flex-basis .22s ease, margin-left .22s ease, opacity .18s ease;
       }
       #lan-main.list-hidden #vm-side { flex-basis: 0; margin-left: 0; opacity: 0; }
+      /* No VMs yet → hide the (empty) list entirely. */
+      #lan-main.no-vms #vm-side { display: none; }
       .vm-side-head {
         display: flex; align-items: center; justify-content: space-between; gap: .4rem;
         background: var(--panel2); padding: .35rem .4rem .35rem .55rem; font-size: .68rem;
@@ -160,7 +162,7 @@
 
     <div id="lan-status" class="status">pick an image and Start</div>
 
-    <div id="lan-main">
+    <div id="lan-main" class="no-vms">
       <section id="vm-stage"></section>
       <div id="vm-side">
         <div class="vm-side-head">
@@ -173,6 +175,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./lan.js?v=9"></script>
+    <script type="module" src="./lan.js?v=10"></script>
   </body>
 </html>

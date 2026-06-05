@@ -106,6 +106,7 @@ function stopLan() {
   sw = new L2Switch();
   $("vm-stage").innerHTML = "";
   $("vm-list").querySelectorAll(".vm-item").forEach((el) => el.remove());
+  updateSideVisibility();
 }
 
 async function loadManifest() {
@@ -274,6 +275,7 @@ function addOneVm() {
 
   addPane(i);
   bootWorker(i);
+  updateSideVisibility();
   return i;
 }
 
@@ -301,6 +303,12 @@ function restartVm(i) {
   if (workers[i]) { try { workers[i].terminate(); } catch {} workers[i] = null; sw.forgetPort(i); }
   try { terms[i]?.reset(); } catch {}
   bootWorker(i);
+}
+
+// Hide the "Running VMs" list entirely while there are no VM slots (stopped VMs
+// keep their slot, so they still show — this only hides the empty initial state).
+function updateSideVisibility() {
+  $("lan-main").classList.toggle("no-vms", workers.length === 0);
 }
 
 // Reflect running/stopped on the power button (⏹ stop vs ▶ start).
