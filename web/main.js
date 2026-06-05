@@ -301,10 +301,15 @@ function sendMouse(dx, dy, buttons) {
 // Collapse/show the settings sidebar.
 $("sidebar-toggle")?.addEventListener("click", () =>
   document.body.classList.toggle("sidebar-hidden"));
-// Collapse/show the Fleet panel (the embedded virtual-LAN lab). The lab keeps
-// running while hidden — the iframe isn't destroyed, just display:none'd.
-$("fleet-toggle")?.addEventListener("click", () =>
-  document.body.classList.toggle("fleet-hidden"));
+// Switch the single working area between the Fleet (networked VMs, default) and
+// the classic single-VM workspace. Both engines keep running across switches —
+// the Fleet iframe and the single VM are only hidden, never torn down. The
+// button shows the OTHER mode you can switch to.
+$("fleet-toggle")?.addEventListener("click", () => {
+  const single = document.body.classList.toggle("mode-single");
+  document.body.classList.toggle("mode-fleet", !single);
+  $("fleet-toggle").textContent = single ? "🖥 Fleet" : "🖳 Single VM";
+});
 // Fullscreen (canvas or UART) + Keyboard Lock: in fullscreen Chromium grants
 // keyboard lock so even browser-reserved combos (Ctrl+W/T/N) reach the guest.
 // Firefox has no Keyboard Lock API, so there those combos can't be captured.
