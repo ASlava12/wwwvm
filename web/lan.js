@@ -203,7 +203,7 @@ function addPane(i) {
   pane.id = `pane-${i}`;
   pane.innerHTML =
     `<div class="vm-head"><span>VM ${i + 1} · ${ipOf(i)} · <span id="head-${i}">booting…</span></span>` +
-    `<button class="lan-list-toggle" title="Show / hide the VM list">☰</button></div>` +
+    `<button class="toggle-btn lan-list-toggle" title="Show the VM list">☰</button></div>` +
     `<div class="vm-term" id="term-${i}"></div>`;
   stage.appendChild(pane);
   pane.querySelector(".lan-list-toggle").addEventListener("click", toggleList);
@@ -313,7 +313,12 @@ $("lan-add").addEventListener("click", () => {
   }
 });
 $("lan-stop").addEventListener("click", () => { stopLan(); setStatus("stopped"); });
-// Keep the focused terminal sized to its pane as the layout changes.
+// "Hide list" button lives in the list's own header (shown while the list is
+// open); the per-VM-header "☰" reopens it (shown while hidden). Same action.
+$("lan-list-close").addEventListener("click", toggleList);
+// Keep the focused terminal sized to its pane as the layout changes — this also
+// fires continuously while the list slides open/closed, so the terminal reflows
+// smoothly with the animation.
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(() => fitActive()).observe($("vm-stage"));
 }
