@@ -1105,6 +1105,16 @@ fn load_bzimage_rejects_setup_past_end_without_panic() {
 }
 
 #[test]
+fn framebuffer_bytes_clamps_oversize_config_without_panic() {
+    // Absurd geometry (as a malicious snapshot could restore) must not
+    // overflow start+len or panic the slice — framebuffer_bytes clamps to RAM.
+    let mut vm = Vm::with_ram_size(0x0010_0000); // 1 MiB
+    vm.enable_linear_framebuffer(u32::MAX, u32::MAX, VIDEO_TYPE_EFI);
+    let bytes = vm.framebuffer_bytes().expect("fb enabled");
+    assert!(bytes.len() <= 0x0010_0000);
+}
+
+#[test]
 fn start_protected_mode_at_jumps_into_pm_kernel() {
     // Synthetic v2.10 bzImage with a 32-bit kernel payload:
     //   MOV EAX, 0xCAFEBABE ; HLT

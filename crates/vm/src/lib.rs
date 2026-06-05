@@ -2165,7 +2165,9 @@ impl Vm {
         let bpp = 32u8;
         let stride = width.saturating_mul(4);
         let raw = stride.saturating_mul(height);
-        let size = (raw + 0xFFF) & !0xFFF; // page-round the reservation
+        // Page-round the reservation. saturating_add so a near-u32::MAX `raw`
+        // (huge width/height) can't overflow-panic in debug.
+        let size = raw.saturating_add(0xFFF) & !0xFFF;
         let ram = self.mem.size() as u32;
         let base = ram.saturating_sub(size) & !0xFFF; // top of RAM, page-aligned
         self.fb = Some(FramebufferConfig {
@@ -2191,10 +2193,14 @@ impl Vm {
     /// B,G,R,X → R,G,B,A as needed.
     pub fn framebuffer_bytes(&self) -> Option<Vec<u8>> {
         let fb = self.fb?;
-        let start = fb.base as usize;
-        let len = (fb.stride as usize) * (fb.height as usize);
         let ram = self.mem.as_slice();
-        let end = (start + len).min(ram.len());
+        // Clamp every term: a restored (untrusted) snapshot can carry an
+        // arbitrary base/stride/height, so unchecked `start + len` or
+        // `ram[start..end]` would overflow/panic. Clamp start into the buffer
+        // and saturate len so the slice is always valid (possibly empty).
+        let start = (fb.base as usize).min(ram.len());
+        let len = (fb.stride as usize).saturating_mul(fb.height as usize);
+        let end = start.saturating_add(len).min(ram.len());
         Some(ram[start..end].to_vec())
     }
 
