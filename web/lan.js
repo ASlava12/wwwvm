@@ -72,6 +72,13 @@ function fitActive() {
   if (f) { try { f.fit(); } catch {} }
 }
 
+// Show/hide the running-VM list (toggle lives in each VM's header). Hiding it
+// gives the console the full width — no leftover panel strip.
+function toggleList() {
+  $("lan-main").classList.toggle("list-hidden");
+  fitActive();
+}
+
 // Focus VM `i`: show its pane, hide the others, highlight its list entry, then
 // size + focus its terminal so typing goes straight to that guest.
 function activate(i) {
@@ -195,9 +202,11 @@ function addPane(i) {
   pane.className = "vm-pane";
   pane.id = `pane-${i}`;
   pane.innerHTML =
-    `<div class="vm-head">VM ${i + 1} · ${ipOf(i)} · <span id="head-${i}">booting…</span></div>` +
+    `<div class="vm-head"><span>VM ${i + 1} · ${ipOf(i)} · <span id="head-${i}">booting…</span></span>` +
+    `<button class="lan-list-toggle" title="Show / hide the VM list">☰</button></div>` +
     `<div class="vm-term" id="term-${i}"></div>`;
   stage.appendChild(pane);
+  pane.querySelector(".lan-list-toggle").addEventListener("click", toggleList);
   makeTerminal(i);
 
   const item = document.createElement("button");
@@ -304,10 +313,6 @@ $("lan-add").addEventListener("click", () => {
   }
 });
 $("lan-stop").addEventListener("click", () => { stopLan(); setStatus("stopped"); });
-$("vm-list-toggle").addEventListener("click", () => {
-  $("vm-list").classList.toggle("collapsed");
-  fitActive(); // the console widened/narrowed — resize the terminal to match
-});
 // Keep the focused terminal sized to its pane as the layout changes.
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(() => fitActive()).observe($("vm-stage"));

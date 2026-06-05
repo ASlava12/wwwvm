@@ -53,32 +53,34 @@
         border-radius: 8px; overflow: hidden; background: var(--panel);
       }
       .vm-pane.active { display: flex; }
-      .vm-head { background: var(--panel2); padding: .4rem .6rem; font-size: .82rem; border-bottom: 1px solid var(--border); }
+      /* Pane header carries the VM label on the left and the list toggle on the
+         right (so collapsing hides the whole list — no leftover panel strip). */
+      .vm-head {
+        display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+        background: var(--panel2); padding: .35rem .5rem .35rem .6rem; font-size: .82rem;
+        border-bottom: 1px solid var(--border);
+      }
+      .vm-head .lan-list-toggle {
+        background: transparent; border: 1px solid var(--border); border-radius: 5px;
+        color: var(--fg); cursor: pointer; padding: .05rem .45rem; font-size: .85rem; line-height: 1.2; flex: 0 0 auto;
+      }
+      .vm-head .lan-list-toggle:hover { border-color: var(--accent); }
       /* Interactive xterm.js terminal — fills the pane below the header. */
       .vm-term { flex: 1; min-height: 0; padding: .25rem .3rem; background: #000; overflow: hidden; }
       .vm-term .xterm { height: 100%; }
 
-      /* Right column: a card whose header carries the collapse toggle (so the
-         button stays attached to the list, and survives collapsing). */
+      /* Right column: the running-VM list. Collapsing hides it entirely (the
+         toggle lives in the VM header), so the console takes the full width. */
       #vm-side {
         flex: 0 0 230px; display: flex; flex-direction: column; border: 1px solid var(--border);
         border-radius: 8px; overflow: hidden; background: var(--panel);
       }
+      #lan-main.list-hidden #vm-side { display: none; }
       .vm-side-head {
-        display: flex; align-items: center; justify-content: space-between; gap: .4rem;
         background: var(--panel2); padding: .4rem .55rem; font-size: .68rem; text-transform: uppercase;
         letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--border);
       }
-      .vm-side-head button {
-        background: transparent; border: 1px solid var(--border); border-radius: 5px;
-        color: var(--fg); cursor: pointer; padding: .05rem .4rem; font-size: .85rem; line-height: 1.2;
-      }
-      .vm-side-head button:hover { border-color: var(--accent); }
       #vm-list { flex: 1; overflow: auto; }
-      #vm-list.collapsed { display: none; }
-      /* When collapsed, shrink the column to just the toggle. */
-      #vm-side:has(#vm-list.collapsed) { flex-basis: auto; }
-      #vm-side:has(#vm-list.collapsed) .ttl { display: none; }
 
       .vm-item {
         display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid var(--border);
@@ -150,16 +152,13 @@
     <div id="lan-main">
       <section id="vm-stage"></section>
       <div id="vm-side">
-        <div class="vm-side-head">
-          <span class="ttl">Running VMs</span>
-          <button id="vm-list-toggle" title="Collapse / expand the list">☰</button>
-        </div>
+        <div class="vm-side-head">Running VMs</div>
         <aside id="vm-list"></aside>
       </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./lan.js?v=6"></script>
+    <script type="module" src="./lan.js?v=7"></script>
   </body>
 </html>
