@@ -36,6 +36,15 @@ test("classifyFrame: a custom gateway MAC is honoured", () => {
   assert.equal(classifyFrame(frame(GW_MAC, SRC), gw), "switch"); // not the gw now
 });
 
+test("VM NIC MACs never collide with the gateway (route as switch, not nat)", () => {
+  // lan.js assigns VM NIC MACs as 52:54:00:00:01:(i+1); none may equal GW_MAC
+  // (52:54:00:00:00:02) or peer unicast would be misrouted into the NAT.
+  for (let i = 0; i < 8; i++) {
+    const mac = [0x52, 0x54, 0x00, 0x00, 0x01, i + 1];
+    assert.equal(classifyFrame(frame(mac, SRC)), "switch", `VM ${i + 1} MAC must not be the gateway`);
+  }
+});
+
 test("isGroupMac: I/G bit of octet 0", () => {
   assert.equal(isGroupMac(BCAST), true);
   assert.equal(isGroupMac(MCAST), true);

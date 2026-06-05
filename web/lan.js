@@ -257,7 +257,11 @@ function addOneVm() {
   const i = workers.length;
   const ram = Math.max(64, parseInt($("lan-ram").value, 10) || 256);
   const ramdisk = Math.max(0, parseInt($("lan-ramdisk").value, 10) || 0);
-  const mac = [0x52, 0x54, 0x00, 0x00, 0x00, i + 1];
+  // 5th byte 0x01 keeps VM NIC MACs (52:54:00:00:01:NN) clear of the NAT gateway
+  // MAC (52:54:00:00:00:02) — otherwise VM #2 (i=1) would BE the gateway MAC, and
+  // in hybrid mode peer frames addressed to it get routed into the NAT, not the
+  // switch (ARP resolves but unicast never arrives). Must stay != GW_MAC.
+  const mac = [0x52, 0x54, 0x00, 0x00, 0x01, i + 1];
   const rd = ramdisk > 0 ? ` wwwvm.ramdisk=${ramdisk}` : "";
   const gw = lanCfg.netOn ? " wwwvm.gw=10.0.2.2" : "";
   const cmdline = `${lanCfg.base} wwwvm.ip=${ipOf(i)}/24${gw}${rd}`;
