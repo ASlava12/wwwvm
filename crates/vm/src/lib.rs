@@ -2380,6 +2380,15 @@ impl Vm {
     /// real-mode setup execution flow.
     pub fn load_bzimage(&mut self, bytes: &[u8]) -> Result<BzImage, BzImageError> {
         let bz = bzimage::parse(bytes)?;
+        // The setup blob is the first `payload_offset` bytes of the file; a
+        // crafted header (large setup_sects, short file) can make that exceed
+        // the data. Reject instead of slicing `bytes[..payload_offset]` OOB.
+        if bz.payload_offset > bytes.len() {
+            return Err(BzImageError::SetupPastEnd {
+                payload_offset: bz.payload_offset,
+                len: bytes.len(),
+            });
+        }
         // Validate init_size against available RAM. The check uses
         // u64 arithmetic to avoid the corner where code32_start +
         // init_size overflows u32 on a maliciously-large header.

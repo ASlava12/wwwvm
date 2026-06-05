@@ -1088,6 +1088,23 @@ fn bios_int15_e820_with_nonzero_continuation_signals_done() {
 /// the LGDT/CR0/JMP-FAR boot stub. The CPU lands in PM with flat
 /// segments and IP = entry, ready to execute the kernel.
 #[test]
+fn load_bzimage_rejects_setup_past_end_without_panic() {
+    // Crafted header: valid signature/magic but setup_sects = 0xFF →
+    // payload_offset = 256*512 = 131072, far past a 1 KiB file. Must return
+    // Err(SetupPastEnd), not panic slicing bytes[..payload_offset].
+    let mut bz = vec![0u8; 1024];
+    bz[0x1F1] = 0xFF;
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+    let mut vm = Vm::with_ram_size(0x0020_0000);
+    assert!(matches!(
+        vm.load_bzimage(&bz),
+        Err(crate::bzimage::BzImageError::SetupPastEnd { .. })
+    ));
+}
+
+#[test]
 fn start_protected_mode_at_jumps_into_pm_kernel() {
     // Synthetic v2.10 bzImage with a 32-bit kernel payload:
     //   MOV EAX, 0xCAFEBABE ; HLT

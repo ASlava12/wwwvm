@@ -99,6 +99,11 @@ pub enum BzImageError {
     /// has. Real silicon doesn't enforce this — the kernel just
     /// overruns and faults — but our loader catches it up front.
     NotEnoughRam { need: u64, have: u64 },
+    /// The setup blob (`payload_offset` bytes, derived from
+    /// `setup_sects`) is larger than the image file itself — a
+    /// crafted header where `(setup_sects+1)*512` exceeds the data.
+    /// The loader rejects it instead of slicing out of bounds.
+    SetupPastEnd { payload_offset: usize, len: usize },
 }
 
 impl std::fmt::Display for BzImageError {
@@ -115,6 +120,13 @@ impl std::fmt::Display for BzImageError {
             Self::NotEnoughRam { need, have } => write!(
                 f,
                 "bzImage init_size says kernel needs {need} bytes; VM has {have}"
+            ),
+            Self::SetupPastEnd {
+                payload_offset,
+                len,
+            } => write!(
+                f,
+                "bzImage setup blob ends at {payload_offset} but the image is only {len} bytes"
             ),
         }
     }

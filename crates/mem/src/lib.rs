@@ -507,9 +507,16 @@ impl Memory {
 
     pub fn write_slice(&mut self, addr: u32, data: &[u8]) {
         let start = addr as usize;
+        // Fully out of range → open-bus drop (mirrors write_u8). Without this,
+        // `start > len` makes the final `self.bytes[start..start]` slice panic
+        // ("range start index out of range") instead of clipping — a host
+        // loader (e.g. load_bzimage) must never panic on a crafted address.
+        if start >= self.bytes.len() {
+            return;
+        }
         let end = start.saturating_add(data.len()).min(self.bytes.len());
-        let n = end.saturating_sub(start);
-        self.bytes[start..start + n].copy_from_slice(&data[..n]);
+        let n = end - start;
+        self.bytes[start..end].copy_from_slice(&data[..n]);
     }
 
     /// Borrow the entire backing buffer. Used by the VM's snapshot
@@ -625,6 +632,18 @@ mod tests {
         m.write_slice(6, &[1, 2, 3, 4]);
         assert_eq!(m.read_u8(6), 1);
         assert_eq!(m.read_u8(7), 2);
+    }
+
+    #[test]
+    fn write_slice_out_of_range_is_noop_not_panic() {
+        // A start address at or past the end must drop (open-bus), not panic —
+        // crafted bzImage/loader addresses reach this with start > len.
+        let mut m = Memory::new(8);
+        m.write_slice(8, &[1, 2, 3]); // exactly at end
+        m.write_slice(0xFFFF_FFF0, &[1, 2, 3]); // far past end
+        for i in 0..8 {
+            assert_eq!(m.read_u8(i), 0);
+        }
     }
 
     #[test]
