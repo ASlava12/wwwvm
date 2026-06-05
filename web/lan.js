@@ -137,6 +137,7 @@ function relayTx(i, frames) {
   for (const f of frames) {
     const u = new Uint8Array(f);
     for (const eg of sw.egress(i, u, workers.length)) {
+      if (!workers[eg]) continue; // skip stopped VMs (their slot is null)
       const copy = u.slice(); // fresh buffer per target (transfer consumes it)
       workers[eg].postMessage({ t: "rx", frame: copy.buffer }, [copy.buffer]);
     }
@@ -148,7 +149,7 @@ function wireWorker(i, worker) {
     const m = e.data;
     switch (m.t) {
       case "output": terms[i]?.write(m.text); break;
-      case "booted": setVmState(i, "up", true); break;
+      case "booted": setVmState(i, "up", true); updateControls(i); break;
       case "tx": relayTx(i, m.frames); break;
       case "stat": setVmStat(i, m); break;
       case "error": terms[i]?.write(`\r\n[error] ${m.message}\r\n`); setVmState(i, "error"); break;
@@ -202,10 +203,16 @@ function addPane(i) {
   pane.className = "vm-pane";
   pane.id = `pane-${i}`;
   pane.innerHTML =
-    `<div class="vm-head"><span>VM ${i + 1} · ${ipOf(i)} · <span id="head-${i}">booting…</span></span>` +
-    `<button class="toggle-btn lan-list-toggle" title="Show the VM list">☰</button></div>` +
+    `<div class="vm-head"><span class="vm-id">VM ${i + 1} · ${ipOf(i)} · <span id="head-${i}">booting…</span></span>` +
+    `<span class="vm-ctl">` +
+      `<button class="toggle-btn" id="rst-${i}" title="Restart this VM">⟳</button>` +
+      `<button class="toggle-btn" id="pwr-${i}" title="Stop this VM">⏹</button>` +
+      `<button class="toggle-btn lan-list-toggle" title="Show the VM list">☰</button>` +
+    `</span></div>` +
     `<div class="vm-term" id="term-${i}"></div>`;
   stage.appendChild(pane);
+  pane.querySelector(`#rst-${i}`).addEventListener("click", () => restartVm(i));
+  pane.querySelector(`#pwr-${i}`).addEventListener("click", () => (workers[i] ? stopVm(i) : startVm(i)));
   pane.querySelector(".lan-list-toggle").addEventListener("click", toggleList);
   makeTerminal(i);
 
@@ -219,21 +226,36 @@ function addPane(i) {
   list.appendChild(item);
 }
 
+// (Re)boot the worker for slot `i` from its saved config in meta[i]. Used by
+// both the initial launch and Start/Restart.
+function bootWorker(i) {
+  const m = meta[i];
+  const worker = new Worker(new URL("./vm-worker.js?v=10", import.meta.url), { type: "module" });
+  wireWorker(i, worker);
+  workers[i] = worker;
+  worker.postMessage({
+    t: "boot",
+    linux: true,
+    kernel: lanCfg.kernel, // structured-clone copy per worker (no transfer)
+    initrd: lanCfg.initrd,
+    cmdline: m.cmdline,
+    fb: null,
+    net: m.net,
+    ramMiB: m.ram,
+  });
+  setVmState(i, "booting…");
+  updateControls(i);
+}
+
 // Spin up one more VM on the running LAN, using the current RAM / RAM disk
-// inputs (so consecutive adds can be sized differently).
+// inputs (so consecutive adds can be sized differently). The full boot config is
+// saved in meta[i] so the VM can be stopped and re-started in place.
 function addOneVm() {
   if (!lanCfg) { setStatus("Start the LAN first"); return -1; }
   if (workers.length >= 8) { setStatus("max 8 VMs on the lab switch"); return -1; }
   const i = workers.length;
   const ram = Math.max(64, parseInt($("lan-ram").value, 10) || 256);
   const ramdisk = Math.max(0, parseInt($("lan-ramdisk").value, 10) || 0);
-  meta[i] = { ip: ipOf(i), ram, ramdisk };
-
-  addPane(i);
-  const worker = new Worker(new URL("./vm-worker.js?v=10", import.meta.url), { type: "module" });
-  wireWorker(i, worker);
-  workers.push(worker);
-
   const mac = [0x52, 0x54, 0x00, 0x00, 0x00, i + 1];
   const rd = ramdisk > 0 ? ` wwwvm.ramdisk=${ramdisk}` : "";
   const gw = lanCfg.netOn ? " wwwvm.gw=10.0.2.2" : "";
@@ -248,18 +270,46 @@ function addOneVm() {
         upstream: {},
       }
     : { mode: "switch", mac };
+  meta[i] = { ip: ipOf(i), ram, ramdisk, mac, cmdline, net };
 
-  worker.postMessage({
-    t: "boot",
-    linux: true,
-    kernel: lanCfg.kernel, // structured-clone copy per worker (no transfer)
-    initrd: lanCfg.initrd,
-    cmdline,
-    fb: null,
-    net,
-    ramMiB: ram,
-  });
+  addPane(i);
+  bootWorker(i);
   return i;
+}
+
+// Per-VM lifecycle — stop keeps the slot (IP/MAC/pane/terminal) so the VM can be
+// re-started in place; restart = stop + boot. forgetPort drops the switch's
+// learned MACs for the dead/replaced port so frames aren't misrouted.
+function stopVm(i) {
+  if (!workers[i]) return;
+  try { workers[i].terminate(); } catch {}
+  workers[i] = null;
+  sw.forgetPort(i);
+  setVmState(i, "stopped");
+  try { terms[i]?.write("\r\n\x1b[33m[stopped]\x1b[0m\r\n"); } catch {}
+  updateControls(i);
+}
+
+function startVm(i) {
+  if (workers[i] || !meta[i] || !lanCfg) return;
+  try { terms[i]?.reset(); } catch {}
+  bootWorker(i);
+}
+
+function restartVm(i) {
+  if (!meta[i] || !lanCfg) return;
+  if (workers[i]) { try { workers[i].terminate(); } catch {} workers[i] = null; sw.forgetPort(i); }
+  try { terms[i]?.reset(); } catch {}
+  bootWorker(i);
+}
+
+// Reflect running/stopped on the power button (⏹ stop vs ▶ start).
+function updateControls(i) {
+  const b = $(`pwr-${i}`);
+  if (!b) return;
+  const running = !!workers[i];
+  b.textContent = running ? "⏹" : "▶";
+  b.title = running ? "Stop this VM" : "Start this VM";
 }
 
 async function startLan() {
@@ -273,7 +323,8 @@ async function startLan() {
   try {
     const [kr, ir] = await Promise.all([
       fetch(IMAGES_BASE + img.kernel),
-      fetch(IMAGES_BASE + img.initramfs),
+      // Content-keyed query → a rebuilt image (new size) busts the cache.
+      fetch(IMAGES_BASE + img.initramfs + `?b=${img.bytes || 0}`),
     ]);
     kernel = await kr.arrayBuffer();
     initrd = await ir.arrayBuffer();

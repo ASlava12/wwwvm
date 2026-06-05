@@ -987,7 +987,9 @@ $("boot-image").addEventListener("click", async () => {
     // If-Modified-Since (304, no re-download) yet pick up a rebuilt image.
     const [kr, ir] = await Promise.all([
       fetch(IMAGES_BASE + img.kernel),
-      fetch(IMAGES_BASE + img.initramfs),
+      // Content-keyed query busts the browser cache when the image is rebuilt
+      // (manifest is always revalidated, so img.bytes is current).
+      fetch(IMAGES_BASE + img.initramfs + `?b=${img.bytes || 0}`),
     ]);
     if (!kr.ok) throw new Error(`kernel HTTP ${kr.status}`);
     if (!ir.ok) throw new Error(`initramfs HTTP ${ir.status}`);
