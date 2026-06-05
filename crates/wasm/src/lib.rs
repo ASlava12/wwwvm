@@ -46,6 +46,26 @@ pub struct WwwVm {
     net: Option<NetBridge>,
 }
 
+/// Escape a string for embedding in the hand-built control-plane JSON
+/// (`net_take_*`). A guest-resolved DNS name can carry arbitrary bytes
+/// (DNS labels aren't restricted to LDH), so without escaping a `"`/`\`/
+/// control char would break `JSON.parse` on the JS side and drop the batch.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[wasm_bindgen]
 impl WwwVm {
     #[wasm_bindgen(constructor)]
@@ -655,7 +675,7 @@ impl WwwVm {
                 s.push(',');
             }
             s.push('"');
-            s.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
+            s.push_str(&json_escape(&name));
             s.push('"');
         }
         s.push(']');
@@ -748,7 +768,7 @@ impl WwwVm {
                 s.push(',');
             }
             let host = net.nat.host_for_ip(ip).map(str::to_string);
-            let host = host.unwrap_or_else(|| ip.to_string());
+            let host = json_escape(&host.unwrap_or_else(|| ip.to_string()));
             s.push_str(&format!(
                 "{{\"id\":{id},\"host\":\"{host}\",\"ip\":\"{ip}\",\"port\":{port}}}"
             ));
@@ -811,6 +831,14 @@ impl Default for WwwVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_escape_neutralizes_quotes_backslash_control() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(json_escape("x\ny"), "x\\ny");
+        assert_eq!(json_escape("a\u{0001}b"), "a\\u0001b");
+        assert_eq!(json_escape("plain.host"), "plain.host"); // untouched
+    }
 
     // wasm-bindgen attributes are inert on the host target, so we can
     // exercise the wrapper directly.
