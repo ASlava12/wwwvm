@@ -139,7 +139,7 @@ fn main() {
     let net_lan = std::env::var_os("WWWVM_NET_LAN").is_some();
     let net_setup = if net_lan {
         "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
-         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
+         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null; insmod /af_packet.ko 2>/dev/null\n\
          ip link set eth0 up 2>/dev/null\n\
          IP=$(cat /proc/cmdline | tr ' ' '\\n' | sed -n 's/^wwwvm.ip=//p')\n\
          [ -n \"$IP\" ] && ip addr add \"$IP\" dev eth0 2>/dev/null\n\
@@ -149,7 +149,7 @@ fn main() {
            sed -i 's,https://,http://,g' /etc/apk/repositories 2>/dev/null; }\n"
     } else if net_stub {
         "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n\
-         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null\n\
+         insmod /mii.ko 2>/dev/null; insmod /8139too.ko 2>/dev/null; insmod /af_packet.ko 2>/dev/null\n\
          ip link set eth0 up 2>/dev/null\n\
          ip addr add 10.0.2.15/24 dev eth0 2>/dev/null\n\
          ip route add default via 10.0.2.2 2>/dev/null\n\

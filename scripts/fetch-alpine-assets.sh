@@ -103,14 +103,19 @@ extract_mod() {
   fi
 }
 
-# --- NIC modules (optional; needed for in-guest apk over the network) ---
+# --- NIC + packet-socket modules (optional) ---
+# mii/8139too: the RTL8139 NIC driver (in-guest apk over the network).
+# af_packet: AF_PACKET sockets — the lts kernel builds CONFIG_PACKET=m, so
+# without this `tcpdump`/raw capture fail ("not supported on that device") even
+# though IP works (the IPv4 stack is built in). /init insmods it next to the NIC.
 if [ "$WITH_NET" = 1 ]; then
-  if [ "$FORCE" = 1 ] || [ ! -s "$ROOT/8139too.ko" ]; then
+  if [ "$FORCE" = 1 ] || [ ! -s "$ROOT/8139too.ko" ] || [ ! -s "$ROOT/af_packet.ko" ]; then
     ensure_modloop
     extract_mod "kernel/drivers/net/mii.ko" mii.ko
     extract_mod "kernel/drivers/net/ethernet/realtek/8139too.ko" 8139too.ko
+    extract_mod "kernel/net/packet/af_packet.ko" af_packet.ko
     if [ -s "$ROOT/mii.ko" ] && [ -s "$ROOT/8139too.ko" ]; then
-      say "NIC modules in place: $ROOT/{mii,8139too}.ko"
+      say "NIC modules in place: $ROOT/{mii,8139too,af_packet}.ko"
     fi
   else
     say "NIC modules present — skip"
