@@ -122,7 +122,11 @@ impl Cmos {
         if bytes.len() < 1 + 128 {
             return Err("cmos: truncated");
         }
-        self.index = bytes[0];
+        // Mask to 0..127: `storage` is [u8; 128] and read/write index it
+        // directly, so an unmasked index from a malicious snapshot (>= 0x80)
+        // would panic on the next port-0x71 access. Live writes already mask
+        // (write() at &0x7F); restore must too.
+        self.index = bytes[0] & 0x7F;
         self.storage.copy_from_slice(&bytes[1..1 + 128]);
         Ok(1 + 128)
     }
@@ -260,5 +264,18 @@ mod tests {
         let mut cmos = Cmos::new();
         let err = cmos.restore(&[0u8; 128]).unwrap_err();
         assert!(err.contains("truncated"));
+    }
+
+    /// A malicious snapshot must not be able to set the index >= 128 and then
+    /// OOB-panic the [u8; 128] storage on the next port-0x71 access.
+    #[test]
+    fn restore_masks_index_to_storage_bounds() {
+        let mut cmos = Cmos::new();
+        let mut blob = vec![0u8; 1 + 128];
+        blob[0] = 0xFF; // crafted: index past storage
+        cmos.restore(&blob).expect("restore");
+        assert!(cmos.index < 128, "index must be masked into 0..127");
+        // And a data-port read must not panic.
+        let _ = cmos.read(cmos.data_port);
     }
 }
