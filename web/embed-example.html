@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>wwwvm — minimal embed example</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <style>
+      body { margin: 0; background: #0d1117; color: #c9d1d9; font: 14px ui-monospace, monospace; }
+      header { padding: .6rem 1rem; border-bottom: 1px solid #30363d; }
+      h1 { font-size: 1rem; margin: 0; color: #58a6ff; }
+      p { margin: .3rem 0 0; color: #8b949e; font-size: .8rem; }
+      #term { height: calc(100vh - 4rem); padding: .4rem; }
+      a { color: #58a6ff; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>wwwvm — minimal embed</h1>
+      <p id="status">loading…</p>
+    </header>
+    <div id="term"></div>
+
+    <!-- A terminal for display; any UI works — the VM API is framework-agnostic. -->
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+
+    <!-- ===== This is the whole integration ===== -->
+    <script type="module">
+      import { ready, Vm } from "./wwwvm.js";
+
+      const status = (t) => (document.getElementById("status").textContent = t);
+      const term = new Terminal({ convertEol: true, fontSize: 13, theme: { background: "#000" } });
+      const fit = new FitAddon.FitAddon();
+      term.loadAddon(fit);
+      term.open(document.getElementById("term"));
+      fit.fit();
+      addEventListener("resize", () => fit.fit());
+
+      status("initialising wasm…");
+      await ready();
+
+      status("downloading kernel + image…");
+      const [kernel, initrd] = await Promise.all([
+        fetch("images/vmlinuz-lts").then((r) => r.arrayBuffer()),
+        fetch("images/alpine-console.cpio.gz").then((r) => r.arrayBuffer()),
+      ]);
+
+      status("booting — type once the shell is ready");
+      const vm = new Vm({ ramMiB: 256 }).onOutput((s) => term.write(s));
+      term.onData((d) => vm.send(d)); // keystrokes → guest UART
+      vm.bootLinux(kernel, initrd);
+    </script>
+    <!-- ========================================= -->
+  </body>
+</html>
