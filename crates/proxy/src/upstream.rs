@@ -82,7 +82,24 @@ async fn dial_upstream(up: &Upstream) -> Result<TcpStream> {
 }
 
 /// Open a tunnel to `target_host:target_port` through one specific upstream.
+/// Reject hostnames whose *form* could subvert a text upstream protocol. The
+/// allowlist already gates *which* hosts are permitted; this guards their shape
+/// before they reach an upstream — a CR/LF/NUL in `http_connect` would inject
+/// extra headers/requests into the upstream proxy (request smuggling). Hosts and
+/// IP literals are ASCII (punycode for IDNs), so we require printable ASCII
+/// (0x21..=0x7E) and a sane length.
+fn validate_upstream_host(host: &str) -> Result<()> {
+    if host.is_empty() || host.len() > 255 {
+        bail!("upstream: invalid host length");
+    }
+    if host.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+        bail!("upstream: host has control/space/non-ASCII characters");
+    }
+    Ok(())
+}
+
 pub async fn open_via(up: &Upstream, target_host: &str, target_port: u16) -> Result<TcpStream> {
+    validate_upstream_host(target_host)?;
     let mut stream = dial_upstream(up).await?;
     let handshake = async {
         match up.kind {
@@ -289,6 +306,17 @@ pub async fn load_auto_list(path: &Path) -> Result<Vec<Upstream>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_upstream_host_rejects_injection_and_accepts_normal() {
+        assert!(validate_upstream_host("dl-cdn.alpinelinux.org").is_ok());
+        assert!(validate_upstream_host("93.184.216.34").is_ok());
+        assert!(validate_upstream_host("").is_err());
+        assert!(validate_upstream_host("evil.com\r\nHost: inner").is_err()); // CRLF injection
+        assert!(validate_upstream_host("a b").is_err()); // space
+        assert!(validate_upstream_host("x\0y").is_err()); // NUL
+        assert!(validate_upstream_host(&"a".repeat(256)).is_err()); // too long
+    }
 
     #[test]
     fn proxy_kind_parses_lowercase() {
