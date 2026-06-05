@@ -608,6 +608,25 @@ fn sar_sign_extends_negative() {
 }
 
 #[test]
+fn shr_by_more_than_width_is_zero_cf0_no_panic() {
+    // MOV AL, 0xFF ; SHR AL, 10 → 0x00, CF=0. count (10) > operand width must
+    // not shift-panic on the CF extraction (regression for the masked-count bug).
+    // SHR r/m8, imm8 = 0xC0 /5, ModR/M 0xE8, imm 0x0A.
+    let (cpu, _, _) = run_payload(&[0xB0, 0xFF, 0xC0, 0xE8, 0x0A, 0xF4], 4);
+    assert_eq!(cpu.read_r8(0), 0x00);
+    assert!(!cpu.has(flag::CF));
+}
+
+#[test]
+fn sar_by_more_than_width_sign_fills_cf_sign_no_panic() {
+    // MOV AL, 0x80 ; SAR AL, 12 → 0xFF (sign-filled), CF = sign bit = 1.
+    // SAR r/m8, imm8 = 0xC0 /7, ModR/M 0xF8, imm 0x0C.
+    let (cpu, _, _) = run_payload(&[0xB0, 0x80, 0xC0, 0xF8, 0x0C, 0xF4], 4);
+    assert_eq!(cpu.read_r8(0), 0xFF);
+    assert!(cpu.has(flag::CF));
+}
+
+#[test]
 fn rol_by_one_wraps_msb_to_lsb() {
     // MOV AL, 0x81 ; ROL AL, 1 → 0x03, CF=1, OF=0 (no sign flip)
     // ROL r/m8, 1 = 0xD0 /0. ModR/M = 11 000 000 = 0xC0

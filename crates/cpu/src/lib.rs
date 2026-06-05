@@ -3011,7 +3011,14 @@ impl Cpu {
             }
             // SHR — logical right shift
             5 => {
-                let cf = (value >> (count - 1)) & 1 != 0;
+                // count is masked to 0x1F (1..=31) but the operand is 8-bit, so
+                // `value >> (count-1)` would shift past the width (debug panic /
+                // release wrong CF) for count > 8. Past a full shift-out CF = 0.
+                let cf = if count <= 8 {
+                    (value >> (count - 1)) & 1 != 0
+                } else {
+                    false
+                };
                 let result = if count >= 8 { 0 } else { value >> count };
                 self.set_flag(flag::CF, cf);
                 if count == 1 {
@@ -3022,7 +3029,12 @@ impl Cpu {
             }
             // SAR — arithmetic right shift, sign-extends
             7 => {
-                let cf = (value >> (count - 1)) & 1 != 0;
+                // SAR: past a full shift-out the last bit out is the sign bit.
+                let cf = if count <= 8 {
+                    (value >> (count - 1)) & 1 != 0
+                } else {
+                    value & 0x80 != 0
+                };
                 let result = if count >= 8 {
                     if value & 0x80 != 0 {
                         0xFF
@@ -3121,7 +3133,12 @@ impl Cpu {
                 Ok(result)
             }
             5 => {
-                let cf = (value >> (count - 1)) & 1 != 0;
+                // 16-bit operand, count masked to 0x1F → guard count > 16.
+                let cf = if count <= 16 {
+                    (value >> (count - 1)) & 1 != 0
+                } else {
+                    false
+                };
                 let result = if count >= 16 { 0 } else { value >> count };
                 self.set_flag(flag::CF, cf);
                 if count == 1 {
@@ -3131,7 +3148,12 @@ impl Cpu {
                 Ok(result)
             }
             7 => {
-                let cf = (value >> (count - 1)) & 1 != 0;
+                // SAR16: past a full shift-out CF = sign bit.
+                let cf = if count <= 16 {
+                    (value >> (count - 1)) & 1 != 0
+                } else {
+                    value & 0x8000 != 0
+                };
                 let result = if count >= 16 {
                     if value & 0x8000 != 0 {
                         0xFFFF
