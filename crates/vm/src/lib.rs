@@ -1859,16 +1859,21 @@ impl Vm {
                 bytes[dev_off + 2],
                 bytes[dev_off + 3],
             ]) as usize;
-            if bytes.len() < dev_off + 4 + dev_len {
+            // dev_len is a full u32 from the (untrusted) blob; on wasm32
+            // (usize = 32-bit) dev_off + 4 + dev_len could wrap and defeat this
+            // guard, so saturate — an overflow becomes "need = usize::MAX" → the
+            // length check fails cleanly instead of slicing OOB.
+            let dev_need = dev_off.saturating_add(4).saturating_add(dev_len);
+            if bytes.len() < dev_need {
                 return Err(SnapshotError::TooSmall {
                     got: bytes.len(),
-                    need: dev_off + 4 + dev_len,
+                    need: dev_need,
                 });
             }
             self.io
-                .restore(&bytes[dev_off + 4..dev_off + 4 + dev_len])
+                .restore(&bytes[dev_off + 4..dev_need])
                 .map_err(SnapshotError::DeviceRestore)?;
-            seg_end = dev_off + 4 + dev_len;
+            seg_end = dev_need;
         }
 
         // v15 segment-cache section: 6 × (u32 base, u32 limit, u8 access) = 54 B,
