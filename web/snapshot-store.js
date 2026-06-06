@@ -18,15 +18,32 @@ const toHex = (bytes) => {
 };
 
 // Parse the header of an export (or a standalone manifest — it only reads up to
-// the page region). Returns offsets + the per-page hash list.
+// the page region). Returns offsets + the per-page hash list. Every field is
+// bounds-checked: the manifest may come from an untrusted store, so a malformed
+// header must throw a clean Error rather than RangeError / a 4-billion-iteration
+// loop / a giant allocation.
 export function parseExport(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const len = buf.byteLength;
+  const u32 = (p) => {
+    if (p < 0 || p + 4 > len) throw new Error("snapshot: truncated header");
+    return dv.getUint32(p, true);
+  };
   let p = 0;
-  const metaLen = dv.getUint32(p, true); p += 4;
+  const metaLen = u32(p); p += 4;
+  if (metaLen > len - p) throw new Error("snapshot: meta length out of range");
   const meta = buf.subarray(p, p + metaLen); p += metaLen;
-  const ramOff = dv.getUint32(p, true); p += 4;
-  const ramLen = dv.getUint32(p, true); p += 4;
-  const nPages = dv.getUint32(p, true); p += 4;
+  const ramOff = u32(p); p += 4;
+  const ramLen = u32(p); p += 4;
+  const nPages = u32(p); p += 4;
+  // Each page contributes a 32-byte hash, so nPages can't exceed the bytes left,
+  // and must be exactly ceil(ramLen / PAGE) — the count encode_export produced.
+  if (nPages > Math.floor((len - p) / 32)) {
+    throw new Error(`snapshot: nPages ${nPages} exceeds buffer`);
+  }
+  if (nPages !== Math.ceil(ramLen / PAGE)) {
+    throw new Error("snapshot: nPages inconsistent with ramLen");
+  }
   const hashes = [];
   for (let i = 0; i < nPages; i++) {
     hashes.push(toHex(buf.subarray(p, p + 32)));
@@ -147,9 +164,18 @@ export async function downloadSnapshot(store, id) {
     if (!pg) {
       pg = await store.getPage(hex);
       if (!pg) throw new Error(`snapshot "${id}" missing page ${hex.slice(0, 8)}…`);
+      // A page is at most PAGE bytes; an oversized one means a bad/hostile store.
+      if (pg.length > PAGE) throw new Error(`snapshot "${id}" page ${hex.slice(0, 8)}… oversized`);
       cache.set(hex, pg);
     }
     pages.push(pg);
+  }
+  // The page bytes must total exactly ramLen (the last page may be short). This
+  // is a length check, not a hash check (JS has no blake3) — it catches a store
+  // serving wrong-sized pages, but a trusted store is still assumed for content.
+  const ramTotal = pages.reduce((n, pg) => n + pg.length, 0);
+  if (ramTotal !== parsed.ramLen) {
+    throw new Error(`snapshot "${id}": page bytes (${ramTotal}) != ramLen (${parsed.ramLen})`);
   }
   return buildExport(manifestBytes, pages);
 }

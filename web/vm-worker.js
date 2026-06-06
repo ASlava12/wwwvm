@@ -80,6 +80,17 @@ async function netPreResolve(allowlist) {
 function netOpenConn({ id, host, port }) {
   const c = { ws: null, open: false, hostClosed: false, pendingIn: [] };
   netConns.set(id, c);
+  // An https page can't open a ws:// relay — the browser blocks it as mixed
+  // content (the connection just fails). Call out that specific cause once,
+  // before the generic "relay unreachable" hint.
+  if (!relayWarned && self.location?.protocol === "https:" && /^ws:\/\//i.test(netProxyUrl)) {
+    relayWarned = true;
+    post({
+      t: "output",
+      text: `\r\n[net] this page is https but the relay is ws:// (${netProxyUrl}) — browsers ` +
+        `block that as mixed content. Use a wss:// (TLS) relay.\r\n`,
+    });
+  }
   let ws;
   try {
     ws = new WebSocket(netProxyUrl);

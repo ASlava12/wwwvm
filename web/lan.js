@@ -231,7 +231,7 @@ function addPane(i) {
 // both the initial launch and Start/Restart.
 function bootWorker(i) {
   const m = meta[i];
-  const worker = new Worker(new URL("./vm-worker.js?v=10", import.meta.url), { type: "module" });
+  const worker = new Worker(new URL("./vm-worker.js?v=11", import.meta.url), { type: "module" });
   wireWorker(i, worker);
   workers[i] = worker;
   worker.postMessage({

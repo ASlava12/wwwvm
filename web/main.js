@@ -7,7 +7,7 @@
 import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
 import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
 import { makeBytes, breakBytes, comboBytes } from "./ps2-keymap.js?v=2";
-import { SnapStore, uploadSnapshot, downloadSnapshot } from "./snapshot-store.js?v=1";
+import { SnapStore, uploadSnapshot, downloadSnapshot } from "./snapshot-store.js?v=2";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -62,7 +62,7 @@ window.__wwwvm = vm;
 // The VM engine: by default a Web Worker; the "Web Worker" checkbox (default
 // on) can switch boots to the inline main-thread path. `active` tracks which
 // engine currently owns the live VM, so input/snapshot route to the right one.
-const worker = new Worker(new URL("./vm-worker.js?v=10", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./vm-worker.js?v=11", import.meta.url), { type: "module" });
 let active = "inline"; // "inline" | "worker"
 let useWorker = true;
 let workerBooted = false;
