@@ -177,6 +177,13 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Refuse to start as an open relay (`*` allowlist) on a public (non-loopback)
+/// bind unless explicitly overridden — a forgotten `*` on a reachable port is
+/// the worst footgun. Pure decision so it's unit-tested.
+fn refuse_open_relay(allows_anything: bool, is_loopback: bool, override_set: bool) -> bool {
+    allows_anything && !is_loopback && !override_set
+}
+
 /// Build a rustls server config from PEM cert + key files (for serving `wss://`
 /// directly, so an https-hosted page doesn't need a separate TLS reverse proxy).
 /// Uses the `ring` crypto provider explicitly so we don't depend on a process
@@ -228,15 +235,25 @@ async fn main() -> Result<()> {
         );
     }
     // An open relay (`*`) is dangerous; on a non-loopback bind it lets ANY
-    // reachable client tunnel TCP to ANY host through this process. Warn hard.
+    // reachable client tunnel TCP to ANY host through this process. Refuse to
+    // start in that configuration unless the operator explicitly opts in — a
+    // forgotten `*` on a public bind is the single biggest footgun here.
     if allow.allows_anything() {
         let public = !bind.ip().is_loopback();
+        let override_set = env::var_os("WWWVM_PROXY_I_REALLY_WANT_AN_OPEN_RELAY").is_some();
+        if refuse_open_relay(true, bind.ip().is_loopback(), override_set) {
+            bail!(
+                "refusing to start: WWWVM_PROXY_ALLOWLIST permits `*` (OPEN RELAY) on a \
+                 non-loopback bind ({bind}). Anyone who can reach this port could tunnel TCP \
+                 to any host through you. Use a SPECIFIC allowlist (e.g. \
+                 dl-cdn.alpinelinux.org:443) and/or bind to 127.0.0.1. To override (you \
+                 understand the risk), set WWWVM_PROXY_I_REALLY_WANT_AN_OPEN_RELAY=1."
+            );
+        }
         log::warn!(
             "WWWVM_PROXY_ALLOWLIST permits `*` (ANY host:port) — this is an OPEN RELAY.{}",
             if public {
-                " Bound to a NON-loopback address: anyone who can reach this port can \
-                 tunnel through you. Use a SPECIFIC allowlist (e.g. dl-cdn.alpinelinux.org:443) \
-                 and/or bind to 127.0.0.1. `*` is for throwaway local testing only."
+                " Override is set — running an open relay on a public bind. You own the risk."
             } else {
                 " (Bound to loopback — local testing only; never expose this.)"
             }
@@ -611,6 +628,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_relay_refused_only_on_public_bind_without_override() {
+        assert!(refuse_open_relay(true, false, false)); // `*` + public + no override → refuse
+        assert!(!refuse_open_relay(true, false, true)); // override set → allow
+        assert!(!refuse_open_relay(true, true, false)); // loopback → allow (warn only)
+        assert!(!refuse_open_relay(false, false, false)); // specific allowlist → allow
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
