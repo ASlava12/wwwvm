@@ -58,3 +58,14 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-test-
       - name: cargo test --workspace
         run: cargo test --workspace --locked
+
+  web-js:
+    name: web-js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: pure-logic JS tests (net-route, l2-switch, snapshot-store, ps2-keymap)
+        run: ./scripts/test-web-js.sh
