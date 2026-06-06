@@ -1304,6 +1304,7 @@ impl Vm {
     /// Enable the CPU's debug instruction-trace ring (see
     /// `Cpu::enable_pf_trace`). Diagnostics use this to dump the last
     /// `cap` instructions when a wild jump / null-deref #PF fires.
+    /// Diagnostic/unstable — not part of the stable embedding API.
     pub fn enable_cpu_pf_trace(&self, cap: usize) {
         self.cpu.enable_pf_trace(cap);
     }
