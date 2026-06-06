@@ -33,6 +33,11 @@ struct DnsQueryFrame<'a> {
     payload: &'a [u8],
 }
 
+/// Cap on the on-demand-resolution queue. A guest with a `*` allowlist could
+/// otherwise enqueue unbounded distinct random names between drains. Past this,
+/// new names are dropped (the guest's retry re-queues once a drain frees space).
+const MAX_PENDING: usize = 256;
+
 pub struct DnsForwarder {
     gw_ip: [u8; 4],
     gw_mac: [u8; 6],
@@ -138,7 +143,11 @@ impl DnsForwarder {
                 // cached (routable-only, resolved-name-only at connect).
                 _ => {
                     if self.allow.permits_host(&query.name) {
-                        self.pending.insert(query.name.clone());
+                        // Bounded: drop past the cap (already-queued names still
+                        // resolve; the guest retries dropped ones after a drain).
+                        if self.pending.len() < MAX_PENDING || self.pending.contains(&query.name) {
+                            self.pending.insert(query.name.clone());
+                        }
                         return None;
                     }
                     DnsAnswer::NxDomain
@@ -357,6 +366,18 @@ mod tests {
         );
         assert_eq!(f.take_pending(), vec!["newhost.example.com".to_string()]);
         assert!(f.take_pending().is_empty(), "drained");
+    }
+
+    #[test]
+    fn pending_queue_is_capped() {
+        // A `*` allowlist must not let a guest grow the pending set unbounded.
+        let mut f = DnsForwarder::new(GW_IP, GW_MAC, Allowlist::parse("*"));
+        for i in 0..(MAX_PENDING + 50) {
+            let name = format!("h{i}.example.com");
+            let frame = query_frame(GW_IP, &dns_query_payload(1, &name, QTYPE_A));
+            let _ = f.handle_frame(&frame);
+        }
+        assert!(f.take_pending().len() <= MAX_PENDING, "pending must be capped");
     }
 
     #[test]
