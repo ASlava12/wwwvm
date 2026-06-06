@@ -16,6 +16,6 @@ path = "src/bin/snapstore-server.rs"
 # Content-addressing: a page's name IS its blake3 hash, verified on write.
 blake3 = { version = "1", default-features = false }
 # The HTTP service binary (the lib's routing logic is transport-agnostic).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 log = { workspace = true }
 env_logger = "0.11"

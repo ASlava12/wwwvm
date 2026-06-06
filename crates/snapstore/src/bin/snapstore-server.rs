@@ -16,9 +16,11 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use wwwvm_snapstore::{http, Store};
 
 /// Max request-body bytes. A manifest (non-RAM snapshot bytes + a page-hash list
@@ -26,6 +28,11 @@ use wwwvm_snapstore::{http, Store};
 const MAX_BODY: usize = 128 * 1024 * 1024;
 /// Max request-head bytes (guards against a client that never sends `\r\n\r\n`).
 const MAX_HEAD: usize = 16 * 1024;
+/// Per-read idle timeout: if no bytes arrive within this window the connection
+/// is dropped, so a slowloris client can't pin a task/socket indefinitely.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Max concurrent connections — bounds task/fd/memory use under a flood.
+const MAX_CONNS: usize = 64;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -54,15 +61,31 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     log::info!("wwwvm-snapstore listening on {bind} (root {root})");
 
+    // Cap concurrent connections: acquire a permit before spawning so the accept
+    // loop back-pressures (new connections wait in the OS backlog) past the cap.
+    let conns = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
         let (sock, peer) = listener.accept().await?;
+        let permit = conns.clone().acquire_owned().await.expect("semaphore open");
         let store = store.clone();
         let token = token.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's lifetime
             if let Err(e) = serve(sock, store, token).await {
                 log::debug!("{peer}: {e}");
             }
         });
+    }
+}
+
+/// Read into `tmp`, failing if no bytes arrive within [`IDLE_TIMEOUT`].
+async fn read_idle(sock: &mut TcpStream, tmp: &mut [u8]) -> std::io::Result<usize> {
+    match tokio::time::timeout(IDLE_TIMEOUT, sock.read(tmp)).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "idle read timeout",
+        )),
     }
 }
 
@@ -81,7 +104,7 @@ async fn serve(
         if buf.len() > MAX_HEAD {
             return respond(&mut sock, &resp(413, "head too large"), false).await;
         }
-        let n = sock.read(&mut tmp).await?;
+        let n = read_idle(&mut sock, &mut tmp).await?;
         if n == 0 {
             return Ok(()); // client closed before sending a full request
         }
@@ -100,14 +123,20 @@ async fn serve(
     }
     let is_head = method == "HEAD";
 
-    // Read the body (already-buffered remainder + the rest up to Content-Length).
-    let body_start = head_end + 4;
-    let mut body = buf[body_start..].to_vec();
     if content_len > MAX_BODY {
         return respond(&mut sock, &resp(413, "body too large"), false).await;
     }
+    // Reject an unauthorized PUT BEFORE reading its (up to MAX_BODY) body, so an
+    // unauthenticated client can't make us buffer 128 MiB just to 401 it.
+    if method == "PUT" && !http::authorized(token.as_deref(), auth.as_deref()) {
+        return respond(&mut sock, &resp(401, "unauthorized"), false).await;
+    }
+
+    // Read the body (already-buffered remainder + the rest up to Content-Length).
+    let body_start = head_end + 4;
+    let mut body = buf[body_start..].to_vec();
     while body.len() < content_len {
-        let n = sock.read(&mut tmp).await?;
+        let n = read_idle(&mut sock, &mut tmp).await?;
         if n == 0 {
             break;
         }
@@ -144,7 +173,9 @@ fn parse_head(head: &[u8]) -> Option<(String, String, usize, Option<String>)> {
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
             match name.as_str() {
-                "content-length" => content_len = value.parse().unwrap_or(0),
+                // A present-but-malformed Content-Length is a bad request, not
+                // silently 0 (which would read the body as empty).
+                "content-length" => content_len = value.parse().ok()?,
                 "authorization" => auth = Some(value.to_string()),
                 _ => {}
             }

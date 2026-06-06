@@ -76,6 +76,13 @@ pub fn bearer(auth_header: Option<&str>) -> Option<&str> {
     auth_header?.strip_prefix("Bearer ").map(str::trim)
 }
 
+/// Whether a presented bearer `auth` is a valid admin token. Fail-closed: an
+/// unset `admin_token` rejects everything (constant-time compare otherwise).
+/// Exposed so the server can check auth *before* reading a (large) PUT body.
+pub fn authorized(admin_token: Option<&str>, auth: Option<&str>) -> bool {
+    matches!((admin_token, auth), (Some(t), Some(a)) if ct_eq(a, t))
+}
+
 /// Route one request. `admin_token` is the configured secret (None = writes
 /// disabled). `auth` is the bearer token the client presented. `body` is the
 /// request body (empty for GET/HEAD).
@@ -87,8 +94,7 @@ pub fn route(
     auth: Option<&str>,
     body: &[u8],
 ) -> Response {
-    let authorized =
-        admin_token.is_some() && auth.is_some() && ct_eq(auth.unwrap(), admin_token.unwrap());
+    let authorized = authorized(admin_token, auth);
 
     if let Some(hex) = path.strip_prefix("/pages/") {
         let Some(hash) = from_hex(hex) else {
@@ -286,5 +292,14 @@ mod tests {
         assert!(ct_eq("hunter2", "hunter2"));
         assert!(!ct_eq("hunter2", "hunter3"));
         assert!(!ct_eq("short", "longer"));
+    }
+
+    #[test]
+    fn authorized_is_fail_closed() {
+        assert!(authorized(Some("secret"), Some("secret")));
+        assert!(!authorized(Some("secret"), Some("wrong")));
+        assert!(!authorized(Some("secret"), None));
+        assert!(!authorized(None, Some("secret"))); // unset token → reject even a presented one
+        assert!(!authorized(None, None));
     }
 }
