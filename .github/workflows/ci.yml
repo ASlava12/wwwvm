@@ -92,3 +92,17 @@ jobs:
       # non-wasm-compatible dep or a usize-32 regression that the host build misses).
       - name: cargo build -p wwwvm-wasm --target wasm32-unknown-unknown
         run: cargo build -p wwwvm-wasm --target wasm32-unknown-unknown --release
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails CI on a known vulnerability (RUSTSEC) in any dependency. Plain
+      # `cargo audit` exits 0 on informational "unmaintained" warnings, so the
+      # tree stays green until an actual advisory lands.
+      - name: cargo audit
+        run: cargo audit
