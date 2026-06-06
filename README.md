@@ -164,11 +164,11 @@ getcwd-блокер — это была ошибка теста, не ядра).
  cpu   mem   devices (UART 16550 on COM1)
 
 (сеть)
-┌──────────────────────────┐  WS  ┌──────────────────────────────┐
-│ Browser                  │◄────►│ crates/proxy (Rust, tokio)    │
-│ (future virtio-net stub) │      │ WebSocket ↔ TCP gateway       │
-└──────────────────────────┘      │ allowlist via env var         │
-                                  └──────────────────────────────┘
+┌──────────────────────────────┐  WS  ┌──────────────────────────────┐
+│ guest RTL8139 NIC            │◄────►│ crates/proxy (Rust, tokio)    │
+│ → in-wasm smoltcp NAT        │      │ WebSocket ↔ TCP gateway       │
+│   (crates/net, slirp role)  │      │ allowlist + Origin lock (env) │
+└──────────────────────────────┘      └──────────────────────────────┘
 ```
 
 ## Что работает сейчас
@@ -1472,7 +1472,7 @@ workload (RES_0→RES_8414). Затрагивает ЛЮБОЙ FP-код, гру
 | Полный #DF / #NP / #SS | средний | #DE, #UD, #PF и весь основной #GP набор уже доезжают; #DF/#NP/#SS — ещё нет |
 | IDE/ATA DMA / virtio-blk | средний | Оба канала (primary + secondary) read+write через PIO уже работают; для модерн дистров нужно ещё DMA |
 | HPET таймер-IRQ / реалистичный PIT-тайминг | малый | LAPIC периодический таймер уже доставляет; HPET — только probe-stub без доставки. Linux в большинстве конфигов берёт LAPIC, так что HPET-доставка — second-tier. |
-| ne2k/virtio-net + slirp поверх `crates/proxy` | средний | Сеть из гостя |
+| ✅ **РЕШЕНО** — Сеть из гостя (RTL8139 + NAT + relay) | — | Реализовано иначе, чем планировалось (RTL8139 вместо ne2k/virtio): NIC `crates/devices/src/rtl8139.rs` + in-wasm smoltcp-NAT (`crates/net`) с slirp-ролью → relay `crates/proxy` (WebSocket↔TCP). В госте: `apk update/add`, `wget`, TCP наружу; плюс виртуальный L2-LAN между несколькими VM (`crates/net::switch`) и гибрид LAN+интернет. См. разделы «Снапшот-платформа + виртуальный LAN» и `docs/EMBED.md`. Остаётся (second-tier): ICMP-релей наружу, DMA/offload. |
 | ✅ **РЕШЕНО (31 мая 2026)** — VGA graphics, framebuffer | — | `Vm::enable_linear_framebuffer` прописывает boot-protocol `screen_info` (efifb/vesafb) + резервирует регион RAM в e820; ядро биндит efifb прямо из `screen_info` (без VESA BIOS/EFI firmware), fbcon рисует консоль пикселями, хост читает байты обратно и блитит на `<canvas>`. Teeth: `linux_efifb_framebuffer_renders_pixels_milestone` (efifb клеймит наш base, 230 KB ненулевых пикселей). У Alpine `vmlinuz-lts` встроен только efifb (vesafb выпилен) → дефолт EFI; для true-GUI (X/Wayland) ещё нужны 2D/DRM-устройства. |
 | 🚧 **GUI (X/DRM) — дисплей разблокирован (2 июн 2026)** | в работе | Цель: графический десктоп в госте. **Recon:** netboot `vmlinuz-lts` имеет только минимум встроенного — fbcon рисует консоль, но юзерспейс-устройства (`/dev/fb0`, `/dev/dri`, `/dev/input/*`) отсутствуют (драйверы — модули в `modloop-lts`, как было с сетью). **✅ Дисплей решён без пересборки ядра:** `fetch-alpine-assets.sh --with-gui` достаёт из modloop замыкание `i2c-core→drm→drm_kms_helper→drm_shmem_helper→simpledrm` (+`evdev`/`mousedev`/`psmouse`); `alpine_console` /init грузит их при `WWWVM_FB`. `simpledrm` биндит `simple-framebuffer.0` (созданный `sysfb` из EFI `screen_info`) → **`/dev/dri/card0`** (устройство для X `modesetting`). `evdev` даёт `/dev/input/event*`. **Осталось:** ввод — 8042 сейчас заглушка (`i8042: Can't read CTR` → built-in `atkbd` не биндится), нужен полный контроллер 8042 + PS/2-мышь (AUX, IRQ12); затем `apk add xorg-server` + `modesetting` + WM. |
 | ✅ **GUI ввод — клавиатура + мышь (2 июн 2026)** | — | Переписан `crates/devices/src/keyboard.rs` из заглушки в полноценный контроллер 8042: config-byte (`0x20`/`0x60` — чинит «Can't read CTR»), enable/disable портов (+ CCB clock-биты), протокол клавиатуры (reset→`FA AA`, identify→`FA AB 83`, set-LEDs/typematic), AUX-канал мыши (`0xA8`/`0xD4`, reset→`FA AA 00`, sample-rate knock, reporting, 3-байтные пакеты → **IRQ12**), AUX_LOOP `0xD3`/`0xD2` для детекта порта мыши. Ответы устройств поднимают IRQ (atkbd ждёт их по прерыванию). Teeth (in-guest, lts): `serio i8042 KBD irq 1` + `AUX irq 12`, `input: AT Raw Set 2 keyboard` + `PS/2 Generic Mouse`, **`/dev/input/event0`+`event1`** — то, что нужно X. 11 новых юнит-тестов (110 в devices). |
