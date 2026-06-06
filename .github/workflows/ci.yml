@@ -69,3 +69,26 @@ jobs:
           node-version: '20'
       - name: pure-logic JS tests (net-route, l2-switch, snapshot-store, ps2-keymap)
         run: ./scripts/test-web-js.sh
+
+  wasm-build:
+    name: wasm-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + wasm32 target
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm-
+      # The shipped artifact: ensure it compiles for its real target (catches a
+      # non-wasm-compatible dep or a usize-32 regression that the host build misses).
+      - name: cargo build -p wwwvm-wasm --target wasm32-unknown-unknown
+        run: cargo build -p wwwvm-wasm --target wasm32-unknown-unknown --release
