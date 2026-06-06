@@ -1120,6 +1120,13 @@ pub mod snapshot {
     ///   calibration setup at port 0x42 + the port-0x61 gate/
     ///   speaker bits round-trip. Pre-v14 snapshots leave ch2
     ///   idle on restore; the kernel re-arms it next calibration.
+    /// * v15 — appends the real protected-mode segment caches (6 ×
+    ///   base/limit/access) after the device blob, restored verbatim;
+    ///   pre-v15 re-derives them as `sel << 4` (real-mode), which
+    ///   corrupted PM guests on resume. See restore().
+    /// * v16 — appends the framebuffer config (present byte + base/
+    ///   size/dims/stride/bpp/video_type) so a restored GUI guest's
+    ///   canvas renders; pre-v16 leaves `fb` as None.
     pub const VERSION: u8 = 16;
     /// Bytes the v10 LAPIC section adds past the RAM region. Sized
     /// to match [`wwwvm_mem::LAPIC_SIZE`] but kept as a const here

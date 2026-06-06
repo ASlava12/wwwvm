@@ -395,9 +395,10 @@ impl WwwVm {
         self.inner.vga_text_snapshot()
     }
 
-    /// Capture CPU + RAM as a byte blob the host can persist (IndexedDB,
-    /// download as file, etc.) and later feed to `restore`. ~1 MiB.
-    /// Device state is *not* preserved in this version.
+    /// Capture CPU + RAM + device state (UART/PIC/PIT/CMOS/ATA/PCI/NIC,
+    /// LAPIC/HPET, segment caches, framebuffer config) as a byte blob the host
+    /// can persist (IndexedDB, download as file, etc.) and later feed to
+    /// `restore`. ~RAM-sized. See `snapshot_export` for the paged/diffable form.
     pub fn snapshot(&self) -> Vec<u8> {
         self.inner.snapshot()
     }

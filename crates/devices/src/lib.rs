@@ -1,9 +1,10 @@
 //! IO-port-mapped devices visible to the CPU.
 //!
-//! Three concrete devices today: a 16550 UART on COM1 (the JS ↔ guest
-//! byte stream), a master 8259A PIC (IRQ controller), and an 8254 PIT
-//! (timer wired to IRQ 0). Each lives in its own module; this file is
-//! just the trait, the dispatcher, and the IoBus glue.
+//! Concrete devices today: a 16550 UART on COM1 (the JS ↔ guest byte stream),
+//! master + slave 8259A PICs, an 8254 PIT (timer on IRQ 0), an 8042 keyboard
+//! controller, an MC146818 CMOS/RTC, two IDE/ATA channels, a PCI config space
+//! (host bridge at 00:00.0), and an RTL8139 NIC. Each lives in its own module;
+//! this file is just the trait, the dispatcher, and the IoBus glue.
 //!
 //! `IoBus` is concrete (not a trait-object container) on purpose: the
 //! CPU needs typed access to the PIC for IRQ vector delivery and the
@@ -65,7 +66,7 @@ pub struct IoBus {
     /// Primary IDE channel + its in-memory boot disk. The disk is
     /// owned by the controller; existing call sites that used to
     /// reach for `io.disk` directly now go through `io.disk()` /
-    /// `io.disk_mut()` accessors. Not snapshotted yet.
+    /// `io.disk_mut()` accessors. Snapshotted (DEV_ATA_PRIMARY).
     pub ata: Ata,
     /// Secondary IDE channel (ports 0x170..0x177). Same controller
     /// type, different port base — the standard PC two-channel
