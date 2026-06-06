@@ -427,6 +427,9 @@ function blitFramebuffer() {
 // the browser can't do raw DNS. SECURITY: never run the proxy with a "*"
 // allowlist on a reachable host — it's an open relay.
 let netEnabled = false;
+// Warn once if the relay can't be reached / is mixed-content-blocked, so a hung
+// apk/wget has a visible cause (parity with the worker path in vm-worker.js).
+let relayWarned = false;
 let netProxyUrl = "ws://localhost:8080";
 // Upstream-proxy selection merged into every connect frame: {} = direct,
 // {auto:true} = server rotates its pool, {upstream:{kind,host,port}} = chain
@@ -528,10 +531,19 @@ function netOpenConn({ id, host, port }) {
   // of a response is dropped and the guest is FIN'd early).
   const c = { ws: null, open: false, hostClosed: false, pendingIn: [] };
   netConns.set(id, c);
+  // An https page can't open a ws:// relay (mixed content, silently blocked).
+  if (!relayWarned && location.protocol === "https:" && /^ws:\/\//i.test(netProxyUrl)) {
+    relayWarned = true;
+    setNetStatus(`relay is ws:// but the page is https — blocked as mixed content; use a wss:// relay`);
+  }
   let ws;
   try {
     ws = new WebSocket(netProxyUrl);
   } catch (e) {
+    if (!relayWarned) {
+      relayWarned = true;
+      setNetStatus(`bad relay URL "${netProxyUrl}": ${e.message || e}`);
+    }
     vm.net_conn_closed(id);
     netConns.delete(id);
     return;
@@ -556,6 +568,11 @@ function netOpenConn({ id, host, port }) {
     c.pendingIn.push(new Uint8Array(ev.data)); // delivered to the guest in pumpNet()
   };
   ws.onclose = ws.onerror = () => {
+    // Never opened → the relay is unreachable (not started / wrong URL / blocked).
+    if (!c.open && !relayWarned) {
+      relayWarned = true;
+      setNetStatus(`relay unreachable at ${netProxyUrl} — start it (cargo run -p wwwvm-proxy) and check its allowlist + WWWVM_PROXY_ORIGINS`);
+    }
     c.hostClosed = true; // drained + torn down in pumpNet once pendingIn empties
   };
 }
@@ -859,6 +876,7 @@ async function bootLinux(kbuf, ibuf, { ramMiB = 256 } = {}) {
       }
     }
     netConns.clear();
+    relayWarned = false;
     netEnabled = $("net-enable").checked;
     if (netEnabled) {
       netProxyUrl = $("net-proxy").value.trim() || "ws://localhost:8080";
