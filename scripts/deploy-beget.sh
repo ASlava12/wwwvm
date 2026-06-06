@@ -35,6 +35,15 @@ AddType application/wasm .wasm
 <IfModule mod_deflate.c>
 AddOutputFilterByType DEFLATE text/html text/css application/javascript text/javascript application/wasm application/json image/svg+xml
 </IfModule>
+# Revalidate the app shell + wasm on every load (cheap If-Modified-Since → 304
+# when unchanged) so a redeploy — especially a rebuilt wasm, whose URL has no
+# ?v cache-bust — is picked up without a manual hard-reload. The .js modules are
+# ?v-versioned in the HTML; this covers the wasm and the HTML itself.
+<IfModule mod_headers.c>
+<FilesMatch "\.(html|wasm)$">
+Header set Cache-Control "no-cache"
+</FilesMatch>
+</IfModule>
 HT
 
 echo "-> syncing web/ to $HOST:$DEST"
