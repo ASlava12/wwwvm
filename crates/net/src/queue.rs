@@ -100,8 +100,14 @@ impl QueueConnector {
             let (in_tx, in_rx) = mpsc::sync_channel::<Vec<u8>>(IN_DEPTH);
             let stop = Arc::new(AtomicBool::new(false));
             let mut s = state.borrow_mut();
+            // Find a free id. next_id wraps after 2^32 opens (wrapping_add, no
+            // debug panic); skip any still-live id so a wrapped counter can
+            // never alias a live connection's queue. Normally runs 0 iterations.
+            while s.conns.contains_key(&s.next_id) {
+                s.next_id = s.next_id.wrapping_add(1);
+            }
             let id = s.next_id;
-            s.next_id += 1;
+            s.next_id = s.next_id.wrapping_add(1);
             s.new.push(id);
             s.conns.insert(
                 id,
