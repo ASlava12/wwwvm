@@ -3,6 +3,7 @@ name = "wwwvm-wasm"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
+description = "In-browser x86 PC emulator (boots Linux) — wasm bindings for the wwwvm VM. See docs/EMBED.md."
 publish = false
 
 [lib]
