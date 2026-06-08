@@ -530,10 +530,11 @@ fn bios_int13(cpu: &mut Cpu, mem: &mut Memory, io: &mut IoBus) -> bool {
 ///     entry and updates EBX. EBX=0 on return means "this was the
 ///     last entry".
 ///
-/// Our model returns a single usable entry covering the VM's RAM
-/// — sufficient for kernels that just want to know how much memory
-/// they have, and consistent with how a flat physical address
-/// space looks.
+/// Our model returns the canonical three-entry PC map (conventional
+/// usable / EBDA+video+ROM reserved / extended usable), walked via the
+/// EBX continuation token — the same shape `start_protected_mode_at`
+/// writes directly into boot_params, so the real-mode-setup boot path
+/// and the PM-direct path agree on memory layout.
 fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
     let ax = cpu.regs[wwwvm_cpu::r16::AX];
     // AH=0x88 — legacy "Get Extended Memory Size" fallback. Returns
@@ -634,34 +635,42 @@ fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
     if ax != 0xE820 {
         return false;
     }
-    // Validate "SMAP" signature in EDX. If the guest didn't set it
-    // we still service the call (some loaders skip it), but it's
-    // the canonical check Linux setup does.
-    let ebx = cpu.read_r32(3); // EBX
-    let ecx = cpu.read_r32(1); // ECX (buffer size)
+    // E820 memory map, walked via the EBX continuation token. We model
+    // the canonical three-entry PC layout (the same shape
+    // `start_protected_mode_at` writes straight into boot_params for the
+    // PM-direct path; here the guest's own real-mode setup collects it
+    // through repeated INT 15h, AX=0xE820 calls):
+    //   [0]      0x0 .. 0x9FC00   usable    (conventional low memory)
+    //   [1]  0x9FC00 .. 0x100000  reserved  (EBDA / video / BIOS ROM)
+    //   [2] 0x100000 .. ram_size  usable    (extended memory)
+    // EBX is the continuation index: it comes in 0, then we hand back
+    // 1, 2, and finally 0 to mean "that was the last entry" — exactly
+    // what Linux's detect_memory_e820 loops on.
+    let ecx = cpu.read_r32(1); // ECX = caller buffer size
     if ecx < 20 {
-        // Buffer too small for a 20-byte entry. Set CF=1.
+        // Buffer can't hold a 20-byte entry. Real BIOS sets CF=1.
         cpu.flags |= wwwvm_cpu::flag::CF;
         return true;
     }
-    if ebx != 0 {
-        // We only model one entry. Any nonzero continuation index
-        // means "we already returned the last one" — surface that
-        // by setting CF=1 and EBX=0.
+    let ram = mem.size() as u64;
+    let entries: [(u64, u64, u32); 3] = [
+        (0x0, 0x0009_FC00, 1),
+        (0x0009_FC00, 0x0006_0400, 2),
+        (0x0010_0000, ram.saturating_sub(0x0010_0000), 1),
+    ];
+    let idx = cpu.read_r32(3) as usize; // EBX = continuation token
+    if idx >= entries.len() {
+        // Past the final entry — signal "no more" (CF=1, EBX=0).
         cpu.flags |= wwwvm_cpu::flag::CF;
         cpu.write_r32(3, 0);
         return true;
     }
+    let (base, length, entry_type) = entries[idx];
 
-    // Linear destination = ES:DI.
+    // Linear destination = ES:DI. base (u64), length (u64), type (u32),
+    // little-endian.
     let di = cpu.regs[wwwvm_cpu::r16::DI];
     let dest = cpu.linear_seg(wwwvm_cpu::sreg::ES, di as u32);
-
-    let base: u64 = 0;
-    let length = mem.size() as u64;
-    let entry_type: u32 = 1; // usable
-
-    // base (u64), length (u64), type (u32) — little-endian.
     for i in 0..8 {
         cpu.mem_write_u8(mem, dest + i, (base >> (i * 8)) as u8);
     }
@@ -672,11 +681,15 @@ fn bios_int15(cpu: &mut Cpu, mem: &mut Memory) -> bool {
         cpu.mem_write_u8(mem, dest + 16 + i, (entry_type >> (i * 8)) as u8);
     }
 
-    // Returns: EAX = "SMAP", ECX = 20, EBX = 0 (no more entries),
-    // CF = 0.
-    cpu.write_r32(0, 0x534D_4150); // "SMAP"
-    cpu.write_r32(1, 20); // bytes returned
-    cpu.write_r32(3, 0); // continuation = 0 → no more
+    // Next token: idx+1, or 0 once the last entry has been handed out.
+    let next = if idx + 1 < entries.len() {
+        (idx + 1) as u32
+    } else {
+        0
+    };
+    cpu.write_r32(0, 0x534D_4150); // EAX = "SMAP"
+    cpu.write_r32(1, 20); // ECX = bytes returned
+    cpu.write_r32(3, next); // EBX = continuation
     cpu.flags &= !wwwvm_cpu::flag::CF;
     true
 }

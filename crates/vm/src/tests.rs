@@ -985,9 +985,10 @@ fn bios_int15_88_caps_at_0xffff() {
 }
 
 /// INT 0x15 AX=0xE820 — Linux setup uses this to discover usable
-/// RAM ranges. Our shim returns a single entry covering the whole
-/// VM RAM (base=0, length=mem.size(), type=1) and signals "no more
-/// entries" via EBX=0 on the first call.
+/// RAM ranges. Our shim returns the canonical three-entry PC map
+/// (conventional usable / EBDA+video+ROM reserved / extended usable),
+/// walked via the EBX continuation token; this test checks the first
+/// entry and that EBX advances rather than terminating immediately.
 ///
 /// Boot stub:
 ///   MOV AX, 0xE820   ; B8 20 E8
@@ -999,9 +1000,12 @@ fn bios_int15_88_caps_at_0xffff() {
 ///   INT 0x15         ; CD 15
 ///   HLT              ; F4
 ///
-/// Verifies the 20-byte buffer at 0x3000, EBX=0, ECX=20, AX="SMAP".
+/// Verifies the FIRST 20-byte entry at 0x3000 (conventional usable,
+/// 0x0..0x9FC00), the continuation EBX→1, ECX=20, AX="SMAP", CF=0 —
+/// driven through the real `INT 0x15` dispatch path (CPU decodes the
+/// 0x66-prefixed loads + `CD 15`, then bios_hook serves it).
 #[test]
-fn bios_int15_e820_returns_single_ram_entry() {
+fn bios_int15_e820_first_entry_is_conventional_usable() {
     let mut vm = Vm::with_ram_size(0x0200_0000); // 32 MiB
     vm.install_bios();
     vm.load_image(
@@ -1020,12 +1024,11 @@ fn bios_int15_e820_returns_single_ram_entry() {
     let (_, stop) = vm.run_steps(64);
     assert!(matches!(stop, Stop::Halted));
 
-    // base (u64) at 0x3000 = 0
+    // entry[0]: base=0, length=0x9FC00 (conventional), type=1 usable.
     for off in 0..8 {
         assert_eq!(vm.read_mem_u8(0x3000 + off), 0, "base byte {off}");
     }
-    // length (u64) at 0x3008 = 32 MiB = 0x0200_0000
-    let length_bytes = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+    let length_bytes = [0x00, 0xFC, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00]; // 0x9FC00
     for (off, &expected) in length_bytes.iter().enumerate() {
         assert_eq!(
             vm.read_mem_u8(0x3008 + off as u32),
@@ -1033,31 +1036,31 @@ fn bios_int15_e820_returns_single_ram_entry() {
             "length byte {off}"
         );
     }
-    // type (u32) at 0x3010 = 1
-    assert_eq!(vm.read_mem_u8(0x3010), 1);
+    assert_eq!(vm.read_mem_u8(0x3010), 1, "type = usable");
     assert_eq!(vm.read_mem_u8(0x3011), 0);
     assert_eq!(vm.read_mem_u8(0x3012), 0);
     assert_eq!(vm.read_mem_u8(0x3013), 0);
 
-    // Returned register state.
+    // Returned register state: SMAP / 20 bytes / EBX advanced to 1.
     assert_eq!(vm.cpu().read_r32(0), 0x534D_4150, "EAX = SMAP");
     assert_eq!(vm.cpu().read_r32(1), 20, "ECX = 20");
-    assert_eq!(vm.cpu().read_r32(3), 0, "EBX = 0 (no more entries)");
+    assert_eq!(vm.cpu().read_r32(3), 1, "EBX advances to entry 1");
     assert_eq!(vm.cpu().flags & wwwvm_cpu::flag::CF, 0, "CF clear");
 }
 
-/// A second E820 call with EBX != 0 must set CF=1 to signal "done".
-/// (Some loaders re-enter the loop and rely on CF as the terminator
-/// instead of EBX.)
+/// An E820 continuation past the final entry (EBX=3, one beyond the
+/// three we model) must set CF=1 and clear EBX to terminate the loop —
+/// the way a real BIOS signals "no more entries". Driven through the
+/// real `INT 0x15` path.
 #[test]
-fn bios_int15_e820_with_nonzero_continuation_signals_done() {
-    let mut vm = Vm::with_ram_size(0x0010_0000);
+fn bios_int15_e820_continuation_past_end_signals_done() {
+    let mut vm = Vm::with_ram_size(0x0200_0000);
     vm.install_bios();
     vm.load_image(
         BOOT_LOAD_ADDR,
         &[
             0xB8, 0x20, 0xE8, // MOV AX, 0xE820
-            0x66, 0xBB, 0x01, 0x00, 0x00, 0x00, // MOV EBX, 1 (continuation)
+            0x66, 0xBB, 0x03, 0x00, 0x00, 0x00, // MOV EBX, 3 (past the last entry)
             0x66, 0xB9, 0x14, 0x00, 0x00, 0x00, // MOV ECX, 20
             0xBF, 0x00, 0x30, // MOV DI, 0x3000
             0xCD, 0x15, // INT 0x15
@@ -4081,4 +4084,87 @@ fn snapshot_preserves_framebuffer_config() {
         vm3.framebuffer_config().is_none(),
         "no-fb snapshot clears fb"
     );
+}
+
+/// INT 15h AX=0xE820 must hand back the canonical three-entry PC
+/// memory map, walked via the EBX continuation token: conventional
+/// usable → EBDA/video/ROM reserved → extended usable, then EBX=0 to
+/// signal "last entry". This is the map the guest's own real-mode
+/// setup collects (the real-mode-setup boot path depends on it), and
+/// it must match what `start_protected_mode_at` writes for the
+/// PM-direct path. We drive the shim through `bios_hook` directly.
+#[test]
+fn bios_int15_e820_walks_three_entries_via_ebx() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot(); // real mode
+    let mut mem = Memory::new(0x0400_0000); // 64 MiB
+    let mut io = IoBus::new();
+    // ES:DI = 0x0000:0x2000 → linear 0x2000.
+    cpu.write_sreg(wwwvm_cpu::sreg::ES, 0, &mem);
+    cpu.regs[wwwvm_cpu::r16::DI] = 0x2000;
+
+    let read_entry = |mem: &Memory, at: u32| -> (u64, u64, u32) {
+        let base = mem.read_u32(at) as u64 | ((mem.read_u32(at + 4) as u64) << 32);
+        let len = mem.read_u32(at + 8) as u64 | ((mem.read_u32(at + 12) as u64) << 32);
+        (base, len, mem.read_u32(at + 16))
+    };
+
+    // The shim returns EAX="SMAP"; a real guest reloads AX=0xE820 and
+    // ECX before every call, so the test does too.
+    let arm = |cpu: &mut Cpu| {
+        cpu.regs[wwwvm_cpu::r16::AX] = 0xE820;
+        cpu.write_r32(1, 20); // ECX = buffer size
+    };
+
+    // Entry 0 (EBX=0): conventional usable.
+    arm(&mut cpu);
+    cpu.write_r32(3, 0); // EBX = start
+    assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
+    assert_eq!(read_entry(&mem, 0x2000), (0x0, 0x0009_FC00, 1));
+    assert_eq!(cpu.read_r32(0), 0x534D_4150, "EAX = SMAP");
+    assert_eq!(cpu.read_r32(1), 20, "ECX = 20 bytes returned");
+    assert_eq!(cpu.read_r32(3), 1, "EBX advances to 1");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0, "CF clear");
+
+    // Entry 1 (EBX=1): EBDA / video / BIOS-ROM reserved.
+    arm(&mut cpu);
+    assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
+    assert_eq!(read_entry(&mem, 0x2000), (0x0009_FC00, 0x0006_0400, 2));
+    assert_eq!(cpu.read_r32(3), 2, "EBX advances to 2");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0);
+
+    // Entry 2 (EBX=2): extended usable above 1 MiB, then EBX→0 (last).
+    arm(&mut cpu);
+    assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
+    assert_eq!(
+        read_entry(&mem, 0x2000),
+        (0x0010_0000, 0x0400_0000 - 0x0010_0000, 1)
+    );
+    assert_eq!(cpu.read_r32(3), 0, "EBX = 0 marks the final entry");
+    assert_eq!(cpu.flags & wwwvm_cpu::flag::CF, 0);
+
+    // A continuation past the end must fail (CF=1) rather than loop.
+    arm(&mut cpu);
+    cpu.write_r32(3, 5);
+    assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
+    assert_ne!(
+        cpu.flags & wwwvm_cpu::flag::CF,
+        0,
+        "out-of-range continuation → CF=1"
+    );
+}
+
+/// A too-small E820 buffer (ECX < 20) is rejected with CF=1, the way a
+/// real BIOS refuses to write a partial 20-byte entry.
+#[test]
+fn bios_int15_e820_rejects_small_buffer() {
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    let mut mem = Memory::new(0x0200_0000);
+    let mut io = IoBus::new();
+    cpu.regs[wwwvm_cpu::r16::AX] = 0xE820;
+    cpu.write_r32(3, 0);
+    cpu.write_r32(1, 19); // ECX < 20
+    assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
+    assert_ne!(cpu.flags & wwwvm_cpu::flag::CF, 0, "tiny buffer → CF=1");
 }
