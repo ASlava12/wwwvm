@@ -9,6 +9,7 @@ import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
 import { makeBytes, breakBytes, comboBytes } from "./ps2-keymap.js?v=2";
 import { SnapStore, uploadSnapshot, downloadSnapshot } from "./snapshot-store.js?v=2";
 import { parseConfigFromHash, buildHashFromConfig } from "./demo-link.js";
+import { DEMO_PRESETS, pickImageId, presetToConfig } from "./demo-presets.js";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -1099,6 +1100,38 @@ function shareDemoLink() {
   );
 }
 $("share-link")?.addEventListener("click", shareDemoLink);
+
+// Curated demo presets (demo-presets.js): a dropdown of ready scenarios that
+// fill the controls via the same hash-apply path, then surface a share link.
+function populateDemoPresets() {
+  const sel = $("demo-preset");
+  if (!sel) return;
+  for (const p of DEMO_PRESETS) {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = p.label;
+    sel.appendChild(o);
+  }
+}
+
+function applyDemoPreset() {
+  const p = DEMO_PRESETS.find((x) => x.id === $("demo-preset")?.value);
+  if (!p) return;
+  const imageId = pickImageId(imageManifest, p.imageMatch);
+  // Build a hash (boot omitted → fills controls for review) and apply it
+  // through the exact same path a shared link uses, so behaviour can't drift.
+  const hash = buildHashFromConfig(presetToConfig(p, imageId));
+  history.replaceState(null, "", hash || location.pathname);
+  applyDemoLinkFromHash();
+  const note = $("demo-note");
+  if (note) {
+    note.textContent = imageId
+      ? `${p.note} — review, then Load selected image.`
+      : `${p.note}  ⚠ no matching server image — pick one above first.`;
+  }
+}
+$("demo-apply")?.addEventListener("click", applyDemoPreset);
+populateDemoPresets();
 
 loadImageManifest().then(applyDemoLinkFromHash);
 loadProxyList();

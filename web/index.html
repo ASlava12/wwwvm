@@ -26,6 +26,15 @@
 
         <fieldset>
           <legend>Boot Linux / Alpine (real kernel)</legend>
+          <!-- Quick-start: curated demo scenarios fill the controls below. -->
+          <label>Quick demo:
+            <select id="demo-preset">
+              <option value="">— pick a preset —</option>
+            </select>
+            <button id="demo-apply" type="button" title="Fill the controls below from this preset">Apply</button>
+          </label>
+          <small id="demo-note" class="status">a preset fills the controls below + a shareable link; then Load/Boot</small>
+          <hr />
           <!-- Pick a prebuilt image hosted on the server (manifest.json). -->
           <label>Server image:
             <select id="image-select">
@@ -267,6 +276,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=27"></script>
+    <script type="module" src="./main.js?v=28"></script>
   </body>
 </html>
