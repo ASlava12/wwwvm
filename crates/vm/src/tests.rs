@@ -4168,3 +4168,79 @@ fn bios_int15_e820_rejects_small_buffer() {
     assert!(bios_hook(&mut cpu, &mut mem, &mut io, 0x15));
     assert_ne!(cpu.flags & wwwvm_cpu::flag::CF, 0, "tiny buffer → CF=1");
 }
+
+/// A minimal synthetic bzImage for the real-mode boot path: a valid
+/// setup header plus a tiny 16-bit "setup.bin" stub at file offset
+/// 0x200 (the protocol entry point). The stub loads `type_of_loader`
+/// via DS:0x210 and stores it to DS:0x300, then HLTs — observable
+/// proof that the CPU entered 16-bit setup at linear 0x90200 with
+/// DS = the setup segment.
+fn synthetic_realmode_bz() -> Vec<u8> {
+    let mut bz = vec![0u8; 0x400 + 4]; // 2-sector setup blob + tiny payload
+    bz[0x1F1] = 1; // setup_sects=1 → payload_offset = 0x400
+    bz[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes()); // boot_flag
+    bz[0x202..0x206].copy_from_slice(b"HdrS");
+    bz[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes()); // version 2.15
+    bz[0x214..0x218].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // code32_start
+                                                                     // Offset 0x200 is the header's 2-byte `jump` field. As in a real
+                                                                     // kernel it hops over the setup header (which extends past 0x200) to
+                                                                     // the actual entry code. JMP rel8: next IP is 0x202, +0x7E → 0x280.
+    bz[0x200..0x202].copy_from_slice(&[0xEB, 0x7E]);
+    // Entry stub at offset 0x280 (= linear 0x90280, DS=0x9000), past the
+    // header:
+    //   MOV AL, [0x210]   ; A0 10 02   (DS:0x210 = type_of_loader)
+    //   MOV [0x300], AL   ; A2 00 03   (DS:0x300 = 0x90300)
+    //   HLT               ; F4
+    bz[0x280..0x287].copy_from_slice(&[0xA0, 0x10, 0x02, 0xA2, 0x00, 0x03, 0xF4]);
+    bz
+}
+
+/// `boot_bzimage_realmode` must (a) stamp the loader-owned setup-header
+/// fields and place the command line, and (b) hand the CPU the 16-bit
+/// real-mode entry state the Linux boot protocol requires, so the
+/// kernel's own setup.bin runs. Driven with a synthetic stub so the
+/// mechanics are checked without a real (asset-gated) kernel.
+#[test]
+fn boot_bzimage_realmode_enters_setup_with_protocol_register_state() {
+    let mut vm = Vm::with_ram_size(0x0020_0000); // 2 MiB — code32_start fits
+    vm.boot_bzimage_realmode(&synthetic_realmode_bz(), "console=ttyS0", None)
+        .expect("boot_bzimage_realmode");
+
+    // Real-mode entry registers per the 16-bit boot protocol.
+    {
+        let cpu = vm.cpu();
+        assert_eq!(cpu.cr0 & 1, 0, "real mode (PE clear)");
+        assert_eq!(
+            cpu.sregs[wwwvm_cpu::sreg::CS],
+            0x9020,
+            "CS = setup_seg + 0x20"
+        );
+        assert_eq!(cpu.sregs[wwwvm_cpu::sreg::DS], 0x9000, "DS = setup_seg");
+        assert_eq!(cpu.sregs[wwwvm_cpu::sreg::ES], 0x9000, "ES = setup_seg");
+        assert_eq!(cpu.sregs[wwwvm_cpu::sreg::SS], 0x9000, "SS = setup_seg");
+        assert_eq!(cpu.flags & wwwvm_cpu::flag::IF, 0, "interrupts disabled");
+    }
+
+    // Loader-owned header fields stamped into the loaded copy at 0x90000.
+    assert_eq!(vm.read_mem_u8(0x9_0210), 0xFF, "type_of_loader = 0xFF");
+    assert_ne!(vm.read_mem_u8(0x9_0211) & 0x80, 0, "CAN_USE_HEAP set");
+    assert_eq!(
+        vm.read_mem_u16(0x9_0224),
+        0xDE00,
+        "heap_end_ptr = heap-0x200"
+    );
+    assert_eq!(vm.read_mem_u16(0x9_01FA), 0xFFFF, "vid_mode = NORMAL_VGA");
+    assert_eq!(vm.read_mem_u32(0x9_0228), 0x0002_0000, "cmd_line_ptr");
+    assert_eq!(vm.read_mem_u8(0x0002_0000), b'c', "cmdline placed");
+
+    // Run the stub: it copies type_of_loader (0xFF) to 0x90300 and HLTs,
+    // proving execution actually began at 0x90200 in 16-bit mode with
+    // DS = 0x9000.
+    let (_, stop) = vm.run_steps(16);
+    assert!(matches!(stop, Stop::Halted), "setup stub HLTs");
+    assert_eq!(
+        vm.read_mem_u8(0x9_0300),
+        0xFF,
+        "setup stub ran at 0x90200 with DS=0x9000"
+    );
+}

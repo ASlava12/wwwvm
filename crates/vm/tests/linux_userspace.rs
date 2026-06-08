@@ -12087,6 +12087,76 @@ fn linux_userspace_alpine_kernel_milestone() {
     assert_alpine_ok(found, &cumulative, &stop_reason);
 }
 
+/// REAL-MODE SETUP.BIN: boot the real `vmlinuz-lts` the BIOS-bootloader
+/// way — `boot_bzimage_realmode` enters the kernel's own 16-bit setup at
+/// 0x9020:0 and the setup code itself detects memory (INT 15h E820),
+/// sets the video mode (INT 10h), enables A20, builds boot_params,
+/// switches to protected mode, and jumps to the decompressor. This
+/// exercises the whole 16-bit real-mode + BIOS-shim path that the
+/// 32-bit-direct `start_protected_mode_at` route skips. Success =
+/// reaching the "Linux version" banner, which is only possible if
+/// setup.bin ran to completion AND the kernel then self-decompressed.
+/// Needs only the kernel; skips if absent.
+#[test]
+#[ignore = "real-mode setup.bin: 16-bit setup runs on the CPU, then decompress; needs WWWVM_ALPINE_KERNEL; ~40s"]
+fn linux_userspace_bzimage_realmode_setup_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    vm.boot_bzimage_realmode(
+        &kbytes,
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=1 loglevel=8 ignore_loglevel",
+        None,
+    )
+    .expect("boot_bzimage_realmode");
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 8_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        cumulative.extend_from_slice(&vm.drain_output());
+        if String::from_utf8_lossy(&cumulative).contains("Linux version") {
+            found = true;
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                eprintln!("CpuError before banner: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                eprintln!("Halted before banner");
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("=== bzImage real-mode setup: Linux-version-banner={found} steps={steps} ===");
+    eprintln!(
+        "--- UART tail ---\n{}",
+        String::from_utf8_lossy(&cumulative[cumulative.len().saturating_sub(1500)..])
+    );
+    assert!(
+        found,
+        "guest must reach the 'Linux version' banner via the 16-bit setup.bin path"
+    );
+}
+
 /// BZIMAGE SELF-DECOMPRESSION: prove the emulator boots a *real,
 /// compressed* bzImage by running the kernel's OWN in-guest gzip
 /// decompressor — not a host-side unpack. `load_bzimage` copies the

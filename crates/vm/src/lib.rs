@@ -2509,6 +2509,105 @@ impl Vm {
         Ok(())
     }
 
+    /// Boot a bzImage the *real-mode* way: load it, then enter the
+    /// kernel's own 16-bit `setup.bin` and let it run the legacy boot
+    /// dance itself — detect memory via INT 15h E820, set the video mode
+    /// via INT 10h, enable A20, build boot_params, switch to protected
+    /// mode, and jump to the decompressor at `code32_start`. This is the
+    /// BIOS-bootloader path (what GRUB/SYSLINUX trigger), as opposed to
+    /// [`start_protected_mode_at`], which synthesizes boot_params on the
+    /// host and skips straight to the 32-bit entry.
+    ///
+    /// Layout: the real-mode code (boot sector + setup sectors) lands at
+    /// linear 0x90000 (segment 0x9000) via [`load_bzimage`]; the
+    /// protected-mode payload at `code32_start`. The Linux 16-bit boot
+    /// protocol entry point is `0x9020:0x0000` — offset 0x200, where the
+    /// setup header's 2-byte `jump` field hops over the header to
+    /// `start_of_setup`. We populate the loader-owned header fields the
+    /// setup code reads: `type_of_loader` (0x210) = 0xFF (opt into the
+    /// modern protocol); `loadflags` (0x211) |= CAN_USE_HEAP plus
+    /// `heap_end_ptr` (0x224); `vid_mode` (0x1FA) = NORMAL_VGA (0xFFFF)
+    /// so the video step picks 80×25 text without prompting for a mode
+    /// over the (absent) BIOS keyboard; `cmd_line_ptr` (0x228) → the
+    /// command line, placed at a low linear address clear of both the
+    /// setup segment and the 1 MiB kernel (protocol ≥ 2.02 reads it as a
+    /// 32-bit linear address); and `ramdisk_image` / `ramdisk_size` via
+    /// [`set_ramdisk`] when an initrd is supplied. We then install the
+    /// BIOS INT shims plus a default real-mode IVT and hand the CPU the
+    /// entry state the protocol requires: DS/ES/SS = 0x9000, SP at the
+    /// heap top, interrupts disabled.
+    pub fn boot_bzimage_realmode(
+        &mut self,
+        bytes: &[u8],
+        cmdline: &str,
+        initramfs: Option<&[u8]>,
+    ) -> Result<(), BzImageError> {
+        const SEG: u16 = 0x9000;
+        const BASE: u32 = (SEG as u32) << 4; // 0x90000
+        const HEAP_END: u16 = 0xE000; // top of the real-mode stack/heap
+        const CMD_ADDR: u32 = 0x0002_0000; // cmdline: clear of setup seg + kernel
+
+        self.load_bzimage(bytes)?;
+
+        // Loader-owned setup-header fields (in the loaded copy at BASE).
+        self.mem.write_u8(BASE + 0x210, 0xFF); // type_of_loader
+        let loadflags = self.mem.read_u8(BASE + 0x211);
+        self.mem.write_u8(BASE + 0x211, loadflags | 0x80); // CAN_USE_HEAP
+        self.mem.write_u16(BASE + 0x224, HEAP_END - 0x200); // heap_end_ptr
+        self.mem.write_u16(BASE + 0x1FA, 0xFFFF); // vid_mode = NORMAL_VGA
+
+        // Command line at CMD_ADDR; cmd_line_ptr is a 32-bit linear addr.
+        let cb = cmdline.as_bytes();
+        let n = cb.len().min(2047);
+        self.mem.write_slice(CMD_ADDR, &cb[..n]);
+        self.mem.write_u8(CMD_ADDR + n as u32, 0);
+        self.mem.write_u32(BASE + 0x228, CMD_ADDR);
+
+        // Optional initramfs (also stamps ramdisk_image/size + loader id).
+        if let Some(rd) = initramfs {
+            self.set_ramdisk(rd)?;
+        }
+
+        self.install_bios();
+
+        // Populate the real-mode IVT the way a BIOS does: point every
+        // vector at a bare IRET stub. The setup code makes BIOS calls
+        // (INT 10h/15h/16h…) and runs `sti`; `bios_hook` intercepts the
+        // services we model *before* the IVT is consulted, but anything
+        // we don't actively serve — an unhandled BIOS subfunction (e.g.
+        // INT 16h AH=03 "set typematic rate", which the kernel ignores)
+        // or a stray hardware IRQ — would otherwise dispatch through a
+        // zeroed IVT entry to linear 0 and execute garbage. A default
+        // IRET handler makes those harmless no-ops, matching real
+        // hardware.
+        const IRET_STUB: u32 = 0x0000_0520; // free byte in low conventional RAM
+        self.mem.write_u8(IRET_STUB, 0xCF); // IRET
+        for v in 0u32..256 {
+            self.mem.write_u16(v * 4, IRET_STUB as u16); // offset
+            self.mem.write_u16(v * 4 + 2, 0x0000); // segment
+        }
+
+        // Real-mode entry state per the 16-bit boot protocol. CS=0x9020
+        // with IP=0 lands at linear 0x90200 (the header `jump` field).
+        self.cpu.reset_to_boot();
+        self.cpu
+            .write_sreg(wwwvm_cpu::sreg::CS, SEG + 0x20, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::DS, SEG, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::ES, SEG, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::FS, SEG, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::GS, SEG, &self.mem);
+        self.cpu.write_sreg(wwwvm_cpu::sreg::SS, SEG, &self.mem);
+        self.cpu.ip = 0;
+        self.cpu
+            .write_r32(wwwvm_cpu::r16::SP as u8, HEAP_END as u32);
+        self.cpu.flags &= !wwwvm_cpu::flag::IF;
+
+        self.io.uart_mut().push_rx(&self.autorun);
+        self.autorun.clear();
+        self.booted = true;
+        Ok(())
+    }
+
     /// Cold-boot from disk: reset the CPU, copy sector 0 of the loaded
     /// disk image to linear `0x7C00` (the standard boot-sector load
     /// address), then continue with the same autorun/UART setup as
