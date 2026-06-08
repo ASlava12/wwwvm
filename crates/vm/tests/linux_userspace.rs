@@ -12157,6 +12157,29 @@ fn linux_userspace_bzimage_realmode_setup_milestone() {
     );
 }
 
+/// REAL-MODE SETUP → FULL USERSPACE: the 16-bit setup.bin boot path is a
+/// complete drop-in for the 32-bit-direct route, not just a "reaches the
+/// banner" curiosity. Boots the real `vmlinuz-lts` via
+/// `boot_bzimage_realmode` with the musl busybox initramfs and asserts
+/// the guest reaches ALPINE_MUSL_OK — i.e. setup.bin ran, the kernel
+/// decompressed, mounted the initramfs, and exec'd musl userspace, all
+/// through the BIOS-bootloader entry. Needs the Alpine kernel + rootfs;
+/// skips if absent.
+#[test]
+#[ignore = "real-mode setup → userspace: vmlinuz-lts via setup.bin to ALPINE_MUSL_OK; needs WWWVM_ALPINE_KERNEL + WWWVM_ALPINE_ROOTFS; ~70s"]
+fn linux_userspace_alpine_realmode_userspace_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let root = std::env::var("WWWVM_ALPINE_ROOTFS")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/rootfs".to_string());
+    let Some((found, cumulative, stop_reason)) =
+        run_alpine_musl_mode(&kpath, &root, "real-mode setup.bin", true)
+    else {
+        return;
+    };
+    assert_alpine_ok(found, &cumulative, &stop_reason);
+}
+
 /// BZIMAGE SELF-DECOMPRESSION: prove the emulator boots a *real,
 /// compressed* bzImage by running the kernel's OWN in-guest gzip
 /// decompressor — not a host-side unpack. `load_bzimage` copies the
@@ -12256,6 +12279,19 @@ fn linux_userspace_bzimage_self_decompress_milestone() {
 /// missing (the test then skips). Shared by the Alpine stage A / B
 /// milestones, which differ only in the kernel.
 fn run_alpine_musl(kpath: &str, root: &str, stage: &str) -> Option<(bool, Vec<u8>, String)> {
+    run_alpine_musl_mode(kpath, root, stage, false)
+}
+
+/// As `run_alpine_musl`, but `realmode` selects the boot path: `false`
+/// uses the 32-bit-direct entry (`start_protected_mode_at`), `true` the
+/// 16-bit `setup.bin` entry (`boot_bzimage_realmode`). Lets the same
+/// userspace assertion validate both routes reach ALPINE_MUSL_OK.
+fn run_alpine_musl_mode(
+    kpath: &str,
+    root: &str,
+    stage: &str,
+    realmode: bool,
+) -> Option<(bool, Vec<u8>, String)> {
     let kbytes = match std::fs::read(kpath) {
         Ok(b) => b,
         Err(e) => {
@@ -12288,14 +12324,20 @@ fn run_alpine_musl(kpath: &str, root: &str, stage: &str) -> Option<(bool, Vec<u8
         ],
     );
 
+    let cmdline = "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
+         debug loglevel=8 ignore_loglevel";
     let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
-    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
-    vm.set_kernel_cmdline(
-        "earlyprintk=ttyS0,115200 console=ttyS0 panic=10 lpj=1000000 \
-         debug loglevel=8 ignore_loglevel",
-    );
-    vm.set_ramdisk(&cpio).expect("set_ramdisk");
-    vm.start_protected_mode_at(bz.code32_start);
+    if realmode {
+        // 16-bit setup.bin entry — one call sets cmdline + ramdisk +
+        // header fields and enters real mode at the setup blob.
+        vm.boot_bzimage_realmode(&kbytes, cmdline, Some(&cpio))
+            .expect("boot_bzimage_realmode");
+    } else {
+        let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+        vm.set_kernel_cmdline(cmdline);
+        vm.set_ramdisk(&cpio).expect("set_ramdisk");
+        vm.start_protected_mode_at(bz.code32_start);
+    }
 
     let mut cumulative = Vec::<u8>::new();
     let chunk = 10_000_000u32;
