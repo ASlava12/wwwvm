@@ -5782,10 +5782,10 @@ fn int_n_from_ring_3_against_dpl0_gate_faults_with_idt_error_code() {
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
 }
 
-/// `IN AL, 0x60` from CPL=3 with IOPL=0 raises #GP via the same
-/// `raise_gp_if_below_iopl` path as CLI/STI. We only check the
-/// fault branch here; the positive branch (CPL ≤ IOPL) is exercised
-/// by the CLI test, since both arms share the helper.
+/// `IN AL, 0x60` from CPL=3 with IOPL=0 raises #GP: CPL > IOPL, and this TSS has
+/// no I/O bitmap (its I/O-map base points beyond the TSS limit), so the port is
+/// denied. The CPL ≤ IOPL "permitted" branch is exercised by the CLI test; the
+/// bitmap grant/deny branches by `io_bitmap_grants_specific_port_at_cpl3`.
 #[test]
 fn in_al_from_ring_3_with_iopl_zero_faults() {
     let mut mem = Memory::new(0x10_0000);
@@ -5802,9 +5802,12 @@ fn in_al_from_ring_3_with_iopl_zero_faults() {
         0x6000 + 13 * 8,
         &[0x00, 0x90, 0x08, 0x00, 0x00, 0xEE, 0x00, 0x00],
     );
-    // User-mode `IN AL, 0x60` — read the PS/2 data port. Without
-    // the guard this would read whatever the keyboard emulator
-    // returned; with it, the instruction faults at its first byte.
+    // No I/O bitmap: point the I/O-map base (TSS+0x66) beyond the TSS limit
+    // (0x67) so port 0x60 is denied at CPL=3 — the realistic "userspace can't
+    // touch hardware" TSS.
+    mem.write_u16(0x4000 + 0x66, 0xFFFF);
+    // User-mode `IN AL, 0x60` — read the PS/2 data port. Without a bitmap grant
+    // it faults at its first byte.
     mem.write_slice(0x8000, &[0xE4, 0x60]);
 
     let mut cpu = Cpu::new();
@@ -5828,6 +5831,47 @@ fn in_al_from_ring_3_with_iopl_zero_faults() {
     assert_eq!(cpu.ip, 0x9000);
     assert_eq!(mem.read_u32(0x3000 - 20), 0x8000);
     assert_eq!(mem.read_u32(0x3000 - 24), 0);
+}
+
+/// The TSS I/O-permission bitmap grants specific ports to CPL=3 even at IOPL=0:
+/// a clear bit permits the port, a set bit (or a byte past the TSS limit) denies;
+/// a multi-byte access spanning any denied port is denied. CPL ≤ IOPL bypasses.
+#[test]
+fn io_bitmap_grants_specific_port_at_cpl3() {
+    let mut mem = Memory::new(0x10_0000);
+    // GDT with a TSS descriptor (selector 0x28): base 0x4000, limit 0x68 — big
+    // enough for the I/O-map base field (0x66) plus one bitmap byte (0x68).
+    let gdt: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 0, // null
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00, // 0x08 code0
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00, // 0x10 data0
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFA, 0xCF, 0x00, // 0x18 code3
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0xF2, 0xCF, 0x00, // 0x20 data3
+        0x68, 0x00, 0x00, 0x40, 0x00, 0x89, 0x00, 0x00, // 0x28 TSS @0x4000 limit 0x68
+    ];
+    mem.write_slice(0x500, &gdt);
+    // I/O-map base at TSS+0x66 = 0x68; bitmap byte at TSS+0x68 = 0b0000_0010
+    // → port 0 permitted (bit clear), port 1 denied (bit set).
+    mem.write_u16(0x4000 + 0x66, 0x68);
+    mem.write_u8(0x4000 + 0x68, 0b0000_0010);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1;
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x2F;
+    cpu.tr = 0x28;
+    cpu.write_sreg(sreg::CS, 0x001B, &mem); // selector 0x18 | RPL 3 → CPL 3
+    cpu.flags = 0x0002; // IOPL = 0
+
+    // CPL(3) > IOPL(0): the bitmap decides.
+    assert!(cpu.io_access_permitted(0, 1, &mem), "port 0 bit clear → granted");
+    assert!(!cpu.io_access_permitted(1, 1, &mem), "port 1 bit set → denied");
+    assert!(!cpu.io_access_permitted(0, 2, &mem), "word access spans denied port 1");
+    assert!(!cpu.io_access_permitted(8, 1, &mem), "byte 0x69 past TSS limit 0x68 → denied");
+    // Raising IOPL to 3 lifts the gate entirely.
+    cpu.flags = 0x3002;
+    assert!(cpu.io_access_permitted(1, 1, &mem), "CPL <= IOPL → always permitted");
 }
 
 /// CLI in CPL=3 fires #GP iff IOPL < CPL. Same setup pattern as

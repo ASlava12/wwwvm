@@ -963,6 +963,76 @@ impl Cpu {
         }
     }
 
+    /// Limit (in bytes) of the currently-active TSS, decoded from the TR
+    /// descriptor (granularity bit scales to 4 KiB pages, as for any segment).
+    fn tss_limit(&self, mem: &Memory) -> u32 {
+        let desc_addr = self.gdtr.base.wrapping_add((self.tr & 0xFFF8) as u32);
+        let limit_lo = self.mem_read_u16(mem, desc_addr) as u32;
+        let d3 = self.mem_read_u16(mem, desc_addr.wrapping_add(6)) as u32;
+        let mut limit = limit_lo | ((d3 & 0x000F) << 16);
+        if d3 & 0x0080 != 0 {
+            limit = (limit << 12) | 0xFFF;
+        }
+        limit
+    }
+
+    /// Whether the current CPL may access I/O port `port` for `width` bytes.
+    /// CPL <= IOPL is always allowed; otherwise the active TSS's I/O-permission
+    /// bitmap is consulted (Intel SDM Vol.1 §18.5.2): every port the access
+    /// spans must have a clear bit, and the byte covering it must lie within the
+    /// TSS limit — a port whose bitmap byte is at/past the limit (e.g. the usual
+    /// "no bitmap" TSS, whose I/O-map base points beyond the limit) is denied.
+    /// Real mode has no I/O protection.
+    fn io_access_permitted(&self, port: u16, width: u32, mem: &Memory) -> bool {
+        if self.cr0 & 1 == 0 {
+            return true;
+        }
+        let cpl = (self.sregs[sreg::CS] & 3) as u8;
+        let iopl = ((self.flags >> 12) & 3) as u8;
+        if cpl <= iopl {
+            return true;
+        }
+        let tss_base = self.tss_base(mem);
+        let tss_limit = self.tss_limit(mem);
+        // The 16-bit I/O-map base sits at TSS offset 0x66; a TSS too small to
+        // even hold it can have no bitmap → deny.
+        if tss_limit < 0x67 {
+            return false;
+        }
+        let map_base = self.mem_read_u16(mem, tss_base.wrapping_add(0x66)) as u32;
+        let last = port as u32 + width.saturating_sub(1);
+        let mut p = port as u32;
+        while p <= last {
+            let byte_off = map_base + (p >> 3);
+            if byte_off > tss_limit {
+                return false; // bitmap byte beyond the TSS → port not granted
+            }
+            if self.mem_read_u8(mem, tss_base.wrapping_add(byte_off)) & (1 << (p & 7)) != 0 {
+                return false;
+            }
+            p += 1;
+        }
+        true
+    }
+
+    /// Port-I/O privilege gate for IN/OUT. If `port..port+width` isn't permitted
+    /// (CPL > IOPL and the TSS I/O-bitmap forbids it), raise #GP(0) from `op_ip`
+    /// and return true — the caller then `return Ok(())`.
+    fn raise_gp_if_io_denied(
+        &mut self,
+        op_ip: u32,
+        port: u16,
+        width: u32,
+        mem: &mut Memory,
+    ) -> bool {
+        if self.io_access_permitted(port, width, mem) {
+            return false;
+        }
+        self.ip = op_ip;
+        self.do_interrupt_with_error(13, Some(0), mem);
+        true
+    }
+
     pub fn write_sreg(&mut self, idx: usize, value: u16, mem: &Memory) {
         if idx >= 6 {
             return;
@@ -6005,48 +6075,47 @@ impl Cpu {
                 }
             }
 
-            // Port-IO instructions (IN / OUT, byte and word/dword
-            // forms, imm8 and DX-port variants) are all IOPL-
-            // sensitive. We don't model the per-port permission
-            // bitmap in TSS yet — just the coarse `CPL <= IOPL`
-            // check covers the common "user can't touch hardware"
-            // case (real silicon would additionally consult the
-            // bitmap when CPL > IOPL).
+            // Port-IO instructions (IN / OUT, byte and word/dword forms, imm8
+            // and DX-port variants). Privilege: permitted when CPL <= IOPL,
+            // else gated by the active TSS's I/O-permission bitmap
+            // (`raise_gp_if_io_denied` → #GP from the instruction start). The
+            // port is fetched BEFORE the gate so the bitmap can be consulted;
+            // a #GP rewinds IP to op_ip, undoing the imm8 fetch.
             0xEC => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // IN AL, DX
                 let port = self.regs[r16::DX];
+                if self.raise_gp_if_io_denied(op_ip, port, 1, mem) {
+                    return Ok(());
+                }
                 let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xEE => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // OUT DX, AL
                 let port = self.regs[r16::DX];
+                if self.raise_gp_if_io_denied(op_ip, port, 1, mem) {
+                    return Ok(());
+                }
                 let v = self.read_r8(0);
                 self.port_write(io, port, v);
             }
             0xE4 => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // IN AL, imm8
                 let port = self.fetch_u8(mem) as u16;
+                if self.raise_gp_if_io_denied(op_ip, port, 1, mem) {
+                    return Ok(());
+                }
                 let v = self.port_read(io, port);
                 self.write_r8(0, v);
             }
             0xE5 => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                // IN AX/EAX, imm8 — two/four byte reads from consecutive ports.
+                // The 0x66 prefix widens to EAX (four bytes from port..port+3).
+                let port = self.fetch_u8(mem) as u16;
+                let width = if self.op_size_32 { 4 } else { 2 };
+                if self.raise_gp_if_io_denied(op_ip, port, width, mem) {
                     return Ok(());
                 }
-                // IN AX/EAX, imm8 — two/four byte reads from
-                // consecutive ports. The 0x66 prefix widens to EAX
-                // (four bytes from port..port+3).
-                let port = self.fetch_u8(mem) as u16;
                 if self.op_size_32 {
                     let v = port_read_u32(self, io, port);
                     self.write_r32(0, v);
@@ -6057,21 +6126,22 @@ impl Cpu {
                 }
             }
             0xE6 => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // OUT imm8, AL
                 let port = self.fetch_u8(mem) as u16;
+                if self.raise_gp_if_io_denied(op_ip, port, 1, mem) {
+                    return Ok(());
+                }
                 let v = self.read_r8(0);
                 self.port_write(io, port, v);
             }
             0xE7 => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
+                // OUT imm8, AX/EAX — two/four byte writes to consecutive ports
+                // (0x66 → 32-bit form).
+                let port = self.fetch_u8(mem) as u16;
+                let width = if self.op_size_32 { 4 } else { 2 };
+                if self.raise_gp_if_io_denied(op_ip, port, width, mem) {
                     return Ok(());
                 }
-                // OUT imm8, AX/EAX — two/four byte writes to
-                // consecutive ports (0x66 → 32-bit form).
-                let port = self.fetch_u8(mem) as u16;
                 if self.op_size_32 {
                     let v = self.read_r32(0);
                     port_write_u32(self, io, port, v);
@@ -6082,11 +6152,12 @@ impl Cpu {
                 }
             }
             0xED => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // IN AX/EAX, DX
                 let port = self.regs[r16::DX];
+                let width = if self.op_size_32 { 4 } else { 2 };
+                if self.raise_gp_if_io_denied(op_ip, port, width, mem) {
+                    return Ok(());
+                }
                 if self.op_size_32 {
                     let v = port_read_u32(self, io, port);
                     self.write_r32(0, v);
@@ -6097,11 +6168,12 @@ impl Cpu {
                 }
             }
             0xEF => {
-                if self.raise_gp_if_below_iopl(op_ip, mem) {
-                    return Ok(());
-                }
                 // OUT DX, AX/EAX
                 let port = self.regs[r16::DX];
+                let width = if self.op_size_32 { 4 } else { 2 };
+                if self.raise_gp_if_io_denied(op_ip, port, width, mem) {
+                    return Ok(());
+                }
                 if self.op_size_32 {
                     let v = self.read_r32(0);
                     port_write_u32(self, io, port, v);
