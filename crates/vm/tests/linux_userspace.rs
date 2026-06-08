@@ -12087,6 +12087,99 @@ fn linux_userspace_alpine_kernel_milestone() {
     assert_alpine_ok(found, &cumulative, &stop_reason);
 }
 
+/// BZIMAGE SELF-DECOMPRESSION: prove the emulator boots a *real,
+/// compressed* bzImage by running the kernel's OWN in-guest gzip
+/// decompressor — not a host-side unpack. `load_bzimage` copies the
+/// protected-mode payload verbatim to `code32_start` (1 MiB); those
+/// bytes are the gzip self-extractor from arch/x86/boot/compressed,
+/// and the only way they become a running kernel is that extractor
+/// executing on our CPU. We assert the payload is gzip-compressed
+/// *before* boot, then that the guest reaches the "Linux version"
+/// banner *after* — impossible without successful in-guest
+/// decompression. This is the "kernel decompression" + "direct PM
+/// boot-protocol entry" roadmap path, end to end. Needs only the
+/// kernel (no rootfs — the banner prints long before root mount);
+/// skips if absent. Stops at the banner, so it's lighter than the
+/// full userspace milestones.
+#[test]
+#[ignore = "bzImage self-decompression: real gzip vmlinuz-lts decompressed in-guest; needs WWWVM_ALPINE_KERNEL; ~40s"]
+fn linux_userspace_bzimage_self_decompress_milestone() {
+    let kpath = std::env::var("WWWVM_ALPINE_KERNEL")
+        .unwrap_or_else(|_| "/tmp/wwwvm-alpine/vmlinuz-lts".to_string());
+    let kbytes = match std::fs::read(&kpath) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: read {kpath}: {e}");
+            return;
+        }
+    };
+    let mut vm = Vm::with_ram_size(256 * 1024 * 1024);
+    let bz = vm.load_bzimage(&kbytes).expect("load_bzimage");
+
+    // The protected-mode payload at code32_start must be the COMPRESSED
+    // self-extracting kernel. A gzip member starts with 1F 8B 08; assert
+    // the magic is present in the payload we just placed into guest RAM,
+    // so a regression that accidentally pre-decompresses (or mis-places)
+    // the payload fails loudly here instead of silently changing what
+    // the in-guest decompressor is fed.
+    let scan_end = (kbytes.len() - bz.payload_offset) as u32;
+    let mut saw_gzip = false;
+    for off in 0..scan_end {
+        if vm.read_mem_u8(bz.code32_start + off) == 0x1F
+            && vm.read_mem_u8(bz.code32_start + off + 1) == 0x8B
+            && vm.read_mem_u8(bz.code32_start + off + 2) == 0x08
+        {
+            saw_gzip = true;
+            break;
+        }
+    }
+    assert!(
+        saw_gzip,
+        "code32_start payload must be a gzip-compressed kernel — in-guest self-decompression is the whole point of this path"
+    );
+
+    vm.set_kernel_cmdline(
+        "earlyprintk=ttyS0,115200 console=ttyS0 panic=1 loglevel=8 ignore_loglevel",
+    );
+    vm.start_protected_mode_at(bz.code32_start);
+
+    let mut cumulative = Vec::<u8>::new();
+    let chunk = 10_000_000u32;
+    let budget = 8_000_000_000u64;
+    let mut steps = 0u64;
+    let mut found = false;
+    loop {
+        let (s, stop) = vm.run_steps_idle_aware(chunk);
+        steps += s as u64;
+        cumulative.extend_from_slice(&vm.drain_output());
+        if String::from_utf8_lossy(&cumulative).contains("Linux version") {
+            found = true;
+            break;
+        }
+        match stop {
+            wwwvm_vm::Stop::CpuError(e) => {
+                eprintln!("CpuError before banner: {e}");
+                break;
+            }
+            wwwvm_vm::Stop::Halted => {
+                eprintln!("Halted before banner");
+                break;
+            }
+            wwwvm_vm::Stop::StepBudget => {
+                if steps >= budget {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("=== bzImage self-decompress: Linux-version-banner={found} steps={steps} ===");
+    assert!(
+        found,
+        "guest must reach the 'Linux version' banner — proves the in-guest gzip self-decompressor ran. Output tail:\n{}",
+        String::from_utf8_lossy(&cumulative[cumulative.len().saturating_sub(2000)..])
+    );
+}
+
 /// Boot `kpath` with an initramfs whose /init execve's the Alpine musl
 /// `busybox sh -c "echo ALPINE_MUSL_OK"`, reading busybox + ld-musl from
 /// `root`. Returns (found, full UART, stop reason), or None if any asset is
