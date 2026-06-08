@@ -1082,3 +1082,88 @@ workload (RES_0→RES_8414). Затрагивает ЛЮБОЙ FP-код, гру
 были исключены трейсами по пути. Историю расследования см. memory
 `sin-silent-miscompute-bug.md`.
 
+
+## CPU correctness audit (May 2026)
+
+**Аудит корректности CPU (30 мая 2026):** многоагентный adversarial-
+аудит ISA-семантики против Intel SDM нашёл и исправил 5 багов (каждый
+с teeth-confirmed unit-тестом): (1) SHLD/SHRD затирали CF через
+`flags_logic` после вычисления → CF всегда 0; (2) LOOP/JCXZ/JECXZ
+использовали 16-бит CX вместо полного ECX в 32-битном addr-mode; (3)
+MOVZX/MOVSX r16,r/m16 (0x66 0F B7/BF) затирали верхнюю половину
+регистра вместо preserve; (4) IDIV INT_MIN/-1 паниковал («divide with
+overflow») в debug вместо #DE; (5) AF (auxiliary carry) не считался ни
+одним ALU-помощником → `ADD; DAA` использовал stale AF. Отложено
+(экзотика, низкий приоритет): POP [ESP]-base post-increment EA, и
+не-rollback ESP при #GP на faulting POP-в-сегмент. Дубль BCD-находки
+(AAA/AAS byte-carry в AH) НЕ исправлены — поведение эмулятора (раздельный
+`AL±=6; AH±=1`) совпадает с реальным кремнием для valid-domain входов;
+«AX±=106h» из новых SDM расходится только на out-of-domain входах.
+
+**Второй проход — system/privileged lanes (30 мая 2026):** аудит
+сегментов/дескрипторов/пейджинга/far-transfer/IRET/прерываний/system-инструкций.
+Исправлено 3 реальных бага (teeth-confirmed): (1) far CALL 0x9A / RETF
+0xCB/0xCA игнорировали operand-size — пушили/попали 16-бит CS:IP в
+32-битном коде (тот же класс, что far-call-indirect FF/3); (2) LMSW мог
+сбросить CR0.PE (тихий возврат в real mode); (3) ARPL (0x63) не
+декодировался → Unimplemented/краш. ОТЛОЖЕНО как намеренные упрощения
+protection-модели (ядро их не требует — flat-сегменты, валидные
+дескрипторы, корректный код; добавление чеков = риск сломать boot без
+выгоды): null/present/CPL-RPL-DPL чеки сегмент-загрузок, limit-enforcement,
+U/S и WP пейджинг-чеки, IRET EFLAGS-маскирование/SS-reload, IDT
+limit/present чеки, far-transfer privilege/gates. Не реализованы (редкие
+опкоды, ядро/userspace не используют): LAR/LSL, BOUND, SMSW/SLDT/STR
+32-bit zero-ext. Детали в memory `cpu-audit-deferred-findings`.
+
+**Третий проход — атомики и bit-string (30 мая 2026):**
+CMPXCHG/CMPXCHG8B/XADD/XCHG/LOCK + BT/BTS/BTR/BTC/BSF/BSR. Найдено всего
+2 бага — и НИ ОДНОГО в CMPXCHG/CMPXCHG8B, bitmap-операциях
+(BT/BTS/BTR/BTC с reg-индексом, адресующим дальние байты) или BSF/BSR:
+атомарные + bitmap-примитивы ядра корректны. Исправлено: XADD писал dest
+раньше src → вырожденный `XADD AX,AX` оставлял старое значение вместо
+2×old (ядерный `LOCK XADD [mem],reg` всегда был корректен — разное
+хранилище). Отложено: LOCK-префикс (0xF0) как отдельный no-op-шаг
+теряет префикс, стоящий ПЕРЕД ним (`66 F0 …`, неканонический порядок —
+ассемблеры так не генерят); канонический `F0 66 …` работает.
+
+**Четвёртый проход — x87 FPU + SSE (30 мая 2026):** condition-codes,
+стек, control-word, packed-arith. 12 находок, ВСЕ исправлены
+(teeth-confirmed). Главная — **системная инверсия SSE**: каждый
+0F-опкод с мандаторным `0x66` (COMISD/UCOMISD, ADD/MUL/SUB/DIV/MIN/MAX/SQRT
+PD, MOVD/MOVDQA, весь packed-integer PADD/PSUB/PCMP/PAND/PXOR/PMUL/PSHUFD/
+shifts/PMOVMSKB/…) выбирал PD-vs-PS форму по `op_size_32` (= 0x66 XOR
+code_size_32), а не по литеральному префиксу. В 32-битном PM (где идёт
+ВСЯ Linux-userspace SSE) это ИНВЕРТИРОВАЛО выбор: COMISD декодировался
+как COMISS, MOVDQA не распознавался, packed-double читал single-полосы.
+Работало только в real mode (где гоняются старые тесты). Фикс:
+`Cpu::has_66()` = `op_size_32 != code_size_32` (восстанавливает «был ли
+0x66» в обоих режимах), 37 SSE-сайтов переведены на него; genuine
+operand-size 0F-опкоды (MOVZX/MOVSX/CMOVcc/BT/…) не тронуты. НЕ повлияло
+на multi-lib busybox (та же ошибка) — значит SSE не был причиной
+коррапта. Остальные x87-фиксы: DC-форма FSUB/FDIV (операнды
+переставлены), FIST/FISTP (truncate→round-to-nearest по CW), FNINIT
+сбрасывает TOP, FNSTSW кодирует TOP в биты 11-13, FCOM чистит C1.
+Реализованы ранее НЕдекодированные (краш) compare/classify: FCOMI/FCOMIP/
+FUCOMI/FUCOMIP (ставят EFLAGS — современные компиляторы их генерят для
+float-сравнений), FXAM (libm-классификация), FUCOM/FUCOMP, FCOMPP,
+FUCOMPP (новый 0xDA-handler).
+
+**Пятый проход — префиксы/декод + CPUID/MSR + mode-transition
+(30 мая 2026):** 6 находок, 5 исправлено (1 отложена). ГЛАВНАЯ —
+**`rep ret` (F3 C3)**: дефолтный GCC function-return эпилог ~десятилетие
+(обход AMD K8/K10 branch-predict), поэтому реальные i386-бинари содержат
+ТЫСЯЧИ F3 C3 на горячем пути. F2/F3-handler спец-кейсил только
+inner=0x0F (SSE) и 0x90 (PAUSE); всё прочее падало в string-loop, который
+для не-string опкода либо ошибался (CX!=0 → Unimplemented), либо ПРОПУСКАЛ
+инструкцию (CX==0 → corrupt control-flow). Фикс: string-loop только для
+реальных string-опкодов (A4-A7/AA-AF/6C-6F), иначе префикс игнорируется
+(rewind на байт после него). (НЕ исправил multi-lib busybox — тот же
+0x6f622037-краш; значит rep ret не причина того коррапта.) Остальные:
+near RET imm16 (0xC2) корректирует полный ESP (carry в верхнюю
+половину); SS-load защёлкивает stack_size_32 из B-бита дескриптора;
+SYSEXIT форсит RPL=3/CPL=3 на CS/SS (иначе post-sysenter userspace бежал
+на CPL=0 → неверный U/S в #PF — а glibc через vDSO использует sysenter,
+SEP в CPUID есть); real-mode CS/SS reload сбрасывает code/stack_size_32 в
+16-бит. Отложено: LOCK-префикс (0xF0) как отдельный no-op-шаг теряет
+предшествующий префикс (`66 F0 …`, неканонический порядок — ассемблеры
+так не генерят).
