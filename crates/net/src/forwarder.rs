@@ -377,7 +377,8 @@ mod tests {
             let frame = query_frame(GW_IP, &dns_query_payload(1, &name, QTYPE_A));
             let _ = f.handle_frame(&frame);
         }
-        assert!(f.take_pending().len() <= MAX_PENDING, "pending must be capped");
+        let pending = f.take_pending().len();
+        assert!(pending <= MAX_PENDING, "pending must be capped");
     }
 
     #[test]
