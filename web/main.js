@@ -1104,15 +1104,31 @@ $("share-link")?.addEventListener("click", shareDemoLink);
 // Curated demo presets (demo-presets.js): a dropdown of ready scenarios that
 // fill the controls via the same hash-apply path, then surface a share link.
 function populateDemoPresets() {
-  const sel = $("demo-preset");
-  if (!sel) return;
-  for (const p of DEMO_PRESETS) {
-    const o = document.createElement("option");
-    o.value = p.id;
-    o.textContent = p.label;
-    sel.appendChild(o);
+  // The same presets feed both the single-VM sidebar dropdown and the launcher
+  // in the (default) Fleet header.
+  for (const id of ["demo-preset", "fleet-demo-preset"]) {
+    const sel = $(id);
+    if (!sel) continue;
+    for (const p of DEMO_PRESETS) {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = p.label;
+      sel.appendChild(o);
+    }
   }
 }
+
+// Fleet-header launcher: hop to the single-VM workspace and apply the chosen
+// preset there (the presets are single-VM scenarios). Reuses applyDemoPreset
+// so behaviour is identical to the sidebar dropdown.
+function launchFleetDemo() {
+  const id = $("fleet-demo-preset")?.value;
+  if (!id) return;
+  if (document.body.classList.contains("mode-fleet")) $("fleet-toggle")?.click();
+  if ($("demo-preset")) $("demo-preset").value = id;
+  applyDemoPreset();
+}
+$("fleet-demo-go")?.addEventListener("click", launchFleetDemo);
 
 function applyDemoPreset() {
   const p = DEMO_PRESETS.find((x) => x.id === $("demo-preset")?.value);
