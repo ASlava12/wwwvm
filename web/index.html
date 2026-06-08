@@ -85,6 +85,8 @@
           <small id="net-upstream-status" class="status">public proxies are untrusted — non-sensitive traffic only</small>
           <br />
           <button id="boot-image" disabled>Load selected image</button>
+          <button id="share-link" title="Copy a link that boots this exact scenario (image + cmdline + RAM + framebuffer + networking + autorun)">🔗 Share link</button>
+          <small id="share-status" class="status"></small>
           <hr />
           <details>
             <summary>…or load your own kernel files</summary>
@@ -265,6 +267,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=26"></script>
+    <script type="module" src="./main.js?v=27"></script>
   </body>
 </html>

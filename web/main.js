@@ -8,6 +8,7 @@ import init, { WwwVm } from "./pkg/wwwvm_wasm.js";
 import { saveSnapshot, loadSnapshot, listSnapshots } from "./storage.js";
 import { makeBytes, breakBytes, comboBytes } from "./ps2-keymap.js?v=2";
 import { SnapStore, uploadSnapshot, downloadSnapshot } from "./snapshot-store.js?v=2";
+import { parseConfigFromHash, buildHashFromConfig } from "./demo-link.js";
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -1023,7 +1024,83 @@ $("boot-image").addEventListener("click", async () => {
   }
 });
 
-loadImageManifest();
+// Shareable demo links: apply a `#img=…&autorun=…&net=1&boot=1` hash to the
+// controls once the image list is in (so an `img` id can select its <option>),
+// and a "Share" button that captures the current controls back into such a
+// link. Lets a whole demo scenario travel as one URL. See demo-link.js.
+function applyDemoLinkFromHash() {
+  const cfg = parseConfigFromHash(location.hash);
+  if (!Object.keys(cfg).length) return;
+  // An image id selects its option + its defaults FIRST, so explicit hash
+  // fields below win over the image's cmdline/fb/ram defaults.
+  let imgFound = false;
+  if (cfg.img) {
+    const img = imageManifest.find((x) => x.id === cfg.img);
+    if (img) {
+      $("image-select").value = cfg.img;
+      applyImageToControls(img);
+      imgFound = true;
+    } else {
+      $("image-status").textContent =
+        `shared link wants image "${cfg.img}", which this server doesn't have`;
+    }
+  }
+  if (cfg.cmdline !== undefined) $("cmdline").value = cfg.cmdline;
+  if (cfg.ram && $("vm-ram")) $("vm-ram").value = cfg.ram;
+  if (cfg.ramdisk && $("vm-ramdisk")) $("vm-ramdisk").value = cfg.ramdisk;
+  if (cfg.fb !== undefined) $("fb-enable").checked = cfg.fb === "1";
+  if (cfg.fbres) {
+    const sel = $("fb-res");
+    if (![...sel.options].some((o) => o.value === cfg.fbres)) {
+      const o = document.createElement("option");
+      o.value = cfg.fbres;
+      o.textContent = cfg.fbres.replace("x", "×");
+      sel.appendChild(o);
+    }
+    sel.value = cfg.fbres;
+  }
+  if (cfg.net !== undefined) $("net-enable").checked = cfg.net === "1";
+  if (cfg.allow !== undefined) $("net-allow").value = cfg.allow;
+  if (cfg.autorun !== undefined) $("autorun").value = cfg.autorun;
+
+  if (cfg.boot === "1") {
+    // Auto-boot the scenario: the named server image when this server has it
+    // (and the button is live), otherwise the built-in "Boot VM". Don't boot
+    // some *other* image just because the link asked for one we lack.
+    if (imgFound && !$("boot-image").disabled) $("boot-image").click();
+    else if (!cfg.img) $("boot").click();
+  }
+}
+
+// Capture the current Linux/Alpine controls into a shareable hash and copy it.
+function shareDemoLink() {
+  const cfg = {
+    img: $("image-select").value || "",
+    cmdline: $("cmdline").value,
+    ram: $("vm-ram")?.value || "",
+    ramdisk: ($("vm-ramdisk")?.value || "0") !== "0" ? $("vm-ramdisk").value : "",
+    fb: $("fb-enable").checked,
+    fbres: $("fb-res").value,
+    net: $("net-enable").checked,
+    allow: $("net-enable").checked ? $("net-allow").value.trim() : "",
+    autorun: $("autorun").value.trim(),
+    boot: true, // a demo link auto-boots the scenario on open
+  };
+  const hash = buildHashFromConfig(cfg);
+  const url = location.origin + location.pathname + hash;
+  history.replaceState(null, "", hash || location.pathname);
+  const note = (msg) => {
+    const el = $("share-status");
+    if (el) el.textContent = msg;
+  };
+  navigator.clipboard?.writeText(url).then(
+    () => note("link copied to clipboard ✓"),
+    () => note("link is in the address bar (copy it)"),
+  );
+}
+$("share-link")?.addEventListener("click", shareDemoLink);
+
+loadImageManifest().then(applyDemoLinkFromHash);
 loadProxyList();
 
 // `runCommand()` — send a line, collect output until it stops growing
