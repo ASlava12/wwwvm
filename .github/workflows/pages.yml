@@ -13,6 +13,7 @@ name: pages
 # separate server (a Rust service + a wss:// relay) and stay off here.
 #
 # One-time setup in the repo: Settings → Pages → Source = "GitHub Actions".
+# Published at: https://aslava12.github.io/wwwvm/
 
 on:
   push:
