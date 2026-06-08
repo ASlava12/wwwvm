@@ -179,6 +179,7 @@ impl IoBus {
     /// Standard wiring on a PC: COM1 → IRQ 4 (level-triggered, mirrors
     /// the line); PIT channel 0 → IRQ 0 (edge-triggered, one IRR pulse
     /// per terminal count).
+    #[inline]
     pub fn refresh_irqs(&mut self) {
         // PIT — prescaler-divided tick. Runs every step (ungated below): the
         // divider already throttles it, and it's the one source that advances
@@ -218,6 +219,16 @@ impl IoBus {
         if !self.irq_dirty && self.irq_poll != 0 {
             return;
         }
+        self.poll_device_irqs();
+    }
+
+    /// Latch the level-triggered device IRQ lines (UART / keyboard /
+    /// mouse / NIC) into the PIC IRRs and propagate the slave cascade.
+    /// Split out of `refresh_irqs` and marked `#[cold]` so the per-step
+    /// prologue — which reaches here only when `irq_dirty` is set or the
+    /// 256-step backstop wraps — keeps its common clean path inlinable.
+    #[cold]
+    fn poll_device_irqs(&mut self) {
         self.irq_dirty = false;
         // UART — level-triggered. IRR bit 4 mirrors the line.
         let irq4_bit = 1u8 << 4;
