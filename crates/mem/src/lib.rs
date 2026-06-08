@@ -330,6 +330,7 @@ impl Memory {
     ///   bit  16    mask (1 = no interrupt fires)
     ///   bits 18:17 timer mode (00 = one-shot, 01 = periodic, 10 = TSC-deadline)
     /// We don't model TSC-deadline.
+    #[inline]
     pub fn tick_lapic_timer(&mut self) {
         let cur_off = 0x390;
         let cur = u32::from_le_bytes([
@@ -338,6 +339,10 @@ impl Memory {
             self.lapic[cur_off + 2],
             self.lapic[cur_off + 3],
         ]);
+        // Cheap inlinable fast path: an un-armed timer (Current Count 0 —
+        // the state in early boot and the benchmarks) folds into the
+        // caller's prologue. The running case just decrements; only the
+        // rare zero crossing drops into the (non-inlined) handler below.
         if cur == 0 {
             return;
         }
@@ -346,6 +351,15 @@ impl Memory {
         if next != 0 {
             return;
         }
+        self.lapic_timer_zero_crossing();
+    }
+
+    /// The LVT_TIMER work done on a Current-Count zero crossing: queue
+    /// the timer IRQ (honoring mask + SVR software-enable) and, in
+    /// periodic mode, reload Current Count from Initial Count. Split out
+    /// of `tick_lapic_timer` so the per-step decrement stays inlinable.
+    fn lapic_timer_zero_crossing(&mut self) {
+        let cur_off = 0x390;
         // Zero crossing — check LVT_TIMER.
         let lvt = u32::from_le_bytes([
             self.lapic[0x320],
@@ -405,10 +419,23 @@ impl Memory {
     /// slot (both targets are the local APIC anyway); the kernel
     /// can't tell whether the delivery came from LAPIC timer or
     /// HPET except by the vector it programmed.
+    /// Per-step entry. The General Configuration ENABLE_CNF bit is clear
+    /// in the overwhelmingly common case (most kernels run the LAPIC
+    /// timer, HPET is off entirely during early boot, and the benchmarks
+    /// never touch it), so keep this a tiny `#[inline]` gate that folds
+    /// the disabled-counter check into the caller's per-step prologue —
+    /// the actual advance lives in a separate, non-inlined body that
+    /// only runs when the counter is enabled. A disabled HPET can't
+    /// reach a comparator match, so skipping the body is behavior-neutral.
+    #[inline]
     pub fn tick_hpet_counter(&mut self) {
         if self.hpet[0x10] & 1 == 0 {
             return;
         }
+        self.tick_hpet_counter_enabled();
+    }
+
+    fn tick_hpet_counter_enabled(&mut self) {
         let off = 0xF0;
         let cur = u64::from_le_bytes([
             self.hpet[off],
