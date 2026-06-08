@@ -132,6 +132,30 @@ pre { margin: 0; max-height: 8rem; overflow: auto;
 .snapshot-row button { flex: 1; }
 #snapshot-status { display: block; margin-top: .25rem; }
 
+/* Collapsed "Advanced" section: hides the rarely-used fieldsets (built-in
+   guests, send-keys, snapshots, diagnostics) behind one disclosure so the
+   demo presets + image boot are what a newcomer sees first. The wrapper has
+   no box of its own — the inner fieldsets keep their look; we just restore the
+   inter-fieldset spacing the parent flex `gap` doesn't reach inside <details>. */
+details.advanced > summary { color: var(--accent); cursor: pointer; user-select: none;
+  font-weight: 600; padding: .3rem 0; }
+details.advanced[open] > summary { margin-bottom: .5rem; }
+details.advanced > fieldset { margin-bottom: .75rem; }
+
+/* First-run welcome overlay (shown once; main.js toggles the `hidden` attr). */
+#welcome { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center;
+  justify-content: center; background: rgba(0, 0, 0, .6); padding: 1rem; }
+#welcome[hidden] { display: none; } /* override the flex display above when hidden */
+.welcome-card { max-width: 31rem; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1.25rem 1.5rem; box-shadow: 0 8px 40px rgba(0, 0, 0, .6); }
+.welcome-card h2 { margin: 0 0 .5rem; color: var(--accent); font-size: 1.15rem; }
+.welcome-card p { margin: .4rem 0; }
+.welcome-card ul { padding-left: 1.1rem; margin: .5rem 0; }
+.welcome-card li { margin: .35rem 0; }
+.welcome-actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
+.welcome-card button.secondary { background: var(--panel); color: var(--fg);
+  border: 1px solid var(--border); font-weight: 500; }
+
 /* "Send keys to VM": quick-combo buttons wrap; composer is a tidy row. */
 .key-combos { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .4rem; }
 .key-combos button { flex: 0 0 auto; font-size: .8rem; padding: .2rem .45rem; }

@@ -1133,6 +1133,32 @@ function applyDemoPreset() {
 $("demo-apply")?.addEventListener("click", applyDemoPreset);
 populateDemoPresets();
 
+// First-run welcome overlay: shown once per browser. localStorage can throw in
+// private mode / sandboxed frames, so guard it — a failure just means we show
+// the welcome again (harmless) rather than crashing.
+const WWWVM_WELCOME_KEY = "wwwvm.welcomed";
+function dismissWelcome() {
+  $("welcome")?.setAttribute("hidden", "");
+  try {
+    localStorage.setItem(WWWVM_WELCOME_KEY, "1");
+  } catch {
+    /* private mode — fine, just won't persist */
+  }
+}
+let wwwvmWelcomed = null;
+try {
+  wwwvmWelcomed = localStorage.getItem(WWWVM_WELCOME_KEY);
+} catch {
+  /* ignore */
+}
+if (!wwwvmWelcomed) $("welcome")?.removeAttribute("hidden");
+$("welcome-close")?.addEventListener("click", dismissWelcome);
+$("welcome-try")?.addEventListener("click", () => {
+  dismissWelcome();
+  // Hop to the single-VM workspace, where the Quick-demo presets live.
+  if (document.body.classList.contains("mode-fleet")) $("fleet-toggle")?.click();
+});
+
 loadImageManifest().then(applyDemoLinkFromHash);
 loadProxyList();
 

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <title>wwwvm — Rust VM in the browser</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
-    <link rel="stylesheet" href="./style.css?v=13" />
+    <link rel="stylesheet" href="./style.css?v=14" />
   </head>
   <body class="mode-fleet">
     <header>
@@ -112,6 +112,11 @@
           </details>
         </fieldset>
 
+        <!-- Everything below is collapsed by default so a newcomer sees the
+             demo presets + image boot first, not the whole control wall. -->
+        <details class="advanced">
+          <summary>Advanced — built-in guests, send keys, snapshots, diagnostics</summary>
+
         <fieldset>
           <legend>Built-in guest (for “Boot VM” below)</legend>
           <label>
@@ -212,6 +217,7 @@
           <legend>Diagnostics</legend>
           <pre id="diag">CPU not booted</pre>
         </fieldset>
+        </details>
       </aside>
 
       <!-- Main column: Canvas (top, when present) · UART · bottom controls. -->
@@ -267,6 +273,28 @@
       </aside>
     </main>
 
+    <!-- First-run welcome: a brief orientation overlay shown once per browser
+         (localStorage flag in main.js). Explains the two modes + points at the
+         Quick-demo presets so a newcomer isn't dropped straight into controls. -->
+    <div id="welcome" hidden>
+      <div class="welcome-card">
+        <h2>wwwvm — a real x86 PC in your browser</h2>
+        <p>An Intel-x86 CPU and PC devices emulated in Rust → WebAssembly,
+           booting real Linux / Alpine entirely client-side. Two views, switch
+           any time with the header button:</p>
+        <ul>
+          <li><b>🖥 Fleet</b> (this view) — several networked VMs on a virtual
+              LAN, with internet through a proxy; guests can ping each other.</li>
+          <li><b>🖳 Single VM</b> — boot your own kernel, snapshot / restore, and
+              the <b>Quick-demo</b> presets (Alpine shell, Python, numpy…).</li>
+        </ul>
+        <div class="welcome-actions">
+          <button id="welcome-try">Try a single-VM demo →</button>
+          <button id="welcome-close" class="secondary">Explore the Fleet</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Floating settings toggle (FAB), like a phone. Lives outside the panel
          so it can re-show a hidden sidebar. -->
     <button id="sidebar-toggle" title="Show/hide settings" aria-label="Settings">⚙</button>
@@ -276,6 +304,6 @@
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-    <script type="module" src="./main.js?v=28"></script>
+    <script type="module" src="./main.js?v=29"></script>
   </body>
 </html>
