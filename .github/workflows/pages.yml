@@ -1,0 +1,96 @@
+name: pages
+
+# Publish the static web/ front-end to GitHub Pages. Pages serves .wasm with
+# the correct application/wasm MIME (needed for streaming compile) and the app
+# uses no SharedArrayBuffer, so it needs no COOP/COEP headers Pages can't set.
+#
+# web/pkg (wasm) and web/images (boot kernels + initramfs) are .gitignored —
+# large, locally-built — so this workflow rebuilds them before uploading.
+#
+# Limitations on Pages (a static host, like the Beget deploy): single VM,
+# graphics, the Fleet peer-LAN, local snapshots and the offline demo presets
+# work; the Internet mode (NAT → WebSocket relay) and the snapshot store need a
+# separate server (a Rust service + a wss:// relay) and stay off here.
+#
+# One-time setup in the repo: Settings → Pages → Source = "GitHub Actions".
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "web/**"
+      - "crates/**"
+      - "scripts/build-web-images.sh"
+      - "scripts/fetch-alpine-assets.sh"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deploys at once; let an in-flight build finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System deps (squashfs-tools — extracts the DRM/input .ko's from modloop)
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+
+      - name: Rust wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pages-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-pages-
+
+      - name: Build wasm → web/pkg
+        run: wasm-pack build crates/wasm --target web --out-dir ../../web/pkg --release
+
+      # Builds the kernel + console/gui/lan initramfs images into web/images/ +
+      # manifest.json (self-fetches the Alpine assets). Best-effort: if the
+      # asset download flakes, still publish the app — the UI degrades to
+      # built-in guests + "load your own kernel", and the manifest-driven image
+      # picker shows "no server images" gracefully.
+      - name: Build browser boot images (best-effort)
+        run: scripts/build-web-images.sh
+        continue-on-error: true
+
+      # Drop dev-only files from the published site; disable Jekyll so nothing
+      # under web/ (e.g. pkg/) gets filtered.
+      - name: Prune dev files + disable Jekyll
+        run: |
+          rm -f web/*.test.mjs web/package.json
+          touch web/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
