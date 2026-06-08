@@ -2601,6 +2601,66 @@ fn protected_mode_int_dispatches_via_idt_gate() {
     );
 }
 
+/// End-to-end HPET delivery: a HPET timer in FSB (MSI) mode, armed
+/// before the guest halts, must wake the CPU out of HLT and dispatch
+/// its MSI vector through the IDT — exercising the full path
+/// `tick_hpet_counter` (mem) → `pending_lapic_irq` → HLT-idle drain →
+/// `do_interrupt`. The mem crate tests only assert the pending vector
+/// gets set; this proves the CPU actually delivers it to guest code.
+#[test]
+fn hpet_fsb_timer_wakes_halted_cpu_and_dispatches_idt_vector() {
+    use wwwvm_mem::{HPET_BASE, LAPIC_BASE};
+
+    let mut mem = Memory::new(0x10_0000);
+    // Boot stub at 0x7C00: STI (IF=1 so the IRQ can be taken); HLT.
+    mem.write_slice(0x7C00, &[0xFB, 0xF4]);
+
+    // GDT[1] = 16-bit code base=0x9000 (selector 0x08) for the handler.
+    cpu_pe_setup(&mut mem);
+
+    // IDT at 0x4000. Pick MSI vector 0x40 → gate at 0x4000 + 0x40*8 = 0x4200.
+    // offset_lo=0x0300, selector=0x08, type=0x86 (16-bit interrupt gate).
+    mem.write_slice(0x4200, &[0x00, 0x03, 0x08, 0x00, 0x00, 0x86, 0x00, 0x00]);
+    // Handler at 0x9000 + 0x0300 = 0x9300: MOV AL, 0x77; HLT.
+    mem.write_slice(0x9300, &[0xB0, 0x77, 0xF4]);
+
+    // Arm HPET timer 0 in FSB mode, firing at main-counter == 5.
+    //   main config (0x10): ENABLE_CNF (bit 0)
+    //   timer0 config (0x100): Tn_INT_ENB (bit 2) | Tn_FSB_EN (bit 14)
+    //   timer0 comparator (0x108): 5
+    //   timer0 FSB route low (0x110): MSI data = vector 0x40
+    mem.write_u32(HPET_BASE + 0x10, 0x0000_0001);
+    mem.write_u32(HPET_BASE + 0x100, (1 << 2) | (1 << 14));
+    mem.write_u32(HPET_BASE + 0x108, 5);
+    mem.write_u32(HPET_BASE + 0x110, 0x0000_0040);
+    // LAPIC software-enable (SVR bit 8); FSB delivery is gated on it.
+    mem.write_u32(LAPIC_BASE + 0xF0, 0x0000_010F);
+
+    let mut cpu = Cpu::new();
+    cpu.reset_to_boot();
+    cpu.cr0 = 1; // PE
+    cpu.gdtr.base = 0x0500;
+    cpu.gdtr.limit = 0x0017;
+    cpu.idtr.base = 0x4000;
+    cpu.idtr.limit = 0x07FF;
+
+    let mut io = IoBus::new();
+    // STI + HLT (2 steps) then ~5 HLT-idle ticks to reach the comparator,
+    // then the handler's MOV/HLT — 16 is comfortable headroom.
+    for _ in 0..16 {
+        cpu.step(&mut mem, &mut io).expect("step");
+        if cpu.halted && cpu.read_r8(0) == 0x77 {
+            break;
+        }
+    }
+    assert!(cpu.halted, "CPU must be halted in the handler's final HLT");
+    assert_eq!(
+        cpu.read_r8(0),
+        0x77,
+        "HPET FSB timer must wake HLT and dispatch MSI vector 0x40 (handler sets AL=0x77)"
+    );
+}
+
 /// Builds GDT[1] = code segment base=0x9000 access=0x9A at gdtr.base=0x0500.
 fn cpu_pe_setup(mem: &mut Memory) {
     mem.write_slice(
@@ -5865,13 +5925,28 @@ fn io_bitmap_grants_specific_port_at_cpl3() {
     cpu.flags = 0x0002; // IOPL = 0
 
     // CPL(3) > IOPL(0): the bitmap decides.
-    assert!(cpu.io_access_permitted(0, 1, &mem), "port 0 bit clear → granted");
-    assert!(!cpu.io_access_permitted(1, 1, &mem), "port 1 bit set → denied");
-    assert!(!cpu.io_access_permitted(0, 2, &mem), "word access spans denied port 1");
-    assert!(!cpu.io_access_permitted(8, 1, &mem), "byte 0x69 past TSS limit 0x68 → denied");
+    assert!(
+        cpu.io_access_permitted(0, 1, &mem),
+        "port 0 bit clear → granted"
+    );
+    assert!(
+        !cpu.io_access_permitted(1, 1, &mem),
+        "port 1 bit set → denied"
+    );
+    assert!(
+        !cpu.io_access_permitted(0, 2, &mem),
+        "word access spans denied port 1"
+    );
+    assert!(
+        !cpu.io_access_permitted(8, 1, &mem),
+        "byte 0x69 past TSS limit 0x68 → denied"
+    );
     // Raising IOPL to 3 lifts the gate entirely.
     cpu.flags = 0x3002;
-    assert!(cpu.io_access_permitted(1, 1, &mem), "CPL <= IOPL → always permitted");
+    assert!(
+        cpu.io_access_permitted(1, 1, &mem),
+        "CPL <= IOPL → always permitted"
+    );
 }
 
 /// CLI in CPL=3 fires #GP iff IOPL < CPL. Same setup pattern as
